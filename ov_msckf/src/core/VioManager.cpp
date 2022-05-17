@@ -263,17 +263,28 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
 
   // Return if the camera measurement is out of order
   if (state->_timestamp > message.timestamp) {
-    PRINT_WARNING(YELLOW "image received out of order, unable to do anything (prop dt = %3f)\n" RESET,
+    PRINT_WARNING(YELLOW "%s image received out of order, unable to do anything (prop dt = %3f)\n" RESET, message.images.size() == 2 ? "stereo" : "mono",
                   (message.timestamp - state->_timestamp));
     return;
   }
 
   // Propagate the state forward to the current update time
-  // Also augment it with a new clone!
+  // Also augment it with a new clone! - TURI testing just cloning on master cam intervals
   // NOTE: if the state is already at the given time (can happen in sim)
   // NOTE: then no need to prop since we already are at the desired timestep
-  if (state->_timestamp != message.timestamp) {
-    propagator->propagate_and_clone(state, message.timestamp);
+  // if (state->_timestamp != message.timestamp) {
+  //   propagator->propagate_and_clone(state, message.timestamp);
+  // }
+  if (state->_timestamp != message.timestamp){
+    // treating id 0 as our base/master camera to run clones off of
+    if (std::find(message.sensor_ids.begin(), message.sensor_ids.end(), 0) != message.sensor_ids.end()) {
+      fprintf(stderr, "propogating and cloning with master cam\n");
+      propagator->propagate_and_clone(state, message.timestamp);
+    }
+    else {
+      fprintf(stderr, "propogating only with slave cam\n");
+      propagator->propagate_only(state, message.timestamp);
+    }
   }
   rT3 = boost::posix_time::microsec_clock::local_time();
 
@@ -314,6 +325,7 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
   // Remove any lost features that were from other image streams
   // E.g: if we are cam1 and cam0 has not processed yet, we don't want to try to use those in the update yet
   // E.g: thus we wait until cam0 process its newest image to remove features which were seen from that camera
+  int feats_start = feats_lost.size();
   auto it1 = feats_lost.begin();
   while (it1 != feats_lost.end()) {
     bool found_current_message_camid = false;
@@ -329,13 +341,15 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
       it1 = feats_lost.erase(it1);
     }
   }
+  fprintf(stderr, "feature propogate for cam %d dropped %d feats from other streams\n", message.sensor_ids[0], feats_start - (int)feats_lost.size());
+
 
   // We also need to make sure that the max tracks does not contain any lost features
   // This could happen if the feature was lost in the last frame, but has a measurement at the marg timestep
   it1 = feats_lost.begin();
   while (it1 != feats_lost.end()) {
     if (std::find(feats_marg.begin(), feats_marg.end(), (*it1)) != feats_marg.end()) {
-      // PRINT_WARNING(YELLOW "FOUND FEATURE THAT WAS IN BOTH feats_lost and feats_marg!!!!!!\n" RESET);
+      PRINT_WARNING(YELLOW "FOUND FEATURE THAT WAS IN BOTH feats_lost and feats_marg!!!!!!\n" RESET);
       it1 = feats_lost.erase(it1);
     } else {
       it1++;
@@ -349,6 +363,7 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
     // See if any of our camera's reached max track
     bool reached_max = false;
     for (const auto &cams : (*it2)->timestamps) {
+      fprintf(stderr, "cam id %ld, track len: %d\n", cams.first, cams.second.size());
       if ((int)cams.second.size() > state->_options.max_clone_size) {
         reached_max = true;
         break;
