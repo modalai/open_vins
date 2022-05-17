@@ -38,22 +38,6 @@ list(APPEND thirdparty_libraries
         ${catkin_LIBRARIES}
 )
 
-# If we are not building with ROS then we need to manually link to its headers
-# This isn't that elegant of a way, but this at least allows for building without ROS
-# See this stackoverflow answer: https://stackoverflow.com/a/11217008/7718197
-if (NOT catkin_FOUND OR NOT ENABLE_ROS)
-
-    message(STATUS "MANUALLY LINKING TO OV_CORE LIBRARY....")
-    include_directories(${CMAKE_SOURCE_DIR}/../ov_core/src/)
-    file(GLOB_RECURSE OVCORE_LIBRARY_SOURCES "${CMAKE_SOURCE_DIR}/../ov_core/src/*.cpp")
-    list(FILTER OVCORE_LIBRARY_SOURCES EXCLUDE REGEX ".*test_webcam\\.cpp$")
-    list(FILTER OVCORE_LIBRARY_SOURCES EXCLUDE REGEX ".*test_tracking\\.cpp$")
-    list(APPEND LIBRARY_SOURCES ${OVCORE_LIBRARY_SOURCES})
-    file(GLOB_RECURSE OVCORE_LIBRARY_HEADERS "${CMAKE_SOURCE_DIR}/../ov_core/src/*.h")
-    list(APPEND LIBRARY_HEADERS ${OVCORE_LIBRARY_HEADERS})
-
-endif ()
-
 ##################################################
 # Make the shared library
 ##################################################
@@ -67,6 +51,17 @@ list(APPEND LIBRARY_SOURCES
 )
 file(GLOB_RECURSE LIBRARY_HEADERS "src/*.h")
 add_library(ov_init_lib SHARED ${LIBRARY_SOURCES} ${LIBRARY_HEADERS})
+
+# If we are not building with ROS then we need to manually link to its headers
+# This isn't that elegant of a way, but this at least allows for building without ROS
+# See this stackoverflow answer: https://stackoverflow.com/a/11217008/7718197
+if (NOT catkin_FOUND OR NOT ENABLE_ROS)
+
+    message(STATUS "MANUALLY LINKING TO OV_CORE LIBRARY....")
+    include_directories(${CMAKE_SOURCE_DIR}/../ov_core/src/)
+    target_link_libraries(ov_init_lib ov_core_lib)
+endif ()
+
 target_link_libraries(ov_init_lib ${thirdparty_libraries})
 target_include_directories(ov_init_lib PUBLIC src/)
 install(TARGETS ov_init_lib
