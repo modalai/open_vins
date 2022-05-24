@@ -71,25 +71,25 @@ install(DIRECTORY src/
 # Make binary files!
 ##################################################
 
-if (catkin_FOUND AND ENABLE_ROS)
+# if (catkin_FOUND AND ENABLE_ROS)
 
-    add_executable(test_tracking src/test_tracking.cpp)
-    target_link_libraries(test_tracking ov_core_lib ${thirdparty_libraries})
-    install(TARGETS test_tracking
-            ARCHIVE DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}
-            LIBRARY DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}
-            RUNTIME DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
-    )
+#     add_executable(test_tracking src/test_tracking.cpp)
+#     target_link_libraries(test_tracking ov_core_lib ${thirdparty_libraries})
+#     install(TARGETS test_tracking
+#             ARCHIVE DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}
+#             LIBRARY DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}
+#             RUNTIME DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
+#     )
 
-endif ()
+# endif ()
 
-add_executable(test_webcam src/test_webcam.cpp)
-target_link_libraries(test_webcam ov_core_lib ${thirdparty_libraries})
-install(TARGETS test_webcam
-        ARCHIVE DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}
-        LIBRARY DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}
-        RUNTIME DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
-)
+# add_executable(test_webcam src/test_webcam.cpp)
+# target_link_libraries(test_webcam ov_core_lib ${thirdparty_libraries})
+# install(TARGETS test_webcam
+#         ARCHIVE DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}
+#         LIBRARY DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}
+#         RUNTIME DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
+# )
 
 
 

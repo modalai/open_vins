@@ -79,28 +79,28 @@ install(DIRECTORY src/
 # Make binary files!
 ##################################################
 
-add_executable(test_simulation src/test_simulation.cpp)
-target_link_libraries(test_simulation ov_init_lib ${thirdparty_libraries})
-install(TARGETS test_simulation
-        ARCHIVE DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}
-        LIBRARY DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}
-        RUNTIME DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
-)
+# add_executable(test_simulation src/test_simulation.cpp)
+# target_link_libraries(test_simulation ov_init_lib ${thirdparty_libraries})
+# install(TARGETS test_simulation
+#         ARCHIVE DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}
+#         LIBRARY DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}
+#         RUNTIME DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
+# )
 
-add_executable(test_dynamic_mle src/test_dynamic_mle.cpp)
-target_link_libraries(test_dynamic_mle ov_init_lib ${thirdparty_libraries})
-install(TARGETS test_dynamic_mle
-        ARCHIVE DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}
-        LIBRARY DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}
-        RUNTIME DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
-)
+# add_executable(test_dynamic_mle src/test_dynamic_mle.cpp)
+# target_link_libraries(test_dynamic_mle ov_init_lib ${thirdparty_libraries})
+# install(TARGETS test_dynamic_mle
+#         ARCHIVE DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}
+#         LIBRARY DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}
+#         RUNTIME DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
+# )
 
-add_executable(test_dynamic_init src/test_dynamic_init.cpp)
-target_link_libraries(test_dynamic_init ov_init_lib ${thirdparty_libraries})
-install(TARGETS test_dynamic_init
-        ARCHIVE DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}
-        LIBRARY DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}
-        RUNTIME DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
-)
+# add_executable(test_dynamic_init src/test_dynamic_init.cpp)
+# target_link_libraries(test_dynamic_init ov_init_lib ${thirdparty_libraries})
+# install(TARGETS test_dynamic_init
+#         ARCHIVE DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}
+#         LIBRARY DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}
+#         RUNTIME DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
+# )
 
 

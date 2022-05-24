@@ -189,7 +189,7 @@ public:
       // std::string var = "sometext" + std::to_string(somevar) + "sometext" + std::to_string(somevar);  
       Eigen::Matrix<double, 3, 1> dx = state->_imu->pos();// - state->_clones_IMU.at(timelastupdate)->pos();
       overlay = "X: " + std::to_string(dx(0)) + ", Y: " + std::to_string(dx(1)) + ", Z: " + std::to_string(dx(2));
-      fprintf(stderr, "overlay text is: %s\n", overlay.c_str());
+      // fprintf(stderr, "overlay text is: %s\n", overlay.c_str());
     }
 
     // Get the current active tracks
