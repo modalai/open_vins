@@ -183,6 +183,15 @@ public:
     std::string overlay = (did_zupt_update) ? "zvupt" : "";
     overlay = (!is_initialized_vio) ? "init" : overlay;
 
+    // if our overlay is empty here, we are running good
+    // thus, just need to get our states current pos, probably at the current ts of this image but for now just active state's pose
+    if (overlay == ""){
+      // std::string var = "sometext" + std::to_string(somevar) + "sometext" + std::to_string(somevar);  
+      Eigen::Matrix<double, 3, 1> dx = state->_imu->pos();// - state->_clones_IMU.at(timelastupdate)->pos();
+      overlay = "X: " + std::to_string(dx(0)) + ", Y: " + std::to_string(dx(1)) + ", Z: " + std::to_string(dx(2));
+      fprintf(stderr, "overlay text is: %s\n", overlay.c_str());
+    }
+
     // Get the current active tracks
     cv::Mat img_history;
     trackFEATS->display_history(img_history, 255, 255, 0, 255, 255, 255, highlighted_ids, overlay);

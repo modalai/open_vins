@@ -277,15 +277,15 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
   // }
   if (state->_timestamp != message.timestamp){
     // treating id 0 as our base/master camera to run clones off of
-    if (std::find(message.sensor_ids.begin(), message.sensor_ids.end(), 0) != message.sensor_ids.end()) {
-      fprintf(stderr, "propogating and cloning with master cam\n");
+    // if (std::find(message.sensor_ids.begin(), message.sensor_ids.end(), 0) != message.sensor_ids.end()) {
+      // fprintf(stderr, "propogating and cloning with master cam\n");
       propagator->propagate_and_clone(state, message.timestamp);
     }
-    else {
-      fprintf(stderr, "propogating only with slave cam\n");
-      propagator->propagate_only(state, message.timestamp);
-    }
-  }
+    // else {
+      // fprintf(stderr, "propogating only with slave cam\n");
+      // propagator->propagate_only(state, message.timestamp);
+    // }
+  // }
   rT3 = boost::posix_time::microsec_clock::local_time();
 
   // If we have not reached max clones, we should just return...
@@ -341,7 +341,7 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
       it1 = feats_lost.erase(it1);
     }
   }
-  fprintf(stderr, "feature propogate for cam %d dropped %d feats from other streams\n", message.sensor_ids[0], feats_start - (int)feats_lost.size());
+  // fprintf(stderr, "feature propogate for cam %d dropped %d feats from other streams\n", message.sensor_ids[0], feats_start - (int)feats_lost.size());
 
 
   // We also need to make sure that the max tracks does not contain any lost features
@@ -363,8 +363,7 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
     // See if any of our camera's reached max track
     bool reached_max = false;
     for (const auto &cams : (*it2)->timestamps) {
-      fprintf(stderr, "cam id %ld, track len: %d\n", cams.first, cams.second.size());
-      if ((int)cams.second.size() > state->_options.max_clone_size) {
+      if ((int)cams.second.size() > state->_options.max_clone_size / state->_options.num_cameras + 1) {
         reached_max = true;
         break;
       }
