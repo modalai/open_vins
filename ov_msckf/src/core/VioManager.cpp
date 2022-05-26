@@ -190,7 +190,7 @@ void VioManager::feed_measurement_simulation(double timestamp, const std::vector
 
 void VioManager::track_image_and_update(const ov_core::CameraData &message_const) {
 
-  fprintf(stderr, "tracking and updating\n");
+  // fprintf(stderr, "tracking and updating\n");
   // Start timing
   rT1 = boost::posix_time::microsec_clock::local_time();
 
@@ -213,7 +213,7 @@ void VioManager::track_image_and_update(const ov_core::CameraData &message_const
     message.masks.at(i) = mask_temp;
   }
 
-  fprintf(stderr, "tracking and updating2\n");
+  // , "tracking and updating2\n");
 
 
   // Perform our feature tracking!
@@ -222,7 +222,7 @@ void VioManager::track_image_and_update(const ov_core::CameraData &message_const
     trackDATABASE->append_new_measurements(trackFEATS->get_feature_database());
   }
 
-  fprintf(stderr, "tracking and updating3\n");
+  // fprintf(stderr, "tracking and updating3\n");
 
   // If the aruco tracker is available, the also pass to it
   // NOTE: binocular tracking for aruco doesn't make sense as we by default have the ids
