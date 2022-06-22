@@ -82,7 +82,7 @@ struct InertialInitializerOptions {
   int init_dyn_mle_max_threads = 20;
 
   /// Max time for MLE optimization (seconds)
-  double init_dyn_mle_max_time = 5.0;
+  double init_dyn_mle_max_time = 2.0;
 
   /// Number of poses to use during initialization (max should be cam freq * window)
   int init_dyn_num_pose = 5;

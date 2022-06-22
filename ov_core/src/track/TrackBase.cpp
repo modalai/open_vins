@@ -75,7 +75,7 @@ void TrackBase::display_active(cv::Mat &img_out, int r1, int g1, int b1, int r2,
       // Get bounding pts for our boxes
       cv::Point2f pt_l = pts_last[pair.first].at(i).pt;
       // Draw the extracted points and ID
-      cv::circle(img_temp, pt_l, (is_small) ? 1 : 2, cv::Scalar(r1, g1, b1), cv::FILLED);
+      cv::circle(img_temp, pt_l, (is_small) ? 1 : 6, cv::Scalar(r1, g1, b1), cv::FILLED);
       // cv::putText(img_out, std::to_string(ids_left_last.at(i)), pt_l, cv::FONT_HERSHEY_SIMPLEX,0.5,cv::Scalar(0,0,255),1,cv::LINE_AA);
       // Draw rectangle around the point
       cv::Point2f pt_l_top = cv::Point2f(pt_l.x - 5, pt_l.y - 5);
@@ -127,6 +127,7 @@ void TrackBase::display_history(cv::Mat &img_out, int r1, int g1, int b1, int r2
     return;
 
   // If the image is "small" thus we shoudl use smaller display codes
+  // TURI hardcoding to small image so we can fit more stuff in the overlay
   bool is_small = (std::min(max_width, max_height) < 400);
 
   // If the image is "new" then draw the images from scratch
@@ -159,7 +160,7 @@ void TrackBase::display_history(cv::Mat &img_out, int r1, int g1, int b1, int r2
         cv::Point2f pt_l_top = cv::Point2f(pt_c.x - ((is_small) ? 3 : 5), pt_c.y - ((is_small) ? 3 : 5));
         cv::Point2f pt_l_bot = cv::Point2f(pt_c.x + ((is_small) ? 3 : 5), pt_c.y + ((is_small) ? 3 : 5));
         cv::rectangle(img_temp, pt_l_top, pt_l_bot, cv::Scalar(0, 255, 0), 1);
-        cv::circle(img_temp, pt_c, (is_small) ? 1 : 2, cv::Scalar(0, 255, 0), cv::FILLED);
+        cv::circle(img_temp, pt_c, (is_small) ? 1 : 6, cv::Scalar(0, 255, 0), cv::FILLED);
       }
       // Get the feature from the database
       std::shared_ptr<Feature> feat = database->get_feature(ids_last[pair.first].at(i));
@@ -178,7 +179,7 @@ void TrackBase::display_history(cv::Mat &img_out, int r1, int g1, int b1, int r2
         int color_b = (is_stereo ? g2 : b2) - (int)((is_stereo ? g1 : b1) / feat->uvs[pair.first].size() * z);
         // Draw current point
         cv::Point2f pt_c(feat->uvs[pair.first].at(z)(0), feat->uvs[pair.first].at(z)(1));
-        cv::circle(img_temp, pt_c, (is_small) ? 1 : 2, cv::Scalar(color_r, color_g, color_b), cv::FILLED);
+        cv::circle(img_temp, pt_c, (is_small) ? 1 : 6, cv::Scalar(color_r, color_g, color_b), cv::FILLED);
         // If there is a next point, then display the line from this point to the next
         if (z + 1 < feat->uvs[pair.first].size()) {
           cv::Point2f pt_n(feat->uvs[pair.first].at(z + 1)(0), feat->uvs[pair.first].at(z + 1)(1));
@@ -192,6 +193,7 @@ void TrackBase::display_history(cv::Mat &img_out, int r1, int g1, int b1, int r2
       }
     }
     // Draw what camera this is
+    is_small = true;
     auto txtpt = (is_small) ? cv::Point(10, 30) : cv::Point(30, 60);
     if (overlay == "") {
       cv::putText(img_temp, "CAM:" + std::to_string((int)pair.first), txtpt, cv::FONT_HERSHEY_COMPLEX_SMALL, (is_small) ? 1.5 : 3.0,
@@ -206,5 +208,6 @@ void TrackBase::display_history(cv::Mat &img_out, int r1, int g1, int b1, int r2
     // Replace the output image
     img_temp.copyTo(img_out(cv::Rect(max_width * index_cam, 0, img_last_cache[pair.first].cols, img_last_cache[pair.first].rows)));
     index_cam++;
+    is_small = false;
   }
 }

@@ -266,8 +266,6 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
   //===================================================================================
   // State propagation, and clone augmentation
   //===================================================================================
-    PRINT_WARNING(YELLOW "%s image received out of order, unable to do anything (prop dt = %3f)\n" RESET, message.images.size() == 2 ? "stereo" : "mono",
-                  (message.timestamp - state->_timestamp));
   // Return if the camera measurement is out of order
   if (state->_timestamp > message.timestamp) {
     PRINT_WARNING(YELLOW "%s image received out of order, unable to do anything (prop dt = %3f)\n" RESET, message.images.size() == 2 ? "stereo" : "mono",
@@ -283,17 +281,8 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
   //   propagator->propagate_and_clone(state, message.timestamp);
   // }
   if (state->_timestamp != message.timestamp){
-    // TURI
-    // treating id 0 as our base/master camera to run clones off of
-    // if (std::find(message.sensor_ids.begin(), message.sensor_ids.end(), 0) != message.sensor_ids.end()) {
-      // fprintf(stderr, "propogating and cloning with master cam\n");
       propagator->propagate_and_clone(state, message.timestamp);
     }
-    // else {
-      // fprintf(stderr, "propogating only with slave cam\n");
-      // propagator->propagate_only(state, message.timestamp);
-    // }
-  // }
   rT3 = boost::posix_time::microsec_clock::local_time();
 
   // If we have not reached max clones, we should just return...
@@ -304,8 +293,8 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
   // this isnt necessarily true if we have a multi-cam setup
   // i.e. could have a few clones, but half from a completely different view so no triangulating...
 
-  // if ((int)state->_clones_IMU.size() < std::min(state->_options.max_clone_size, 5)) {
-  if ((int)state->_clones_IMU.size() < std::min(state->_options.max_clone_size, 5 * state->_options.num_cameras)) {
+  if ((int)state->_clones_IMU.size() < std::min(state->_options.max_clone_size, 5)) {
+  // if ((int)state->_clones_IMU.size() < std::min(state->_options.max_clone_size, 5 * state->_options.num_cameras)) {
     PRINT_DEBUG("waiting for enough clone states (%d of %d)....\n", (int)state->_clones_IMU.size(),
                 std::min(state->_options.max_clone_size, 5));
     return;
@@ -325,8 +314,6 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
 
   // Now, lets get all features that should be used for an update that are lost in the newest frame
   // We explicitly request features that have not been deleted (used) in another update step
-
-  // TURI: what would delete a feature besides an update?
 
   std::vector<std::shared_ptr<Feature>> feats_lost, feats_marg, feats_slam;
   feats_lost = trackFEATS->get_feature_database()->features_not_containing_newer(state->_timestamp, false, true);
@@ -378,9 +365,9 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
     // See if any of our camera's reached max track
     bool reached_max = false;
     for (const auto &cams : (*it2)->timestamps) {
+      if ((int)cams.second.size() > state->_options.max_clone_size) {
       // TURI - multicam tracks
-      // if ((int)cams.second.size() > state->_options.max_clone_size) {
-      if ((int)cams.second.size() > state->_options.max_clone_size / state->_options.num_cameras) {
+      // if ((int)cams.second.size() > state->_options.max_clone_size / state->_options.num_cameras) {
         reached_max = true;
         break;
       }
