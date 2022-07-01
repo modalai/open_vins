@@ -170,6 +170,23 @@ public:
   /// Accessor to get the current propagator
   std::shared_ptr<Propagator> get_propagator() { return propagator; }
 
+  // features
+  std::vector<std::pair<int, cv::Point2f>> get_pixel_loc_features() {
+
+    // Build an id-list of our "in state" features
+    // i.e. SLAM and last msckf update features
+    std::vector<size_t> highlighted_ids;
+    for (const auto &feat : state->_features_SLAM) {
+      highlighted_ids.push_back(feat.first);
+    }
+
+    for (const auto &id : MSCKF_ids) {
+      highlighted_ids.push_back(id);
+    }
+    
+    return trackFEATS->return_active_pix_locs(highlighted_ids);
+  }
+
   /// Get a nice visualization image of what tracks we have
   cv::Mat get_historical_viz_image() {
 
@@ -367,6 +384,8 @@ protected:
 
   // Good features that where used in the last update (used in visualization)
   std::vector<Eigen::Vector3d> good_features_MSCKF;
+  // store the entire representation as well, so we can draw with them
+  std::vector<size_t> MSCKF_ids;
 
   /// Feature initializer used to triangulate all active tracks
   std::shared_ptr<ov_core::FeatureInitializer> active_tracks_initializer;

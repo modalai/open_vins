@@ -511,8 +511,11 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
   }
 
   // Save all the MSCKF features used in the update
+  // _features_MSCKF = (featsup_MSCKF.clone());
   for (auto const &feat : featsup_MSCKF) {
     good_features_MSCKF.push_back(feat->p_FinG);
+    MSCKF_ids.push_back(feat->featid);
+    // pix_features_MSCKF.push_back(feat->p_FinA);
     feat->to_delete = true;
   }
 

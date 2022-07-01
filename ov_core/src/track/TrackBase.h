@@ -40,6 +40,9 @@
 #include "utils/opencv_lambda_body.h"
 #include "utils/sensor_data.h"
 
+#define INS_FEAT_ID 0
+#define OOS_FEAT_ID 1
+
 namespace ov_core {
 
 /**
@@ -130,6 +133,9 @@ public:
    * @return FeatureDatabase pointer that one can query for features
    */
   std::shared_ptr<FeatureDatabase> get_feature_database() { return database; }
+
+
+  virtual std::vector<std::pair<int, cv::Point2f>> return_active_pix_locs(std::vector<size_t> highlighted);
 
   /**
    * @brief Changes the ID of an actively tracked feature to another one.

@@ -67,7 +67,7 @@ struct InertialInitializerOptions {
   double init_imu_thresh = 1.0;
 
   /// Max disparity we will consider the unit to be stationary
-  double init_max_disparity = 1.0;
+  double init_max_disparity = 1.5;
 
   /// Number of features we should try to track
   int init_max_features = 50;
