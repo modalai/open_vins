@@ -439,8 +439,7 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
       // measurements)\n",(int)feats_slam.at(i)->featid,(int)feats_slam.at(i)->timestamps_left.size());
     } else {
       feats_slam_DELAYED.push_back(feats_slam.at(i));
-      // PRINT_DEBUG("[UPDATE-SLAM]: new feature ready %d (%d
-      // measurements)\n",(int)feats_slam.at(i)->featid,(int)feats_slam.at(i)->timestamps_left.size());
+      // fprintf(stderr, "[UPDATE-SLAM]: new feature ready (%d measurements)\n", (int)feats_slam.at(i)->timestamps.size());
     }
   }
 
@@ -508,14 +507,14 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
     // Thus we should be able to visualize the other unique camera stream
     // MSCKF features as they will also be appended to the vector
     good_features_MSCKF.clear();
+    MSCKF_locs.clear();
   }
 
   // Save all the MSCKF features used in the update
   // _features_MSCKF = (featsup_MSCKF.clone());
   for (auto const &feat : featsup_MSCKF) {
     good_features_MSCKF.push_back(feat->p_FinG);
-    MSCKF_ids.push_back(feat->featid);
-    // pix_features_MSCKF.push_back(feat->p_FinA);
+    MSCKF_locs.push_back(cv::Point2f(feat->uvs[0].back()(0), feat->uvs[0].back()(1)));
     feat->to_delete = true;
   }
 

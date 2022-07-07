@@ -172,6 +172,7 @@ public:
 
   // features
   std::vector<std::pair<int, cv::Point2f>> get_pixel_loc_features() {
+  std::vector<std::pair<int, cv::Point2f>> pixel_loc_feats;
 
     // Build an id-list of our "in state" features
     // i.e. SLAM and last msckf update features
@@ -180,11 +181,14 @@ public:
       highlighted_ids.push_back(feat.first);
     }
 
-    for (const auto &id : MSCKF_ids) {
-      highlighted_ids.push_back(id);
+   trackFEATS->return_active_pix_locs(highlighted_ids, &pixel_loc_feats);
+
+   // SLAM features are now in the vector, just need to append (INSTATE, MSCKF LOC) now
+    for (const auto &loc : MSCKF_locs) {
+      pixel_loc_feats.push_back(std::make_pair(INS_FEAT_ID, loc));
     }
     
-    return trackFEATS->return_active_pix_locs(highlighted_ids);
+    return pixel_loc_feats;
   }
 
   /// Get a nice visualization image of what tracks we have
@@ -385,7 +389,7 @@ protected:
   // Good features that where used in the last update (used in visualization)
   std::vector<Eigen::Vector3d> good_features_MSCKF;
   // store the entire representation as well, so we can draw with them
-  std::vector<size_t> MSCKF_ids;
+  std::vector<cv::Point2f> MSCKF_locs;
 
   /// Feature initializer used to triangulate all active tracks
   std::shared_ptr<ov_core::FeatureInitializer> active_tracks_initializer;

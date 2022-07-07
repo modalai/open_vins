@@ -135,7 +135,8 @@ public:
   std::shared_ptr<FeatureDatabase> get_feature_database() { return database; }
 
 
-  virtual std::vector<std::pair<int, cv::Point2f>> return_active_pix_locs(std::vector<size_t> highlighted);
+  virtual void return_active_pix_locs(std::vector<size_t> highlighted, std::vector<std::pair<int, cv::Point2f>> *MSCKF_locs );
+
 
   /**
    * @brief Changes the ID of an actively tracked feature to another one.

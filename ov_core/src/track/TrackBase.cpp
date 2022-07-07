@@ -23,23 +23,22 @@
 
 using namespace ov_core;
 
-std::vector<std::pair<int, cv::Point2f>> TrackBase::return_active_pix_locs(std::vector<size_t> highlighted){
-    std::vector<std::pair<int, cv::Point2f>> pixel_loc_vector;
+void TrackBase::return_active_pix_locs(std::vector<size_t> highlighted, std::vector<std::pair<int, cv::Point2f>> *MSCKF_locs ){
   // this is gonna loop through every image in our last update set, not sure expected behgavior
   for (auto const &pair : img_last) {
     for (size_t i = 0; i < ids_last[pair.first].size(); i++) {
       // If a highlighted point, then put a nice box around it
       if (std::find(highlighted.begin(), highlighted.end(), ids_last[pair.first].at(i)) != highlighted.end()) {
         cv::Point2f pt_c = pts_last[pair.first].at(i).pt;
-        pixel_loc_vector.push_back(std::make_pair(INS_FEAT_ID, pt_c));
+        MSCKF_locs->push_back(std::make_pair(INS_FEAT_ID, pt_c));
       }
       else {
         cv::Point2f pt_c = pts_last[pair.first].at(i).pt;
-        pixel_loc_vector.push_back(std::make_pair(OOS_FEAT_ID, pt_c));
+        MSCKF_locs->push_back(std::make_pair(OOS_FEAT_ID, pt_c));
       }
     }
   }
-  return pixel_loc_vector;
+  return;
 }
 
 void TrackBase::display_active(cv::Mat &img_out, int r1, int g1, int b1, int r2, int g2, int b2, std::string overlay) {
