@@ -514,7 +514,7 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
   // _features_MSCKF = (featsup_MSCKF.clone());
   for (auto const &feat : featsup_MSCKF) {
     good_features_MSCKF.push_back(feat->p_FinG);
-    MSCKF_locs.push_back(cv::Point2f(feat->uvs[0].back()(0), feat->uvs[0].back()(1)));
+    MSCKF_locs.push_back(std::make_pair(feat->anchor_cam_id, cv::Point2f(feat->uvs[feat->anchor_cam_id].back()(0), feat->uvs[feat->anchor_cam_id].back()(1))));
     feat->to_delete = true;
   }
 

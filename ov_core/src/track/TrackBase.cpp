@@ -23,20 +23,31 @@
 
 using namespace ov_core;
 
-void TrackBase::return_active_pix_locs(std::vector<size_t> highlighted, std::vector<std::pair<int, cv::Point2f>> *MSCKF_locs ){
-  // this is gonna loop through every image in our last update set, not sure expected behgavior
+void TrackBase::return_active_pix_locs(std::vector<size_t> highlighted, std::vector<pixel_features> *MSCKF_locs ){
+  // this is gonna loop through every image in our last update set, not sure expected behavior
+  // need to also return the camera id associated with each feature
+  int cam_id = 0;
   for (auto const &pair : img_last) {
     for (size_t i = 0; i < ids_last[pair.first].size(); i++) {
       // If a highlighted point, then put a nice box around it
       if (std::find(highlighted.begin(), highlighted.end(), ids_last[pair.first].at(i)) != highlighted.end()) {
         cv::Point2f pt_c = pts_last[pair.first].at(i).pt;
-        MSCKF_locs->push_back(std::make_pair(INS_FEAT_ID, pt_c));
+        pixel_features pf;
+        pf.camera_id = cam_id;
+        pf.state_indicator = INS_FEAT_ID;
+        pf.location = pt_c;
+        MSCKF_locs->push_back(pf);
       }
       else {
         cv::Point2f pt_c = pts_last[pair.first].at(i).pt;
-        MSCKF_locs->push_back(std::make_pair(OOS_FEAT_ID, pt_c));
+        pixel_features pf;
+        pf.camera_id = cam_id;
+        pf.state_indicator = OOS_FEAT_ID;
+        pf.location = pt_c;
+        MSCKF_locs->push_back(pf);
       }
     }
+    cam_id++;
   }
   return;
 }

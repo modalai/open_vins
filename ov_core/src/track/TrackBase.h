@@ -43,6 +43,13 @@
 #define INS_FEAT_ID 0
 #define OOS_FEAT_ID 1
 
+typedef struct pixel_features {
+  int state_indicator;
+  int camera_id;
+  cv::Point2f location;
+} pixel_features;
+
+
 namespace ov_core {
 
 /**
@@ -135,7 +142,7 @@ public:
   std::shared_ptr<FeatureDatabase> get_feature_database() { return database; }
 
 
-  virtual void return_active_pix_locs(std::vector<size_t> highlighted, std::vector<std::pair<int, cv::Point2f>> *MSCKF_locs );
+  virtual void return_active_pix_locs(std::vector<size_t> highlighted, std::vector<pixel_features> *MSCKF_locs );
 
 
   /**
