@@ -87,25 +87,25 @@ ament_export_libraries(ov_msckf_lib)
 # Make binary files!
 ##################################################
 
-add_executable(run_subscribe_msckf src/run_subscribe_msckf.cpp)
-ament_target_dependencies(run_subscribe_msckf ${ament_libraries})
-target_link_libraries(run_subscribe_msckf ov_msckf_lib ${thirdparty_libraries})
-install(TARGETS run_subscribe_msckf DESTINATION lib/${PROJECT_NAME})
+# add_executable(run_subscribe_msckf src/run_subscribe_msckf.cpp)
+# ament_target_dependencies(run_subscribe_msckf ${ament_libraries})
+# target_link_libraries(run_subscribe_msckf ov_msckf_lib ${thirdparty_libraries})
+# install(TARGETS run_subscribe_msckf DESTINATION lib/${PROJECT_NAME})
 
-add_executable(run_simulation src/run_simulation.cpp)
-ament_target_dependencies(run_simulation ${ament_libraries})
-target_link_libraries(run_simulation ov_msckf_lib ${thirdparty_libraries})
-install(TARGETS run_simulation DESTINATION lib/${PROJECT_NAME})
+# add_executable(run_simulation src/run_simulation.cpp)
+# ament_target_dependencies(run_simulation ${ament_libraries})
+# target_link_libraries(run_simulation ov_msckf_lib ${thirdparty_libraries})
+# install(TARGETS run_simulation DESTINATION lib/${PROJECT_NAME})
 
-add_executable(test_sim_meas src/test_sim_meas.cpp)
-ament_target_dependencies(test_sim_meas ${ament_libraries})
-target_link_libraries(test_sim_meas ov_msckf_lib ${thirdparty_libraries})
-install(TARGETS test_sim_meas DESTINATION lib/${PROJECT_NAME})
+# add_executable(test_sim_meas src/test_sim_meas.cpp)
+# ament_target_dependencies(test_sim_meas ${ament_libraries})
+# target_link_libraries(test_sim_meas ov_msckf_lib ${thirdparty_libraries})
+# install(TARGETS test_sim_meas DESTINATION lib/${PROJECT_NAME})
 
-add_executable(test_sim_repeat src/test_sim_repeat.cpp)
-ament_target_dependencies(test_sim_repeat ${ament_libraries})
-target_link_libraries(test_sim_repeat ov_msckf_lib ${thirdparty_libraries})
-install(TARGETS test_sim_repeat DESTINATION lib/${PROJECT_NAME})
+# add_executable(test_sim_repeat src/test_sim_repeat.cpp)
+# ament_target_dependencies(test_sim_repeat ${ament_libraries})
+# target_link_libraries(test_sim_repeat ov_msckf_lib ${thirdparty_libraries})
+# install(TARGETS test_sim_repeat DESTINATION lib/${PROJECT_NAME})
 
 # Install launch and config directories
 install(DIRECTORY launch/ DESTINATION share/${PROJECT_NAME}/launch/)
