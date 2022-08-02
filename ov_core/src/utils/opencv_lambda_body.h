@@ -35,12 +35,12 @@ namespace ov_core {
  * https://answers.opencv.org/question/65800/how-to-use-lambda-as-a-parameter-to-parallel_for_/?answer=130691#post-id-130691
  */
 class LambdaBody : public cv::ParallelLoopBody {
-public:
-  explicit LambdaBody(const std::function<void(const cv::Range &)> &body) { _body = body; }
-  void operator()(const cv::Range &range) const override { _body(range); }
+  public:
+    explicit LambdaBody(const std::function<void(const cv::Range &)> &body) { _body = body; }
+    void operator()(const cv::Range &range) const override { _body(range); }
 
-private:
-  std::function<void(const cv::Range &)> _body;
+  private:
+    std::function<void(const cv::Range &)> _body;
 };
 
 } /* namespace ov_core */

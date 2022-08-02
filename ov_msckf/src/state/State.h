@@ -47,75 +47,75 @@ namespace ov_msckf {
  */
 class State {
 
-public:
-  /**
-   * @brief Default Constructor (will initialize variables to defaults)
-   * @param options_ Options structure containing filter options
-   */
-  State(StateOptions &options_);
+  public:
+    /**
+     * @brief Default Constructor (will initialize variables to defaults)
+     * @param options_ Options structure containing filter options
+     */
+    State(StateOptions &options_);
 
-  ~State() {}
+    ~State() {}
 
-  /**
-   * @brief Will return the timestep that we will marginalize next.
-   * As of right now, since we are using a sliding window, this is the oldest clone.
-   * But if you wanted to do a keyframe system, you could selectively marginalize clones.
-   * @return timestep of clone we will marginalize
-   */
-  double margtimestep() {
-    double time = INFINITY;
-    for (const auto &clone_imu : _clones_IMU) {
-      if (clone_imu.first < time) {
-        time = clone_imu.first;
-      }
+    /**
+     * @brief Will return the timestep that we will marginalize next.
+     * As of right now, since we are using a sliding window, this is the oldest clone.
+     * But if you wanted to do a keyframe system, you could selectively marginalize clones.
+     * @return timestep of clone we will marginalize
+     */
+    double margtimestep() {
+        double time = INFINITY;
+        for (const auto &clone_imu : _clones_IMU) {
+            if (clone_imu.first < time) {
+                time = clone_imu.first;
+            }
+        }
+        return time;
     }
-    return time;
-  }
 
-  /**
-   * @brief Calculates the current max size of the covariance
-   * @return Size of the current covariance matrix
-   */
-  int max_covariance_size() { return (int)_Cov.rows(); }
+    /**
+     * @brief Calculates the current max size of the covariance
+     * @return Size of the current covariance matrix
+     */
+    int max_covariance_size() { return (int)_Cov.rows(); }
 
-  /// Current timestamp (should be the last update time!)
-  double _timestamp = -1;
+    /// Current timestamp (should be the last update time!)
+    double _timestamp = -1;
 
-  /// Struct containing filter options
-  StateOptions _options;
+    /// Struct containing filter options
+    StateOptions _options;
 
-  /// Pointer to the "active" IMU state (q_GtoI, p_IinG, v_IinG, bg, ba)
-  std::shared_ptr<ov_type::IMU> _imu;
+    /// Pointer to the "active" IMU state (q_GtoI, p_IinG, v_IinG, bg, ba)
+    std::shared_ptr<ov_type::IMU> _imu;
 
-  /// Map between imaging times and clone poses (q_GtoIi, p_IiinG)
-  std::map<double, std::shared_ptr<ov_type::PoseJPL>> _clones_IMU;
+    /// Map between imaging times and clone poses (q_GtoIi, p_IiinG)
+    std::map<double, std::shared_ptr<ov_type::PoseJPL>> _clones_IMU;
 
-  /// Our current set of SLAM features (3d positions)
-  std::unordered_map<size_t, std::shared_ptr<ov_type::Landmark>> _features_SLAM;
+    /// Our current set of SLAM features (3d positions)
+    std::unordered_map<size_t, std::shared_ptr<ov_type::Landmark>> _features_SLAM;
 
-  /// Time offset base IMU to camera (t_imu = t_cam + t_off)
-  std::shared_ptr<ov_type::Vec> _calib_dt_CAMtoIMU;
+    /// Time offset base IMU to camera (t_imu = t_cam + t_off)
+    std::shared_ptr<ov_type::Vec> _calib_dt_CAMtoIMU;
 
-  /// Calibration poses for each camera (R_ItoC, p_IinC)
-  std::unordered_map<size_t, std::shared_ptr<ov_type::PoseJPL>> _calib_IMUtoCAM;
+    /// Calibration poses for each camera (R_ItoC, p_IinC)
+    std::unordered_map<size_t, std::shared_ptr<ov_type::PoseJPL>> _calib_IMUtoCAM;
 
-  /// Camera intrinsics
-  std::unordered_map<size_t, std::shared_ptr<ov_type::Vec>> _cam_intrinsics;
+    /// Camera intrinsics
+    std::unordered_map<size_t, std::shared_ptr<ov_type::Vec>> _cam_intrinsics;
 
-  /// Camera intrinsics camera objects
-  std::unordered_map<size_t, std::shared_ptr<ov_core::CamBase>> _cam_intrinsics_cameras;
+    /// Camera intrinsics camera objects
+    std::unordered_map<size_t, std::shared_ptr<ov_core::CamBase>> _cam_intrinsics_cameras;
 
-private:
-  // Define that the state helper is a friend class of this class
-  // This will allow it to access the below functions which should normally not be called
-  // This prevents a developer from thinking that the "insert clone" will actually correctly add it to the covariance
-  friend class StateHelper;
+  private:
+    // Define that the state helper is a friend class of this class
+    // This will allow it to access the below functions which should normally not be called
+    // This prevents a developer from thinking that the "insert clone" will actually correctly add it to the covariance
+    friend class StateHelper;
 
-  /// Covariance of all active variables
-  Eigen::MatrixXd _Cov;
+    /// Covariance of all active variables
+    Eigen::MatrixXd _Cov;
 
-  /// Vector of variables
-  std::vector<std::shared_ptr<ov_type::Type>> _variables;
+    /// Vector of variables
+    std::vector<std::shared_ptr<ov_type::Type>> _variables;
 };
 
 } // namespace ov_msckf

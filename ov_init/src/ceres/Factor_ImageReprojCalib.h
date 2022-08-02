@@ -39,39 +39,39 @@ namespace ov_init {
  * @brief Factor of feature bearing observation (raw) with calibration
  */
 class Factor_ImageReprojCalib : public ceres::CostFunction {
-public:
-  // Measurement observation of the feature (raw pixel coordinates)
-  Eigen::Vector2d uv_meas;
+  public:
+    // Measurement observation of the feature (raw pixel coordinates)
+    Eigen::Vector2d uv_meas;
 
-  // Measurement noise
-  double pix_sigma = 1.0;
-  Eigen::Matrix<double, 2, 2> sqrtQ;
+    // Measurement noise
+    double pix_sigma = 1.0;
+    Eigen::Matrix<double, 2, 2> sqrtQ;
 
-  // If distortion model is fisheye or radtan
-  bool is_fisheye = false;
+    // If distortion model is fisheye or radtan
+    bool is_fisheye = false;
 
-  // If value of 1 then this residual adds to the problem, otherwise if zero it is "gated"
-  double gate = 1.0;
+    // If value of 1 then this residual adds to the problem, otherwise if zero it is "gated"
+    double gate = 1.0;
 
-  /**
-   * @brief Default constructor
-   * @param uv_meas_ Raw pixel uv measurement of a environmental feature
-   * @param pix_sigma_ Raw pixel measurement uncertainty (typically 1)
-   * @param is_fisheye_ If this raw pixel camera uses fisheye distortion
-   */
-  Factor_ImageReprojCalib(const Eigen::Vector2d &uv_meas_, double pix_sigma_, bool is_fisheye_);
+    /**
+     * @brief Default constructor
+     * @param uv_meas_ Raw pixel uv measurement of a environmental feature
+     * @param pix_sigma_ Raw pixel measurement uncertainty (typically 1)
+     * @param is_fisheye_ If this raw pixel camera uses fisheye distortion
+     */
+    Factor_ImageReprojCalib(const Eigen::Vector2d &uv_meas_, double pix_sigma_, bool is_fisheye_);
 
-  virtual ~Factor_ImageReprojCalib() {}
+    virtual ~Factor_ImageReprojCalib() {}
 
-  /**
-   * @brief Error residual and Jacobian calculation
-   *
-   * This computes the Jacobians and residual of the feature projection model.
-   * This is a function of the observing pose, feature in global, and calibration parameters.
-   * The normalized pixel coordinates are found and then distorted using the camera distortion model.
-   * See the @ref update-feat page for more details.
-   */
-  bool Evaluate(double const *const *parameters, double *residuals, double **jacobians) const override;
+    /**
+     * @brief Error residual and Jacobian calculation
+     *
+     * This computes the Jacobians and residual of the feature projection model.
+     * This is a function of the observing pose, feature in global, and calibration parameters.
+     * The normalized pixel coordinates are found and then distorted using the camera distortion model.
+     * See the @ref update-feat page for more details.
+     */
+    bool Evaluate(double const *const *parameters, double *residuals, double **jacobians) const override;
 };
 
 } // namespace ov_init

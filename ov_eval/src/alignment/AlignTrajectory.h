@@ -45,75 +45,76 @@ namespace ov_eval {
  */
 class AlignTrajectory {
 
-public:
-  /**
-   * @brief Align estimate to GT using a desired method using a set of initial poses
-   * @param traj_es Estimated trajectory values in estimate frame [pos,quat]
-   * @param traj_gt Groundtruth trjaectory in groundtruth frame [pos,quat]
-   * @param R Rotation from estimate to GT frame that will be computed
-   * @param t translation from estimate to GT frame that will be computed
-   * @param s scale from estimate to GT frame that will be computed
-   * @param method Method used for alignment
-   * @param n_aligned Number of poses to use for alignment (-1 will use all)
-   */
-  static void align_trajectory(const std::vector<Eigen::Matrix<double, 7, 1>> &traj_es,
-                               const std::vector<Eigen::Matrix<double, 7, 1>> &traj_gt, Eigen::Matrix3d &R, Eigen::Vector3d &t, double &s,
-                               std::string method, int n_aligned = -1);
+  public:
+    /**
+     * @brief Align estimate to GT using a desired method using a set of initial poses
+     * @param traj_es Estimated trajectory values in estimate frame [pos,quat]
+     * @param traj_gt Groundtruth trjaectory in groundtruth frame [pos,quat]
+     * @param R Rotation from estimate to GT frame that will be computed
+     * @param t translation from estimate to GT frame that will be computed
+     * @param s scale from estimate to GT frame that will be computed
+     * @param method Method used for alignment
+     * @param n_aligned Number of poses to use for alignment (-1 will use all)
+     */
+    static void align_trajectory(const std::vector<Eigen::Matrix<double, 7, 1>> &traj_es,
+                                 const std::vector<Eigen::Matrix<double, 7, 1>> &traj_gt, Eigen::Matrix3d &R, Eigen::Vector3d &t, double &s,
+                                 std::string method, int n_aligned = -1);
 
-protected:
-  /**
-   * @brief Align estimate to GT using only position and yaw (for gravity aligned trajectories) using only the first poses
-   * @param traj_es Estimated trajectory values in estimate frame [pos,quat]
-   * @param traj_gt Groundtruth trjaectory in groundtruth frame [pos,quat]
-   * @param R Rotation from estimate to GT frame that will be computed
-   * @param t translation from estimate to GT frame that will be computed
-   */
-  static void align_posyaw_single(const std::vector<Eigen::Matrix<double, 7, 1>> &traj_es,
-                                  const std::vector<Eigen::Matrix<double, 7, 1>> &traj_gt, Eigen::Matrix3d &R, Eigen::Vector3d &t);
+  protected:
+    /**
+     * @brief Align estimate to GT using only position and yaw (for gravity aligned trajectories) using only the first poses
+     * @param traj_es Estimated trajectory values in estimate frame [pos,quat]
+     * @param traj_gt Groundtruth trjaectory in groundtruth frame [pos,quat]
+     * @param R Rotation from estimate to GT frame that will be computed
+     * @param t translation from estimate to GT frame that will be computed
+     */
+    static void align_posyaw_single(const std::vector<Eigen::Matrix<double, 7, 1>> &traj_es,
+                                    const std::vector<Eigen::Matrix<double, 7, 1>> &traj_gt, Eigen::Matrix3d &R, Eigen::Vector3d &t);
 
-  /**
-   * @brief Align estimate to GT using only position and yaw (for gravity aligned trajectories) using a set of initial poses
-   * @param traj_es Estimated trajectory values in estimate frame [pos,quat]
-   * @param traj_gt Groundtruth trjaectory in groundtruth frame [pos,quat]
-   * @param R Rotation from estimate to GT frame that will be computed
-   * @param t translation from estimate to GT frame that will be computed
-   * @param n_aligned Number of poses to use for alignment (-1 will use all)
-   */
-  static void align_posyaw(const std::vector<Eigen::Matrix<double, 7, 1>> &traj_es, const std::vector<Eigen::Matrix<double, 7, 1>> &traj_gt,
-                           Eigen::Matrix3d &R, Eigen::Vector3d &t, int n_aligned = -1);
+    /**
+     * @brief Align estimate to GT using only position and yaw (for gravity aligned trajectories) using a set of initial poses
+     * @param traj_es Estimated trajectory values in estimate frame [pos,quat]
+     * @param traj_gt Groundtruth trjaectory in groundtruth frame [pos,quat]
+     * @param R Rotation from estimate to GT frame that will be computed
+     * @param t translation from estimate to GT frame that will be computed
+     * @param n_aligned Number of poses to use for alignment (-1 will use all)
+     */
+    static void align_posyaw(const std::vector<Eigen::Matrix<double, 7, 1>> &traj_es,
+                             const std::vector<Eigen::Matrix<double, 7, 1>> &traj_gt, Eigen::Matrix3d &R, Eigen::Vector3d &t,
+                             int n_aligned = -1);
 
-  /**
-   * @brief Align estimate to GT using a full SE(3) transform using only the first poses
-   * @param traj_es Estimated trajectory values in estimate frame [pos,quat]
-   * @param traj_gt Groundtruth trjaectory in groundtruth frame [pos,quat]
-   * @param R Rotation from estimate to GT frame that will be computed
-   * @param t translation from estimate to GT frame that will be computed
-   */
-  static void align_se3_single(const std::vector<Eigen::Matrix<double, 7, 1>> &traj_es,
-                               const std::vector<Eigen::Matrix<double, 7, 1>> &traj_gt, Eigen::Matrix3d &R, Eigen::Vector3d &t);
+    /**
+     * @brief Align estimate to GT using a full SE(3) transform using only the first poses
+     * @param traj_es Estimated trajectory values in estimate frame [pos,quat]
+     * @param traj_gt Groundtruth trjaectory in groundtruth frame [pos,quat]
+     * @param R Rotation from estimate to GT frame that will be computed
+     * @param t translation from estimate to GT frame that will be computed
+     */
+    static void align_se3_single(const std::vector<Eigen::Matrix<double, 7, 1>> &traj_es,
+                                 const std::vector<Eigen::Matrix<double, 7, 1>> &traj_gt, Eigen::Matrix3d &R, Eigen::Vector3d &t);
 
-  /**
-   * @brief Align estimate to GT using a full SE(3) transform using a set of initial poses
-   * @param traj_es Estimated trajectory values in estimate frame [pos,quat]
-   * @param traj_gt Groundtruth trjaectory in groundtruth frame [pos,quat]
-   * @param R Rotation from estimate to GT frame that will be computed
-   * @param t translation from estimate to GT frame that will be computed
-   * @param n_aligned Number of poses to use for alignment (-1 will use all)
-   */
-  static void align_se3(const std::vector<Eigen::Matrix<double, 7, 1>> &traj_es, const std::vector<Eigen::Matrix<double, 7, 1>> &traj_gt,
-                        Eigen::Matrix3d &R, Eigen::Vector3d &t, int n_aligned = -1);
+    /**
+     * @brief Align estimate to GT using a full SE(3) transform using a set of initial poses
+     * @param traj_es Estimated trajectory values in estimate frame [pos,quat]
+     * @param traj_gt Groundtruth trjaectory in groundtruth frame [pos,quat]
+     * @param R Rotation from estimate to GT frame that will be computed
+     * @param t translation from estimate to GT frame that will be computed
+     * @param n_aligned Number of poses to use for alignment (-1 will use all)
+     */
+    static void align_se3(const std::vector<Eigen::Matrix<double, 7, 1>> &traj_es, const std::vector<Eigen::Matrix<double, 7, 1>> &traj_gt,
+                          Eigen::Matrix3d &R, Eigen::Vector3d &t, int n_aligned = -1);
 
-  /**
-   * @brief Align estimate to GT using a full SIM(3) transform using a set of initial poses
-   * @param traj_es Estimated trajectory values in estimate frame [pos,quat]
-   * @param traj_gt Groundtruth trjaectory in groundtruth frame [pos,quat]
-   * @param R Rotation from estimate to GT frame that will be computed
-   * @param t translation from estimate to GT frame that will be computed
-   * @param s scale from estimate to GT frame that will be computed
-   * @param n_aligned Number of poses to use for alignment (-1 will use all)
-   */
-  static void align_sim3(const std::vector<Eigen::Matrix<double, 7, 1>> &traj_es, const std::vector<Eigen::Matrix<double, 7, 1>> &traj_gt,
-                         Eigen::Matrix3d &R, Eigen::Vector3d &t, double &s, int n_aligned = -1);
+    /**
+     * @brief Align estimate to GT using a full SIM(3) transform using a set of initial poses
+     * @param traj_es Estimated trajectory values in estimate frame [pos,quat]
+     * @param traj_gt Groundtruth trjaectory in groundtruth frame [pos,quat]
+     * @param R Rotation from estimate to GT frame that will be computed
+     * @param t translation from estimate to GT frame that will be computed
+     * @param s scale from estimate to GT frame that will be computed
+     * @param n_aligned Number of poses to use for alignment (-1 will use all)
+     */
+    static void align_sim3(const std::vector<Eigen::Matrix<double, 7, 1>> &traj_es, const std::vector<Eigen::Matrix<double, 7, 1>> &traj_gt,
+                           Eigen::Matrix3d &R, Eigen::Vector3d &t, double &s, int n_aligned = -1);
 };
 
 } // namespace ov_eval

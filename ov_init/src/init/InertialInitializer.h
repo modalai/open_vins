@@ -59,59 +59,59 @@ class DynamicInitializer;
  */
 class InertialInitializer {
 
-public:
-  /**
-   * @brief Default constructor
-   * @param params_ Parameters loaded from either ROS or CMDLINE
-   * @param db Feature tracker database with all features in it
-   */
-  explicit InertialInitializer(InertialInitializerOptions &params_, std::shared_ptr<ov_core::FeatureDatabase> db);
+  public:
+    /**
+     * @brief Default constructor
+     * @param params_ Parameters loaded from either ROS or CMDLINE
+     * @param db Feature tracker database with all features in it
+     */
+    explicit InertialInitializer(InertialInitializerOptions &params_, std::shared_ptr<ov_core::FeatureDatabase> db);
 
-  /**
-   * @brief Feed function for inertial data
-   * @param message Contains our timestamp and inertial information
-   * @param oldest_time Time that we can discard measurements before
-   */
-  void feed_imu(const ov_core::ImuData &message, double oldest_time = -1);
+    /**
+     * @brief Feed function for inertial data
+     * @param message Contains our timestamp and inertial information
+     * @param oldest_time Time that we can discard measurements before
+     */
+    void feed_imu(const ov_core::ImuData &message, double oldest_time = -1);
 
-  /**
-   * @brief Try to get the initialized system
-   *
-   *
-   * @m_class{m-note m-warning}
-   *
-   * @par Processing Cost
-   * This is a serial process that can take on orders of seconds to complete.
-   * If you are a real-time application then you will likely want to call this from
-   * a async thread which allows for this to process in the background.
-   * The features used are cloned from the feature database thus should be thread-safe
-   * to continue to append new feature tracks to the database.
-   *
-   * @param[out] timestamp Timestamp we have initialized the state at
-   * @param[out] covariance Calculated covariance of the returned state
-   * @param[out] order Order of the covariance matrix
-   * @param[out] t_imu Our imu type (need to have correct ids)
-   * @param wait_for_jerk If true we will wait for a "jerk"
-   * @return True if we have successfully initialized our system
-   */
-  bool initialize(double &timestamp, Eigen::MatrixXd &covariance, std::vector<std::shared_ptr<ov_type::Type>> &order,
-                  std::shared_ptr<ov_type::IMU> t_imu, bool wait_for_jerk = true);
+    /**
+     * @brief Try to get the initialized system
+     *
+     *
+     * @m_class{m-note m-warning}
+     *
+     * @par Processing Cost
+     * This is a serial process that can take on orders of seconds to complete.
+     * If you are a real-time application then you will likely want to call this from
+     * a async thread which allows for this to process in the background.
+     * The features used are cloned from the feature database thus should be thread-safe
+     * to continue to append new feature tracks to the database.
+     *
+     * @param[out] timestamp Timestamp we have initialized the state at
+     * @param[out] covariance Calculated covariance of the returned state
+     * @param[out] order Order of the covariance matrix
+     * @param[out] t_imu Our imu type (need to have correct ids)
+     * @param wait_for_jerk If true we will wait for a "jerk"
+     * @return True if we have successfully initialized our system
+     */
+    bool initialize(double &timestamp, Eigen::MatrixXd &covariance, std::vector<std::shared_ptr<ov_type::Type>> &order,
+                    std::shared_ptr<ov_type::IMU> t_imu, bool wait_for_jerk = true);
 
-protected:
-  /// Initialization parameters
-  InertialInitializerOptions params;
+  protected:
+    /// Initialization parameters
+    InertialInitializerOptions params;
 
-  /// Feature tracker database with all features in it
-  std::shared_ptr<ov_core::FeatureDatabase> _db;
+    /// Feature tracker database with all features in it
+    std::shared_ptr<ov_core::FeatureDatabase> _db;
 
-  /// Our history of IMU messages (time, angular, linear)
-  std::shared_ptr<std::vector<ov_core::ImuData>> imu_data;
+    /// Our history of IMU messages (time, angular, linear)
+    std::shared_ptr<std::vector<ov_core::ImuData>> imu_data;
 
-  /// Static initialization helper class
-  std::shared_ptr<StaticInitializer> init_static;
+    /// Static initialization helper class
+    std::shared_ptr<StaticInitializer> init_static;
 
-  /// Dynamic initialization helper class
-  std::shared_ptr<DynamicInitializer> init_dynamic;
+    /// Dynamic initialization helper class
+    std::shared_ptr<DynamicInitializer> init_dynamic;
 };
 
 } // namespace ov_init

@@ -36,199 +36,199 @@ namespace ov_type {
  */
 class IMU : public Type {
 
-public:
-  IMU() : Type(15) {
+  public:
+    IMU() : Type(15) {
 
-    // Create all the sub-variables
-    _pose = std::shared_ptr<PoseJPL>(new PoseJPL());
-    _v = std::shared_ptr<Vec>(new Vec(3));
-    _bg = std::shared_ptr<Vec>(new Vec(3));
-    _ba = std::shared_ptr<Vec>(new Vec(3));
+        // Create all the sub-variables
+        _pose = std::shared_ptr<PoseJPL>(new PoseJPL());
+        _v = std::shared_ptr<Vec>(new Vec(3));
+        _bg = std::shared_ptr<Vec>(new Vec(3));
+        _ba = std::shared_ptr<Vec>(new Vec(3));
 
-    // Set our default state value
-    Eigen::VectorXd imu0 = Eigen::VectorXd::Zero(16, 1);
-    imu0(3) = 1.0;
-    set_value_internal(imu0);
-    set_fej_internal(imu0);
-  }
-
-  ~IMU() {}
-
-  /**
-   * @brief Sets id used to track location of variable in the filter covariance
-   *
-   * Note that we update the sub-variables also.
-   *
-   * @param new_id entry in filter covariance corresponding to this variable
-   */
-  void set_local_id(int new_id) override {
-    _id = new_id;
-    _pose->set_local_id(new_id);
-    _v->set_local_id(_pose->id() + ((new_id != -1) ? _pose->size() : 0));
-    _bg->set_local_id(_v->id() + ((new_id != -1) ? _v->size() : 0));
-    _ba->set_local_id(_bg->id() + ((new_id != -1) ? _bg->size() : 0));
-  }
-
-  /**
-   * @brief Performs update operation using JPLQuat update for orientation, then vector updates for
-   * position, velocity, gyro bias, and accel bias (in that order).
-   *
-   * @param dx 15 DOF vector encoding update using the following order (q, p, v, bg, ba)
-   */
-  void update(const Eigen::VectorXd &dx) override {
-
-    assert(dx.rows() == _size);
-
-    Eigen::Matrix<double, 16, 1> newX = _value;
-
-    Eigen::Matrix<double, 4, 1> dq;
-    dq << .5 * dx.block(0, 0, 3, 1), 1.0;
-    dq = ov_core::quatnorm(dq);
-
-    newX.block(0, 0, 4, 1) = ov_core::quat_multiply(dq, quat());
-    newX.block(4, 0, 3, 1) += dx.block(3, 0, 3, 1);
-
-    newX.block(7, 0, 3, 1) += dx.block(6, 0, 3, 1);
-    newX.block(10, 0, 3, 1) += dx.block(9, 0, 3, 1);
-    newX.block(13, 0, 3, 1) += dx.block(12, 0, 3, 1);
-
-    set_value(newX);
-  }
-
-  /**
-   * @brief Sets the value of the estimate
-   * @param new_value New value we should set
-   */
-  void set_value(const Eigen::MatrixXd &new_value) override { set_value_internal(new_value); }
-
-  /**
-   * @brief Sets the value of the first estimate
-   * @param new_value New value we should set
-   */
-  void set_fej(const Eigen::MatrixXd &new_value) override { set_fej_internal(new_value); }
-
-  std::shared_ptr<Type> clone() override {
-    auto Clone = std::shared_ptr<Type>(new IMU());
-    Clone->set_value(value());
-    Clone->set_fej(fej());
-    return Clone;
-  }
-
-  std::shared_ptr<Type> check_if_subvariable(const std::shared_ptr<Type> check) override {
-    if (check == _pose) {
-      return _pose;
-    } else if (check == _pose->check_if_subvariable(check)) {
-      return _pose->check_if_subvariable(check);
-    } else if (check == _v) {
-      return _v;
-    } else if (check == _bg) {
-      return _bg;
-    } else if (check == _ba) {
-      return _ba;
+        // Set our default state value
+        Eigen::VectorXd imu0 = Eigen::VectorXd::Zero(16, 1);
+        imu0(3) = 1.0;
+        set_value_internal(imu0);
+        set_fej_internal(imu0);
     }
-    return nullptr;
-  }
 
-  /// Rotation access
-  Eigen::Matrix<double, 3, 3> Rot() const { return _pose->Rot(); }
+    ~IMU() {}
 
-  /// FEJ Rotation access
-  Eigen::Matrix<double, 3, 3> Rot_fej() const { return _pose->Rot_fej(); }
+    /**
+     * @brief Sets id used to track location of variable in the filter covariance
+     *
+     * Note that we update the sub-variables also.
+     *
+     * @param new_id entry in filter covariance corresponding to this variable
+     */
+    void set_local_id(int new_id) override {
+        _id = new_id;
+        _pose->set_local_id(new_id);
+        _v->set_local_id(_pose->id() + ((new_id != -1) ? _pose->size() : 0));
+        _bg->set_local_id(_v->id() + ((new_id != -1) ? _v->size() : 0));
+        _ba->set_local_id(_bg->id() + ((new_id != -1) ? _bg->size() : 0));
+    }
 
-  /// Rotation access quaternion
-  Eigen::Matrix<double, 4, 1> quat() const { return _pose->quat(); }
+    /**
+     * @brief Performs update operation using JPLQuat update for orientation, then vector updates for
+     * position, velocity, gyro bias, and accel bias (in that order).
+     *
+     * @param dx 15 DOF vector encoding update using the following order (q, p, v, bg, ba)
+     */
+    void update(const Eigen::VectorXd &dx) override {
 
-  /// FEJ Rotation access quaternion
-  Eigen::Matrix<double, 4, 1> quat_fej() const { return _pose->quat_fej(); }
+        assert(dx.rows() == _size);
 
-  /// Position access
-  Eigen::Matrix<double, 3, 1> pos() const { return _pose->pos(); }
+        Eigen::Matrix<double, 16, 1> newX = _value;
 
-  /// FEJ position access
-  Eigen::Matrix<double, 3, 1> pos_fej() const { return _pose->pos_fej(); }
+        Eigen::Matrix<double, 4, 1> dq;
+        dq << .5 * dx.block(0, 0, 3, 1), 1.0;
+        dq = ov_core::quatnorm(dq);
 
-  /// Velocity access
-  Eigen::Matrix<double, 3, 1> vel() const { return _v->value(); }
+        newX.block(0, 0, 4, 1) = ov_core::quat_multiply(dq, quat());
+        newX.block(4, 0, 3, 1) += dx.block(3, 0, 3, 1);
 
-  // FEJ velocity access
-  Eigen::Matrix<double, 3, 1> vel_fej() const { return _v->fej(); }
+        newX.block(7, 0, 3, 1) += dx.block(6, 0, 3, 1);
+        newX.block(10, 0, 3, 1) += dx.block(9, 0, 3, 1);
+        newX.block(13, 0, 3, 1) += dx.block(12, 0, 3, 1);
 
-  /// Gyro bias access
-  Eigen::Matrix<double, 3, 1> bias_g() const { return _bg->value(); }
+        set_value(newX);
+    }
 
-  /// FEJ gyro bias access
-  Eigen::Matrix<double, 3, 1> bias_g_fej() const { return _bg->fej(); }
+    /**
+     * @brief Sets the value of the estimate
+     * @param new_value New value we should set
+     */
+    void set_value(const Eigen::MatrixXd &new_value) override { set_value_internal(new_value); }
 
-  /// Accel bias access
-  Eigen::Matrix<double, 3, 1> bias_a() const { return _ba->value(); }
+    /**
+     * @brief Sets the value of the first estimate
+     * @param new_value New value we should set
+     */
+    void set_fej(const Eigen::MatrixXd &new_value) override { set_fej_internal(new_value); }
 
-  // FEJ accel bias access
-  Eigen::Matrix<double, 3, 1> bias_a_fej() const { return _ba->fej(); }
+    std::shared_ptr<Type> clone() override {
+        auto Clone = std::shared_ptr<Type>(new IMU());
+        Clone->set_value(value());
+        Clone->set_fej(fej());
+        return Clone;
+    }
 
-  /// Pose type access
-  std::shared_ptr<PoseJPL> pose() { return _pose; }
+    std::shared_ptr<Type> check_if_subvariable(const std::shared_ptr<Type> check) override {
+        if (check == _pose) {
+            return _pose;
+        } else if (check == _pose->check_if_subvariable(check)) {
+            return _pose->check_if_subvariable(check);
+        } else if (check == _v) {
+            return _v;
+        } else if (check == _bg) {
+            return _bg;
+        } else if (check == _ba) {
+            return _ba;
+        }
+        return nullptr;
+    }
 
-  /// Quaternion type access
-  std::shared_ptr<JPLQuat> q() { return _pose->q(); }
+    /// Rotation access
+    Eigen::Matrix<double, 3, 3> Rot() const { return _pose->Rot(); }
 
-  /// Position type access
-  std::shared_ptr<Vec> p() { return _pose->p(); }
+    /// FEJ Rotation access
+    Eigen::Matrix<double, 3, 3> Rot_fej() const { return _pose->Rot_fej(); }
 
-  /// Velocity type access
-  std::shared_ptr<Vec> v() { return _v; }
+    /// Rotation access quaternion
+    Eigen::Matrix<double, 4, 1> quat() const { return _pose->quat(); }
 
-  /// Gyroscope bias access
-  std::shared_ptr<Vec> bg() { return _bg; }
+    /// FEJ Rotation access quaternion
+    Eigen::Matrix<double, 4, 1> quat_fej() const { return _pose->quat_fej(); }
 
-  /// Acceleration bias access
-  std::shared_ptr<Vec> ba() { return _ba; }
+    /// Position access
+    Eigen::Matrix<double, 3, 1> pos() const { return _pose->pos(); }
 
-protected:
-  /// Pose subvariable
-  std::shared_ptr<PoseJPL> _pose;
+    /// FEJ position access
+    Eigen::Matrix<double, 3, 1> pos_fej() const { return _pose->pos_fej(); }
 
-  /// Velocity subvariable
-  std::shared_ptr<Vec> _v;
+    /// Velocity access
+    Eigen::Matrix<double, 3, 1> vel() const { return _v->value(); }
 
-  /// Gyroscope bias subvariable
-  std::shared_ptr<Vec> _bg;
+    // FEJ velocity access
+    Eigen::Matrix<double, 3, 1> vel_fej() const { return _v->fej(); }
 
-  /// Acceleration bias subvariable
-  std::shared_ptr<Vec> _ba;
+    /// Gyro bias access
+    Eigen::Matrix<double, 3, 1> bias_g() const { return _bg->value(); }
 
-  /**
-   * @brief Sets the value of the estimate
-   * @param new_value New value we should set
-   */
-  void set_value_internal(const Eigen::MatrixXd &new_value) {
+    /// FEJ gyro bias access
+    Eigen::Matrix<double, 3, 1> bias_g_fej() const { return _bg->fej(); }
 
-    assert(new_value.rows() == 16);
-    assert(new_value.cols() == 1);
+    /// Accel bias access
+    Eigen::Matrix<double, 3, 1> bias_a() const { return _ba->value(); }
 
-    _pose->set_value(new_value.block(0, 0, 7, 1));
-    _v->set_value(new_value.block(7, 0, 3, 1));
-    _bg->set_value(new_value.block(10, 0, 3, 1));
-    _ba->set_value(new_value.block(13, 0, 3, 1));
+    // FEJ accel bias access
+    Eigen::Matrix<double, 3, 1> bias_a_fej() const { return _ba->fej(); }
 
-    _value = new_value;
-  }
+    /// Pose type access
+    std::shared_ptr<PoseJPL> pose() { return _pose; }
 
-  /**
-   * @brief Sets the value of the first estimate
-   * @param new_value New value we should set
-   */
-  void set_fej_internal(const Eigen::MatrixXd &new_value) {
+    /// Quaternion type access
+    std::shared_ptr<JPLQuat> q() { return _pose->q(); }
 
-    assert(new_value.rows() == 16);
-    assert(new_value.cols() == 1);
+    /// Position type access
+    std::shared_ptr<Vec> p() { return _pose->p(); }
 
-    _pose->set_fej(new_value.block(0, 0, 7, 1));
-    _v->set_fej(new_value.block(7, 0, 3, 1));
-    _bg->set_fej(new_value.block(10, 0, 3, 1));
-    _ba->set_fej(new_value.block(13, 0, 3, 1));
+    /// Velocity type access
+    std::shared_ptr<Vec> v() { return _v; }
 
-    _fej = new_value;
-  }
+    /// Gyroscope bias access
+    std::shared_ptr<Vec> bg() { return _bg; }
+
+    /// Acceleration bias access
+    std::shared_ptr<Vec> ba() { return _ba; }
+
+  protected:
+    /// Pose subvariable
+    std::shared_ptr<PoseJPL> _pose;
+
+    /// Velocity subvariable
+    std::shared_ptr<Vec> _v;
+
+    /// Gyroscope bias subvariable
+    std::shared_ptr<Vec> _bg;
+
+    /// Acceleration bias subvariable
+    std::shared_ptr<Vec> _ba;
+
+    /**
+     * @brief Sets the value of the estimate
+     * @param new_value New value we should set
+     */
+    void set_value_internal(const Eigen::MatrixXd &new_value) {
+
+        assert(new_value.rows() == 16);
+        assert(new_value.cols() == 1);
+
+        _pose->set_value(new_value.block(0, 0, 7, 1));
+        _v->set_value(new_value.block(7, 0, 3, 1));
+        _bg->set_value(new_value.block(10, 0, 3, 1));
+        _ba->set_value(new_value.block(13, 0, 3, 1));
+
+        _value = new_value;
+    }
+
+    /**
+     * @brief Sets the value of the first estimate
+     * @param new_value New value we should set
+     */
+    void set_fej_internal(const Eigen::MatrixXd &new_value) {
+
+        assert(new_value.rows() == 16);
+        assert(new_value.cols() == 1);
+
+        _pose->set_fej(new_value.block(0, 0, 7, 1));
+        _v->set_fej(new_value.block(7, 0, 3, 1));
+        _bg->set_fej(new_value.block(10, 0, 3, 1));
+        _ba->set_fej(new_value.block(13, 0, 3, 1));
+
+        _fej = new_value;
+    }
 };
 
 } // namespace ov_type

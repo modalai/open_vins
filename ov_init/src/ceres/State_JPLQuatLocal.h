@@ -30,35 +30,35 @@ namespace ov_init {
  * @brief JPL quaternion CERES state parameterization
  */
 class State_JPLQuatLocal : public ceres::LocalParameterization {
-public:
-  /**
-   * @brief State update function for a JPL quaternion representation.
-   *
-   * Implements update operation by left-multiplying the current
-   * quaternion with a quaternion built from a small axis-angle perturbation.
-   *
-   * @f[
-   * \bar{q}=norm\Big(\begin{bmatrix} 0.5*\mathbf{\theta_{dx}} \\ 1 \end{bmatrix}\Big) \hat{\bar{q}}
-   * @f]
-   */
-  bool Plus(const double *x, const double *delta, double *x_plus_delta) const override;
+  public:
+    /**
+     * @brief State update function for a JPL quaternion representation.
+     *
+     * Implements update operation by left-multiplying the current
+     * quaternion with a quaternion built from a small axis-angle perturbation.
+     *
+     * @f[
+     * \bar{q}=norm\Big(\begin{bmatrix} 0.5*\mathbf{\theta_{dx}} \\ 1 \end{bmatrix}\Big) \hat{\bar{q}}
+     * @f]
+     */
+    bool Plus(const double *x, const double *delta, double *x_plus_delta) const override;
 
-  /**
-   * @brief Computes the jacobian in respect to the local parameterization
-   *
-   * This essentially "tricks" ceres.
-   * Instead of doing what ceres wants:
-   * dr/dlocal= dr/dglobal * dglobal/dlocal
-   *
-   * We instead directly do:
-   * dr/dlocal= [ dr/dlocal, 0] * [I; 0]= dr/dlocal.
-   * Therefore we here define dglobal/dlocal= [I; 0]
-   */
-  bool ComputeJacobian(const double *x, double *jacobian) const override;
+    /**
+     * @brief Computes the jacobian in respect to the local parameterization
+     *
+     * This essentially "tricks" ceres.
+     * Instead of doing what ceres wants:
+     * dr/dlocal= dr/dglobal * dglobal/dlocal
+     *
+     * We instead directly do:
+     * dr/dlocal= [ dr/dlocal, 0] * [I; 0]= dr/dlocal.
+     * Therefore we here define dglobal/dlocal= [I; 0]
+     */
+    bool ComputeJacobian(const double *x, double *jacobian) const override;
 
-  int GlobalSize() const override { return 4; };
+    int GlobalSize() const override { return 4; };
 
-  int LocalSize() const override { return 3; };
+    int LocalSize() const override { return 3; };
 };
 
 } // namespace ov_init

@@ -60,7 +60,7 @@ class Propagator;
  * If we have measurements to propagate or update with, this class will call on our state to do that.
  */
 class VioManager {
-   public:
+  public:
     /**
      * @brief Default constructor, will load all configuration variables
      * @param params_ Parameters loaded from either ROS or CMDLINE
@@ -72,7 +72,7 @@ class VioManager {
      * @param message Contains our timestamp, images, and camera ids
      */
     void feed_measurement_camera(const ov_core::CameraData &message) { track_image_and_update(message); }
-    
+
     /**
      * @brief Feed function for inertial data
      * @param message Contains our timestamp and inertial information
@@ -106,72 +106,72 @@ class VioManager {
     /// Accessor to get the current propagator
     std::shared_ptr<Propagator> get_propagator() { return propagator; }
 
-    // features
-    std::vector<pixel_features> get_pixel_loc_features() {
-        std::vector<pixel_features> pixel_loc_feats;
+    // // features
+    // std::vector<pixel_features> get_pixel_loc_features() {
+    //     std::vector<pixel_features> pixel_loc_feats;
 
-        // Build an id-list of our "in state" features
-        // i.e. SLAM and last msckf update features
-        std::vector<size_t> highlighted_ids;
-        for (const auto &feat : state->_features_SLAM) {
-            highlighted_ids.push_back(feat.first);
-        }
+    //     // Build an id-list of our "in state" features
+    //     // i.e. SLAM and last msckf update features
+    //     std::vector<size_t> highlighted_ids;
+    //     for (const auto &feat : state->_features_SLAM) {
+    //         highlighted_ids.push_back(feat.first);
+    //     }
 
-        trackFEATS->return_active_pix_locs(highlighted_ids, &pixel_loc_feats);
+    //     trackFEATS->return_active_pix_locs(highlighted_ids, &pixel_loc_feats);
 
-        // SLAM features are now in the vector, just need to append (INSTATE, MSCKF LOC) now
-        for (const auto &loc : MSCKF_locs) {
-            pixel_features pf;
-            pf.camera_id = loc.first;
-            pf.state_indicator = INS_FEAT_ID;
-            pf.location = loc.second;
-            pixel_loc_feats.push_back(pf);
-        }
+    //     // SLAM features are now in the vector, just need to append (INSTATE, MSCKF LOC) now
+    //     for (const auto &loc : MSCKF_locs) {
+    //         pixel_features pf;
+    //         pf.camera_id = loc.first;
+    //         pf.state_indicator = INS_FEAT_ID;
+    //         pf.location = loc.second;
+    //         pixel_loc_feats.push_back(pf);
+    //     }
 
-        return pixel_loc_feats;
+    //     return pixel_loc_feats;
+    // }
+
+    //   /// Returns 3d SLAM features in the global frame
+    //   std::vector<Eigen::Vector3d> get_features_SLAM() {
+    //       std::vector<Eigen::Vector3d> slam_feats;
+    //       for (auto &f : state->_features_SLAM) {
+    //           if ((int)f.first <= 4 * state->_options.max_aruco_features)
+    //               continue;
+    //           if (ov_type::LandmarkRepresentation::is_relative_representation(f.second->_feat_representation)) {
+    //               // Assert that we have an anchor pose for this feature
+    //               assert(f.second->_anchor_cam_id != -1);
+    //               // Get calibration for our anchor camera
+    //               Eigen::Matrix<double, 3, 3> R_ItoC = state->_calib_IMUtoCAM.at(f.second->_anchor_cam_id)->Rot();
+    //               Eigen::Matrix<double, 3, 1> p_IinC = state->_calib_IMUtoCAM.at(f.second->_anchor_cam_id)->pos();
+    //               // Anchor pose orientation and position
+    //               Eigen::Matrix<double, 3, 3> R_GtoI = state->_clones_IMU.at(f.second->_anchor_clone_timestamp)->Rot();
+    //               Eigen::Matrix<double, 3, 1> p_IinG = state->_clones_IMU.at(f.second->_anchor_clone_timestamp)->pos();
+    //               // Feature in the global frame
+    //               slam_feats.push_back(R_GtoI.transpose() * R_ItoC.transpose() * (f.second->get_xyz(false) - p_IinC) + p_IinG);
+    //           } else {
+    //               slam_feats.push_back(f.second->get_xyz(false));
+    //           }
+    //       }
+    //       return slam_feats;
+    //   }
+
+    /// Get a nice visualization image of what tracks we have
+    cv::Mat get_historical_viz_image();
+
+    /// Returns 3d SLAM features in the global frame
+    std::vector<Eigen::Vector3d> get_features_SLAM();
+
+    /// Returns 3d ARUCO features in the global frame
+    std::vector<Eigen::Vector3d> get_features_ARUCO();
+
+    /// Returns 3d features used in the last update in global frame
+    std::vector<Eigen::Vector3d> get_good_features_MSCKF() { return good_features_MSCKF; }
+
+    /// Return the image used when projecting the active tracks
+    void get_active_image(double &timestamp, cv::Mat &image) {
+        timestamp = active_tracks_time;
+        image = active_image;
     }
-
-  /// Returns 3d SLAM features in the global frame
-  std::vector<Eigen::Vector3d> get_features_SLAM() {
-      std::vector<Eigen::Vector3d> slam_feats;
-      for (auto &f : state->_features_SLAM) {
-          if ((int)f.first <= 4 * state->_options.max_aruco_features)
-              continue;
-          if (ov_type::LandmarkRepresentation::is_relative_representation(f.second->_feat_representation)) {
-              // Assert that we have an anchor pose for this feature
-              assert(f.second->_anchor_cam_id != -1);
-              // Get calibration for our anchor camera
-              Eigen::Matrix<double, 3, 3> R_ItoC = state->_calib_IMUtoCAM.at(f.second->_anchor_cam_id)->Rot();
-              Eigen::Matrix<double, 3, 1> p_IinC = state->_calib_IMUtoCAM.at(f.second->_anchor_cam_id)->pos();
-              // Anchor pose orientation and position
-              Eigen::Matrix<double, 3, 3> R_GtoI = state->_clones_IMU.at(f.second->_anchor_clone_timestamp)->Rot();
-              Eigen::Matrix<double, 3, 1> p_IinG = state->_clones_IMU.at(f.second->_anchor_clone_timestamp)->pos();
-              // Feature in the global frame
-              slam_feats.push_back(R_GtoI.transpose() * R_ItoC.transpose() * (f.second->get_xyz(false) - p_IinC) + p_IinG);
-          } else {
-              slam_feats.push_back(f.second->get_xyz(false));
-          }
-      }
-      return slam_feats;
-  }
-
-  /// Get a nice visualization image of what tracks we have
-  cv::Mat get_historical_viz_image();
-
-  /// Returns 3d SLAM features in the global frame
-  std::vector<Eigen::Vector3d> get_features_SLAM();
-
-  /// Returns 3d ARUCO features in the global frame
-  std::vector<Eigen::Vector3d> get_features_ARUCO();
-
-  /// Returns 3d features used in the last update in global frame
-  std::vector<Eigen::Vector3d> get_good_features_MSCKF() { return good_features_MSCKF; }
-
-  /// Return the image used when projecting the active tracks
-  void get_active_image(double &timestamp, cv::Mat &image) {
-    timestamp = active_tracks_time;
-    image = active_image;
-  }
 
     /// Returns active tracked features in the current frame
     void get_active_tracks(double &timestamp, std::unordered_map<size_t, Eigen::Vector3d> &feat_posinG,
@@ -181,7 +181,7 @@ class VioManager {
         feat_tracks_uvd = active_tracks_uvd;
     }
 
-   protected:
+  protected:
     /**
      * @brief Given a new set of camera images, this will track them.
      *
@@ -292,6 +292,6 @@ class VioManager {
     cv::Mat active_image;
 };
 
-}  // namespace ov_msckf
+} // namespace ov_msckf
 
-#endif  // OV_MSCKF_VIOMANAGER_H
+#endif // OV_MSCKF_VIOMANAGER_H

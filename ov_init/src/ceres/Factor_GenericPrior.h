@@ -70,31 +70,31 @@ namespace ov_init {
  *
  */
 class Factor_GenericPrior : public ceres::CostFunction {
-public:
-  /// State estimates at the time of marginalization to linearize the problem
-  Eigen::MatrixXd x_lin;
+  public:
+    /// State estimates at the time of marginalization to linearize the problem
+    Eigen::MatrixXd x_lin;
 
-  /// State type for each variable in x_lin. Can be [quat, quat_yaw, vec3, vec8]
-  std::vector<std::string> x_type;
+    /// State type for each variable in x_lin. Can be [quat, quat_yaw, vec3, vec8]
+    std::vector<std::string> x_type;
 
-  /// The square-root of the information s.t. sqrtI^T * sqrtI = marginal information
-  Eigen::MatrixXd sqrtI;
+    /// The square-root of the information s.t. sqrtI^T * sqrtI = marginal information
+    Eigen::MatrixXd sqrtI;
 
-  /// Constant term inside the cost s.t. sqrtI^T * b = marginal gradient (can be zero)
-  Eigen::MatrixXd b;
+    /// Constant term inside the cost s.t. sqrtI^T * b = marginal gradient (can be zero)
+    Eigen::MatrixXd b;
 
-  /**
-   * @brief Default constructor
-   */
-  Factor_GenericPrior(const Eigen::MatrixXd &x_lin_, const std::vector<std::string> &x_type_, const Eigen::MatrixXd &prior_Info,
-                      const Eigen::MatrixXd &prior_grad);
+    /**
+     * @brief Default constructor
+     */
+    Factor_GenericPrior(const Eigen::MatrixXd &x_lin_, const std::vector<std::string> &x_type_, const Eigen::MatrixXd &prior_Info,
+                        const Eigen::MatrixXd &prior_grad);
 
-  virtual ~Factor_GenericPrior() {}
+    virtual ~Factor_GenericPrior() {}
 
-  /**
-   * @brief Error residual and Jacobian calculation
-   */
-  bool Evaluate(double const *const *parameters, double *residuals, double **jacobians) const override;
+    /**
+     * @brief Error residual and Jacobian calculation
+     */
+    bool Evaluate(double const *const *parameters, double *residuals, double **jacobians) const override;
 };
 
 } // namespace ov_init

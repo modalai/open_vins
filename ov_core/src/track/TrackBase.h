@@ -41,11 +41,10 @@
 #define OOS_FEAT_ID 1
 
 typedef struct pixel_features {
-  int state_indicator;
-  int camera_id;
-  cv::Point2f location;
+    int state_indicator;
+    int camera_id;
+    cv::Point2f location;
 } pixel_features;
-
 
 namespace ov_core {
 
@@ -81,120 +80,118 @@ class FeatureDatabase;
  */
 class TrackBase {
 
-public:
-  /**
-   * @brief Desired pre-processing image method.
-   */
-  enum HistogramMethod { NONE, HISTOGRAM, CLAHE };
+  public:
+    /**
+     * @brief Desired pre-processing image method.
+     */
+    enum HistogramMethod { NONE, HISTOGRAM, CLAHE };
 
-  /**
-   * @brief Public constructor with configuration variables
-   * @param cameras camera calibration object which has all camera intrinsics in it
-   * @param numfeats number of features we want want to track (i.e. track 200 points from frame to frame)
-   * @param numaruco the max id of the arucotags, so we ensure that we start our non-auroc features above this value
-   * @param stereo if we should do stereo feature tracking or binocular
-   * @param histmethod what type of histogram pre-processing should be done (histogram eq?)
-   */
-  TrackBase(std::unordered_map<size_t, std::shared_ptr<CamBase>> cameras, int numfeats, int numaruco, bool stereo,
-            HistogramMethod histmethod);
+    /**
+     * @brief Public constructor with configuration variables
+     * @param cameras camera calibration object which has all camera intrinsics in it
+     * @param numfeats number of features we want want to track (i.e. track 200 points from frame to frame)
+     * @param numaruco the max id of the arucotags, so we ensure that we start our non-auroc features above this value
+     * @param stereo if we should do stereo feature tracking or binocular
+     * @param histmethod what type of histogram pre-processing should be done (histogram eq?)
+     */
+    TrackBase(std::unordered_map<size_t, std::shared_ptr<CamBase>> cameras, int numfeats, int numaruco, bool stereo,
+              HistogramMethod histmethod);
 
-  virtual ~TrackBase() {}
+    virtual ~TrackBase() {}
 
-  /**
-   * @brief Process a new image
-   * @param message Contains our timestamp, images, and camera ids
-   */
-  virtual void feed_new_camera(const CameraData &message) = 0;
+    /**
+     * @brief Process a new image
+     * @param message Contains our timestamp, images, and camera ids
+     */
+    virtual void feed_new_camera(const CameraData &message) = 0;
 
-  /**
-   * @brief Shows features extracted in the last image
-   * @param img_out image to which we will overlayed features on
-   * @param r1,g1,b1 first color to draw in
-   * @param r2,g2,b2 second color to draw in
-   * @param overlay Text overlay to replace to normal "cam0" in the top left of screen
-   */
-  virtual void display_active(cv::Mat &img_out, int r1, int g1, int b1, int r2, int g2, int b2, std::string overlay = "");
+    /**
+     * @brief Shows features extracted in the last image
+     * @param img_out image to which we will overlayed features on
+     * @param r1,g1,b1 first color to draw in
+     * @param r2,g2,b2 second color to draw in
+     * @param overlay Text overlay to replace to normal "cam0" in the top left of screen
+     */
+    virtual void display_active(cv::Mat &img_out, int r1, int g1, int b1, int r2, int g2, int b2, std::string overlay = "");
 
-  /**
-   * @brief Shows a "trail" for each feature (i.e. its history)
-   * @param img_out image to which we will overlayed features on
-   * @param r1,g1,b1 first color to draw in
-   * @param r2,g2,b2 second color to draw in
-   * @param highlighted unique ids which we wish to highlight (e.g. slam feats)
-   * @param overlay Text overlay to replace to normal "cam0" in the top left of screen
-   */
-  virtual void display_history(cv::Mat &img_out, int r1, int g1, int b1, int r2, int g2, int b2, std::vector<size_t> highlighted = {},
-                               std::string overlay = "");
+    /**
+     * @brief Shows a "trail" for each feature (i.e. its history)
+     * @param img_out image to which we will overlayed features on
+     * @param r1,g1,b1 first color to draw in
+     * @param r2,g2,b2 second color to draw in
+     * @param highlighted unique ids which we wish to highlight (e.g. slam feats)
+     * @param overlay Text overlay to replace to normal "cam0" in the top left of screen
+     */
+    virtual void display_history(cv::Mat &img_out, int r1, int g1, int b1, int r2, int g2, int b2, std::vector<size_t> highlighted = {},
+                                 std::string overlay = "");
 
-  /**
-   * @brief Get the feature database with all the track information
-   * @return FeatureDatabase pointer that one can query for features
-   */
-  std::shared_ptr<FeatureDatabase> get_feature_database() { return database; }
+    /**
+     * @brief Get the feature database with all the track information
+     * @return FeatureDatabase pointer that one can query for features
+     */
+    std::shared_ptr<FeatureDatabase> get_feature_database() { return database; }
 
+    virtual void return_active_pix_locs(std::vector<size_t> highlighted, std::vector<pixel_features> *MSCKF_locs);
 
-  virtual void return_active_pix_locs(std::vector<size_t> highlighted, std::vector<pixel_features> *MSCKF_locs );
+    /**
+     * @brief Changes the ID of an actively tracked feature to another one.
+     *
+     * This function can be helpfull if you detect a loop-closure with an old frame.
+     * One could then change the id of an active feature to match the old feature id!
+     *
+     * @param id_old Old id we want to change
+     * @param id_new Id we want to change the old id to
+     */
+    void change_feat_id(size_t id_old, size_t id_new);
 
+    /// Getter method for number of active features
+    int get_num_features() { return num_features; }
 
-  /**
-   * @brief Changes the ID of an actively tracked feature to another one.
-   *
-   * This function can be helpfull if you detect a loop-closure with an old frame.
-   * One could then change the id of an active feature to match the old feature id!
-   *
-   * @param id_old Old id we want to change
-   * @param id_new Id we want to change the old id to
-   */
-  void change_feat_id(size_t id_old, size_t id_new);
+    /// Setter method for number of active features
+    void set_num_features(int _num_features) { num_features = _num_features; }
 
-  /// Getter method for number of active features
-  int get_num_features() { return num_features; }
+  protected:
+    /// Camera object which has all calibration in it
+    std::unordered_map<size_t, std::shared_ptr<CamBase>> camera_calib;
 
-  /// Setter method for number of active features
-  void set_num_features(int _num_features) { num_features = _num_features; }
+    /// Database with all our current features
+    std::shared_ptr<FeatureDatabase> database;
 
-protected:
-  /// Camera object which has all calibration in it
-  std::unordered_map<size_t, std::shared_ptr<CamBase>> camera_calib;
+    /// If we are a fisheye model or not
+    std::map<size_t, bool> camera_fisheye;
 
-  /// Database with all our current features
-  std::shared_ptr<FeatureDatabase> database;
+    /// Number of features we should try to track frame to frame
+    int num_features;
 
-  /// If we are a fisheye model or not
-  std::map<size_t, bool> camera_fisheye;
+    /// If we should use binocular tracking or stereo tracking for multi-camera
+    bool use_stereo;
 
-  /// Number of features we should try to track frame to frame
-  int num_features;
+    /// What histogram equalization method we should pre-process images with?
+    HistogramMethod histogram_method;
 
-  /// If we should use binocular tracking or stereo tracking for multi-camera
-  bool use_stereo;
+    /// Mutexs for our last set of image storage (img_last, pts_last, and ids_last)
+    std::vector<std::mutex> mtx_feeds;
 
-  /// What histogram equalization method we should pre-process images with?
-  HistogramMethod histogram_method;
+    /// Mutex for editing the *_last variables
+    std::mutex mtx_last_vars;
 
-  /// Mutexs for our last set of image storage (img_last, pts_last, and ids_last)
-  std::vector<std::mutex> mtx_feeds;
+    /// Last set of images (use map so all trackers render in the same order)
+    std::map<size_t, cv::Mat> img_last;
 
-  /// Mutex for editing the *_last variables
-  std::mutex mtx_last_vars;
+    /// Last set of images (use map so all trackers render in the same order)
+    std::map<size_t, cv::Mat> img_mask_last;
 
-  /// Last set of images (use map so all trackers render in the same order)
-  std::map<size_t, cv::Mat> img_last;
+    /// Last set of tracked points
+    std::unordered_map<size_t, std::vector<cv::KeyPoint>> pts_last;
 
-  /// Last set of images (use map so all trackers render in the same order)
-  std::map<size_t, cv::Mat> img_mask_last;
+    /// Set of IDs of each current feature in the database
+    std::unordered_map<size_t, std::vector<size_t>> ids_last;
 
-  /// Last set of tracked points
-  std::unordered_map<size_t, std::vector<cv::KeyPoint>> pts_last;
+    /// Master ID for this tracker (atomic to allow for multi-threading)
+    std::atomic<size_t> currid;
 
-  /// Set of IDs of each current feature in the database
-  std::unordered_map<size_t, std::vector<size_t>> ids_last;
-
-  /// Master ID for this tracker (atomic to allow for multi-threading)
-  std::atomic<size_t> currid;
-
-  // Timing variables (most children use these...)
-  boost::posix_time::ptime rT1, rT2, rT3, rT4, rT5, rT6, rT7;
+    // Timing variables (most children use these...)
+    boost::posix_time::ptime rT1, rT2, rT3, rT4, rT5, rT6, rT7;
 };
 
 } // namespace ov_core
