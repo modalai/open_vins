@@ -38,7 +38,7 @@ list(APPEND thirdparty_libraries
 list(APPEND ament_libraries
         rclcpp
         tf2_ros
-	tf2_geometry_msgs
+        tf2_geometry_msgs
         std_msgs
         geometry_msgs
         sensor_msgs
@@ -60,12 +60,13 @@ list(APPEND LIBRARY_SOURCES
         src/state/StateHelper.cpp
         src/state/Propagator.cpp
         src/core/VioManager.cpp
+        src/core/VioManagerHelper.cpp
         src/update/UpdaterHelper.cpp
         src/update/UpdaterMSCKF.cpp
         src/update/UpdaterSLAM.cpp
         src/update/UpdaterZeroVelocity.cpp
 )
-list(APPEND LIBRARY_SOURCES src/ros/ROS2Visualizer.cpp)
+list(APPEND LIBRARY_SOURCES src/ros/ROS2Visualizer.cpp src/ros/ROSVisualizerHelper.cpp)
 file(GLOB_RECURSE LIBRARY_HEADERS "src/*.h")
 add_library(ov_msckf_lib SHARED ${LIBRARY_SOURCES} ${LIBRARY_HEADERS})
 ament_target_dependencies(ov_msckf_lib ${ament_libraries})

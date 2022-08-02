@@ -21,6 +21,16 @@
 
 #include "ROS2Visualizer.h"
 
+#include "core/VioManager.h"
+#include "ros/ROSVisualizerHelper.h"
+#include "sim/Simulator.h"
+#include "state/Propagator.h"
+#include "state/State.h"
+#include "state/StateHelper.h"
+#include "utils/dataset_reader.h"
+#include "utils/print.h"
+#include "utils/sensor_data.h"
+
 using namespace ov_core;
 using namespace ov_type;
 using namespace ov_msckf;
@@ -35,48 +45,51 @@ ROS2Visualizer::ROS2Visualizer(std::shared_ptr<rclcpp::Node> node, std::shared_p
   image_transport::ImageTransport it(node);
 
   // Setup pose and path publisher
-  pub_poseimu = node->create_publisher<geometry_msgs::msg::PoseWithCovarianceStamped>("/ov_msckf/poseimu", 2);
+  pub_poseimu = node->create_publisher<geometry_msgs::msg::PoseWithCovarianceStamped>("poseimu", 2);
   PRINT_DEBUG("Publishing: %s\n", pub_poseimu->get_topic_name());
-  pub_odomimu = node->create_publisher<nav_msgs::msg::Odometry>("/ov_msckf/odomimu", 2);
+  pub_odomimu = node->create_publisher<nav_msgs::msg::Odometry>("odomimu", 2);
   PRINT_DEBUG("Publishing: %s\n", pub_odomimu->get_topic_name());
-  pub_pathimu = node->create_publisher<nav_msgs::msg::Path>("/ov_msckf/pathimu", 2);
+  pub_pathimu = node->create_publisher<nav_msgs::msg::Path>("pathimu", 2);
   PRINT_DEBUG("Publishing: %s\n", pub_pathimu->get_topic_name());
 
   // 3D points publishing
-  pub_points_msckf = node->create_publisher<sensor_msgs::msg::PointCloud2>("/ov_msckf/points_msckf", 2);
+  pub_points_msckf = node->create_publisher<sensor_msgs::msg::PointCloud2>("points_msckf", 2);
   PRINT_DEBUG("Publishing: %s\n", pub_points_msckf->get_topic_name());
-  pub_points_slam = node->create_publisher<sensor_msgs::msg::PointCloud2>("/ov_msckf/points_slam", 2);
+  pub_points_slam = node->create_publisher<sensor_msgs::msg::PointCloud2>("points_slam", 2);
   PRINT_DEBUG("Publishing: %s\n", pub_points_msckf->get_topic_name());
-  pub_points_aruco = node->create_publisher<sensor_msgs::msg::PointCloud2>("/ov_msckf/points_aruco", 2);
+  pub_points_aruco = node->create_publisher<sensor_msgs::msg::PointCloud2>("points_aruco", 2);
   PRINT_DEBUG("Publishing: %s\n", pub_points_aruco->get_topic_name());
-  pub_points_sim = node->create_publisher<sensor_msgs::msg::PointCloud2>("/ov_msckf/points_sim", 2);
+  pub_points_sim = node->create_publisher<sensor_msgs::msg::PointCloud2>("points_sim", 2);
   PRINT_DEBUG("Publishing: %s\n", pub_points_sim->get_topic_name());
 
   // Our tracking image
-  it_pub_tracks = it.advertise("/ov_msckf/trackhist", 2);
+  it_pub_tracks = it.advertise("trackhist", 2);
   PRINT_DEBUG("Publishing: %s\n", it_pub_tracks.getTopic().c_str());
 
   // Groundtruth publishers
-  pub_posegt = node->create_publisher<geometry_msgs::msg::PoseStamped>("/ov_msckf/posegt", 2);
+  pub_posegt = node->create_publisher<geometry_msgs::msg::PoseStamped>("posegt", 2);
   PRINT_DEBUG("Publishing: %s\n", pub_posegt->get_topic_name());
-  pub_pathgt = node->create_publisher<nav_msgs::msg::Path>("/ov_msckf/pathgt", 2);
+  pub_pathgt = node->create_publisher<nav_msgs::msg::Path>("pathgt", 2);
   PRINT_DEBUG("Publishing: %s\n", pub_pathgt->get_topic_name());
 
   // Loop closure publishers
-  pub_loop_pose = node->create_publisher<nav_msgs::msg::Odometry>("/ov_msckf/loop_pose", 2);
-  pub_loop_point = node->create_publisher<sensor_msgs::msg::PointCloud>("/ov_msckf/loop_feats", 2);
-  pub_loop_extrinsic = node->create_publisher<nav_msgs::msg::Odometry>("/ov_msckf/loop_extrinsic", 2);
-  pub_loop_intrinsics = node->create_publisher<sensor_msgs::msg::CameraInfo>("/ov_msckf/loop_intrinsics", 2);
-  it_pub_loop_img_depth = it.advertise("/ov_msckf/loop_depth", 2);
-  it_pub_loop_img_depth_color = it.advertise("/ov_msckf/loop_depth_colored", 2);
+  pub_loop_pose = node->create_publisher<nav_msgs::msg::Odometry>("loop_pose", 2);
+  pub_loop_point = node->create_publisher<sensor_msgs::msg::PointCloud>("loop_feats", 2);
+  pub_loop_extrinsic = node->create_publisher<nav_msgs::msg::Odometry>("loop_extrinsic", 2);
+  pub_loop_intrinsics = node->create_publisher<sensor_msgs::msg::CameraInfo>("loop_intrinsics", 2);
+  it_pub_loop_img_depth = it.advertise("loop_depth", 2);
+  it_pub_loop_img_depth_color = it.advertise("loop_depth_colored", 2);
 
   // option to enable publishing of global to IMU transformation
-  node->declare_parameter<bool>("publish_global_to_imu_tf", true);
-  node->get_parameter("publish_global_to_imu_tf", publish_global2imu_tf);
-  node->declare_parameter<bool>("publish_calibration_tf", true);
-  node->get_parameter("publish_calibration_tf", publish_calibration_tf);
+  if (node->has_parameter("publish_global_to_imu_tf")) {
+    node->get_parameter<bool>("publish_global_to_imu_tf", publish_global2imu_tf);
+  }
+  if (node->has_parameter("publish_calibration_tf")) {
+    node->get_parameter<bool>("publish_calibration_tf", publish_calibration_tf);
+  }
 
   // Load groundtruth if we have it and are not doing simulation
+  // NOTE: needs to be a csv ASL format file
   std::string path_to_gt;
   bool has_gt = node->get_parameter("path_gt", path_to_gt);
   if (has_gt && _sim == nullptr && !path_to_gt.empty()) {
@@ -85,26 +98,35 @@ ROS2Visualizer::ROS2Visualizer(std::shared_ptr<rclcpp::Node> node, std::shared_p
   }
 
   // Load if we should save the total state to file
-  node->declare_parameter<bool>("save_total_state", false);
-  node->get_parameter("save_total_state", save_total_state);
-
-  // If the file is not open, then open the file
+  // If so, then open the file and create folders as needed
+  if (node->has_parameter("save_total_state")) {
+    node->get_parameter<bool>("save_total_state", save_total_state);
+  }
   if (save_total_state) {
 
     // files we will open
-    std::string filepath_est, filepath_std, filepath_gt;
-    node->declare_parameter<std::string>("filepath_est", "state_estimate.txt");
-    node->declare_parameter<std::string>("filepath_std", "state_deviation.txt");
-    node->declare_parameter<std::string>("filepath_gt", "state_groundtruth.txt");
-    node->get_parameter<std::string>("filepath_est", filepath_est);
-    node->get_parameter<std::string>("filepath_std", filepath_std);
-    node->get_parameter<std::string>("filepath_gt", filepath_gt);
+    std::string filepath_est = "state_estimate.txt";
+    std::string filepath_std = "state_deviation.txt";
+    std::string filepath_gt = "state_groundtruth.txt";
+    if (node->has_parameter("filepath_est")) {
+      node->get_parameter<std::string>("filepath_est", filepath_est);
+    }
+    if (node->has_parameter("filepath_std")) {
+      node->get_parameter<std::string>("filepath_std", filepath_std);
+    }
+    if (node->has_parameter("filepath_gt")) {
+      node->get_parameter<std::string>("filepath_gt", filepath_gt);
+    }
 
     // If it exists, then delete it
     if (boost::filesystem::exists(filepath_est))
       boost::filesystem::remove(filepath_est);
     if (boost::filesystem::exists(filepath_std))
       boost::filesystem::remove(filepath_std);
+
+    // Create folder path to this location if not exists
+    boost::filesystem::create_directories(boost::filesystem::path(filepath_est.c_str()).parent_path());
+    boost::filesystem::create_directories(boost::filesystem::path(filepath_std.c_str()).parent_path());
 
     // Open the files
     of_state_est.open(filepath_est.c_str());
@@ -116,9 +138,22 @@ ROS2Visualizer::ROS2Visualizer(std::shared_ptr<rclcpp::Node> node, std::shared_p
     if (_sim != nullptr) {
       if (boost::filesystem::exists(filepath_gt))
         boost::filesystem::remove(filepath_gt);
+      boost::filesystem::create_directories(boost::filesystem::path(filepath_gt.c_str()).parent_path());
       of_state_gt.open(filepath_gt.c_str());
       of_state_gt << "# timestamp(s) q p v bg ba cam_imu_dt num_cam cam0_k cam0_d cam0_rot cam0_trans .... etc" << std::endl;
     }
+  }
+
+  // Start thread for the image publishing
+  if (_app->get_params().use_multi_threading_pubs) {
+    std::thread thread([&] {
+      rclcpp::Rate loop_rate(20);
+      while (rclcpp::ok()) {
+        publish_images();
+        loop_rate.sleep();
+      }
+    });
+    thread.detach();
   }
 }
 
@@ -132,7 +167,7 @@ void ROS2Visualizer::setup_subscribers(std::shared_ptr<ov_core::YamlParser> pars
   _node->declare_parameter<std::string>("topic_imu", "/imu0");
   _node->get_parameter("topic_imu", topic_imu);
   parser->parse_external("relative_config_imu", "imu0", "rostopic", topic_imu);
-  sub_imu = _node->create_subscription<sensor_msgs::msg::Imu>(topic_imu, 1000,
+  sub_imu = _node->create_subscription<sensor_msgs::msg::Imu>(topic_imu, rclcpp::SensorDataQoS(),
                                                               std::bind(&ROS2Visualizer::callback_inertial, this, std::placeholders::_1));
 
   // Logic for sync stereo subscriber
@@ -187,11 +222,12 @@ void ROS2Visualizer::visualize() {
   last_visualization_timestamp = _app->get_state()->_timestamp;
 
   // Start timing
-  boost::posix_time::ptime rT0_1, rT0_2;
-  rT0_1 = boost::posix_time::microsec_clock::local_time();
+  // boost::posix_time::ptime rT0_1, rT0_2;
+  // rT0_1 = boost::posix_time::microsec_clock::local_time();
 
-  // publish current image
-  publish_images();
+  // publish current image (only if not multi-threaded)
+  if (!_app->get_params().use_multi_threading_pubs)
+    publish_images();
 
   // Return if we have not inited
   if (!_app->initialized())
@@ -217,13 +253,13 @@ void ROS2Visualizer::visualize() {
 
   // Save total state
   if (save_total_state) {
-    RosVisualizerHelper::sim_save_total_state_to_file(_app->get_state(), _sim, of_state_est, of_state_std, of_state_gt);
+    ROSVisualizerHelper::sim_save_total_state_to_file(_app->get_state(), _sim, of_state_est, of_state_std, of_state_gt);
   }
 
   // Print how much time it took to publish / displaying things
-  rT0_2 = boost::posix_time::microsec_clock::local_time();
-  double time_total = (rT0_2 - rT0_1).total_microseconds() * 1e-6;
-  PRINT_DEBUG(BLUE "[TIME]: %.4f seconds for visualization\n" RESET, time_total);
+  // rT0_2 = boost::posix_time::microsec_clock::local_time();
+  // double time_total = (rT0_2 - rT0_1).total_microseconds() * 1e-6;
+  // PRINT_DEBUG(BLUE "[TIME]: %.4f seconds for visualization\n" RESET, time_total);
 }
 
 void ROS2Visualizer::visualize_odometry(double timestamp) {
@@ -244,7 +280,7 @@ void ROS2Visualizer::visualize_odometry(double timestamp) {
 
     // Our odometry message
     nav_msgs::msg::Odometry odomIinM;
-    odomIinM.header.stamp = RosVisualizerHelper::get_time_from_seconds(timestamp);
+    odomIinM.header.stamp = ROSVisualizerHelper::get_time_from_seconds(timestamp);
     odomIinM.header.frame_id = "global";
 
     // The POSE component (orientation and position)
@@ -289,7 +325,7 @@ void ROS2Visualizer::visualize_odometry(double timestamp) {
   // NOTE: a rotation from GtoI in JPL has the same xyzw as a ItoG Hamilton rotation
   auto odom_pose = std::make_shared<ov_type::PoseJPL>();
   odom_pose->set_value(state_plus.block(0, 0, 7, 1));
-  geometry_msgs::msg::TransformStamped trans = RosVisualizerHelper::get_stamped_transform_from_pose(_node, odom_pose, false);
+  geometry_msgs::msg::TransformStamped trans = ROSVisualizerHelper::get_stamped_transform_from_pose(_node, odom_pose, false);
   trans.header.stamp = _node->now();
   trans.header.frame_id = "global";
   trans.child_frame_id = "imu";
@@ -299,7 +335,7 @@ void ROS2Visualizer::visualize_odometry(double timestamp) {
 
   // Loop through each camera calibration and publish it
   for (const auto &calib : state->_calib_IMUtoCAM) {
-    geometry_msgs::msg::TransformStamped trans_calib = RosVisualizerHelper::get_stamped_transform_from_pose(_node, calib.second, true);
+    geometry_msgs::msg::TransformStamped trans_calib = ROSVisualizerHelper::get_stamped_transform_from_pose(_node, calib.second, true);
     trans_calib.header.stamp = _node->now();
     trans_calib.header.frame_id = "imu";
     trans_calib.child_frame_id = "cam" + std::to_string(calib.first);
@@ -399,12 +435,13 @@ void ROS2Visualizer::callback_inertial(const sensor_msgs::msg::Imu::SharedPtr ms
       double timestamp_imu_inC = message.timestamp - _app->get_state()->_calib_dt_CAMtoIMU->value()(0);
       while (!camera_queue.empty() && camera_queue.at(0).timestamp < timestamp_imu_inC) {
         auto rT0_1 = boost::posix_time::microsec_clock::local_time();
+        double update_dt = 100.0 * (timestamp_imu_inC - camera_queue.at(0).timestamp);
         _app->feed_measurement_camera(camera_queue.at(0));
         visualize();
         camera_queue.pop_front();
         auto rT0_2 = boost::posix_time::microsec_clock::local_time();
         double time_total = (rT0_2 - rT0_1).total_microseconds() * 1e-6;
-        PRINT_INFO(BLUE "[TIME]: %.4f seconds total (%.1f hz)\n" RESET, time_total, 1.0 / time_total);
+        PRINT_INFO(BLUE "[TIME]: %.4f seconds total (%.1f hz, %.2f ms behind)\n" RESET, time_total, 1.0 / time_total, update_dt);
       }
     }
     thread_update_running = false;
@@ -412,7 +449,7 @@ void ROS2Visualizer::callback_inertial(const sensor_msgs::msg::Imu::SharedPtr ms
 
   // If we are single threaded, then run single threaded
   // Otherwise detach this thread so it runs in the background!
-  if (!_app->get_params().use_multi_threading) {
+  if (!_app->get_params().use_multi_threading_subs) {
     thread.join();
   } else {
     thread.detach();
@@ -524,7 +561,7 @@ void ROS2Visualizer::publish_state() {
 
   // Create pose of IMU (note we use the bag time)
   geometry_msgs::msg::PoseWithCovarianceStamped poseIinM;
-  poseIinM.header.stamp = RosVisualizerHelper::get_time_from_seconds(timestamp_inI);
+  poseIinM.header.stamp = ROSVisualizerHelper::get_time_from_seconds(timestamp_inI);
   poseIinM.header.frame_id = "global";
   poseIinM.pose.pose.orientation.x = state->_imu->quat()(0);
   poseIinM.pose.pose.orientation.y = state->_imu->quat()(1);
@@ -569,12 +606,21 @@ void ROS2Visualizer::publish_state() {
 
 void ROS2Visualizer::publish_images() {
 
+  // Return if we have already visualized
+  if (_app->get_state() == nullptr)
+    return;
+  if (last_visualization_timestamp_image == _app->get_state()->_timestamp && _app->initialized())
+    return;
+  last_visualization_timestamp_image = _app->get_state()->_timestamp;
+
   // Check if we have subscribers
   if (it_pub_tracks.getNumSubscribers() == 0)
     return;
 
   // Get our image of history tracks
   cv::Mat img_history = _app->get_historical_viz_image();
+  if (img_history.empty())
+    return;
 
   // Create our message
   std_msgs::msg::Header header;
@@ -595,17 +641,17 @@ void ROS2Visualizer::publish_features() {
 
   // Get our good MSCKF features
   std::vector<Eigen::Vector3d> feats_msckf = _app->get_good_features_MSCKF();
-  sensor_msgs::msg::PointCloud2 cloud = RosVisualizerHelper::get_ros_pointcloud(_node, feats_msckf);
+  sensor_msgs::msg::PointCloud2 cloud = ROSVisualizerHelper::get_ros_pointcloud(_node, feats_msckf);
   pub_points_msckf->publish(cloud);
 
   // Get our good SLAM features
   std::vector<Eigen::Vector3d> feats_slam = _app->get_features_SLAM();
-  sensor_msgs::msg::PointCloud2 cloud_SLAM = RosVisualizerHelper::get_ros_pointcloud(_node, feats_slam);
+  sensor_msgs::msg::PointCloud2 cloud_SLAM = ROSVisualizerHelper::get_ros_pointcloud(_node, feats_slam);
   pub_points_slam->publish(cloud_SLAM);
 
   // Get our good ARUCO features
   std::vector<Eigen::Vector3d> feats_aruco = _app->get_features_ARUCO();
-  sensor_msgs::msg::PointCloud2 cloud_ARUCO = RosVisualizerHelper::get_ros_pointcloud(_node, feats_aruco);
+  sensor_msgs::msg::PointCloud2 cloud_ARUCO = ROSVisualizerHelper::get_ros_pointcloud(_node, feats_aruco);
   pub_points_aruco->publish(cloud_ARUCO);
 
   // Skip the rest of we are not doing simulation
@@ -614,7 +660,7 @@ void ROS2Visualizer::publish_features() {
 
   // Get our good SIMULATION features
   std::vector<Eigen::Vector3d> feats_sim = _sim->get_map_vec();
-  sensor_msgs::msg::PointCloud2 cloud_SIM = RosVisualizerHelper::get_ros_pointcloud(_node, feats_sim);
+  sensor_msgs::msg::PointCloud2 cloud_SIM = ROSVisualizerHelper::get_ros_pointcloud(_node, feats_sim);
   pub_points_sim->publish(cloud_SIM);
 }
 
@@ -646,7 +692,7 @@ void ROS2Visualizer::publish_groundtruth() {
 
   // Create pose of IMU
   geometry_msgs::msg::PoseStamped poseIinM;
-  poseIinM.header.stamp = RosVisualizerHelper::get_time_from_seconds(timestamp_inI);
+  poseIinM.header.stamp = ROSVisualizerHelper::get_time_from_seconds(timestamp_inI);
   poseIinM.header.frame_id = "global";
   poseIinM.pose.orientation.x = state_gt(1, 0);
   poseIinM.pose.orientation.y = state_gt(2, 0);
@@ -764,7 +810,7 @@ void ROS2Visualizer::publish_loopclosure_information() {
 
   // Default header
   std_msgs::msg::Header header;
-  header.stamp = RosVisualizerHelper::get_time_from_seconds(active_tracks_time1);
+  header.stamp = ROSVisualizerHelper::get_time_from_seconds(active_tracks_time1);
 
   //======================================================
   // Check if we have subscribers for the pose odometry, camera intrinsics, or extrinsics
