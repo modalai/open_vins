@@ -25,9 +25,9 @@
 #include "feat/FeatureDatabase.h"
 #include "feat/FeatureInitializer.h"
 #include "track/TrackAruco.h"
+#include "track/TrackCVP.h"
 #include "track/TrackDescriptor.h"
 #include "track/TrackKLT.h"
-#include "track/TrackCVP.h"
 
 #include "track/TrackSIM.h"
 #include "types/Landmark.h"
@@ -120,7 +120,9 @@ VioManager::VioManager(VioManagerOptions &params_) : thread_init_running(false),
     // NOTE: we will split the total number of features over all cameras uniformly
     trackDATABASE = std::make_shared<FeatureDatabase>();
     // TURI -> this is bad logic, as we need a decent amount of features to properly match
-    int init_max_features = params.init_options.init_max_features; //std::floor((double)params.init_options.init_max_features / (double)params.state_options.num_cameras);
+    int init_max_features =
+        params.init_options
+            .init_max_features; // std::floor((double)params.init_options.init_max_features / (double)params.state_options.num_cameras);
     if (params.use_klt) {
         trackFEATS = std::shared_ptr<TrackBase>(new TrackKLT(state->_cam_intrinsics_cameras, init_max_features,
                                                              state->_options.max_aruco_features, params.use_stereo, params.histogram_method,
@@ -469,7 +471,7 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
         assert(landmark.second->_unique_camera_id != -1);
         bool current_unique_cam =
             std::find(message.sensor_ids.begin(), message.sensor_ids.end(), landmark.second->_unique_camera_id) != message.sensor_ids.end();
-        if (feat2 == nullptr && current_unique_cam){
+        if (feat2 == nullptr && current_unique_cam) {
             landmark.second->should_marg = true;
             // fprintf(stderr, "marginalizing feat id %d\n", landmark.second->_featid);
         }

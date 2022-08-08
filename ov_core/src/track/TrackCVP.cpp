@@ -53,7 +53,7 @@ void TrackCVP::feed_new_camera(const CameraData &message) {
         parallel_for_(cv::Range(0, (int)num_images), LambdaBody([&](const cv::Range &range) {
                           for (int i = range.start; i < range.end; i++) {
                               feed_KLT_monocular(message, i);
-                            // feed_orb_monocular(message, i);
+                              // feed_orb_monocular(message, i);
                           }
                       }));
     } else {
@@ -74,18 +74,18 @@ void TrackCVP::feed_orb_monocular(const CameraData &message, size_t msg_id) {
     // Histogram equalize
     cv::Mat img, mask;
     // if (histogram_method == HistogramMethod::HISTOGRAM) {
-        // cv::equalizeHist(message.images.at(msg_id), img);
+    // cv::equalizeHist(message.images.at(msg_id), img);
     // } else if (histogram_method == HistogramMethod::CLAHE) {
-        // double eq_clip_limit = 10.0;
-        // cv::Size eq_win_size = cv::Size(8, 8);
-        // cv::Ptr<cv::CLAHE> clahe = cv::createCLAHE(eq_clip_limit, eq_win_size);
-        // clahe->apply(message.images.at(msg_id), img);
+    // double eq_clip_limit = 10.0;
+    // cv::Size eq_win_size = cv::Size(8, 8);
+    // cv::Ptr<cv::CLAHE> clahe = cv::createCLAHE(eq_clip_limit, eq_win_size);
+    // clahe->apply(message.images.at(msg_id), img);
     // } else {
     cv::Mat _img = message.images.at(msg_id);
     // now do a lpf over the image
     // cv::gaussianBlur(_img, img, 11);
-    cv::GaussianBlur(_img, img, cv::Size(7,7), 0, 0, cv::BORDER_DEFAULT);
-    
+    cv::GaussianBlur(_img, img, cv::Size(7, 7), 0, 0, cv::BORDER_DEFAULT);
+
     // }
     mask = message.masks.at(msg_id);
 
@@ -120,7 +120,8 @@ void TrackCVP::feed_orb_monocular(const CameraData &message, size_t msg_id) {
     std::vector<cv::DMatch> matches_ll;
 
     // Lets match temporally
-    robust_orb_match(img, positions, pts_new.size(), img_last[cam_id], prev_positions[cam_id], pts_last[cam_id].size(), cam_id, cam_id, matches_ll);
+    robust_orb_match(img, positions, pts_new.size(), img_last[cam_id], prev_positions[cam_id], pts_last[cam_id].size(), cam_id, cam_id,
+                     matches_ll);
     rT3 = boost::posix_time::microsec_clock::local_time();
 
     // Get our "good tracks"
@@ -152,8 +153,8 @@ void TrackCVP::feed_orb_monocular(const CameraData &message, size_t msg_id) {
             num_tracklast++;
         } else {
             // if (num_non_matched + num_tracklast < num_features){
-                num_non_matched++;
-                good_ids_left.push_back(ids_new[i]);
+            num_non_matched++;
+            good_ids_left.push_back(ids_new[i]);
             // }
         }
     }
@@ -167,7 +168,7 @@ void TrackCVP::feed_orb_monocular(const CameraData &message, size_t msg_id) {
     }
 
     // Debug info
-    PRINT_DEBUG("LtoL = %d | good = %d | fromlast = %d\n",(int)matches_ll.size(),(int)good_left.size(),num_tracklast);
+    PRINT_DEBUG("LtoL = %d | good = %d | fromlast = %d\n", (int)matches_ll.size(), (int)good_left.size(), num_tracklast);
 
     // Move forward in time
     {
@@ -181,15 +182,18 @@ void TrackCVP::feed_orb_monocular(const CameraData &message, size_t msg_id) {
     rT5 = boost::posix_time::microsec_clock::local_time();
 
     // Our timing information
-    PRINT_DEBUG("[TIME-DESC]: %.4f seconds for preprocessing\n",(rT0-rT1).total_microseconds() * 1e-6);
-    PRINT_DEBUG("[TIME-DESC]: %.4f seconds for detection\n",(rT2-rT0).total_microseconds() * 1e-6);
-    PRINT_DEBUG("[TIME-DESC]: %.4f seconds for matching\n",(rT3-rT2).total_microseconds() * 1e-6);
-    PRINT_DEBUG("[TIME-DESC]: %.4f seconds for merging\n",(rT4-rT3).total_microseconds() * 1e-6);
-    PRINT_DEBUG("[TIME-DESC]: %.4f seconds for feature DB update (%d features)\n",(rT5-rT4).total_microseconds() * 1e-6,
-    (int)good_left.size()); PRINT_DEBUG("[TIME-DESC]: %.4f seconds for total\n",(rT5-rT1).total_microseconds() * 1e-6);
+    PRINT_DEBUG("[TIME-DESC]: %.4f seconds for preprocessing\n", (rT0 - rT1).total_microseconds() * 1e-6);
+    PRINT_DEBUG("[TIME-DESC]: %.4f seconds for detection\n", (rT2 - rT0).total_microseconds() * 1e-6);
+    PRINT_DEBUG("[TIME-DESC]: %.4f seconds for matching\n", (rT3 - rT2).total_microseconds() * 1e-6);
+    PRINT_DEBUG("[TIME-DESC]: %.4f seconds for merging\n", (rT4 - rT3).total_microseconds() * 1e-6);
+    PRINT_DEBUG("[TIME-DESC]: %.4f seconds for feature DB update (%d features)\n", (rT5 - rT4).total_microseconds() * 1e-6,
+                (int)good_left.size());
+    PRINT_DEBUG("[TIME-DESC]: %.4f seconds for total\n", (rT5 - rT1).total_microseconds() * 1e-6);
 }
 
-void TrackCVP::perform_orb_detection_monocular(const cv::Mat &img0, const cv::Mat &mask0, std::vector<size_t> &ids0, std::vector<cv::KeyPoint> &pts0, bool reference_set_empty, size_t cam_id, mcv_dcm_pos_t* positions) {
+void TrackCVP::perform_orb_detection_monocular(const cv::Mat &img0, const cv::Mat &mask0, std::vector<size_t> &ids0,
+                                               std::vector<cv::KeyPoint> &pts0, bool reference_set_empty, size_t cam_id,
+                                               mcv_dcm_pos_t *positions) {
 
     // Assert that we need features
     assert(pts0.empty());
@@ -227,7 +231,7 @@ void TrackCVP::perform_orb_detection_monocular(const cv::Mat &img0, const cv::Ma
             continue;
         }
         // TODO check if this is within a masked region!!!!s
-        // TURI 
+        // TURI
 
         // Check if this keypoint is near another point
         if (grid_2d.at<uint8_t>(y_grid, x_grid) > 127)
@@ -249,17 +253,15 @@ void TrackCVP::perform_orb_detection_monocular(const cv::Mat &img0, const cv::Ma
 
     // if our reference set is empty, that means we need to calculate the descriptors for this batch of features now
     // then we have something to match against next round
-    if (reference_set_empty){
-        if(mcv_dcm_calc(img0.data, positions, actual_index, cam_id)){
+    if (reference_set_empty) {
+        if (mcv_dcm_calc(img0.data, positions, actual_index, cam_id)) {
             return;
         }
     }
 }
 
-
-void TrackCVP::robust_orb_match(const cv::Mat &img1, mcv_dcm_pos_t* positions1, size_t n_pos1,
-                      const cv::Mat &img0, mcv_dcm_pos_t* positions0, size_t n_pos0,
-                      size_t id0, size_t id1, std::vector<cv::DMatch> &matches) {
+void TrackCVP::robust_orb_match(const cv::Mat &img1, mcv_dcm_pos_t *positions1, size_t n_pos1, const cv::Mat &img0,
+                                mcv_dcm_pos_t *positions0, size_t n_pos0, size_t id0, size_t id1, std::vector<cv::DMatch> &matches) {
 
     // Our 1to2 and 2to1 match vectors
     mcv_dcm_match_t matches_0_1[MCV_MAX_MATCH_BUF_SIZE];
@@ -267,7 +269,7 @@ void TrackCVP::robust_orb_match(const cv::Mat &img1, mcv_dcm_pos_t* positions1, 
     int n_matches_0, n_matches_1;
 
     // last arg is true to update reference descriptor set
-    if(mcv_dcm_match(img1.data, positions1, n_pos1, matches_0_1, &n_matches_0, id0, true)){
+    if (mcv_dcm_match(img1.data, positions1, n_pos1, matches_0_1, &n_matches_0, id0, true)) {
         fprintf(stderr, "EARLY RET\n");
         return;
     }
@@ -276,11 +278,10 @@ void TrackCVP::robust_orb_match(const cv::Mat &img1, mcv_dcm_pos_t* positions1, 
     std::vector<cv::DMatch> matches_good;
     std::vector<cv::DMatch> matches_1_to_2, matches_2_to_1;
 
-
-    for(int i=0;i<n_matches_0;i++){
-        uint16_t idx   = matches_0_1[i].index;
+    for (int i = 0; i < n_matches_0; i++) {
+        uint16_t idx = matches_0_1[i].index;
         uint16_t score = matches_0_1[i].score;
-        if (score < 20){
+        if (score < 20) {
             matches_good.push_back(cv::DMatch(idx, i, 1));
             pts0_rsc.push_back(cv::Point2f(positions0[idx].x, positions0[idx].y));
             pts1_rsc.push_back(cv::Point2f(positions1[i].x, positions1[i].y));
@@ -315,7 +316,8 @@ void TrackCVP::robust_orb_match(const cv::Mat &img1, mcv_dcm_pos_t* positions1, 
         matches.push_back(matches_good.at(i));
     }
 
-    // fprintf(stderr, "MATCHED %d FEATS, REJECTED %d via RANSAC, REJECTED %d via SCORE\n", matches.size(),  matches_good.size() -  matches.size(), n_matches_0 -  matches_good.size());
+    // fprintf(stderr, "MATCHED %d FEATS, REJECTED %d via RANSAC, REJECTED %d via SCORE\n", matches.size(),  matches_good.size() -
+    // matches.size(), n_matches_0 -  matches_good.size());
 }
 
 void TrackCVP::feed_KLT_monocular(const CameraData &message, size_t msg_id) {
@@ -360,7 +362,6 @@ void TrackCVP::feed_KLT_monocular(const CameraData &message, size_t msg_id) {
     auto ids_left_old = ids_last[cam_id];
     perform_KLT_detection_monocular(img_pyramid_last[cam_id], img_mask_last[cam_id], pts_left_old, ids_left_old, msg_id);
     rT3 = boost::posix_time::microsec_clock::local_time();
-
 
     // Our return success masks, and predicted new features
     std::vector<uchar> mask_ll;
@@ -410,7 +411,8 @@ void TrackCVP::feed_KLT_monocular(const CameraData &message, size_t msg_id) {
     for (size_t i = 0; i < good_left.size(); i++) {
         cv::Point2f npt_l = camera_calib.at(cam_id)->undistort_cv(good_left.at(i).pt);
         // fprintf(stderr, "inserting into feature db at time %6.5f\n", message.timestamp);
-        database->update_feature(good_ids_left.at(i), message.timestamp, cam_id, good_left.at(i).pt.x, good_left.at(i).pt.y, npt_l.x, npt_l.y);
+        database->update_feature(good_ids_left.at(i), message.timestamp, cam_id, good_left.at(i).pt.x, good_left.at(i).pt.y, npt_l.x,
+                                 npt_l.y);
     }
 
     // Move forward in time
@@ -433,7 +435,6 @@ void TrackCVP::feed_KLT_monocular(const CameraData &message, size_t msg_id) {
     PRINT_DEBUG("[TIME-KLT]: %.4f seconds for total\n", (rT5 - rT1).total_microseconds() * 1e-6);
 }
 
-
 static bool compare_response(mcv_fpx_feature_t first, mcv_fpx_feature_t second) { return first.score > second.score; }
 
 // instead, just use the zone mode and only add in the best n_features per grid, starting at like 2
@@ -448,11 +449,11 @@ void TrackCVP::perform_KLT_detection_monocular(const std::vector<cv::Mat> &img0p
     // Note that we scale this down, so that each grid point is equal to a set of pixels
     // This means that we will reject points that less than grid_px_size points away then existing features
     cv::Size size_close((int)((float)img0pyr.at(0).cols / (float)min_px_dist),
-                        (int)((float)img0pyr.at(0).rows / (float)min_px_dist));  // width x height
+                        (int)((float)img0pyr.at(0).rows / (float)min_px_dist)); // width x height
     cv::Mat grid_2d_close = cv::Mat::zeros(size_close, CV_8UC1);
     float size_x = (float)img0pyr.at(0).cols / (float)grid_x;
     float size_y = (float)img0pyr.at(0).rows / (float)grid_y;
-    cv::Size size_grid(grid_x, grid_y);  // width x height
+    cv::Size size_grid(grid_x, grid_y); // width x height
     cv::Mat grid_2d_grid = cv::Mat::zeros(size_grid, CV_8UC1);
     cv::Mat mask0_updated = mask0.clone();
     auto it0 = pts0.begin();
@@ -512,7 +513,7 @@ void TrackCVP::perform_KLT_detection_monocular(const std::vector<cv::Mat> &img0p
         it1++;
     }
 
-      // First compute how many more features we need to extract from this image
+    // First compute how many more features we need to extract from this image
     // If we don't need any features, just return
     int num_featsneeded = num_features - (int)pts0.size();
     // fprintf(stderr, "previous points: %d, need %d\n", (int)pts0.size(), num_featsneeded);
@@ -543,31 +544,31 @@ void TrackCVP::perform_KLT_detection_monocular(const std::vector<cv::Mat> &img0p
     // basically, sort our returned features, do the same grid checks, and only add the amount of features needed
     std::vector<std::vector<mcv_fpx_feature_t>> feat_vec(grid_y, std::vector<mcv_fpx_feature_t>(grid_x));
 
-    int max_allowed_y = img0pyr[0].rows/grid_y;
+    int max_allowed_y = img0pyr[0].rows / grid_y;
     int prev_index = -1;
     int start_index = 0;
     int vec_index = 0;
     int grid_points = 0;
     for (int i = 0; i < n_points; i++) {
         // if y is within the grid cell range, we're good
-        if (mcv_features[msg_id][i].y <= max_allowed_y && mcv_features[msg_id][i].y >= max_allowed_y - img0pyr[0].rows/grid_y) {
+        if (mcv_features[msg_id][i].y <= max_allowed_y && mcv_features[msg_id][i].y >= max_allowed_y - img0pyr[0].rows / grid_y) {
             prev_index = i;
             grid_points++;
             continue;
         } else {
-            if (prev_index >= 0){
+            if (prev_index >= 0) {
                 feat_vec[vec_index].resize(grid_points);
                 feat_vec[vec_index].assign(mcv_features[msg_id] + start_index, mcv_features[msg_id] + prev_index);
                 std::sort(feat_vec[vec_index].begin(), feat_vec[vec_index].end(), compare_response);
                 vec_index++;
             }
             grid_points = 1;
-            max_allowed_y += img0pyr[0].rows/grid_y;
+            max_allowed_y += img0pyr[0].rows / grid_y;
             prev_index = i;
             start_index = i;
             if (vec_index > grid_y - 1) {
-              // fprintf(stderr, "SKIPPED %d POINTS\n", n_points - i);
-              break;
+                // fprintf(stderr, "SKIPPED %d POINTS\n", n_points - i);
+                break;
             }
         }
     }
@@ -604,17 +605,18 @@ void TrackCVP::perform_KLT_detection_monocular(const std::vector<cv::Mat> &img0p
         int x_grid = (int)(good_feats[i].x / (float)min_px_dist);
         int y_grid = (int)(good_feats[i].y / (float)min_px_dist);
 
-        if (x_grid < 0 || x_grid >= size_close.width || y_grid < 0 || y_grid >= size_close.height){
-          continue;
+        if (x_grid < 0 || x_grid >= size_close.width || y_grid < 0 || y_grid >= size_close.height) {
+            continue;
         }
 
         // See if there is a point at this location
-        if (grid_2d_close.at<uint8_t>(y_grid, x_grid) > 127){
-          continue;
+        if (grid_2d_close.at<uint8_t>(y_grid, x_grid) > 127) {
+            continue;
         }
         // lets add it!
-        kpts0_new.push_back(cv::KeyPoint(good_feats[i].x, good_feats[i].y, 1));  // need to fake a keypoint here, going to construct with mcv feature data
-        pts0_new.push_back(cv::Point2f(good_feats[i].x, good_feats[i].y));       // cv point2f
+        kpts0_new.push_back(
+            cv::KeyPoint(good_feats[i].x, good_feats[i].y, 1)); // need to fake a keypoint here, going to construct with mcv feature data
+        pts0_new.push_back(cv::Point2f(good_feats[i].x, good_feats[i].y)); // cv point2f
     }
 
     // Sub-pixel refinement parameters
@@ -646,8 +648,9 @@ void TrackCVP::perform_KLT_detection_monocular(const std::vector<cv::Mat> &img0p
     PRINT_DEBUG("[TIME-KLT]: %.4f seconds for refine\n", (end_refine_t - start_refine_t).total_microseconds() * 1e-6);
 }
 
-void TrackCVP::perform_KLT_matching(const std::vector<cv::Mat> &img0pyr, const std::vector<cv::Mat> &img1pyr, std::vector<cv::KeyPoint> &kpts0,
-                                std::vector<cv::KeyPoint> &kpts1, size_t id0, size_t id1, std::vector<uchar> &mask_out) {
+void TrackCVP::perform_KLT_matching(const std::vector<cv::Mat> &img0pyr, const std::vector<cv::Mat> &img1pyr,
+                                    std::vector<cv::KeyPoint> &kpts0, std::vector<cv::KeyPoint> &kpts1, size_t id0, size_t id1,
+                                    std::vector<uchar> &mask_out) {
     // We must have equal vectors
     assert(kpts0.size() == kpts1.size());
 
@@ -718,73 +721,10 @@ void TrackCVP::perform_KLT_matching(const std::vector<cv::Mat> &img0pyr, const s
         kpts1.at(i).pt = pts1.at(i);
     }
 
-    PRINT_DEBUG("[TIME-MATCH]: %.4f seconds for optical flow with %d points\n", (opt_finish - opt_time).total_microseconds() * 1e-6, pts0.size());
+    PRINT_DEBUG("[TIME-MATCH]: %.4f seconds for optical flow with %d points\n", (opt_finish - opt_time).total_microseconds() * 1e-6,
+                pts0.size());
     PRINT_DEBUG("[TIME-MATCH]: %.4f seconds for RANSAC\n", (ran_finish - ran_time).total_microseconds() * 1e-6);
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 // void TrackCVP::feed_stereo(const CameraData &message, size_t msg_id_left, size_t msg_id_right) {
 
@@ -926,7 +866,8 @@ void TrackCVP::perform_KLT_matching(const std::vector<cv::Mat> &img0pyr, const s
 //         cv::Point2f npt_l = camera_calib.at(cam_id_left)->undistort_cv(good_left.at(i).pt);
 //         cv::Point2f npt_r = camera_calib.at(cam_id_right)->undistort_cv(good_right.at(i).pt);
 //         // Append to the database
-//         database->update_feature(good_ids_left.at(i), message.timestamp, cam_id_left, good_left.at(i).pt.x, good_left.at(i).pt.y, npt_l.x,
+//         database->update_feature(good_ids_left.at(i), message.timestamp, cam_id_left, good_left.at(i).pt.x, good_left.at(i).pt.y,
+//         npt_l.x,
 //                                  npt_l.y);
 //         database->update_feature(good_ids_left.at(i), message.timestamp, cam_id_right, good_right.at(i).pt.x, good_right.at(i).pt.y,
 //                                  npt_r.x, npt_r.y);

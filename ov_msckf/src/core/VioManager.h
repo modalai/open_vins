@@ -108,7 +108,7 @@ class VioManager {
 
     // features
     std::vector<pixel_features> get_pixel_loc_features();
-    
+
     bool initialized() { return is_initialized_vio; }
 
     /// Get a nice visualization image of what tracks we have

@@ -243,7 +243,7 @@ void VioManager::retriangulate_active_tracks(const ov_core::CameraData &message)
     retri_rT2 = boost::posix_time::microsec_clock::local_time();
 
     // Return if no features
-    if (active_features.empty() && state->_features_SLAM.empty()){
+    if (active_features.empty() && state->_features_SLAM.empty()) {
         return;
     }
 
@@ -290,7 +290,7 @@ void VioManager::retriangulate_active_tracks(const ov_core::CameraData &message)
     retri_rT4 = boost::posix_time::microsec_clock::local_time();
 
     // Return if no features
-    if (active_features.empty() && state->_features_SLAM.empty()){
+    if (active_features.empty() && state->_features_SLAM.empty()) {
         return;
     }
 
@@ -359,11 +359,11 @@ void VioManager::retriangulate_active_tracks(const ov_core::CameraData &message)
     retri_rT5 = boost::posix_time::microsec_clock::local_time();
 
     // Timing information
-    PRINT_DEBUG(CYAN "[RETRI-TIME]: %.4f seconds for cleaning\n" RESET, (retri_rT2-retri_rT1).total_microseconds() * 1e-6);
-    PRINT_DEBUG(CYAN "[RETRI-TIME]: %.4f seconds for triangulate setup\n" RESET, (retri_rT3-retri_rT2).total_microseconds() * 1e-6);
-    PRINT_DEBUG(CYAN "[RETRI-TIME]: %.4f seconds for triangulation\n" RESET, (retri_rT4-retri_rT3).total_microseconds() * 1e-6);
-    PRINT_DEBUG(CYAN "[RETRI-TIME]: %.4f seconds for re-projection\n" RESET, (retri_rT5-retri_rT4).total_microseconds() * 1e-6);
-    PRINT_DEBUG(CYAN "[RETRI-TIME]: %.4f seconds total\n" RESET, (retri_rT5-retri_rT1).total_microseconds() * 1e-6);
+    PRINT_DEBUG(CYAN "[RETRI-TIME]: %.4f seconds for cleaning\n" RESET, (retri_rT2 - retri_rT1).total_microseconds() * 1e-6);
+    PRINT_DEBUG(CYAN "[RETRI-TIME]: %.4f seconds for triangulate setup\n" RESET, (retri_rT3 - retri_rT2).total_microseconds() * 1e-6);
+    PRINT_DEBUG(CYAN "[RETRI-TIME]: %.4f seconds for triangulation\n" RESET, (retri_rT4 - retri_rT3).total_microseconds() * 1e-6);
+    PRINT_DEBUG(CYAN "[RETRI-TIME]: %.4f seconds for re-projection\n" RESET, (retri_rT5 - retri_rT4).total_microseconds() * 1e-6);
+    PRINT_DEBUG(CYAN "[RETRI-TIME]: %.4f seconds total\n" RESET, (retri_rT5 - retri_rT1).total_microseconds() * 1e-6);
 }
 
 cv::Mat VioManager::get_historical_viz_image() {
@@ -440,7 +440,6 @@ std::vector<pixel_features> VioManager::get_pixel_loc_features() {
 
     return pixel_loc_feats;
 }
-
 
 std::vector<Eigen::Vector3d> VioManager::get_features_ARUCO() {
     std::vector<Eigen::Vector3d> aruco_feats;
