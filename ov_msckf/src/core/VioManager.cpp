@@ -27,6 +27,8 @@
 #include "track/TrackAruco.h"
 #include "track/TrackDescriptor.h"
 #include "track/TrackKLT.h"
+#include "track/TrackCVP.h"
+
 #include "track/TrackSIM.h"
 #include "types/Landmark.h"
 #include "types/LandmarkRepresentation.h"
@@ -117,15 +119,16 @@ VioManager::VioManager(VioManagerOptions &params_) : thread_init_running(false),
     // NOTE: after we initialize we will increase the total number of feature tracks
     // NOTE: we will split the total number of features over all cameras uniformly
     trackDATABASE = std::make_shared<FeatureDatabase>();
-    int init_max_features = std::floor((double)params.init_options.init_max_features / (double)params.state_options.num_cameras);
+    // TURI -> this is bad logic, as we need a decent amount of features to properly match
+    int init_max_features = params.init_options.init_max_features; //std::floor((double)params.init_options.init_max_features / (double)params.state_options.num_cameras);
     if (params.use_klt) {
         trackFEATS = std::shared_ptr<TrackBase>(new TrackKLT(state->_cam_intrinsics_cameras, init_max_features,
                                                              state->_options.max_aruco_features, params.use_stereo, params.histogram_method,
                                                              params.fast_threshold, params.grid_x, params.grid_y, params.min_px_dist));
     } else {
-        trackFEATS = std::shared_ptr<TrackBase>(new TrackDescriptor(
+        trackFEATS = std::shared_ptr<TrackBase>(new TrackCVP(
             state->_cam_intrinsics_cameras, init_max_features, state->_options.max_aruco_features, params.use_stereo,
-            params.histogram_method, params.fast_threshold, params.grid_x, params.grid_y, params.min_px_dist, params.knn_ratio));
+            params.histogram_method, params.fast_threshold, params.grid_x, params.grid_y, params.min_px_dist, params.mcv_feature_ptr));
     }
 
     // Initialize our aruco tag extractor
@@ -395,7 +398,7 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
     it1 = feats_lost.begin();
     while (it1 != feats_lost.end()) {
         if (std::find(feats_marg.begin(), feats_marg.end(), (*it1)) != feats_marg.end()) {
-            PRINT_WARNING(YELLOW "FOUND FEATURE THAT WAS IN BOTH feats_lost and feats_marg!!!!!!\n" RESET);
+            // PRINT_WARNING(YELLOW "FOUND FEATURE THAT WAS IN BOTH feats_lost and feats_marg!!!!!!\n" RESET);
             it1 = feats_lost.erase(it1);
         } else {
             it1++;
@@ -418,6 +421,7 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
         }
         // If max track, then add it to our possible slam feature list
         if (reached_max) {
+            // fprintf(stderr, "feat reached max track\n");
             feats_maxtracks.push_back(*it2);
             it2 = feats_marg.erase(it2);
         } else {
@@ -465,8 +469,10 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
         assert(landmark.second->_unique_camera_id != -1);
         bool current_unique_cam =
             std::find(message.sensor_ids.begin(), message.sensor_ids.end(), landmark.second->_unique_camera_id) != message.sensor_ids.end();
-        if (feat2 == nullptr && current_unique_cam)
+        if (feat2 == nullptr && current_unique_cam){
             landmark.second->should_marg = true;
+            // fprintf(stderr, "marginalizing feat id %d\n", landmark.second->_featid);
+        }
     }
 
     // Lets marginalize out all old SLAM features here
@@ -479,8 +485,8 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
     for (size_t i = 0; i < feats_slam.size(); i++) {
         if (state->_features_SLAM.find(feats_slam.at(i)->featid) != state->_features_SLAM.end()) {
             feats_slam_UPDATE.push_back(feats_slam.at(i));
-            // PRINT_DEBUG("[UPDATE-SLAM]: found old feature %d (%d
-            // measurements)\n",(int)feats_slam.at(i)->featid,(int)feats_slam.at(i)->timestamps_left.size());
+            // fprintf(stderr, "[UPDATE-SLAM]: old feature found (%d measurements)\n", (int)feats_slam.at(i)->timestamps.size());
+
         } else {
             feats_slam_DELAYED.push_back(feats_slam.at(i));
             // fprintf(stderr, "[UPDATE-SLAM]: new feature ready (%d measurements)\n", (int)feats_slam.at(i)->timestamps.size());

@@ -106,54 +106,10 @@ class VioManager {
     /// Accessor to get the current propagator
     std::shared_ptr<Propagator> get_propagator() { return propagator; }
 
-    // // features
-    // std::vector<pixel_features> get_pixel_loc_features() {
-    //     std::vector<pixel_features> pixel_loc_feats;
-
-    //     // Build an id-list of our "in state" features
-    //     // i.e. SLAM and last msckf update features
-    //     std::vector<size_t> highlighted_ids;
-    //     for (const auto &feat : state->_features_SLAM) {
-    //         highlighted_ids.push_back(feat.first);
-    //     }
-
-    //     trackFEATS->return_active_pix_locs(highlighted_ids, &pixel_loc_feats);
-
-    //     // SLAM features are now in the vector, just need to append (INSTATE, MSCKF LOC) now
-    //     for (const auto &loc : MSCKF_locs) {
-    //         pixel_features pf;
-    //         pf.camera_id = loc.first;
-    //         pf.state_indicator = INS_FEAT_ID;
-    //         pf.location = loc.second;
-    //         pixel_loc_feats.push_back(pf);
-    //     }
-
-    //     return pixel_loc_feats;
-    // }
-
-    //   /// Returns 3d SLAM features in the global frame
-    //   std::vector<Eigen::Vector3d> get_features_SLAM() {
-    //       std::vector<Eigen::Vector3d> slam_feats;
-    //       for (auto &f : state->_features_SLAM) {
-    //           if ((int)f.first <= 4 * state->_options.max_aruco_features)
-    //               continue;
-    //           if (ov_type::LandmarkRepresentation::is_relative_representation(f.second->_feat_representation)) {
-    //               // Assert that we have an anchor pose for this feature
-    //               assert(f.second->_anchor_cam_id != -1);
-    //               // Get calibration for our anchor camera
-    //               Eigen::Matrix<double, 3, 3> R_ItoC = state->_calib_IMUtoCAM.at(f.second->_anchor_cam_id)->Rot();
-    //               Eigen::Matrix<double, 3, 1> p_IinC = state->_calib_IMUtoCAM.at(f.second->_anchor_cam_id)->pos();
-    //               // Anchor pose orientation and position
-    //               Eigen::Matrix<double, 3, 3> R_GtoI = state->_clones_IMU.at(f.second->_anchor_clone_timestamp)->Rot();
-    //               Eigen::Matrix<double, 3, 1> p_IinG = state->_clones_IMU.at(f.second->_anchor_clone_timestamp)->pos();
-    //               // Feature in the global frame
-    //               slam_feats.push_back(R_GtoI.transpose() * R_ItoC.transpose() * (f.second->get_xyz(false) - p_IinC) + p_IinG);
-    //           } else {
-    //               slam_feats.push_back(f.second->get_xyz(false));
-    //           }
-    //       }
-    //       return slam_feats;
-    //   }
+    // features
+    std::vector<pixel_features> get_pixel_loc_features();
+    
+    bool initialized() { return is_initialized_vio; }
 
     /// Get a nice visualization image of what tracks we have
     cv::Mat get_historical_viz_image();

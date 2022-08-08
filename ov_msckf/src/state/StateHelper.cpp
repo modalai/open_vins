@@ -632,6 +632,7 @@ void StateHelper::marginalize_slam(std::shared_ptr<State> state) {
         if ((*it0).second->should_marg && (int)(*it0).first > 4 * state->_options.max_aruco_features) {
             StateHelper::marginalize(state, (*it0).second);
             it0 = state->_features_SLAM.erase(it0);
+            // fprintf(stderr, "marginalizing slam feature\n");
         } else {
             it0++;
         }

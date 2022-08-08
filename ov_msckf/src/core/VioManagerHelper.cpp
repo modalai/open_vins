@@ -243,8 +243,9 @@ void VioManager::retriangulate_active_tracks(const ov_core::CameraData &message)
     retri_rT2 = boost::posix_time::microsec_clock::local_time();
 
     // Return if no features
-    if (active_features.empty() && state->_features_SLAM.empty())
+    if (active_features.empty() && state->_features_SLAM.empty()){
         return;
+    }
 
     // 2. Create vector of cloned *CAMERA* poses at each of our clone timesteps
     std::unordered_map<size_t, std::unordered_map<double, FeatureInitializer::ClonePose>> clones_cam;
@@ -289,8 +290,9 @@ void VioManager::retriangulate_active_tracks(const ov_core::CameraData &message)
     retri_rT4 = boost::posix_time::microsec_clock::local_time();
 
     // Return if no features
-    if (active_features.empty() && state->_features_SLAM.empty())
+    if (active_features.empty() && state->_features_SLAM.empty()){
         return;
+    }
 
     // Points which we have in the global frame
     for (const auto &feat : active_features) {
@@ -357,11 +359,11 @@ void VioManager::retriangulate_active_tracks(const ov_core::CameraData &message)
     retri_rT5 = boost::posix_time::microsec_clock::local_time();
 
     // Timing information
-    // PRINT_DEBUG(CYAN "[RETRI-TIME]: %.4f seconds for cleaning\n" RESET, (retri_rT2-retri_rT1).total_microseconds() * 1e-6);
-    // PRINT_DEBUG(CYAN "[RETRI-TIME]: %.4f seconds for triangulate setup\n" RESET, (retri_rT3-retri_rT2).total_microseconds() * 1e-6);
-    // PRINT_DEBUG(CYAN "[RETRI-TIME]: %.4f seconds for triangulation\n" RESET, (retri_rT4-retri_rT3).total_microseconds() * 1e-6);
-    // PRINT_DEBUG(CYAN "[RETRI-TIME]: %.4f seconds for re-projection\n" RESET, (retri_rT5-retri_rT4).total_microseconds() * 1e-6);
-    // PRINT_DEBUG(CYAN "[RETRI-TIME]: %.4f seconds total\n" RESET, (retri_rT5-retri_rT1).total_microseconds() * 1e-6);
+    PRINT_DEBUG(CYAN "[RETRI-TIME]: %.4f seconds for cleaning\n" RESET, (retri_rT2-retri_rT1).total_microseconds() * 1e-6);
+    PRINT_DEBUG(CYAN "[RETRI-TIME]: %.4f seconds for triangulate setup\n" RESET, (retri_rT3-retri_rT2).total_microseconds() * 1e-6);
+    PRINT_DEBUG(CYAN "[RETRI-TIME]: %.4f seconds for triangulation\n" RESET, (retri_rT4-retri_rT3).total_microseconds() * 1e-6);
+    PRINT_DEBUG(CYAN "[RETRI-TIME]: %.4f seconds for re-projection\n" RESET, (retri_rT5-retri_rT4).total_microseconds() * 1e-6);
+    PRINT_DEBUG(CYAN "[RETRI-TIME]: %.4f seconds total\n" RESET, (retri_rT5-retri_rT1).total_microseconds() * 1e-6);
 }
 
 cv::Mat VioManager::get_historical_viz_image() {
@@ -414,6 +416,31 @@ std::vector<Eigen::Vector3d> VioManager::get_features_SLAM() {
     }
     return slam_feats;
 }
+
+std::vector<pixel_features> VioManager::get_pixel_loc_features() {
+    std::vector<pixel_features> pixel_loc_feats;
+
+    // Build an id-list of our "in state" features
+    // i.e. SLAM and last msckf update features
+    std::vector<size_t> highlighted_ids;
+    for (const auto &feat : state->_features_SLAM) {
+        highlighted_ids.push_back(feat.first);
+    }
+
+    trackFEATS->return_active_pix_locs(highlighted_ids, &pixel_loc_feats);
+
+    // SLAM features are now in the vector, just need to append (INSTATE, MSCKF LOC) now
+    for (const auto &loc : MSCKF_locs) {
+        pixel_features pf;
+        pf.camera_id = loc.first;
+        pf.state_indicator = INS_FEAT_ID;
+        pf.location = loc.second;
+        pixel_loc_feats.push_back(pf);
+    }
+
+    return pixel_loc_feats;
+}
+
 
 std::vector<Eigen::Vector3d> VioManager::get_features_ARUCO() {
     std::vector<Eigen::Vector3d> aruco_feats;

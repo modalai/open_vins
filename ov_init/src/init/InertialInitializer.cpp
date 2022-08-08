@@ -72,6 +72,8 @@ void InertialInitializer::feed_imu(const ov_core::ImuData &message, double oldes
 bool InertialInitializer::initialize(double &timestamp, Eigen::MatrixXd &covariance, std::vector<std::shared_ptr<ov_type::Type>> &order,
                                      std::shared_ptr<ov_type::IMU> t_imu, bool wait_for_jerk) {
 
+    // fprintf(stderr, "initializing\n");
+
     // Get the newest and oldest timestamps we will try to initialize between!
     double newest_cam_time = -1;
     for (auto const &feat : _db->get_internal_data()) {
@@ -83,6 +85,7 @@ bool InertialInitializer::initialize(double &timestamp, Eigen::MatrixXd &covaria
     }
     double oldest_time = newest_cam_time - params.init_window_time - 0.01;
     if (newest_cam_time < 0 || oldest_time < 0) {
+        // fprintf(stderr, "returning with times %6.5f and %6.5f\n", oldest_time, newest_cam_time);
         return false;
     }
 

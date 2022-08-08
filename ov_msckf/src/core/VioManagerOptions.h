@@ -43,6 +43,7 @@
 #include "utils/opencv_yaml_parse.h"
 #include "utils/print.h"
 #include "utils/quat_ops.h"
+#include <modalcv.h>
 
 namespace ov_msckf {
 
@@ -369,6 +370,10 @@ struct VioManagerOptions {
 
     /// Parameters used by our feature initialize / triangulator
     ov_core::FeatureInitializerOptions featinit_options;
+
+    // vector of mcv features, pre-allocated before being assigned
+    std::vector<mcv_fpx_feature_t*> *mcv_feature_ptr;
+
 
     /**
      * @brief This function will load print out all parameters related to visual tracking

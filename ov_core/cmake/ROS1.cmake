@@ -34,6 +34,7 @@ list(APPEND thirdparty_libraries
         ${Boost_LIBRARIES}
         ${OpenCV_LIBRARIES}
         ${catkin_LIBRARIES}
+        /usr/lib64/libmodalcv.so
 )
 
 ##################################################
@@ -50,6 +51,7 @@ list(APPEND LIBRARY_SOURCES
         src/track/TrackDescriptor.cpp
         src/track/TrackKLT.cpp
         src/track/TrackSIM.cpp
+        src/track/TrackCVP.cpp
         src/types/Landmark.cpp
         src/feat/Feature.cpp
         src/feat/FeatureDatabase.cpp

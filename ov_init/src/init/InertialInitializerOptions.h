@@ -237,7 +237,7 @@ struct InertialInitializerOptions {
     int num_cameras = 1;
 
     /// If we should process two cameras are being stereo or binocular. If binocular, we do monocular feature tracking on each image.
-    bool use_stereo = true;
+    bool use_stereo = false;
 
     /// Will half the resolution all tracking image (aruco will be 1/4 instead of halved if dowsize_aruoc also enabled)
     bool downsample_cameras = false;

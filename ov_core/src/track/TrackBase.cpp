@@ -33,6 +33,7 @@ void TrackBase::return_active_pix_locs(std::vector<size_t> highlighted, std::vec
     int cam_id = 0;
     for (auto const &pair : img_last) {
         for (size_t i = 0; i < ids_last[pair.first].size(); i++) {
+            // fprintf(stderr, "return active pixel_locs index %d\n", ids_last[pair.first].at(i));
             // If a highlighted point, then put a nice box around it
             if (std::find(highlighted.begin(), highlighted.end(), ids_last[pair.first].at(i)) != highlighted.end()) {
                 cv::Point2f pt_c = pts_last[pair.first].at(i).pt;
