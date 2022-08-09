@@ -35,6 +35,11 @@
 #include "types/Type.h"
 #include "types/Vec.h"
 
+// some state flags pulled in for error reporting/blowup detection
+#define OV_STATE_FAILED 0
+#define OV_STATE_INITIALIZING 1
+#define OV_STATE_OK 2
+
 namespace ov_msckf {
 
 /**
@@ -80,6 +85,9 @@ class State {
 
     /// Current timestamp (should be the last update time!)
     double _timestamp = -1;
+
+    /// extra MAI error flag for blowups
+    uint8_t error_flag = OV_STATE_INITIALIZING;
 
     /// Struct containing filter options
     StateOptions _options;

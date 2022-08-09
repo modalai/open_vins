@@ -131,6 +131,9 @@ VioManager::VioManager(VioManagerOptions &params_) : thread_init_running(false),
         trackFEATS = std::shared_ptr<TrackBase>(new TrackCVP(
             state->_cam_intrinsics_cameras, init_max_features, state->_options.max_aruco_features, params.use_stereo,
             params.histogram_method, params.fast_threshold, params.grid_x, params.grid_y, params.min_px_dist, params.mcv_feature_ptr));
+        // trackFEATS = std::shared_ptr<TrackBase>(new TrackDescriptor(
+        // state->_cam_intrinsics_cameras, params.init_options.init_max_features, state->_options.max_aruco_features, params.use_stereo,
+        // params.histogram_method, params.fast_threshold, params.grid_x, params.grid_y, params.min_px_dist, params.knn_ratio));
     }
 
     // Initialize our aruco tag extractor
@@ -407,6 +410,8 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
         }
     }
 
+    // fprintf(stderr, "LOST %d FEATS\n", (int)feats_lost.size());
+
     // Find tracks that have reached max length, these can be made into SLAM features
     std::vector<std::shared_ptr<Feature>> feats_maxtracks;
     auto it2 = feats_marg.begin();
@@ -466,8 +471,9 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
                 feats_slam.push_back(feat1);
         }
         std::shared_ptr<Feature> feat2 = trackFEATS->get_feature_database()->get_feature(landmark.second->_featid);
-        if (feat2 != nullptr)
+        if (feat2 != nullptr) {
             feats_slam.push_back(feat2);
+        }
         assert(landmark.second->_unique_camera_id != -1);
         bool current_unique_cam =
             std::find(message.sensor_ids.begin(), message.sensor_ids.end(), landmark.second->_unique_camera_id) != message.sensor_ids.end();
@@ -524,6 +530,28 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
         featsup_MSCKF.erase(featsup_MSCKF.begin(), featsup_MSCKF.end() - state->_options.max_msckf_in_update);
     updaterMSCKF->update(state, featsup_MSCKF);
     rT4 = boost::posix_time::microsec_clock::local_time();
+
+    // now that we have done our ekf update, check to see if we are moving and if there were no features used in the update
+    // basic blowup check, report out via state error code
+    static int lone_ekf_updates = 0;
+    if (featsup_MSCKF.size() == 0) {
+        float vel_now = state->_imu->vel_fej().norm(); //[0] + state->_imu->vel_fej()[1] + state->_imu->vel_fej()[2];
+        if (vel_now > 0.1)                             // arbitrary for now, not sure
+            lone_ekf_updates++;
+    } else {
+        lone_ekf_updates = 0;
+    }
+
+    // this is the absolute check
+    // if we hit this, send out errors!
+    if (lone_ekf_updates > 60) {
+        // reset this, as the counter can stick through a reset
+        lone_ekf_updates = 0;
+        // set state flag, will just cause the system to restart by server end
+        state->error_flag = OV_STATE_FAILED;
+    }
+    // fprintf(stderr, "(%d feats, %6.5f velocity, %d bad updates)\n", (int)featsup_MSCKF.size(), state->_imu->vel_fej().norm(),
+    // lone_ekf_updates);
 
     // Perform SLAM delay init and update
     // NOTE: that we provide the option here to do a *sequential* update

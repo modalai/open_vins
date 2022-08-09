@@ -462,6 +462,7 @@ bool StateHelper::initialize(std::shared_ptr<State> state, std::shared_ptr<Type>
     boost::math::chi_squared chi_squared_dist(res.rows());
     double chi2_check = boost::math::quantile(chi_squared_dist, 0.95);
     if (chi2 > chi_2_mult * chi2_check) {
+        // fprintf(stderr, "CHI2 FAIL\n");
         return false;
     }
 

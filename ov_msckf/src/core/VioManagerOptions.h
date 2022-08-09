@@ -336,7 +336,7 @@ struct VioManagerOptions {
     bool downsample_cameras = false;
 
     /// Threads our front-end should try to use (opencv uses this also)
-    int num_opencv_threads = 4;
+    int num_opencv_threads = 1;
 
     /// If our ROS image publisher should be async (if sim this should be no!)
     bool use_multi_threading_pubs = true;

@@ -137,6 +137,7 @@ void UpdaterSLAM::delayed_init(std::shared_ptr<State> state, std::vector<std::sh
 
         // Remove the feature if not a success
         if (!success_tri || !success_refine) {
+            // fprintf(stderr, "FAILED TRAINGULATION\n");
             (*it1)->to_delete = true;
             it1 = feature_vec.erase(it1);
             continue;
@@ -237,9 +238,12 @@ void UpdaterSLAM::delayed_init(std::shared_ptr<State> state, std::vector<std::sh
         } else {
             (*it2)->to_delete = true;
             it2 = feature_vec.erase(it2);
+            // fprintf(stderr, "FAILED INIT AGAIN\n");
         }
     }
     rT3 = boost::posix_time::microsec_clock::local_time();
+
+    // fprintf(stderr, "ADDED %d FEATS\n", feature_vec.size());
 
     // Debug print timing information
     if (!feature_vec.empty()) {
