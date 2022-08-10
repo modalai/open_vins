@@ -121,7 +121,8 @@ bool VioManager::try_to_initialize(const ov_core::CameraData &message) {
             // Also increase the number of features to the desired amount during estimation
             // NOTE: we will split the total number of features over all cameras uniformly
             trackFEATS->get_feature_database()->cleanup_measurements(state->_timestamp);
-            trackFEATS->set_num_features(std::floor((double)params.num_pts / (double)params.state_options.num_cameras));
+            // TURI -> better to have n points tracked per cam
+            trackFEATS->set_num_features(params.num_pts);
             if (trackARUCO != nullptr) {
                 trackARUCO->get_feature_database()->cleanup_measurements(state->_timestamp);
             }

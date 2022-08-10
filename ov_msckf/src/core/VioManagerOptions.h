@@ -336,13 +336,13 @@ struct VioManagerOptions {
     bool downsample_cameras = false;
 
     /// Threads our front-end should try to use (opencv uses this also)
-    int num_opencv_threads = 1;
+    int num_opencv_threads = 4;
 
     /// If our ROS image publisher should be async (if sim this should be no!)
     bool use_multi_threading_pubs = true;
 
     /// If our ROS subscriber callbacks should be async (if sim and serial then this should be no!)
-    bool use_multi_threading_subs = false;
+    bool use_multi_threading_subs = true;
 
     /// The number of points we should extract and track in *each* image frame. This highly effects the computation required for tracking.
     int num_pts = 150;
@@ -360,7 +360,7 @@ struct VioManagerOptions {
     int min_px_dist = 10;
 
     /// What type of pre-processing histogram method should be applied to images
-    ov_core::TrackBase::HistogramMethod histogram_method = ov_core::TrackBase::HistogramMethod::HISTOGRAM;
+    ov_core::TrackBase::HistogramMethod histogram_method = ov_core::TrackBase::HistogramMethod::NONE;
 
     /// KNN ration between top two descriptor matcher which is required to be a good match
     double knn_ratio = 0.85;

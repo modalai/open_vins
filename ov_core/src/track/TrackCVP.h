@@ -106,7 +106,7 @@ class TrackCVP : public TrackBase {
 
     // How many pyramid levels to track
     int pyr_levels = 3;
-    cv::Size win_size = cv::Size(20, 20);
+    cv::Size win_size = cv::Size(15, 15);
 
     // Last set of image pyramids
     std::map<size_t, std::vector<cv::Mat>> img_pyramid_last;
