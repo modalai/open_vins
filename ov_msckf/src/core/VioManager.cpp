@@ -171,6 +171,11 @@ void VioManager::feed_measurement_imu(const ov_core::ImuData &message) {
     if (oldest_time > state->_timestamp) {
         oldest_time = -1;
     }
+    // hard cutoff of one second of imu_data
+    // if not set, the updater will have thousands of samples to sort through after zupt conditions end
+    if (message.timestamp - oldest_time > 1.0 && is_initialized_vio){
+        oldest_time = message.timestamp - 1.0;
+    }
     propagator->feed_imu(message, oldest_time);
 
     // Push back to our initializer
@@ -544,12 +549,12 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
 
     // this is the absolute check
     // if we hit this, send out errors!
-    if (lone_ekf_updates > 60) {
-        // reset this, as the counter can stick through a reset
-        lone_ekf_updates = 0;
-        // set state flag, will just cause the system to restart by server end
-        state->error_flag = OV_STATE_FAILED;
-    }
+    // if (lone_ekf_updates > 120) {
+    //     // reset this, as the counter can stick through a reset
+    //     lone_ekf_updates = 0;
+    //     // set state flag, will just cause the system to restart by server end
+    //     state->error_flag = OV_STATE_FAILED;
+    // }
     // fprintf(stderr, "(%d feats, %6.5f velocity, %d bad updates)\n", (int)featsup_MSCKF.size(), state->_imu->vel_fej().norm(),
     // lone_ekf_updates);
 

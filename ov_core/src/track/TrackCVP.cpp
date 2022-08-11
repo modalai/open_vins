@@ -386,7 +386,6 @@ void TrackCVP::feed_KLT_monocular(const CameraData &message, size_t msg_id) {
 
     // Get our image objects for this image
     // Start timing
-    rT1 = boost::posix_time::microsec_clock::local_time();
 
     // Lock this data feed for this camera
     size_t cam_id = message.sensor_ids.at(msg_id);
@@ -398,6 +397,7 @@ void TrackCVP::feed_KLT_monocular(const CameraData &message, size_t msg_id) {
 
     // Extract the new image pyramid
     std::vector<cv::Mat> imgpyr;
+    rT1 = boost::posix_time::microsec_clock::local_time();
     cv::buildOpticalFlowPyramid(img, imgpyr, win_size, pyr_levels);
     rT2 = boost::posix_time::microsec_clock::local_time();
 

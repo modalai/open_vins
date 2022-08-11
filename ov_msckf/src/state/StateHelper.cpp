@@ -173,9 +173,12 @@ void StateHelper::EKFUpdate(std::shared_ptr<State> state, const std::vector<std:
         if (diags(i) < 0.0) {
             PRINT_WARNING(RED "StateHelper::EKFUpdate() - diagonal at %d is %.2f\n" RESET, i, diags(i));
             found_neg = true;
+            state->error_flag = OV_STATE_FAILED;
         }
     }
-    assert_r(!found_neg);
+    // removing assertion TURI
+    // open vins should never kill itself, rather should report error status and let the user deal with it
+    // assert_r(!found_neg);
 
     // Calculate our delta and update all our active states
     Eigen::VectorXd dx = K * res;
