@@ -34,8 +34,11 @@ list(APPEND thirdparty_libraries
         ${Boost_LIBRARIES}
         ${OpenCV_LIBRARIES}
         ${catkin_LIBRARIES}
-        /usr/lib64/libmodalcv.so
 )
+
+if (BUILD_QRB5165)
+        list(APPEND thirdparty_libraries /usr/lib64/libmodalcv.so)
+endif ()
 
 ##################################################
 # Make the core library

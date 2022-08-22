@@ -22,6 +22,8 @@
 #ifndef OV_CORE_TRACK_CVP_H
 #define OV_CORE_TRACK_CVP_H
 
+#ifdef BUILD_QRB5165
+
 #include "TrackBase.h"
 #include <modalcv.h>
 
@@ -115,5 +117,7 @@ class TrackCVP : public TrackBase {
 };
 
 } // namespace ov_core
+
+#endif // qrb
 
 #endif /* OV_CORE_TRACK_CVP_H */

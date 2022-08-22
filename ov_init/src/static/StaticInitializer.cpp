@@ -121,6 +121,8 @@ bool StaticInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarianc
     // Get rotation with z axis aligned with -g (z_in_G=0,0,1)
     Eigen::Vector3d z_axis = a_avg_2to1 / a_avg_2to1.norm();
     Eigen::Matrix3d Ro;
+
+    // gram schmidt finds initial rotation from grav/global to imu
     InitializerHelper::gram_schmidt(z_axis, Ro);
     Eigen::Vector4d q_GtoI = rot_2_quat(Ro);
 

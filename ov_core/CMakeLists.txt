@@ -1,6 +1,14 @@
 cmake_minimum_required(VERSION 3.3)
 project(ov_core)
 
+option(BUILD_QRB5165 "Build the qrb5165 binary" OFF)
+
+if(BUILD_QRB5165)
+    add_definitions(-DBUILD_QRB5165)
+endif()
+
+message(STATUS "qrb build: " ${BUILD_QRB5165} ${CMAKE_MODULE_PATH})
+
 # Include libraries (if we don't have opencv 4, then fallback to opencv 3)
 # The OpenCV version needs to match the one used by cv_bridge otherwise you will get a segmentation fault!
 find_package(Eigen3 REQUIRED)

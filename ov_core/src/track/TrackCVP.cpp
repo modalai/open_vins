@@ -19,6 +19,8 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
+#ifdef BUILD_QRB5165
+
 #include "TrackCVP.h"
 
 #include <opencv2/features2d.hpp>
@@ -496,7 +498,7 @@ void TrackCVP::feed_KLT_monocular(const CameraData &message, size_t msg_id) {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 // ***NOTE***
-// GRID X AND GRID Y MUST BE THE SAME AQS THE CVP ZONE WIDTH/ZONE HEIGHT CONFIGS
+// GRID X AND GRID Y MUST BE THE SAME AS THE CVP ZONE WIDTH/ZONE HEIGHT CONFIGS FOR LOGIC HERE
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 void TrackCVP::perform_KLT_detection_monocular(const std::vector<cv::Mat> &img0pyr, const cv::Mat &mask0, std::vector<cv::KeyPoint> &pts0,
                                                std::vector<size_t> &ids0, size_t msg_id) {
@@ -767,3 +769,5 @@ void TrackCVP::perform_KLT_matching(const std::vector<cv::Mat> &img0pyr, const s
                 pts0.size());
     PRINT_DEBUG("[TIME-MATCH]: %.4f seconds for RANSAC\n", (ran_finish - ran_time).total_microseconds() * 1e-6);
 }
+
+#endif

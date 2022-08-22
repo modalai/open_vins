@@ -128,12 +128,17 @@ VioManager::VioManager(VioManagerOptions &params_) : thread_init_running(false),
                                                              state->_options.max_aruco_features, params.use_stereo, params.histogram_method,
                                                              params.fast_threshold, params.grid_x, params.grid_y, params.min_px_dist));
     } else {
+
+    #ifdef BUILD_QRB5165
         trackFEATS = std::shared_ptr<TrackBase>(new TrackCVP(
             state->_cam_intrinsics_cameras, init_max_features, state->_options.max_aruco_features, params.use_stereo,
             params.histogram_method, params.fast_threshold, params.grid_x, params.grid_y, params.min_px_dist, params.mcv_feature_ptr));
-        // trackFEATS = std::shared_ptr<TrackBase>(new TrackDescriptor(
-        // state->_cam_intrinsics_cameras, params.init_options.init_max_features, state->_options.max_aruco_features, params.use_stereo,
-        // params.histogram_method, params.fast_threshold, params.grid_x, params.grid_y, params.min_px_dist, params.knn_ratio));
+    #else
+        trackFEATS = std::shared_ptr<TrackBase>(new TrackDescriptor(
+        state->_cam_intrinsics_cameras, params.init_options.init_max_features, state->_options.max_aruco_features, params.use_stereo,
+        params.histogram_method, params.fast_threshold, params.grid_x, params.grid_y, params.min_px_dist, params.knn_ratio));
+    #endif
+    
     }
 
     // Initialize our aruco tag extractor
@@ -603,6 +608,22 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
             feat->anchor_cam_id, cv::Point2f(feat->uvs[feat->anchor_cam_id].back()(0), feat->uvs[feat->anchor_cam_id].back()(1))));
         feat->to_delete = true;
     }
+
+    //===================================================================================
+    // TURI - MAI
+    // time for some loop closure
+    // this is where we want to add/create a keyframe if it passes our criteria
+    // BASIC CRITERIA:
+    // * if norm distance from last pose > SOME_DIST_THRESH, maybe like 10-20cm to start
+    // * if we have too few landmarks, see note below
+    // * a nice addition would be to not add a keyframe if SOME_PERCENTAGE_THRESH of landmarks are in the last keyframe
+    // 
+    // when we lose all landmarks or have < SOME_LANDMARK_THRESH, we need to search our keyframe db/map for a keyframe from a similar direction and try to match feats to it
+    // this means that we will create a keyframe with some ??? measurements, and if we are unable to match anything it will need to be purged until we have reliable measurements?
+    // not sure if this holds or im way off, will see later
+    // TODO clean this shit up
+    //===================================================================================
+
 
     //===================================================================================
     // Cleanup, marginalize out what we don't need any more...
