@@ -93,7 +93,7 @@ bool UpdaterZeroVelocity::try_update(std::shared_ptr<State> state, double timest
     // get out of hand
     // since the imu rate is so high, we need to be VERY careful of our window size to update over
     // otherwise the system will stall/crash
-    double time0 = timestamp - (1. / (float)state->_options.max_clone_size);
+    double time0 = timestamp - (1. / (float)state->_options.max_clone_size/2);
     double time1 = timestamp + t_off_new;
 
     // Select bounding inertial measurements
