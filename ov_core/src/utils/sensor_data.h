@@ -78,6 +78,37 @@ struct CameraData {
     }
 };
 
+typedef struct MaiFeature {
+    size_t id;
+    size_t cam_id;
+    float x;
+    float y;
+} __attribute((packed)) __MaiFeature;
+
+struct ProcessedCameraData {
+    /// Timestamp of the reading
+    double timestamp;
+
+    /// Camera ids for each of the images collected
+    std::vector<int> sensor_ids;
+
+    // no mask or image for now
+
+    /// Features Extracted per cam
+    std::vector<MaiFeature> feats;
+
+    /// Sort function to allow for using of STL containers
+    bool operator<(const ProcessedCameraData &other) const {
+        if (timestamp == other.timestamp) {
+            int id = *std::min_element(sensor_ids.begin(), sensor_ids.end());
+            int id_other = *std::min_element(other.sensor_ids.begin(), other.sensor_ids.end());
+            return id < id_other;
+        } else {
+            return timestamp < other.timestamp;
+        }
+    }
+};
+
 } // namespace ov_core
 
 #endif // OV_CORE_SENSOR_DATA_H

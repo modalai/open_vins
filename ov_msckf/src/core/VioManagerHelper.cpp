@@ -199,7 +199,7 @@ void VioManager::retriangulate_active_tracks(const ov_core::CameraData &message)
 
     // Clear old active track data
     active_tracks_time = state->_timestamp;
-    active_image = message.images.at(0).clone();
+    // active_image = message.images.at(0).clone();
     active_tracks_posinG.clear();
     active_tracks_uvd.clear();
 
@@ -398,8 +398,9 @@ cv::Mat VioManager::get_historical_viz_image() {
 std::vector<Eigen::Vector3d> VioManager::get_features_SLAM() {
     std::vector<Eigen::Vector3d> slam_feats;
     for (auto &f : state->_features_SLAM) {
-        if ((int)f.first <= 4 * state->_options.max_aruco_features)
-            continue;
+        // why all this aruco bullshit everywhere
+        // if ((int)f.first <= 4 * state->_options.max_aruco_features)
+        // continue;
         if (ov_type::LandmarkRepresentation::is_relative_representation(f.second->_feat_representation)) {
             // Assert that we have an anchor pose for this feature
             assert(f.second->_anchor_cam_id != -1);
@@ -428,16 +429,42 @@ std::vector<pixel_features> VioManager::get_pixel_loc_features() {
         highlighted_ids.push_back(feat.first);
     }
 
-    trackFEATS->return_active_pix_locs(highlighted_ids, &pixel_loc_feats);
+    // this can no longer be handled by the tracker, as we have an external one
+    // soooooooooo, just grab the latest update ones and do it here ourselves
+    // in this loop, if anchor cam is unset we really have no clue where it came from
 
-    // SLAM features are now in the vector, just need to append (INSTATE, MSCKF LOC) now
-    for (const auto &loc : MSCKF_locs) {
-        pixel_features pf;
-        pf.camera_id = loc.first;
-        pf.state_indicator = INS_FEAT_ID;
-        pf.location = loc.second;
-        pixel_loc_feats.push_back(pf);
+    std::vector<std::shared_ptr<Feature>> feats_to_draw;
+    feats_to_draw = trackDATABASE->features_containing_older(state->_timestamp);
+    for (size_t i = 0; i < feats_to_draw.size(); i++) {
+        if (std::find(highlighted_ids.begin(), highlighted_ids.end(), feats_to_draw[i]->featid) != highlighted_ids.end()) {
+            if (feats_to_draw[i]->anchor_cam_id != -1) {
+                Eigen::Vector2f pt_e = feats_to_draw[i]->uvs.at(feats_to_draw[i]->anchor_cam_id).back();
+                pixel_features pf;
+                pf.camera_id = feats_to_draw[i]->anchor_cam_id;
+                pf.state_indicator = INS_FEAT_ID;
+                pf.location = cv::Point2f(pt_e[0], pt_e[1]);
+                pixel_loc_feats.push_back(pf);
+            }
+        } else {
+            if (feats_to_draw[i]->anchor_cam_id != -1) {
+                Eigen::Vector2f pt_e = feats_to_draw[i]->uvs.at(feats_to_draw[i]->anchor_cam_id).back();
+                pixel_features pf;
+                pf.camera_id = feats_to_draw[i]->anchor_cam_id;
+                pf.state_indicator = OOS_FEAT_ID;
+                pf.location = cv::Point2f(pt_e[0], pt_e[1]);
+                pixel_loc_feats.push_back(pf);
+            }
+        }
     }
+
+    // // SLAM features are now in the vector, just need to append (INSTATE, MSCKF LOC) now
+    // for (const auto &loc : MSCKF_locs) {
+    //     pixel_features pf;
+    //     pf.camera_id = loc.first;
+    //     pf.state_indicator = INS_FEAT_ID;
+    //     pf.location = loc.second;
+    //     pixel_loc_feats.push_back(pf);
+    // }
 
     return pixel_loc_feats;
 }

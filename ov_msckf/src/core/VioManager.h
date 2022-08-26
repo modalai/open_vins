@@ -73,6 +73,8 @@ class VioManager {
      */
     void feed_measurement_camera(const ov_core::CameraData &message) { track_image_and_update(message); }
 
+    void feed_measurement_processed_camera(const ov_core::ProcessedCameraData &message);
+
     /**
      * @brief Feed function for inertial data
      * @param message Contains our timestamp and inertial information

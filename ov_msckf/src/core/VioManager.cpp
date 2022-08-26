@@ -25,7 +25,6 @@
 #include "feat/FeatureDatabase.h"
 #include "feat/FeatureInitializer.h"
 #include "track/TrackAruco.h"
-#include "track/TrackCVP.h"
 #include "track/TrackDescriptor.h"
 #include "track/TrackKLT.h"
 
@@ -128,17 +127,9 @@ VioManager::VioManager(VioManagerOptions &params_) : thread_init_running(false),
                                                              state->_options.max_aruco_features, params.use_stereo, params.histogram_method,
                                                              params.fast_threshold, params.grid_x, params.grid_y, params.min_px_dist));
     } else {
-
-    #ifdef BUILD_QRB5165
-        trackFEATS = std::shared_ptr<TrackBase>(new TrackCVP(
-            state->_cam_intrinsics_cameras, init_max_features, state->_options.max_aruco_features, params.use_stereo,
-            params.histogram_method, params.fast_threshold, params.grid_x, params.grid_y, params.min_px_dist, params.mcv_feature_ptr));
-    #else
         trackFEATS = std::shared_ptr<TrackBase>(new TrackDescriptor(
-        state->_cam_intrinsics_cameras, params.init_options.init_max_features, state->_options.max_aruco_features, params.use_stereo,
-        params.histogram_method, params.fast_threshold, params.grid_x, params.grid_y, params.min_px_dist, params.knn_ratio));
-    #endif
-    
+            state->_cam_intrinsics_cameras, params.init_options.init_max_features, state->_options.max_aruco_features, params.use_stereo,
+            params.histogram_method, params.fast_threshold, params.grid_x, params.grid_y, params.min_px_dist, params.knn_ratio));
     }
 
     // Initialize our aruco tag extractor
@@ -178,7 +169,7 @@ void VioManager::feed_measurement_imu(const ov_core::ImuData &message) {
     }
     // hard cutoff of one second of imu_data
     // if not set, the updater will have thousands of samples to sort through after zupt conditions end
-    if (message.timestamp - oldest_time > 1.0 && is_initialized_vio){
+    if (message.timestamp - oldest_time > 1.0 && is_initialized_vio) {
         oldest_time = message.timestamp - 1.0;
     }
     propagator->feed_imu(message, oldest_time);
@@ -323,6 +314,62 @@ void VioManager::track_image_and_update(const ov_core::CameraData &message_const
     do_feature_propagate_update(message);
 }
 
+void VioManager::feed_measurement_processed_camera(const ov_core::ProcessedCameraData &message_const) {
+    // Assert we have valid measurement data and ids
+    assert(!message_const.sensor_ids.empty());
+    for (size_t i = 0; i < message_const.sensor_ids.size() - 1; i++) {
+        assert(message_const.sensor_ids.at(i) != message_const.sensor_ids.at(i + 1));
+    }
+
+    // Update our feature database, with theses new observations
+    for (size_t i = 0; i < message_const.feats.size(); i++) {
+        state->_cam_intrinsics_cameras.at(message_const.feats[i].cam_id);
+        cv::Point2f npt_l = state->_cam_intrinsics_cameras.at(message_const.feats[i].cam_id)
+                                ->undistort_cv(cv::Point2f(message_const.feats[i].x, message_const.feats[i].y));
+        trackFEATS->get_feature_database()->update_feature(message_const.feats[i].id, message_const.timestamp,
+                                                           message_const.feats[i].cam_id, message_const.feats[i].x,
+                                                           message_const.feats[i].y, npt_l.x, npt_l.y);
+    }
+
+    // create a fake camera packet and pass that to functions expecting a CameraData packet
+    // should only ened the timestamp and sensor ids
+    ov_core::CameraData fake_packet;
+    fake_packet.timestamp = message_const.timestamp;
+    fake_packet.sensor_ids = message_const.sensor_ids;
+
+    // put them in our global db
+    if (is_initialized_vio) {
+        trackDATABASE->append_new_measurements(trackFEATS->get_feature_database());
+    }
+
+    // Check if we should do zero-velocity, if so update the state with it
+    // Note that in the case that we only use in the beginning initialization phase
+    // If we have since moved, then we should never try to do a zero velocity update!
+    if (is_initialized_vio && updaterZUPT != nullptr && (!params.zupt_only_at_beginning || !has_moved_since_zupt)) {
+        // If the same state time, use the previous timestep decision
+        if (state->_timestamp != message_const.timestamp) {
+            did_zupt_update = updaterZUPT->try_update(state, message_const.timestamp);
+        }
+        if (did_zupt_update) {
+            return;
+        }
+    }
+
+    // If we do not have VIO initialization, then try to initialize
+    // TODO: Or if we are trying to reset the system, then do that here!
+    if (!is_initialized_vio) {
+        is_initialized_vio = try_to_initialize(fake_packet);
+        if (!is_initialized_vio) {
+            double time_track = (rT2 - rT1).total_microseconds() * 1e-6;
+            PRINT_DEBUG(BLUE "[TIME]: %.4f seconds for tracking\n" RESET, time_track);
+            return;
+        }
+    }
+
+    // Call on our propagate and update function
+    do_feature_propagate_update(fake_packet);
+}
+
 void VioManager::do_feature_propagate_update(const ov_core::CameraData &message) {
 
     //===================================================================================
@@ -448,12 +495,12 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
 
     // Count how many aruco tags we have in our state
     int curr_aruco_tags = 0;
-    auto it0 = state->_features_SLAM.begin();
-    while (it0 != state->_features_SLAM.end()) {
-        if ((int)(*it0).second->_featid <= 4 * state->_options.max_aruco_features)
-            curr_aruco_tags++;
-        it0++;
-    }
+    // auto it0 = state->_features_SLAM.begin();
+    // while (it0 != state->_features_SLAM.end()) {
+    //     if ((int)(*it0).second->_featid <= 4 * state->_options.max_aruco_features)
+    //         curr_aruco_tags++;
+    //     it0++;
+    // }
 
     // Append a new SLAM feature if we have the room to do so
     // Also check that we have waited our delay amount (normally prevents bad first set of slam points)
@@ -617,13 +664,12 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
     // * if norm distance from last pose > SOME_DIST_THRESH, maybe like 10-20cm to start
     // * if we have too few landmarks, see note below
     // * a nice addition would be to not add a keyframe if SOME_PERCENTAGE_THRESH of landmarks are in the last keyframe
-    // 
-    // when we lose all landmarks or have < SOME_LANDMARK_THRESH, we need to search our keyframe db/map for a keyframe from a similar direction and try to match feats to it
-    // this means that we will create a keyframe with some ??? measurements, and if we are unable to match anything it will need to be purged until we have reliable measurements?
-    // not sure if this holds or im way off, will see later
+    //
+    // when we lose all landmarks or have < SOME_LANDMARK_THRESH, we need to search our keyframe db/map for a keyframe from a similar
+    // direction and try to match feats to it this means that we will create a keyframe with some ??? measurements, and if we are unable to
+    // match anything it will need to be purged until we have reliable measurements? not sure if this holds or im way off, will see later
     // TODO clean this shit up
     //===================================================================================
-
 
     //===================================================================================
     // Cleanup, marginalize out what we don't need any more...

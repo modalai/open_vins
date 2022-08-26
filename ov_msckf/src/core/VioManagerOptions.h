@@ -44,10 +44,6 @@
 #include "utils/print.h"
 #include "utils/quat_ops.h"
 
-#ifdef BUILD_QRB5165
-#include <modalcv.h>
-#endif
-
 namespace ov_msckf {
 
 /**
@@ -373,11 +369,6 @@ struct VioManagerOptions {
 
     /// Parameters used by our feature initialize / triangulator
     ov_core::FeatureInitializerOptions featinit_options;
-
-    #ifdef BUILD_QRB5165
-    // vector of mcv features, pre-allocated before being assigned
-    std::vector<mcv_fpx_feature_t *> *mcv_feature_ptr;
-    #endif
 
     /**
      * @brief This function will load print out all parameters related to visual tracking

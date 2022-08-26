@@ -88,11 +88,19 @@ bool UpdaterZeroVelocity::try_update(std::shared_ptr<State> state, double timest
 
     // First lets construct an IMU vector of measurements we need
     // double time0 = state->_timestamp+t_off_new;
-    double time0 = state->_timestamp + last_prop_time_offset;
+    // double time0 = state->_timestamp + last_prop_time_offset;
+    // OV was very casual at picking time windows to update/search over without checking to see if they
+    // get out of hand
+    // since the imu rate is so high, we need to be VERY careful of our window size to update over
+    // otherwise the system will stall/crash
+    double time0 = timestamp - (1. / (float)state->_options.max_clone_size);
     double time1 = timestamp + t_off_new;
 
     // Select bounding inertial measurements
     std::vector<ov_core::ImuData> imu_recent = Propagator::select_imu_readings(imu_data, time0, time1);
+
+    // fprintf(stderr, "CHECKING AGAINST %lu SAMPLES\n", imu_recent.size());
+    // fprintf(stderr, "TIMES: %6.5f to %6.5f\n", time0, time1);
 
     // Move forward in time
     last_prop_time_offset = t_off_new;

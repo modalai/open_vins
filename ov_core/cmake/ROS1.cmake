@@ -36,10 +36,6 @@ list(APPEND thirdparty_libraries
         ${catkin_LIBRARIES}
 )
 
-if (BUILD_QRB5165)
-        list(APPEND thirdparty_libraries /usr/lib64/libmodalcv.so)
-endif ()
-
 ##################################################
 # Make the core library
 ##################################################
@@ -54,7 +50,6 @@ list(APPEND LIBRARY_SOURCES
         src/track/TrackDescriptor.cpp
         src/track/TrackKLT.cpp
         src/track/TrackSIM.cpp
-        src/track/TrackCVP.cpp
         src/types/Landmark.cpp
         src/feat/Feature.cpp
         src/feat/FeatureDatabase.cpp
