@@ -40,10 +40,30 @@
 #define INS_FEAT_ID 0
 #define OOS_FEAT_ID 1
 
+
+typedef enum feat_quality{
+    OV_LOW,     ///< additional low-quality points collected for e.g. collision avoidance
+    OV_MEDIUM,  ///< Points that are not "in state"
+    OV_HIGH     ///< Points that are "in state"
+} feat_quality;
+
+typedef struct output_feature {
+    uint32_t  id;               ///< unique ID for feature point
+    int32_t cam_id;            ///< ID of camera which the point was seen from (typically first), -1 if unknown
+    float pix_loc[2];           ///< pixel location in the last frame
+    float tsf[3];               ///< location of feature in vio frame (relative to init location)
+    float p_tsf[3][3];          ///< covarience of feature location
+    float depth;                ///< distance from camera to point
+    float depth_error_stddev;   ///< depth error in meters
+    feat_quality point_quality;
+} output_feature;
+
 typedef struct pixel_features {
     int state_indicator;
     int camera_id;
     cv::Point2f location;
+    float depth;
+    float depth_error;
 } pixel_features;
 
 namespace ov_core {
@@ -130,8 +150,6 @@ class TrackBase {
      * @return FeatureDatabase pointer that one can query for features
      */
     std::shared_ptr<FeatureDatabase> get_feature_database() { return database; }
-
-    virtual void return_active_pix_locs(std::vector<size_t> highlighted, std::vector<pixel_features> *MSCKF_locs);
 
     /**
      * @brief Changes the ID of an actively tracked feature to another one.

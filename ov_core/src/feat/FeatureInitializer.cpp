@@ -381,9 +381,30 @@ bool FeatureInitializer::single_gaussnewton(std::shared_ptr<Feature> feat,
 
 double FeatureInitializer::compute_error(std::unordered_map<size_t, std::unordered_map<double, ClonePose>> &clonesCAM,
                                          std::shared_ptr<Feature> feat, double alpha, double beta, double rho) {
-
     // Total error
     double err = 0;
+
+    /////////////////////////////////////////////////////////////////////////////////////////////
+    // MAI NOTE
+    // this function is being used to keep track of the relative error of our depth measurements
+    // on top of the original open vins application (feature refinement metric)
+    // because of this, extra safety checks have been added:
+    // making sure the anchor cam / clone fields have been set properly
+    // making sure that we have fully recorded the measurement at that time in clones cam
+    /////////////////////////////////////////////////////////////////////////////////////////////
+
+
+    // cant use anchor cam id if we dont have one..
+    if (feat->anchor_cam_id == -1 || feat->anchor_clone_timestamp == -1){
+        // fprintf(stderr, "ERROR: recieved incomplete measurement\n");
+        return -1;
+    } 
+
+    // final check is just is that id even in the map
+    if (clonesCAM.at(feat->anchor_cam_id).find(feat->anchor_clone_timestamp) == clonesCAM.at(feat->anchor_cam_id).end()){
+        // fprintf(stderr, "ERROR: MEASUREMENT NOT IN CAM VEC\n");
+        return -1;
+    }
 
     // Get the position of the anchor pose
     const Eigen::Matrix<double, 3, 3> &R_GtoA = clonesCAM.at(feat->anchor_cam_id).at(feat->anchor_clone_timestamp).Rot();
@@ -396,6 +417,12 @@ double FeatureInitializer::compute_error(std::unordered_map<size_t, std::unorder
 
             //=====================================================================================
             //=====================================================================================
+
+            // more error handling, as we have some funky behavior on feature inits where timestamps/clone times are misaligned
+            if(clonesCAM.at(pair.first).find(feat->timestamps.at(pair.first).at(m)) == clonesCAM.at(pair.first).end()){
+                // fprintf(stderr, "FAILED CHECK\n");
+                continue;
+            }
 
             // Get the position of this clone in the global
             const Eigen::Matrix<double, 3, 3> &R_GtoCi = clonesCAM.at(pair.first).at(feat->timestamps.at(pair.first).at(m)).Rot();

@@ -27,35 +27,6 @@
 
 using namespace ov_core;
 
-void TrackBase::return_active_pix_locs(std::vector<size_t> highlighted, std::vector<pixel_features> *MSCKF_locs) {
-    // this is gonna loop through every image in our last update set, not sure expected behavior
-    // need to also return the camera id associated with each feature
-    int cam_id = 0;
-    for (auto const &pair : img_last) {
-        for (size_t i = 0; i < ids_last[pair.first].size(); i++) {
-            // fprintf(stderr, "return active pixel_locs index %d\n", ids_last[pair.first].at(i));
-            // If a highlighted point, then put a nice box around it
-            if (std::find(highlighted.begin(), highlighted.end(), ids_last[pair.first].at(i)) != highlighted.end()) {
-                cv::Point2f pt_c = pts_last[pair.first].at(i).pt;
-                pixel_features pf;
-                pf.camera_id = cam_id;
-                pf.state_indicator = INS_FEAT_ID;
-                pf.location = pt_c;
-                MSCKF_locs->push_back(pf);
-            } else {
-                cv::Point2f pt_c = pts_last[pair.first].at(i).pt;
-                pixel_features pf;
-                pf.camera_id = cam_id;
-                pf.state_indicator = OOS_FEAT_ID;
-                pf.location = pt_c;
-                MSCKF_locs->push_back(pf);
-            }
-        }
-        cam_id++;
-    }
-    return;
-}
-
 TrackBase::TrackBase(std::unordered_map<size_t, std::shared_ptr<CamBase>> cameras, int numfeats, int numaruco, bool stereo,
                      HistogramMethod histmethod)
     : camera_calib(cameras), database(new FeatureDatabase()), num_features(numfeats), use_stereo(stereo), histogram_method(histmethod) {

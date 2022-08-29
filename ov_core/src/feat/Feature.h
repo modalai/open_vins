@@ -58,7 +58,7 @@ class Feature {
     int anchor_cam_id = -1;
 
     /// Timestamp of anchor clone
-    double anchor_clone_timestamp;
+    double anchor_clone_timestamp = -1;
 
     /// Triangulated position of this feature, in the anchor frame
     Eigen::Vector3d p_FinA;

@@ -315,11 +315,14 @@ void VioManager::track_image_and_update(const ov_core::CameraData &message_const
 }
 
 void VioManager::feed_measurement_processed_camera(const ov_core::ProcessedCameraData &message_const) {
+
     // Assert we have valid measurement data and ids
     assert(!message_const.sensor_ids.empty());
     for (size_t i = 0; i < message_const.sensor_ids.size() - 1; i++) {
         assert(message_const.sensor_ids.at(i) != message_const.sensor_ids.at(i + 1));
     }
+    
+    rT1 = boost::posix_time::microsec_clock::local_time();
 
     // Update our feature database, with theses new observations
     for (size_t i = 0; i < message_const.feats.size(); i++) {
@@ -341,6 +344,8 @@ void VioManager::feed_measurement_processed_camera(const ov_core::ProcessedCamer
     if (is_initialized_vio) {
         trackDATABASE->append_new_measurements(trackFEATS->get_feature_database());
     }
+    rT2 = boost::posix_time::microsec_clock::local_time();
+
 
     // Check if we should do zero-velocity, if so update the state with it
     // Note that in the case that we only use in the beginning initialization phase
@@ -365,9 +370,26 @@ void VioManager::feed_measurement_processed_camera(const ov_core::ProcessedCamer
             return;
         }
     }
-
     // Call on our propagate and update function
     do_feature_propagate_update(fake_packet);
+}
+
+Eigen::MatrixXd VioManager::get_feature_covariances(){
+
+    Eigen::MatrixXd cov = StateHelper::get_full_covariance(state);
+    Eigen::MatrixXd feat_cov;
+
+    if (state->_features_SLAM.empty()) return cov;
+
+    int feat_cov_index = 0;
+    for (auto &f : state->_features_SLAM) {
+        int id = f.second->id();
+
+        // block into the feat_cov matrix
+        // feat_cov.at() = cov.block(0, id, f.second->size(), f.second->size());
+    }
+
+    return feat_cov;
 }
 
 void VioManager::do_feature_propagate_update(const ov_core::CameraData &message) {

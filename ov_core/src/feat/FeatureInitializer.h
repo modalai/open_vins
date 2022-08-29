@@ -128,20 +128,22 @@ class FeatureInitializer {
      */
     const FeatureInitializerOptions config() { return _options; }
 
+    // MAI unprotected for depth error measurement reporting
+    /**
+   * 
+   * @brief Helper function for the gauss newton method that computes error of the given estimate
+   * @param clonesCAM Map between camera ID to map of timestamp to camera pose estimate
+   * @param feat Pointer to the feature
+   * @param alpha x/z in anchor
+   * @param beta y/z in anchor
+   * @param rho 1/z inverse depth
+   */
+    double compute_error(std::unordered_map<size_t, std::unordered_map<double, ClonePose>> &clonesCAM, std::shared_ptr<Feature> feat,
+                         double alpha, double beta, double rho);
+
   protected:
     /// Contains options for the initializer process
     FeatureInitializerOptions _options;
-
-    /**
-     * @brief Helper function for the gauss newton method that computes error of the given estimate
-     * @param clonesCAM Map between camera ID to map of timestamp to camera pose estimate
-     * @param feat Pointer to the feature
-     * @param alpha x/z in anchor
-     * @param beta y/z in anchor
-     * @param rho 1/z inverse depth
-     */
-    double compute_error(std::unordered_map<size_t, std::unordered_map<double, ClonePose>> &clonesCAM, std::shared_ptr<Feature> feat,
-                         double alpha, double beta, double rho);
 };
 
 } // namespace ov_core

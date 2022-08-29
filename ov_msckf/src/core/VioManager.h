@@ -109,7 +109,7 @@ class VioManager {
     std::shared_ptr<Propagator> get_propagator() { return propagator; }
 
     // features
-    std::vector<pixel_features> get_pixel_loc_features();
+    std::vector<output_feature> get_pixel_loc_features();
 
     bool initialized() { return is_initialized_vio; }
 
@@ -118,6 +118,9 @@ class VioManager {
 
     /// Returns 3d SLAM features in the global frame
     std::vector<Eigen::Vector3d> get_features_SLAM();
+
+    // returns the covariance of our in state features
+    Eigen::MatrixXd get_feature_covariances();
 
     /// Returns 3d ARUCO features in the global frame
     std::vector<Eigen::Vector3d> get_features_ARUCO();
@@ -133,7 +136,7 @@ class VioManager {
 
     /// Returns active tracked features in the current frame
     void get_active_tracks(double &timestamp, std::unordered_map<size_t, Eigen::Vector3d> &feat_posinG,
-                           std::unordered_map<size_t, Eigen::Vector3d> &feat_tracks_uvd) {
+                           std::unordered_map<size_t, Eigen::Vector4d> &feat_tracks_uvd) {
         timestamp = active_tracks_time;
         feat_posinG = active_tracks_posinG;
         feat_tracks_uvd = active_tracks_uvd;
@@ -246,7 +249,8 @@ class VioManager {
     // Re-triangulated features 3d positions seen from the current frame (used in visualization)
     double active_tracks_time = -1;
     std::unordered_map<size_t, Eigen::Vector3d> active_tracks_posinG;
-    std::unordered_map<size_t, Eigen::Vector3d> active_tracks_uvd;
+    // last index will store depth error
+    std::unordered_map<size_t, Eigen::Vector4d> active_tracks_uvd;
     cv::Mat active_image;
 };
 

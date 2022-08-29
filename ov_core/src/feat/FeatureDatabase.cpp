@@ -80,6 +80,11 @@ void FeatureDatabase::update_feature(size_t id, double timestamp, size_t cam_id,
     feat->uvs_norm[cam_id].push_back(Eigen::Vector2f(u_n, v_n));
     feat->timestamps[cam_id].push_back(timestamp);
 
+    // this is a little sketchy, setting anchors before we actually anchor this feature
+    // just assume the first entry is its first "sighting"
+    // feat->anchor_cam_id = cam_id;
+    // feat->anchor_clone_timestamp = timestamp;
+
     // Append this new feature into our database
     features_idlookup[id] = feat;
 }

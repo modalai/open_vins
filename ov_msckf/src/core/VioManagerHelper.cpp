@@ -20,25 +20,21 @@
  */
 
 #include "VioManager.h"
-
 #include "feat/Feature.h"
 #include "feat/FeatureDatabase.h"
 #include "feat/FeatureInitializer.h"
-#include "types/LandmarkRepresentation.h"
-#include "utils/print.h"
-
 #include "init/InertialInitializer.h"
-
 #include "state/Propagator.h"
 #include "state/State.h"
 #include "state/StateHelper.h"
+#include "types/LandmarkRepresentation.h"
+#include "utils/print.h"
 
 using namespace ov_core;
 using namespace ov_type;
 using namespace ov_msckf;
 
 void VioManager::initialize_with_gt(Eigen::Matrix<double, 17, 1> imustate) {
-
     // Initialize the system
     state->_imu->set_value(imustate.block(1, 0, 16, 1));
     state->_imu->set_fej(imustate.block(1, 0, 16, 1));
@@ -47,9 +43,9 @@ void VioManager::initialize_with_gt(Eigen::Matrix<double, 17, 1> imustate) {
     // TODO: Why does this break out simulation consistency metrics?
     std::vector<std::shared_ptr<ov_type::Type>> order = {state->_imu};
     Eigen::MatrixXd Cov = std::pow(0.02, 2) * Eigen::MatrixXd::Identity(state->_imu->size(), state->_imu->size());
-    Cov.block(3, 3, 3, 3) = std::pow(0.017, 2) * Eigen::Matrix3d::Identity(); // q
-    Cov.block(3, 3, 3, 3) = std::pow(0.05, 2) * Eigen::Matrix3d::Identity();  // p
-    Cov.block(6, 6, 3, 3) = std::pow(0.01, 2) * Eigen::Matrix3d::Identity();  // v (static)
+    Cov.block(3, 3, 3, 3) = std::pow(0.017, 2) * Eigen::Matrix3d::Identity();  // q
+    Cov.block(3, 3, 3, 3) = std::pow(0.05, 2) * Eigen::Matrix3d::Identity();   // p
+    Cov.block(6, 6, 3, 3) = std::pow(0.01, 2) * Eigen::Matrix3d::Identity();   // v (static)
     StateHelper::set_initial_covariance(state, Cov, order);
 
     // Set the state time
@@ -76,7 +72,6 @@ void VioManager::initialize_with_gt(Eigen::Matrix<double, 17, 1> imustate) {
 }
 
 bool VioManager::try_to_initialize(const ov_core::CameraData &message) {
-
     // Directly return if the initialization thread is running
     // Note that we lock on the queue since we could have finished an update
     // And are using this queue to propagate the state forward. We should wait in this case
@@ -109,7 +104,6 @@ bool VioManager::try_to_initialize(const ov_core::CameraData &message) {
         // If we have initialized successfully we will set the covariance and state elements as needed
         // TODO: set the clones and SLAM features here so we can start updating right away...
         if (success) {
-
             // Set our covariance (state should already be set in the initializer)
             StateHelper::set_initial_covariance(state, covariance, order);
 
@@ -192,7 +186,6 @@ bool VioManager::try_to_initialize(const ov_core::CameraData &message) {
 }
 
 void VioManager::retriangulate_active_tracks(const ov_core::CameraData &message) {
-
     // Start timing
     boost::posix_time::ptime retri_rT1, retri_rT2, retri_rT3, retri_rT4, retri_rT5;
     retri_rT1 = boost::posix_time::microsec_clock::local_time();
@@ -251,11 +244,9 @@ void VioManager::retriangulate_active_tracks(const ov_core::CameraData &message)
     // 2. Create vector of cloned *CAMERA* poses at each of our clone timesteps
     std::unordered_map<size_t, std::unordered_map<double, FeatureInitializer::ClonePose>> clones_cam;
     for (const auto &clone_calib : state->_calib_IMUtoCAM) {
-
         // For this camera, create the vector of camera poses
         std::unordered_map<double, FeatureInitializer::ClonePose> clones_cami;
         for (const auto &clone_imu : state->_clones_IMU) {
-
             // Get current camera pose
             Eigen::Matrix3d R_GtoCi = clone_calib.second->Rot() * clone_imu.second->Rot();
             Eigen::Vector3d p_CioinG = clone_imu.second->pos() - R_GtoCi.transpose() * clone_calib.second->pos();
@@ -272,7 +263,6 @@ void VioManager::retriangulate_active_tracks(const ov_core::CameraData &message)
     // 3. Try to triangulate all features that have measurements
     auto it1 = active_features.begin();
     while (it1 != active_features.end()) {
-
         // Triangulate the feature and remove if it fails
         bool success_tri = true;
         if (active_tracks_initializer->config().triangulate_1d) {
@@ -352,9 +342,23 @@ void VioManager::retriangulate_active_tracks(const ov_core::CameraData &message)
             continue;
         }
 
+        //////////////////////////////////////////////////////////////////
+        // MAI NOTE
+        // calculating depth error each time we retriangulate a feature
+        //////////////////////////////////////////////////////////////////
+        auto curr_feat =  trackDATABASE->get_feature(feat.first, false);
+
+        double rho = 1 / curr_feat->p_FinA(2);
+        double alpha = curr_feat->p_FinA(0) / curr_feat->p_FinA(2);
+        double beta = curr_feat->p_FinA(1) / curr_feat->p_FinA(2);
+        
+        double error = active_tracks_initializer->compute_error(clones_cam, curr_feat, alpha, beta, rho);
+
         // Finally construct the uv and depth
-        Eigen::Vector3d uvd;
-        uvd << uv_dist, depth;
+        // MAI NOTE: also includes depth error now (last entry)
+        Eigen::Vector4d uvd;
+        uvd << uv_dist, depth, error;
+
         active_tracks_uvd.insert({feat.first, uvd});
     }
     retri_rT5 = boost::posix_time::microsec_clock::local_time();
@@ -419,8 +423,8 @@ std::vector<Eigen::Vector3d> VioManager::get_features_SLAM() {
     return slam_feats;
 }
 
-std::vector<pixel_features> VioManager::get_pixel_loc_features() {
-    std::vector<pixel_features> pixel_loc_feats;
+std::vector<output_feature> VioManager::get_pixel_loc_features() {
+    std::vector<output_feature> feats;
 
     // Build an id-list of our "in state" features
     // i.e. SLAM and last msckf update features
@@ -429,44 +433,114 @@ std::vector<pixel_features> VioManager::get_pixel_loc_features() {
         highlighted_ids.push_back(feat.first);
     }
 
+    // get our full covariance matrix here
+    Eigen::MatrixXd cov = StateHelper::get_full_covariance(state);
     // this can no longer be handled by the tracker, as we have an external one
     // soooooooooo, just grab the latest update ones and do it here ourselves
     // in this loop, if anchor cam is unset we really have no clue where it came from
-
     std::vector<std::shared_ptr<Feature>> feats_to_draw;
     feats_to_draw = trackDATABASE->features_containing_older(state->_timestamp);
     for (size_t i = 0; i < feats_to_draw.size(); i++) {
         if (std::find(highlighted_ids.begin(), highlighted_ids.end(), feats_to_draw[i]->featid) != highlighted_ids.end()) {
             if (feats_to_draw[i]->anchor_cam_id != -1) {
-                Eigen::Vector2f pt_e = feats_to_draw[i]->uvs.at(feats_to_draw[i]->anchor_cam_id).back();
-                pixel_features pf;
-                pf.camera_id = feats_to_draw[i]->anchor_cam_id;
-                pf.state_indicator = INS_FEAT_ID;
-                pf.location = cv::Point2f(pt_e[0], pt_e[1]);
-                pixel_loc_feats.push_back(pf);
+                // MAI 4d
+                output_feature of;
+                of.cam_id = feats_to_draw[i]->anchor_cam_id;
+                of.point_quality = OV_HIGH;
+                of.id = feats_to_draw[i]->featid;
+
+                // todo see if this fails, or how often it does
+                if (active_tracks_uvd.find(feats_to_draw[i]->featid) != active_tracks_uvd.end()) {
+                    Eigen::Vector4d uvd = Eigen::Vector4d::Zero();
+                    uvd = active_tracks_uvd.at(feats_to_draw[i]->featid);
+                    of.depth = uvd(3); // (u,v,depth)
+                    of.depth_error_stddev = uvd(4);
+                    of.pix_loc[0] = uvd(0); 
+                    of.pix_loc[1] = uvd(1);
+                }
+                else {
+                    Eigen::Vector2f pt_e = feats_to_draw[i]->uvs.at(feats_to_draw[i]->anchor_cam_id).back();
+                    of.pix_loc[0] = pt_e[0]; 
+                    of.pix_loc[1] = pt_e[1];
+
+                    // MAI NOTE: depth + depth error of -1 will simply be ignored later on
+                    // fprintf(stderr, "WARNING: SETTING DEPTH TO -1\n");
+                    of.depth = -1;
+                    of.depth_error_stddev = -1;
+                }
+
+                // now do global position
+                Eigen::Vector3d global_position = feats_to_draw[i]->p_FinG;
+                of.tsf[0] = global_position(0);
+                of.tsf[1] = global_position(1);
+                of.tsf[2] = global_position(2);
+
+                // now do covariance of this feature
+                Eigen::MatrixXf::Map(reinterpret_cast<float*>(of.p_tsf), 3, 3) = cov.block(0, state->_features_SLAM.at(feats_to_draw[i]->featid)->id(), state->_features_SLAM.at(feats_to_draw[i]->featid)->size(), state->_features_SLAM.at(feats_to_draw[i]->featid)->size()).cast<float>();
+
+                feats.push_back(of);
             }
         } else {
             if (feats_to_draw[i]->anchor_cam_id != -1) {
                 Eigen::Vector2f pt_e = feats_to_draw[i]->uvs.at(feats_to_draw[i]->anchor_cam_id).back();
-                pixel_features pf;
-                pf.camera_id = feats_to_draw[i]->anchor_cam_id;
-                pf.state_indicator = OOS_FEAT_ID;
-                pf.location = cv::Point2f(pt_e[0], pt_e[1]);
-                pixel_loc_feats.push_back(pf);
+                output_feature of;
+                of.cam_id = feats_to_draw[i]->anchor_cam_id;
+                of.point_quality = OV_MEDIUM;
+                of.id = feats_to_draw[i]->featid;
+
+                of.pix_loc[0] = pt_e[0]; 
+                of.pix_loc[1] = pt_e[1];
+
+                if (active_tracks_uvd.find(feats_to_draw[i]->featid) != active_tracks_uvd.end()) {
+                    Eigen::Vector4d uvd = Eigen::Vector4d::Zero();
+                    uvd = active_tracks_uvd.at(feats_to_draw[i]->featid);
+                    of.depth = uvd(3); // (u,v,depth)
+                    of.depth_error_stddev = uvd(4);
+                    of.pix_loc[0] = uvd(0); 
+                    of.pix_loc[1] = uvd(1);
+                }
+                else {
+                    // MAI NOTE: depth + depth error of -1 will simply be ignored later on
+                    // fprintf(stderr, "WARNING: SETTING DEPTH TO -1\n");
+                    of.depth = -1;
+                    of.depth_error_stddev = -1;
+                }
+
+                // if our feature is not instate yet, we aren't aware of the covariance associated with it
+                Eigen::MatrixXf::Map(reinterpret_cast<float*>(of.p_tsf), 3, 3) = Eigen::Matrix3d::Zero().cast<float>();
+                feats.push_back(of);
+            }
+            else {
+                if (!feats_to_draw[i]->uvs.empty()) {
+                    // loop through the potentials, grab the first one since its not fully inserted into state yet
+                    for (size_t j = 0; j < feats_to_draw[i]->uvs.size(); j++){
+                        // try to grab the BASE camera (id 0), fail otherwise
+                        // todo try every cam id if anchor isnt set?
+                        if (feats_to_draw[i]->uvs.find(j) != feats_to_draw[i]->uvs.end()){
+                            output_feature of;
+                            Eigen::Vector2f pt_e = feats_to_draw[i]->uvs.at(j).back();
+                            of.cam_id = j;
+                            of.point_quality = OV_MEDIUM;
+                            of.id = feats_to_draw[i]->featid;
+                            of.pix_loc[0] = pt_e[0]; 
+                            of.pix_loc[1] = pt_e[1];
+                            // MAI NOTE: depth + depth error of -1 will simply be ignored later on
+                            // fprintf(stderr, "WARNING: SETTING DEPTH TO -1\n");
+                            of.depth = -1;
+                            of.depth_error_stddev = -1;
+
+                            // if our feature is not instate yet, we aren't aware of the covariance associated with it
+                            Eigen::MatrixXf::Map(reinterpret_cast<float*>(of.p_tsf), 3, 3) = Eigen::Matrix3d::Zero().cast<float>();
+                            feats.push_back(of);
+                        }
+                    }
+                    
+                }
             }
         }
     }
 
-    // // SLAM features are now in the vector, just need to append (INSTATE, MSCKF LOC) now
-    // for (const auto &loc : MSCKF_locs) {
-    //     pixel_features pf;
-    //     pf.camera_id = loc.first;
-    //     pf.state_indicator = INS_FEAT_ID;
-    //     pf.location = loc.second;
-    //     pixel_loc_feats.push_back(pf);
-    // }
-
-    return pixel_loc_feats;
+    return feats;
 }
 
 std::vector<Eigen::Vector3d> VioManager::get_features_ARUCO() {
