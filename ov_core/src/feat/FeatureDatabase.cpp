@@ -82,7 +82,7 @@ void FeatureDatabase::update_feature(size_t id, double timestamp, size_t cam_id,
 
     // this is a little sketchy, setting anchors before we actually anchor this feature
     // just assume the first entry is its first "sighting"
-    // feat->anchor_cam_id = cam_id;
+    feat->first_id = cam_id;
     // feat->anchor_clone_timestamp = timestamp;
 
     // Append this new feature into our database
@@ -319,6 +319,7 @@ void FeatureDatabase::append_new_measurements(const std::shared_ptr<FeatureDatab
             temp->timestamps = feat.second->timestamps;
             temp->uvs = feat.second->uvs;
             temp->uvs_norm = feat.second->uvs_norm;
+            temp->first_id = feat.second->first_id;
             features_idlookup[feat.first] = temp;
         }
     }

@@ -294,6 +294,7 @@ void VioManager::retriangulate_active_tracks(const ov_core::CameraData &message)
         if (LandmarkRepresentation::is_relative_representation(feat.second->_feat_representation)) {
             // Assert that we have an anchor pose for this feature
             assert(feat.second->_anchor_cam_id != -1);
+            assert(feat.second->_anchor_clone_timestamp != -1);
             // Get calibration for our anchor camera
             Eigen::Matrix3d R_ItoC = state->_calib_IMUtoCAM.at(feat.second->_anchor_cam_id)->Rot();
             Eigen::Vector3d p_IinC = state->_calib_IMUtoCAM.at(feat.second->_anchor_cam_id)->pos();
@@ -345,7 +346,7 @@ void VioManager::retriangulate_active_tracks(const ov_core::CameraData &message)
         //////////////////////////////////////////////////////////////////
         // MAI NOTE
         // calculating depth error each time we retriangulate a feature
-        //////////////////////////////////////////////////////////////////
+        /////////////////////////////////////////////////////////////////
         auto curr_feat =  trackDATABASE->get_feature(feat.first, false);
 
         double rho = 1 / curr_feat->p_FinA(2);
@@ -408,6 +409,7 @@ std::vector<Eigen::Vector3d> VioManager::get_features_SLAM() {
         if (ov_type::LandmarkRepresentation::is_relative_representation(f.second->_feat_representation)) {
             // Assert that we have an anchor pose for this feature
             assert(f.second->_anchor_cam_id != -1);
+            assert(f.second->_anchor_clone_timestamp != -1);
             // Get calibration for our anchor camera
             Eigen::Matrix<double, 3, 3> R_ItoC = state->_calib_IMUtoCAM.at(f.second->_anchor_cam_id)->Rot();
             Eigen::Matrix<double, 3, 1> p_IinC = state->_calib_IMUtoCAM.at(f.second->_anchor_cam_id)->pos();
@@ -442,10 +444,10 @@ std::vector<output_feature> VioManager::get_pixel_loc_features() {
     feats_to_draw = trackDATABASE->features_containing_older(state->_timestamp);
     for (size_t i = 0; i < feats_to_draw.size(); i++) {
         if (std::find(highlighted_ids.begin(), highlighted_ids.end(), feats_to_draw[i]->featid) != highlighted_ids.end()) {
-            if (feats_to_draw[i]->anchor_cam_id != -1) {
+            if (feats_to_draw[i]->first_id != -1) {
                 // MAI 4d
                 output_feature of;
-                of.cam_id = feats_to_draw[i]->anchor_cam_id;
+                of.cam_id = feats_to_draw[i]->first_id;
                 of.point_quality = OV_HIGH;
                 of.id = feats_to_draw[i]->featid;
 
@@ -459,7 +461,7 @@ std::vector<output_feature> VioManager::get_pixel_loc_features() {
                     of.pix_loc[1] = uvd(1);
                 }
                 else {
-                    Eigen::Vector2f pt_e = feats_to_draw[i]->uvs.at(feats_to_draw[i]->anchor_cam_id).back();
+                    Eigen::Vector2f pt_e = feats_to_draw[i]->uvs.at(feats_to_draw[i]->first_id).back();
                     of.pix_loc[0] = pt_e[0]; 
                     of.pix_loc[1] = pt_e[1];
 
@@ -481,10 +483,10 @@ std::vector<output_feature> VioManager::get_pixel_loc_features() {
                 feats.push_back(of);
             }
         } else {
-            if (feats_to_draw[i]->anchor_cam_id != -1) {
-                Eigen::Vector2f pt_e = feats_to_draw[i]->uvs.at(feats_to_draw[i]->anchor_cam_id).back();
+            if (feats_to_draw[i]->first_id != -1) {
+                Eigen::Vector2f pt_e = feats_to_draw[i]->uvs.at(feats_to_draw[i]->first_id).back();
                 output_feature of;
-                of.cam_id = feats_to_draw[i]->anchor_cam_id;
+                of.cam_id = feats_to_draw[i]->first_id;
                 of.point_quality = OV_MEDIUM;
                 of.id = feats_to_draw[i]->featid;
 
@@ -551,6 +553,8 @@ std::vector<Eigen::Vector3d> VioManager::get_features_ARUCO() {
         if (ov_type::LandmarkRepresentation::is_relative_representation(f.second->_feat_representation)) {
             // Assert that we have an anchor pose for this feature
             assert(f.second->_anchor_cam_id != -1);
+            assert(f.second->_anchor_clone_timestamp != -1);
+
             // Get calibration for our anchor camera
             Eigen::Matrix<double, 3, 3> R_ItoC = state->_calib_IMUtoCAM.at(f.second->_anchor_cam_id)->Rot();
             Eigen::Matrix<double, 3, 1> p_IinC = state->_calib_IMUtoCAM.at(f.second->_anchor_cam_id)->pos();

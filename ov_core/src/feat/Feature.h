@@ -66,6 +66,8 @@ class Feature {
     /// Triangulated position of this feature, in the global frame
     Eigen::Vector3d p_FinG;
 
+    int first_id = -1;
+
     /**
      * @brief Remove measurements that do not occur at passed timestamps.
      *

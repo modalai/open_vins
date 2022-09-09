@@ -316,17 +316,19 @@ void VioManager::track_image_and_update(const ov_core::CameraData &message_const
 
 void VioManager::feed_measurement_processed_camera(const ov_core::ProcessedCameraData &message_const) {
 
-    // Assert we have valid measurement data and ids
-    assert(!message_const.sensor_ids.empty());
+    if (message_const.sensor_ids.empty()){
+        return;
+    }
+
     for (size_t i = 0; i < message_const.sensor_ids.size() - 1; i++) {
         assert(message_const.sensor_ids.at(i) != message_const.sensor_ids.at(i + 1));
     }
-    
+
     rT1 = boost::posix_time::microsec_clock::local_time();
 
     // Update our feature database, with theses new observations
     for (size_t i = 0; i < message_const.feats.size(); i++) {
-        state->_cam_intrinsics_cameras.at(message_const.feats[i].cam_id);
+        // state->_cam_intrinsics_cameras.at(message_const.feats[i].cam_id);
         cv::Point2f npt_l = state->_cam_intrinsics_cameras.at(message_const.feats[i].cam_id)
                                 ->undistort_cv(cv::Point2f(message_const.feats[i].x, message_const.feats[i].y));
         trackFEATS->get_feature_database()->update_feature(message_const.feats[i].id, message_const.timestamp,
@@ -370,6 +372,7 @@ void VioManager::feed_measurement_processed_camera(const ov_core::ProcessedCamer
             return;
         }
     }
+
     // Call on our propagate and update function
     do_feature_propagate_update(fake_packet);
 }
@@ -384,7 +387,6 @@ Eigen::MatrixXd VioManager::get_feature_covariances(){
     int feat_cov_index = 0;
     for (auto &f : state->_features_SLAM) {
         int id = f.second->id();
-
         // block into the feat_cov matrix
         // feat_cov.at() = cov.block(0, id, f.second->size(), f.second->size());
     }
@@ -393,7 +395,6 @@ Eigen::MatrixXd VioManager::get_feature_covariances(){
 }
 
 void VioManager::do_feature_propagate_update(const ov_core::CameraData &message) {
-
     //===================================================================================
     // State propagation, and clone augmentation
     //===================================================================================

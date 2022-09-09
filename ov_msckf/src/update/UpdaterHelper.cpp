@@ -76,6 +76,8 @@ void UpdaterHelper::get_feature_jacobian_representation(std::shared_ptr<State> s
 
     // Assert that we have an anchor pose for this feature
     assert(feature.anchor_cam_id != -1);
+    assert(feature.anchor_clone_timestamp != -1);
+
 
     // Anchor pose orientation and position, and camera calibration for our anchor camera
     Eigen::Matrix3d R_ItoC = state->_calib_IMUtoCAM.at(feature.anchor_cam_id)->Rot();
@@ -239,7 +241,7 @@ void UpdaterHelper::get_feature_jacobian_full(std::shared_ptr<State> state, Upda
 
         // Assert we have a clone
         assert(feature.anchor_cam_id != -1);
-
+        assert(feature.anchor_clone_timestamp != -1);
         // Add this anchor if it is not added already
         std::shared_ptr<PoseJPL> clone_Ai = state->_clones_IMU.at(feature.anchor_clone_timestamp);
         if (map_hx.find(clone_Ai) == map_hx.end()) {
@@ -269,7 +271,7 @@ void UpdaterHelper::get_feature_jacobian_full(std::shared_ptr<State> state, Upda
     if (LandmarkRepresentation::is_relative_representation(feature.feat_representation)) {
         // Assert that we have an anchor pose for this feature
         assert(feature.anchor_cam_id != -1);
-        // Get calibration for our anchor camera
+        assert(feature.anchor_clone_timestamp != -1);        // Get calibration for our anchor camera
         Eigen::Matrix3d R_ItoC = state->_calib_IMUtoCAM.at(feature.anchor_cam_id)->Rot();
         Eigen::Vector3d p_IinC = state->_calib_IMUtoCAM.at(feature.anchor_cam_id)->pos();
         // Anchor pose orientation and position

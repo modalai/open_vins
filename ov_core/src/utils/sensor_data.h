@@ -83,7 +83,7 @@ typedef struct MaiFeature {
     size_t cam_id;
     float x;
     float y;
-} __attribute((packed)) __MaiFeature;
+} __attribute((packed))__MaiFeature;
 
 struct ProcessedCameraData {
     /// Timestamp of the reading
