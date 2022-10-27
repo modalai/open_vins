@@ -328,16 +328,14 @@ void VioManager::feed_measurement_processed_camera(const ov_core::ProcessedCamer
 
     // Update our feature database, with theses new observations
     for (size_t i = 0; i < message_const.feats.size(); i++) {
-        // state->_cam_intrinsics_cameras.at(message_const.feats[i].cam_id);
-        cv::Point2f npt_l = state->_cam_intrinsics_cameras.at(message_const.feats[i].cam_id)
-                                ->undistort_cv(cv::Point2f(message_const.feats[i].x, message_const.feats[i].y));
+        cv::Point2f npt_l = state->_cam_intrinsics_cameras.at(message_const.feats[i].cam_id)->undistort_cv(cv::Point2f(message_const.feats[i].x, message_const.feats[i].y));
         trackFEATS->get_feature_database()->update_feature(message_const.feats[i].id, message_const.timestamp,
                                                            message_const.feats[i].cam_id, message_const.feats[i].x,
                                                            message_const.feats[i].y, npt_l.x, npt_l.y);
     }
 
     // create a fake camera packet and pass that to functions expecting a CameraData packet
-    // should only ened the timestamp and sensor ids
+    // should only need the timestamp and sensor ids
     ov_core::CameraData fake_packet;
     fake_packet.timestamp = message_const.timestamp;
     fake_packet.sensor_ids = message_const.sensor_ids;

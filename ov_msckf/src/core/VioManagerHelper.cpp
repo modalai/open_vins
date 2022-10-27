@@ -432,7 +432,8 @@ std::vector<output_feature> VioManager::get_pixel_loc_features() {
     // i.e. SLAM and last msckf update features
     std::vector<size_t> highlighted_ids;
     for (const auto &feat : state->_features_SLAM) {
-        highlighted_ids.push_back(feat.first);
+        // if (feat.second -> _anchor_cam_id == -1) continue;
+        highlighted_ids.push_back(feat.second->_featid);
     }
 
     // get our full covariance matrix here
@@ -441,105 +442,42 @@ std::vector<output_feature> VioManager::get_pixel_loc_features() {
     // soooooooooo, just grab the latest update ones and do it here ourselves
     // in this loop, if anchor cam is unset we really have no clue where it came from
     std::vector<std::shared_ptr<Feature>> feats_to_draw;
-    feats_to_draw = trackDATABASE->features_containing_older(state->_timestamp);
+    feats_to_draw = trackDATABASE->features_containing(state->_timestamp, false, false);
+
     for (size_t i = 0; i < feats_to_draw.size(); i++) {
+        output_feature of;
+        of.cam_id = feats_to_draw[i]->anchor_cam_id == -1 ? feats_to_draw[i]->first_id : feats_to_draw[i]->anchor_cam_id;
+        of.id = feats_to_draw[i]->featid;
+        // fprintf(stderr, "doing sketchy grab next, uv size is: %lu, id is %d\n", feats_to_draw[i]->uvs[0].size(), of.cam_id);
+        Eigen::Vector2f pt_e = feats_to_draw[i]->uvs.at(of.cam_id).back();
+        // fprintf(stderr, "success\n");
+        of.pix_loc[0] = pt_e[0]; 
+        of.pix_loc[1] = pt_e[1];
+
+        // slam
         if (std::find(highlighted_ids.begin(), highlighted_ids.end(), feats_to_draw[i]->featid) != highlighted_ids.end()) {
-            if (feats_to_draw[i]->first_id != -1) {
-                // MAI 4d
-                output_feature of;
-                of.cam_id = feats_to_draw[i]->first_id;
-                of.point_quality = OV_HIGH;
-                of.id = feats_to_draw[i]->featid;
-
-                // todo see if this fails, or how often it does
-                if (active_tracks_uvd.find(feats_to_draw[i]->featid) != active_tracks_uvd.end()) {
-                    Eigen::Vector4d uvd = Eigen::Vector4d::Zero();
-                    uvd = active_tracks_uvd.at(feats_to_draw[i]->featid);
-                    of.depth = uvd(3); // (u,v,depth)
-                    of.depth_error_stddev = uvd(4);
-                    of.pix_loc[0] = uvd(0); 
-                    of.pix_loc[1] = uvd(1);
-                }
-                else {
-                    Eigen::Vector2f pt_e = feats_to_draw[i]->uvs.at(feats_to_draw[i]->first_id).back();
-                    of.pix_loc[0] = pt_e[0]; 
-                    of.pix_loc[1] = pt_e[1];
-
-                    // MAI NOTE: depth + depth error of -1 will simply be ignored later on
-                    // fprintf(stderr, "WARNING: SETTING DEPTH TO -1\n");
-                    of.depth = -1;
-                    of.depth_error_stddev = -1;
-                }
-
-                // now do global position
-                Eigen::Vector3d global_position = feats_to_draw[i]->p_FinG;
-                of.tsf[0] = global_position(0);
-                of.tsf[1] = global_position(1);
-                of.tsf[2] = global_position(2);
-
-                // now do covariance of this feature
-                Eigen::MatrixXf::Map(reinterpret_cast<float*>(of.p_tsf), 3, 3) = cov.block(0, state->_features_SLAM.at(feats_to_draw[i]->featid)->id(), state->_features_SLAM.at(feats_to_draw[i]->featid)->size(), state->_features_SLAM.at(feats_to_draw[i]->featid)->size()).cast<float>();
-
-                feats.push_back(of);
-            }
-        } else {
-            if (feats_to_draw[i]->first_id != -1) {
-                Eigen::Vector2f pt_e = feats_to_draw[i]->uvs.at(feats_to_draw[i]->first_id).back();
-                output_feature of;
-                of.cam_id = feats_to_draw[i]->first_id;
-                of.point_quality = OV_MEDIUM;
-                of.id = feats_to_draw[i]->featid;
-
-                of.pix_loc[0] = pt_e[0]; 
-                of.pix_loc[1] = pt_e[1];
-
-                if (active_tracks_uvd.find(feats_to_draw[i]->featid) != active_tracks_uvd.end()) {
-                    Eigen::Vector4d uvd = Eigen::Vector4d::Zero();
-                    uvd = active_tracks_uvd.at(feats_to_draw[i]->featid);
-                    of.depth = uvd(3); // (u,v,depth)
-                    of.depth_error_stddev = uvd(4);
-                    of.pix_loc[0] = uvd(0); 
-                    of.pix_loc[1] = uvd(1);
-                }
-                else {
-                    // MAI NOTE: depth + depth error of -1 will simply be ignored later on
-                    // fprintf(stderr, "WARNING: SETTING DEPTH TO -1\n");
-                    of.depth = -1;
-                    of.depth_error_stddev = -1;
-                }
-
-                // if our feature is not instate yet, we aren't aware of the covariance associated with it
-                Eigen::MatrixXf::Map(reinterpret_cast<float*>(of.p_tsf), 3, 3) = Eigen::Matrix3d::Zero().cast<float>();
-                feats.push_back(of);
-            }
-            else {
-                if (!feats_to_draw[i]->uvs.empty()) {
-                    // loop through the potentials, grab the first one since its not fully inserted into state yet
-                    for (size_t j = 0; j < feats_to_draw[i]->uvs.size(); j++){
-                        // try to grab the BASE camera (id 0), fail otherwise
-                        // todo try every cam id if anchor isnt set?
-                        if (feats_to_draw[i]->uvs.find(j) != feats_to_draw[i]->uvs.end()){
-                            output_feature of;
-                            Eigen::Vector2f pt_e = feats_to_draw[i]->uvs.at(j).back();
-                            of.cam_id = j;
-                            of.point_quality = OV_MEDIUM;
-                            of.id = feats_to_draw[i]->featid;
-                            of.pix_loc[0] = pt_e[0]; 
-                            of.pix_loc[1] = pt_e[1];
-                            // MAI NOTE: depth + depth error of -1 will simply be ignored later on
-                            // fprintf(stderr, "WARNING: SETTING DEPTH TO -1\n");
-                            of.depth = -1;
-                            of.depth_error_stddev = -1;
-
-                            // if our feature is not instate yet, we aren't aware of the covariance associated with it
-                            Eigen::MatrixXf::Map(reinterpret_cast<float*>(of.p_tsf), 3, 3) = Eigen::Matrix3d::Zero().cast<float>();
-                            feats.push_back(of);
-                        }
-                    }
-                    
-                }
-            }
+            of.point_quality = OV_HIGH;
+            Eigen::MatrixXf::Map(reinterpret_cast<float*>(of.p_tsf), 3, 3) = cov.block(0, state->_features_SLAM.at(feats_to_draw[i]->featid)->id(), state->_features_SLAM.at(feats_to_draw[i]->featid)->size(), state->_features_SLAM.at(feats_to_draw[i]->featid)->size()).cast<float>();
         }
+        else {
+            of.point_quality = OV_MEDIUM;
+        }
+
+        if (active_tracks_uvd.find(feats_to_draw[i]->featid) != active_tracks_uvd.end()) {
+            Eigen::Vector4d uvd = Eigen::Vector4d::Zero();
+            uvd = active_tracks_uvd.at(feats_to_draw[i]->featid);
+            of.depth = uvd(3); // (u,v,depth)
+            of.depth_error_stddev = uvd(4);
+        }
+
+        // now do global position
+        Eigen::Vector3d global_position = feats_to_draw[i]->p_FinG;
+        of.tsf[0] = global_position(0);
+        of.tsf[1] = global_position(1);
+        of.tsf[2] = global_position(2);
+
+
+        feats.push_back(of);
     }
 
     return feats;
