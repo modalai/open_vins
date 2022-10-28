@@ -430,17 +430,19 @@ std::vector<output_feature> VioManager::get_pixel_loc_features() {
 
     // Build an id-list of our "in state" features
     // i.e. SLAM and last msckf update features
-    std::vector<size_t> highlighted_ids;
+    std::vector<size_t> slam_ids;
+    std::vector<size_t> msckf_ids(MSCKF_ids);
+    std::vector<Eigen::Vector3d> good_features_MSCKF_clone(good_features_MSCKF);
+    std::vector<Eigen::Vector3d> slam_feats_clone = get_features_SLAM();
+
+
     for (const auto &feat : state->_features_SLAM) {
-        // if (feat.second -> _anchor_cam_id == -1) continue;
-        highlighted_ids.push_back(feat.second->_featid);
+        slam_ids.push_back(feat.second->_featid);
     }
 
     // get our full covariance matrix here
     Eigen::MatrixXd cov = StateHelper::get_full_covariance(state);
-    // this can no longer be handled by the tracker, as we have an external one
-    // soooooooooo, just grab the latest update ones and do it here ourselves
-    // in this loop, if anchor cam is unset we really have no clue where it came from
+
     std::vector<std::shared_ptr<Feature>> feats_to_draw;
     feats_to_draw = trackDATABASE->features_containing(state->_timestamp, false, false);
 
@@ -448,39 +450,181 @@ std::vector<output_feature> VioManager::get_pixel_loc_features() {
         output_feature of;
         of.cam_id = feats_to_draw[i]->anchor_cam_id == -1 ? feats_to_draw[i]->first_id : feats_to_draw[i]->anchor_cam_id;
         of.id = feats_to_draw[i]->featid;
-        // fprintf(stderr, "doing sketchy grab next, uv size is: %lu, id is %d\n", feats_to_draw[i]->uvs[0].size(), of.cam_id);
         Eigen::Vector2f pt_e = feats_to_draw[i]->uvs.at(of.cam_id).back();
-        // fprintf(stderr, "success\n");
         of.pix_loc[0] = pt_e[0]; 
         of.pix_loc[1] = pt_e[1];
 
+        auto iter = std::find(slam_ids.begin(), slam_ids.end(), feats_to_draw[i]->featid);
+        auto iter2 = std::find(msckf_ids.begin(), msckf_ids.end(), feats_to_draw[i]->featid);
+
         // slam
-        if (std::find(highlighted_ids.begin(), highlighted_ids.end(), feats_to_draw[i]->featid) != highlighted_ids.end()) {
+        if (iter != slam_ids.end()){
+            auto index = std::distance(slam_ids.begin(), iter);
             of.point_quality = OV_HIGH;
+            of.tsf[0] = slam_feats_clone[index](0);
+            of.tsf[1] = slam_feats_clone[index](1);
+            of.tsf[2] = slam_feats_clone[index](2);
+            // as of now, only the slam features have a recoverable covariance
             Eigen::MatrixXf::Map(reinterpret_cast<float*>(of.p_tsf), 3, 3) = cov.block(0, state->_features_SLAM.at(feats_to_draw[i]->featid)->id(), state->_features_SLAM.at(feats_to_draw[i]->featid)->size(), state->_features_SLAM.at(feats_to_draw[i]->featid)->size()).cast<float>();
         }
-        else {
+        // msckf
+        else if (iter2 != msckf_ids.end()){
+            auto index = std::distance(msckf_ids.begin(), iter2);
             of.point_quality = OV_MEDIUM;
+            of.tsf[0] = good_features_MSCKF_clone[index](0);
+            of.tsf[1] = good_features_MSCKF_clone[index](1);
+            of.tsf[2] = good_features_MSCKF_clone[index](2);
+        }
+        // oos, no 3d projections yet
+        else {
+            of.point_quality = OV_LOW;
         }
 
-        if (active_tracks_uvd.find(feats_to_draw[i]->featid) != active_tracks_uvd.end()) {
-            Eigen::Vector4d uvd = Eigen::Vector4d::Zero();
-            uvd = active_tracks_uvd.at(feats_to_draw[i]->featid);
-            of.depth = uvd(3); // (u,v,depth)
-            of.depth_error_stddev = uvd(4);
+        if (of.point_quality != OV_LOW){
+            if (active_tracks_uvd.find(feats_to_draw[i]->featid) != active_tracks_uvd.end()) {
+                Eigen::Vector4d uvd = Eigen::Vector4d::Zero();
+                uvd = active_tracks_uvd.at(feats_to_draw[i]->featid);
+                of.depth = uvd(2); // (u,v,depth, error)
+                of.depth_error_stddev = uvd(3);
+            }
         }
 
-        // now do global position
-        Eigen::Vector3d global_position = feats_to_draw[i]->p_FinG;
-        of.tsf[0] = global_position(0);
-        of.tsf[1] = global_position(1);
-        of.tsf[2] = global_position(2);
-
+        // special case: we are using feats for zupt state updates rather than msckf
+        if (!has_moved_since_zupt && did_zupt_update && of.point_quality == OV_LOW) of.point_quality = OV_MEDIUM;
 
         feats.push_back(of);
     }
 
     return feats;
+}
+
+int VioManager::pickup_lost_slam_feats(std::vector<std::shared_ptr<Feature>> &new_feats){
+    auto it0 = state->_features_SLAM_lost.begin();
+
+    for (size_t i = 0; i < state->_cam_intrinsics.size(); i++){ // loop through cameras
+        // for (size_t i = 0; i < state->_features_SLAM_lost.size(); i++){
+        while (it0 != state->_features_SLAM_lost.end()) {
+        
+            // Calibration of the first camera (cam0)
+            std::shared_ptr<Vec> distortion = state->_cam_intrinsics.at(i);
+            std::shared_ptr<PoseJPL> calibration = state->_calib_IMUtoCAM.at(i);
+            Eigen::Matrix<double, 3, 3> R_ItoC = calibration->Rot();
+            Eigen::Matrix<double, 3, 1> p_IinC = calibration->pos();
+
+            // Get current IMU clone state
+            std::shared_ptr<PoseJPL> clone_Ii = state->_clones_IMU.at(state->_timestamp);
+            Eigen::Matrix3d R_GtoIi = clone_Ii->Rot();
+            Eigen::Vector3d p_IiinG = clone_Ii->pos();
+
+            // Project the current feature into the current frame of reference
+            Eigen::Vector3d p_FinIi = R_GtoIi * ((*it0)->get_xyz(true) - p_IiinG);
+            Eigen::Vector3d p_FinCi = R_ItoC * p_FinIi + p_IinC;
+            double depth = p_FinCi(2);
+            Eigen::Vector2d uv_norm, uv_dist;
+            uv_norm << p_FinCi(0) / depth, p_FinCi(1) / depth;
+            uv_dist = state->_cam_intrinsics_cameras.at(i)->distort_d(uv_norm);
+
+            // Skip if not valid (i.e. negative depth, or outside of image)
+            if (depth < 0.1) {
+                it0++;
+                continue;
+            }
+
+            // Skip if not valid (i.e. negative depth, or outside of image)
+            int width = state->_cam_intrinsics_cameras.at(i)->w();
+            int height = state->_cam_intrinsics_cameras.at(i)->h();
+            if (uv_dist(0) < 0 || (int)uv_dist(0) >= width || uv_dist(1) < 0 || (int)uv_dist(1) >= height) {
+                // PRINT_DEBUG("feat %zu -> depth = %.2f | u_d = %.2f | v_d = %.2f\n",(*it2)->featid,depth,uv_dist(0),uv_dist(1));
+                it0++;
+                continue;
+            }
+
+            // so uv_dist is the uv coordinates of this feature in our current image frame
+            // we just need to loop through all features at the LAST state timestamp, get a group of the closest ones, and compute hamming distance
+            // 20x20 patch around projected uv coordinates
+            static int patch_size = 40;
+            int patch_x = uv_dist(0) - patch_size/2;
+            int patch_y = uv_dist(1) - patch_size/2;
+
+            if (patch_x < 0) patch_x = 0;
+            if (patch_y < 0) patch_y = 0;
+
+            std::vector<std::shared_ptr<Feature>> feats_last_update;
+            feats_last_update = trackFEATS->get_feature_database()->features_containing(state->_timestamp, false, false);
+
+            // DANGER: this can pull up a slam landmark
+            // if we have already re-identified this landmark, what do we do?
+            
+            std::vector<std::shared_ptr<Feature>> feats_to_compare;
+            for (size_t j = 0; j < feats_last_update.size(); j++){
+                Eigen::Vector2f pt_e = feats_last_update[j]->uvs.at(feats_last_update[j]->anchor_cam_id == -1 ? feats_last_update[j]->first_id : feats_last_update[j]->anchor_cam_id).back();
+
+                if (pt_e[0] < patch_x) continue;
+                if (pt_e[1] < patch_y) continue;
+                if (pt_e[0] > patch_x + patch_size) continue;
+                if (pt_e[1] > patch_y + patch_size) continue;
+
+                feats_to_compare.push_back(feats_last_update[j]);
+            }
+
+            if (feats_to_compare.empty()){
+                it0++;
+                continue;
+            }
+
+
+            int best_dist = std::numeric_limits<int>::max();
+            int best_index = -1;
+            int best_id;
+            for (size_t j = 0; j < feats_to_compare.size(); j++){
+                int dist = DescriptorDistance(feats_to_compare[j]->descriptor, (*it0)->descriptor);
+                if(dist < best_dist) {
+                    best_dist = dist;
+                    best_index = j;
+                    best_id = feats_to_compare[j]->featid;
+                }
+            }
+
+            // now, we need to REINSERT THE LOST SLAM FEAT INTO OUR SLAM FEATS AGAIN WITH THE NEW ID
+
+            (*it0)->_featid = best_id;
+            (*it0)->should_marg = false;
+            // need a pair, with first being featid??_ and second the landmark
+            state->_features_SLAM.insert({best_id, (*it0)});
+
+            new_feats.push_back(feats_to_compare[best_index]);
+
+            it0 = state->_features_SLAM_lost.erase(it0);
+
+            // need an iterator here to efficiently delete from lost features vec now
+
+        }
+    }
+
+    if (!new_feats.empty()) fprintf(stderr, "adding %lu re-found slam feats, %lu still lost\n", new_feats.size(), state->_features_SLAM_lost.size());
+
+    return 0;
+}
+
+
+// Bit set count operation from
+// http://graphics.stanford.edu/~seander/bithacks.html#CountBitsSetParallel
+int VioManager::DescriptorDistance(const cv::Mat &a, const cv::Mat &b)
+{
+    const int *pa = a.ptr<int32_t>();
+    const int *pb = b.ptr<int32_t>();
+
+    int dist=0;
+
+    for(int i=0; i<8; i++, pa++, pb++)
+    {
+        unsigned  int v = *pa ^ *pb;
+        v = v - ((v >> 1) & 0x55555555);
+        v = (v & 0x33333333) + ((v >> 2) & 0x33333333);
+        dist += (((v + (v >> 4)) & 0xF0F0F0F) * 0x1010101) >> 24;
+    }
+
+    return dist;
 }
 
 std::vector<Eigen::Vector3d> VioManager::get_features_ARUCO() {

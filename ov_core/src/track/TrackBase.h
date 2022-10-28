@@ -52,7 +52,7 @@ typedef struct output_feature {
     int32_t cam_id;            ///< ID of camera which the point was seen from (typically first), -1 if unknown
     float pix_loc[2];           ///< pixel location in the last frame
     float tsf[3];               ///< location of feature in vio frame (relative to init location)
-    float p_tsf[3][3];          ///< covarience of feature location
+    float p_tsf[3][3];          ///< covariance of feature location
     float depth;                ///< distance from camera to point
     float depth_error_stddev;   ///< depth error in meters
     feat_quality point_quality;

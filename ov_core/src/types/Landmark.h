@@ -26,6 +26,7 @@
 #include "Vec.h"
 #include "utils/colors.h"
 #include "utils/print.h"
+#include <opencv2/opencv.hpp>
 
 namespace ov_type {
 
@@ -54,6 +55,8 @@ class Landmark : public Vec {
     /// Timestamp of anchor clone
     double _anchor_clone_timestamp = -1;
 
+    double timestamp_lost = -1;
+
     /// Boolean if this landmark has had at least one anchor change
     bool has_had_anchor_change = false;
 
@@ -68,6 +71,9 @@ class Landmark : public Vec {
 
     /// What feature representation this feature currently has
     LandmarkRepresentation::Representation _feat_representation;
+
+    // descriptor given to us by external tracker
+    cv::Mat descriptor;
 
     /**
      * @brief Overrides the default vector update rule

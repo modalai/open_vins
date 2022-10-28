@@ -344,7 +344,7 @@ struct VioManagerOptions {
     bool use_multi_threading_subs = true;
 
     /// The number of points we should extract and track in *each* image frame. This highly effects the computation required for tracking.
-    int num_pts = 150;
+    int num_pts = 40;
 
     /// Fast extraction threshold
     int fast_threshold = 20;

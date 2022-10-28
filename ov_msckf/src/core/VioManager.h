@@ -32,6 +32,7 @@
 #include <string>
 
 #include "VioManagerOptions.h"
+#include "feat/Feature.h"
 
 namespace ov_core {
 struct ImuData;
@@ -127,6 +128,9 @@ class VioManager {
 
     /// Returns 3d features used in the last update in global frame
     std::vector<Eigen::Vector3d> get_good_features_MSCKF() { return good_features_MSCKF; }
+
+    int DescriptorDistance(const cv::Mat &a, const cv::Mat &b);
+    int pickup_lost_slam_feats(std::vector<std::shared_ptr<ov_core::Feature>> &new_feats);
 
     /// Return the image used when projecting the active tracks
     void get_active_image(double &timestamp, cv::Mat &image) {
@@ -241,7 +245,7 @@ class VioManager {
     // Good features that where used in the last update (used in visualization)
     std::vector<Eigen::Vector3d> good_features_MSCKF;
     // store the pixel representation as well, so we can draw with them
-    std::vector<std::pair<int, cv::Point2f>> MSCKF_locs;
+    std::vector<size_t> MSCKF_ids;
 
     /// Feature initializer used to triangulate all active tracks
     std::shared_ptr<ov_core::FeatureInitializer> active_tracks_initializer;

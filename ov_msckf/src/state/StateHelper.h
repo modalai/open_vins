@@ -226,6 +226,8 @@ class StateHelper {
      * @param state Pointer to state
      */
     static void marginalize_slam(std::shared_ptr<State> state);
+    static void marginalize_mai_slam(std::shared_ptr<State> state);
+    static void marginalize_lost_slam(std::shared_ptr<State> state);
 
   private:
     /**

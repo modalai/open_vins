@@ -26,6 +26,7 @@
 #include <iostream>
 #include <unordered_map>
 #include <vector>
+#include <opencv2/opencv.hpp>
 
 namespace ov_core {
 
@@ -67,6 +68,9 @@ class Feature {
     Eigen::Vector3d p_FinG;
 
     int first_id = -1;
+
+    // descriptor given to us by external tracker
+    cv::Mat descriptor;
 
     /**
      * @brief Remove measurements that do not occur at passed timestamps.

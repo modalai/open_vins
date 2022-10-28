@@ -331,7 +331,8 @@ void VioManager::feed_measurement_processed_camera(const ov_core::ProcessedCamer
         cv::Point2f npt_l = state->_cam_intrinsics_cameras.at(message_const.feats[i].cam_id)->undistort_cv(cv::Point2f(message_const.feats[i].x, message_const.feats[i].y));
         trackFEATS->get_feature_database()->update_feature(message_const.feats[i].id, message_const.timestamp,
                                                            message_const.feats[i].cam_id, message_const.feats[i].x,
-                                                           message_const.feats[i].y, npt_l.x, npt_l.y);
+                                                           message_const.feats[i].y, npt_l.x, npt_l.y, cv::Mat(1, 32, CV_8UC1, const_cast<unsigned char *>(message_const.feats[i].descriptor)).clone());
+        // std::cout << "descriptor: " << message_const.feats[i].descriptor << std::endl;
     }
 
     // create a fake camera packet and pass that to functions expecting a CameraData packet
@@ -564,7 +565,8 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
     // Lets marginalize out all old SLAM features here
     // These are ones that where not successfully tracked into the current frame
     // We do *NOT* marginalize out our aruco tags landmarks
-    StateHelper::marginalize_slam(state);
+    StateHelper::marginalize_mai_slam(state);
+    // StateHelper::marginalize_slam(state);
 
     // Separate our SLAM features into new ones, and old ones
     std::vector<std::shared_ptr<Feature>> feats_slam_DELAYED, feats_slam_UPDATE;
@@ -578,6 +580,15 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
             // fprintf(stderr, "[UPDATE-SLAM]: new feature ready (%d measurements)\n", (int)feats_slam.at(i)->timestamps.size());
         }
     }
+
+    // now that we have constructed our slam feature arrays, try to pick back up lost features by projection
+
+    // add found features to our update array since they are still in state
+    std::vector<std::shared_ptr<Feature>> lost_feat_vec;
+
+    pickup_lost_slam_feats(lost_feat_vec);
+    feats_slam_UPDATE.insert(feats_slam_UPDATE.end(), lost_feat_vec.begin(), lost_feat_vec.end());
+
 
     // Concatenate our MSCKF feature arrays (i.e., ones not being used for slam updates)
     std::vector<std::shared_ptr<Feature>> featsup_MSCKF = feats_lost;
@@ -665,18 +676,18 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
         // Thus we should be able to visualize the other unique camera stream
         // MSCKF features as they will also be appended to the vector
         good_features_MSCKF.clear();
-        MSCKF_locs.clear();
+        MSCKF_ids.clear();
     }
 
     // Save all the MSCKF features used in the update
     // _features_MSCKF = (featsup_MSCKF.clone());
     for (auto const &feat : featsup_MSCKF) {
         good_features_MSCKF.push_back(feat->p_FinG);
-        MSCKF_locs.push_back(std::make_pair(
-            feat->anchor_cam_id, cv::Point2f(feat->uvs[feat->anchor_cam_id].back()(0), feat->uvs[feat->anchor_cam_id].back()(1))));
+        MSCKF_ids.push_back(feat->featid);
         feat->to_delete = true;
     }
 
+    // fprintf(stderr, "%lu MSCKF FEATS\n", good_features_MSCKF.size());
     //===================================================================================
     // TURI - MAI
     // time for some loop closure

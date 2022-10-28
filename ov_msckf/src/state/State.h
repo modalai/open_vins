@@ -101,6 +101,8 @@ class State {
     /// Our current set of SLAM features (3d positions)
     std::unordered_map<size_t, std::shared_ptr<ov_type::Landmark>> _features_SLAM;
 
+    std::vector<std::shared_ptr<ov_type::Landmark>> _features_SLAM_lost;
+
     /// Time offset base IMU to camera (t_imu = t_cam + t_off)
     std::shared_ptr<ov_type::Vec> _calib_dt_CAMtoIMU;
 
