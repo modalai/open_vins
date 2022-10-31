@@ -624,7 +624,7 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
     // basic blowup check, report out via state error code
     static int lone_ekf_updates = 0;
     if (featsup_MSCKF.size() == 0) {
-        float vel_now = state->_imu->vel_fej().norm(); //[0] + state->_imu->vel_fej()[1] + state->_imu->vel_fej()[2];
+        float vel_now = state->_imu->vel_fej().norm();
         if (vel_now > 0.1)                             // arbitrary for now, not sure
             lone_ekf_updates++;
     } else {

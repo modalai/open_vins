@@ -44,7 +44,8 @@
 typedef enum feat_quality{
     OV_LOW,     ///< additional low-quality points collected for e.g. collision avoidance
     OV_MEDIUM,  ///< Points that are not "in state"
-    OV_HIGH     ///< Points that are "in state"
+    OV_HIGH,    ///< Points that are "in state"
+    OV_RE_HIGH
 } feat_quality;
 
 typedef struct output_feature {

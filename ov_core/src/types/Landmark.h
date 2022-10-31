@@ -75,6 +75,7 @@ class Landmark : public Vec {
     // descriptor given to us by external tracker
     cv::Mat descriptor;
 
+
     /**
      * @brief Overrides the default vector update rule
      * We want to selectively update the FEJ value if we are using an anchored representation.

@@ -30,6 +30,10 @@
 #include "types/LandmarkRepresentation.h"
 #include "utils/print.h"
 
+
+#define HAMMING_DIST_MAX 125
+
+
 using namespace ov_core;
 using namespace ov_type;
 using namespace ov_msckf;
@@ -480,6 +484,13 @@ std::vector<output_feature> VioManager::get_pixel_loc_features() {
             of.point_quality = OV_LOW;
         }
 
+        if (feats_to_draw[i]->refound){
+            // re-identified slam landmark
+            of.point_quality = OV_RE_HIGH;
+            of.id = feats_to_draw[i]->_og_id;
+            feats_to_draw[i]->refound = false;
+        }
+
         if (of.point_quality != OV_LOW){
             if (active_tracks_uvd.find(feats_to_draw[i]->featid) != active_tracks_uvd.end()) {
                 Eigen::Vector4d uvd = Eigen::Vector4d::Zero();
@@ -499,10 +510,10 @@ std::vector<output_feature> VioManager::get_pixel_loc_features() {
 }
 
 int VioManager::pickup_lost_slam_feats(std::vector<std::shared_ptr<Feature>> &new_feats){
-    auto it0 = state->_features_SLAM_lost.begin();
-
     for (size_t i = 0; i < state->_cam_intrinsics.size(); i++){ // loop through cameras
-        // for (size_t i = 0; i < state->_features_SLAM_lost.size(); i++){
+
+        auto it0 = state->_features_SLAM_lost.begin();
+
         while (it0 != state->_features_SLAM_lost.end()) {
         
             // Calibration of the first camera (cam0)
@@ -541,8 +552,7 @@ int VioManager::pickup_lost_slam_feats(std::vector<std::shared_ptr<Feature>> &ne
 
             // so uv_dist is the uv coordinates of this feature in our current image frame
             // we just need to loop through all features at the LAST state timestamp, get a group of the closest ones, and compute hamming distance
-            // 20x20 patch around projected uv coordinates
-            static int patch_size = 40;
+            static int patch_size = 30;
             int patch_x = uv_dist(0) - patch_size/2;
             int patch_y = uv_dist(1) - patch_size/2;
 
@@ -576,18 +586,47 @@ int VioManager::pickup_lost_slam_feats(std::vector<std::shared_ptr<Feature>> &ne
             int best_dist = std::numeric_limits<int>::max();
             int best_index = -1;
             int best_id;
+            // std::cout << "descriptor " << i << std::endl;
+    
             for (size_t j = 0; j < feats_to_compare.size(); j++){
                 int dist = DescriptorDistance(feats_to_compare[j]->descriptor, (*it0)->descriptor);
+                // std::cout << dist << std::endl;
+
                 if(dist < best_dist) {
                     best_dist = dist;
                     best_index = j;
                     best_id = feats_to_compare[j]->featid;
                 }
             }
+            // std::cout << std::endl;
+
+            if (best_dist > HAMMING_DIST_MAX){
+                it0++;
+                continue;
+            }
+
+            // std::cout << best_dist << std::endl;
 
             // now, we need to REINSERT THE LOST SLAM FEAT INTO OUR SLAM FEATS AGAIN WITH THE NEW ID
 
+            // set the original id here for debug
+            // set to true for debug
+            // trackDATABASE->get_feature(best_id, false)->refound = true;
+            trackDATABASE->get_feature(best_id, false)->_og_id = (*it0)->_featid;
+
+            // if ((*it0)->_unique_camera_id != i){
+                // std::cout << "PICKED UP FEAT FROM CAM " << i << " in cam " << (*it0)->_unique_camera_id << std::endl;
+            // }
+
+
+            // set its new id and new descriptor for the patch
             (*it0)->_featid = best_id;
+            // (*it0)->descriptor = feats_to_compare[best_index]->descriptor;
+            trackDATABASE->get_feature(best_id, false)->refound = true;
+            feats_to_compare[best_index]->refound = true;
+
+            // feats_to_compare[best_index]->p_FinG = (*it0)->get_xyz(true);
+
             (*it0)->should_marg = false;
             // need a pair, with first being featid??_ and second the landmark
             state->_features_SLAM.insert({best_id, (*it0)});
@@ -601,7 +640,9 @@ int VioManager::pickup_lost_slam_feats(std::vector<std::shared_ptr<Feature>> &ne
         }
     }
 
-    if (!new_feats.empty()) fprintf(stderr, "adding %lu re-found slam feats, %lu still lost\n", new_feats.size(), state->_features_SLAM_lost.size());
+    trackDATABASE->append_new_measurements(trackFEATS->get_feature_database());
+
+    // if (!new_feats.empty()) fprintf(stderr, "adding %lu re-found slam feats, %lu still lost\n", new_feats.size(), state->_features_SLAM_lost.size());
 
     return 0;
 }

@@ -43,6 +43,8 @@ class Feature {
     /// Unique ID of this feature
     size_t featid;
 
+    size_t _og_id;
+
     /// If this feature should be deleted
     bool to_delete;
 
@@ -71,6 +73,8 @@ class Feature {
 
     // descriptor given to us by external tracker
     cv::Mat descriptor;
+
+    bool refound = false;
 
     /**
      * @brief Remove measurements that do not occur at passed timestamps.

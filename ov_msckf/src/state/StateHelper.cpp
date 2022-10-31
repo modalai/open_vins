@@ -133,6 +133,9 @@ void StateHelper::EKFUpdate(std::shared_ptr<State> state, const std::vector<std:
     //==========================================================
     // For each active variable find its M = P*H^T
     for (const auto &var : state->_variables) {
+        // TODO: should we not use all of these variables?
+        // idfk mai
+        
         // Sum up effect of each subjacobian = K_i= \sum_m (P_im Hm^T)
         Eigen::MatrixXd M_i = Eigen::MatrixXd::Zero(var->size(), res.rows());
         for (size_t i = 0; i < H_order.size(); i++) {
@@ -173,6 +176,7 @@ void StateHelper::EKFUpdate(std::shared_ptr<State> state, const std::vector<std:
         if (diags(i) < 0.0) {
             PRINT_WARNING(RED "StateHelper::EKFUpdate() - diagonal at %d is %.2f\n" RESET, i, diags(i));
             found_neg = true;
+            fprintf(stderr, "ERROR DIAGONAL WENT NEGATIVE\n");
             state->error_flag = OV_STATE_FAILED;
         }
     }
@@ -652,8 +656,10 @@ void StateHelper::marginalize_mai_slam(std::shared_ptr<State> state) {
     while (it0 != state->_features_SLAM.end()) {
         if ((*it0).second->should_marg) {
             (*it0).second->timestamp_lost = state->_timestamp;
-            state->_features_SLAM_lost.push_back((*it0).second);
-            // StateHelper::marginalize(state, (*it0).second);
+            if (state->_features_SLAM_lost.size() < state->_options.max_slam_in_update)
+                state->_features_SLAM_lost.push_back((*it0).second);
+            else
+                StateHelper::marginalize(state, (*it0).second);
             it0 = state->_features_SLAM.erase(it0);
             // fprintf(stderr, "marginalizing slam feature\n");
         } else {
@@ -666,7 +672,7 @@ void StateHelper::marginalize_mai_slam(std::shared_ptr<State> state) {
 void StateHelper::marginalize_lost_slam(std::shared_ptr<State> state){
     auto it0 = state->_features_SLAM_lost.begin();
     while (it0 != state->_features_SLAM_lost.end()) {
-        if ((*it0)->should_marg &&  (state->_timestamp - (*it0)->timestamp_lost >= 10.)){
+        if ((*it0)->should_marg &&  (state->_timestamp - (*it0)->timestamp_lost >= 8.)){
                 StateHelper::marginalize(state, (*it0));
                 // fprintf(stderr, "marginalizing delayed slam feature\n");
                 it0 = state->_features_SLAM_lost.erase(it0);
