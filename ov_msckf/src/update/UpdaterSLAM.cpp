@@ -419,6 +419,7 @@ void UpdaterSLAM::update(std::shared_ptr<State> state, std::vector<std::shared_p
                 PRINT_WARNING(YELLOW "[SLAM-UP]: rejecting aruco tag %d for chi2 thresh (%.3f > %.3f)\n" RESET, (int)feat.featid, chi2,
                               chi2_multipler * chi2_check);
             } else {
+                // fprintf(stderr, "SELECTING LANDMARK FOR MARG WITH CHI2 OF %f vs %f\n", chi2, chi2_check * chi2_multipler);
                 landmark->should_marg = true;
             }
             (*it2)->to_delete = true;

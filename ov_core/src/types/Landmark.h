@@ -63,6 +63,9 @@ class Landmark : public Vec {
     /// Boolean if this landmark should be marginalized out
     bool should_marg = false;
 
+    //
+    bool was_lost = false;
+
     /// First normalized uv coordinate bearing of this measurement (used for single depth representation)
     Eigen::Vector3d uv_norm_zero;
 

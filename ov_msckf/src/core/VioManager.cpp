@@ -328,11 +328,10 @@ void VioManager::feed_measurement_processed_camera(const ov_core::ProcessedCamer
 
     // Update our feature database, with theses new observations
     for (size_t i = 0; i < message_const.feats.size(); i++) {
-        cv::Point2f npt_l = state->_cam_intrinsics_cameras.at(message_const.feats[i].cam_id)->undistort_cv(cv::Point2f(message_const.feats[i].x, message_const.feats[i].y));
         trackFEATS->get_feature_database()->update_feature(message_const.feats[i].id, message_const.timestamp,
                                                            message_const.feats[i].cam_id, message_const.feats[i].x,
-                                                           message_const.feats[i].y, npt_l.x, npt_l.y, cv::Mat(1, 32, CV_8UC1, const_cast<unsigned char *>(message_const.feats[i].descriptor)).clone());
-        // std::cout << "descriptor: " << message_const.feats[i].descriptor << std::endl;
+                                                           message_const.feats[i].y, message_const.feats[i].u, message_const.feats[i].v, 
+                                                           cv::Mat(1, 32, CV_8UC1, const_cast<unsigned char *>(message_const.feats[i].descriptor)).clone());
     }
 
     // create a fake camera packet and pass that to functions expecting a CameraData packet
@@ -489,7 +488,6 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
         }
     }
 
-    // fprintf(stderr, "LOST %d FEATS\n", (int)feats_lost.size());
 
     // Find tracks that have reached max length, these can be made into SLAM features
     std::vector<std::shared_ptr<Feature>> feats_maxtracks;
@@ -565,8 +563,8 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
     // Lets marginalize out all old SLAM features here
     // These are ones that where not successfully tracked into the current frame
     // We do *NOT* marginalize out our aruco tags landmarks
-    StateHelper::marginalize_mai_slam(state);
-    // StateHelper::marginalize_slam(state);
+    // StateHelper::marginalize_mai_slam(state);
+    StateHelper::marginalize_slam(state);
 
     // Separate our SLAM features into new ones, and old ones
     std::vector<std::shared_ptr<Feature>> feats_slam_DELAYED, feats_slam_UPDATE;
@@ -584,10 +582,9 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
     // now that we have constructed our slam feature arrays, try to pick back up lost features by projection
 
     // add found features to our update array since they are still in state
-    std::vector<std::shared_ptr<Feature>> lost_feat_vec;
-
-    pickup_lost_slam_feats(lost_feat_vec);
-    feats_slam_UPDATE.insert(feats_slam_UPDATE.end(), lost_feat_vec.begin(), lost_feat_vec.end());
+    // std::vector<std::shared_ptr<Feature>> lost_feat_vec;
+    // pickup_lost_slam_feats(lost_feat_vec);
+    // feats_slam_UPDATE.insert(feats_slam_UPDATE.end(), lost_feat_vec.begin(), lost_feat_vec.end());
 
 
     // Concatenate our MSCKF feature arrays (i.e., ones not being used for slam updates)
@@ -686,22 +683,6 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
         MSCKF_ids.push_back(feat->featid);
         feat->to_delete = true;
     }
-
-    // fprintf(stderr, "%lu MSCKF FEATS\n", good_features_MSCKF.size());
-    //===================================================================================
-    // TURI - MAI
-    // time for some loop closure
-    // this is where we want to add/create a keyframe if it passes our criteria
-    // BASIC CRITERIA:
-    // * if norm distance from last pose > SOME_DIST_THRESH, maybe like 10-20cm to start
-    // * if we have too few landmarks, see note below
-    // * a nice addition would be to not add a keyframe if SOME_PERCENTAGE_THRESH of landmarks are in the last keyframe
-    //
-    // when we lose all landmarks or have < SOME_LANDMARK_THRESH, we need to search our keyframe db/map for a keyframe from a similar
-    // direction and try to match feats to it this means that we will create a keyframe with some ??? measurements, and if we are unable to
-    // match anything it will need to be purged until we have reliable measurements? not sure if this holds or im way off, will see later
-    // TODO clean this shit up
-    //===================================================================================
 
     //===================================================================================
     // Cleanup, marginalize out what we don't need any more...

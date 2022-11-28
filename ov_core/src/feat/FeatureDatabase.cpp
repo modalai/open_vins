@@ -101,6 +101,7 @@ void FeatureDatabase::update_feature(size_t id, double timestamp, size_t cam_id,
         feat->uvs[cam_id].push_back(Eigen::Vector2f(u, v));
         feat->uvs_norm[cam_id].push_back(Eigen::Vector2f(u_n, v_n));
         feat->timestamps[cam_id].push_back(timestamp);
+        feat->descriptor = descriptor;
         return;
     }
 
@@ -307,7 +308,7 @@ double FeatureDatabase::get_oldest_timestamp() {
     double oldest_time = -1;
     for (auto const &feat : features_idlookup) {
         for (auto const &camtimepair : feat.second->timestamps) {
-            if (!camtimepair.second.empty() && (oldest_time == -1 || oldest_time < camtimepair.second.at(0))) {
+            if (!camtimepair.second.empty() && (oldest_time == -1 || oldest_time > camtimepair.second.at(0))) {
                 oldest_time = camtimepair.second.at(0);
             }
         }
