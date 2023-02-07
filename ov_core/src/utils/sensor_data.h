@@ -85,7 +85,7 @@ typedef struct MaiFeature {
     float y;
     float u;
     float v;
-    unsigned char descriptor[32];
+    unsigned char descriptor[32] = {0};
 } __attribute((packed))__MaiFeature;
 
 struct ProcessedCameraData {

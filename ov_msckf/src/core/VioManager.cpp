@@ -330,7 +330,7 @@ void VioManager::feed_measurement_processed_camera(const ov_core::ProcessedCamer
     for (size_t i = 0; i < message_const.feats.size(); i++) {
         trackFEATS->get_feature_database()->update_feature(message_const.feats[i].id, message_const.timestamp,
                                                            message_const.feats[i].cam_id, message_const.feats[i].x,
-                                                           message_const.feats[i].y, message_const.feats[i].u, message_const.feats[i].v, 
+                                                           message_const.feats[i].y, message_const.feats[i].u, message_const.feats[i].v,
                                                            cv::Mat(1, 32, CV_8UC1, const_cast<unsigned char *>(message_const.feats[i].descriptor)).clone());
     }
 
