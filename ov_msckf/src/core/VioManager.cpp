@@ -78,6 +78,7 @@ VioManager::VioManager(VioManagerOptions &params_) : thread_init_running(false),
     state->_calib_dt_CAMtoIMU->set_fej(temp_camimu_dt);
 
     // Loop through and load each of the cameras
+    printf("Set camera intrinsics and extrinsics\n");
     state->_cam_intrinsics_cameras = params.camera_intrinsics;
     for (int i = 0; i < state->_options.num_cameras; i++) {
         state->_cam_intrinsics.at(i)->set_value(params.camera_intrinsics.at(i)->get_value());
@@ -159,6 +160,34 @@ VioManager::VioManager(VioManagerOptions &params_) : thread_init_running(false),
     active_tracks_initializer = std::make_shared<FeatureInitializer>(params.featinit_options);
 }
 
+
+void VioManager::feed_measurement_imu(const ov_core::ImuData &message) {
+
+  // The oldest time we need IMU with is the last clone
+  // We shouldn't really need the whole window, but if we go backwards in time we will
+  double oldest_time = state->margtimestep();
+  if (oldest_time > state->_timestamp) {
+    oldest_time = -1;
+  }
+  if (!is_initialized_vio) {
+    oldest_time = message.timestamp - params.init_options.init_window_time + state->_calib_dt_CAMtoIMU->value()(0) - 0.10;
+  }
+  propagator->feed_imu(message, oldest_time);
+
+  // Push back to our initializer
+  if (!is_initialized_vio) {
+    initializer->feed_imu(message, oldest_time);
+  }
+
+  // Push back to the zero velocity updater if it is enabled
+  // No need to push back if we are just doing the zv-update at the begining and we have moved
+  if (is_initialized_vio && updaterZUPT != nullptr && (!params.zupt_only_at_beginning || !has_moved_since_zupt)) {
+    updaterZUPT->feed_imu(message, oldest_time);
+  }
+}
+
+
+#ifdef OUTOFDATE
 void VioManager::feed_measurement_imu(const ov_core::ImuData &message) {
 
     // The oldest time we need IMU with is the last clone
@@ -184,6 +213,7 @@ void VioManager::feed_measurement_imu(const ov_core::ImuData &message) {
         updaterZUPT->feed_imu(message, oldest_time);
     }
 }
+#endif
 
 void VioManager::feed_measurement_simulation(double timestamp, const std::vector<int> &camids,
                                              const std::vector<std::vector<std::pair<size_t, Eigen::VectorXf>>> &feats) {

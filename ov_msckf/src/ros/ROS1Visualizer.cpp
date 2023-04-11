@@ -404,8 +404,7 @@ void ROS1Visualizer::callback_inertial(const sensor_msgs::Imu::ConstPtr &msg) {
         auto params = _app->get_params();
         size_t num_unique_cameras = (params.state_options.num_cameras == 2) ? 1 : params.state_options.num_cameras;
         if (unique_cam_ids.size() == num_unique_cameras) {
-
-            // Loop through our queue and see if we are able to process any of our camera measurements
+        	// Loop through our queue and see if we are able to process any of our camera measurements
             // We are able to process if we have at least one IMU measurement greater than the camera time
             double timestamp_imu_inC = message.timestamp - _app->get_state()->_calib_dt_CAMtoIMU->value()(0);
             while (!camera_queue.empty() && camera_queue.at(0).timestamp < timestamp_imu_inC) {
@@ -416,7 +415,7 @@ void ROS1Visualizer::callback_inertial(const sensor_msgs::Imu::ConstPtr &msg) {
                 camera_queue.pop_front();
                 auto rT0_2 = boost::posix_time::microsec_clock::local_time();
                 double time_total = (rT0_2 - rT0_1).total_microseconds() * 1e-6;
-                PRINT_INFO(BLUE "[TIME]: %.4f seconds total (%.1f hz, %.2f ms behind)\n" RESET, time_total, 1.0 / time_total, update_dt);
+                printf("[TIME]: %.4f seconds total (%.1f hz, %.2f ms behind)\n"  time_total, 1.0 / time_total, update_dt);
             }
         }
         thread_update_running = false;

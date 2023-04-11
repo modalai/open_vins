@@ -224,6 +224,7 @@ struct VioManagerOptions {
                 if (i == 0) {
                     parser->parse_external("relative_config_imucam", "cam" + std::to_string(i), "timeshift_cam_imu", calib_camimu_dt,
                                            false);
+//		    printf("calib_camimu_dt: %f\n", calib_camimu_dt);
                 }
 
                 // Distortion model
