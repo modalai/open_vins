@@ -439,13 +439,19 @@ std::vector<output_feature> VioManager::get_pixel_loc_features() {
     std::vector<Eigen::Vector3d> good_features_MSCKF_clone(good_features_MSCKF);
     std::vector<size_t> slam_ids;
 
+    std::vector<std::shared_ptr<ov_type::Type>> statevars;
+
     for (const auto &feat : state->_features_SLAM) {
         slam_ids.push_back(feat.second->_featid);
+    	statevars.push_back(feat.second);
     }
+
+    Eigen::MatrixXd feat_cov = StateHelper::get_marginal_covariance(state, statevars);
+
     std::vector<Eigen::Vector3d> slam_feats_clone = get_features_SLAM();
 
     // get our full covariance matrix here
-    Eigen::MatrixXd cov = StateHelper::get_full_covariance(state);
+    //Eigen::MatrixXd cov = StateHelper::get_full_covariance(state);
 
     std::vector<std::shared_ptr<Feature>> feats_to_draw;
     feats_to_draw =  trackDATABASE->features_containing(state->_timestamp);
@@ -496,6 +502,10 @@ std::vector<output_feature> VioManager::get_pixel_loc_features() {
             of.tsf[0] = slam_feats_clone[index](0);
             of.tsf[1] = slam_feats_clone[index](1);
             of.tsf[2] = slam_feats_clone[index](2);
+            double cov_val = feat_cov(index);
+            if (cov_val > 0)
+            	of.depth_error_stddev = sqrt(cov_val);
+
             // as of now, only the slam features have a recoverable covariance
             // TODO fix this call, causing malloc issues
             // Eigen::MatrixXf::Map(reinterpret_cast<float*>(of.p_tsf), 3, 3) = cov.block(0, state->_features_SLAM.at(feats_to_draw[i]->featid)->id(), state->_features_SLAM.at(feats_to_draw[i]->featid)->size(), state->_features_SLAM.at(feats_to_draw[i]->featid)->size()).cast<float>();
@@ -525,7 +535,7 @@ std::vector<output_feature> VioManager::get_pixel_loc_features() {
                 Eigen::Vector4d uvd = Eigen::Vector4d::Zero();
                 uvd = active_tracks_uvd.at(feats_to_draw[i]->featid);
                 of.depth = uvd(2); // (u,v,depth, error)
-                of.depth_error_stddev = uvd(3);
+                //of.depth_error_stddev = uvd(3);
             }
         }
 

@@ -234,6 +234,10 @@ void UpdaterSLAM::delayed_init(std::shared_ptr<State> state, std::vector<std::sh
             ((int)feat.featid < state->_options.max_aruco_features) ? _options_aruco.chi2_multipler : _options_slam.chi2_multipler;
         if (StateHelper::initialize(state, landmark, Hx_order, H_x, H_f, R, res, chi2_multipler)) {
             state->_features_SLAM.insert({(*it2)->featid, landmark});
+
+            Eigen::Matrix<double, 3, 1> lm = landmark->get_xyz(false);
+            PRINT_DEBUG(BLUE "Insert SLAM (%d) feature: %f %f %f\n" RESET,  landmark->_featid, lm(0,0),  lm(1,0), lm(2,0));
+
             (*it2)->to_delete = true;
             it2++;
         } else {
@@ -242,9 +246,11 @@ void UpdaterSLAM::delayed_init(std::shared_ptr<State> state, std::vector<std::sh
             // fprintf(stderr, "FAILED INIT AGAIN\n");
         }
     }
+
+
     rT3 = boost::posix_time::microsec_clock::local_time();
 
-    // fprintf(stderr, "ADDED %d FEATS\n", feature_vec.size());
+    PRINT_DEBUG("ADDED %d FEATS (%d)\n", feature_vec.size(), state->_features_SLAM.size());
 
     // Debug print timing information
     if (!feature_vec.empty()) {
@@ -419,11 +425,16 @@ void UpdaterSLAM::update(std::shared_ptr<State> state, std::vector<std::shared_p
                 PRINT_WARNING(YELLOW "[SLAM-UP]: rejecting aruco tag %d for chi2 thresh (%.3f > %.3f)\n" RESET, (int)feat.featid, chi2,
                               chi2_multipler * chi2_check);
             } else {
-                // fprintf(stderr, "SELECTING LANDMARK FOR MARG WITH CHI2 OF %f vs %f\n", chi2, chi2_check * chi2_multipler);
+                PRINT_DEBUG("SELECTING LANDMARK FOR MARG WITH CHI2 OF %f vs %f (%f %f)\n", chi2,
+                		chi2_check * chi2_multipler, chi2_check, chi2_multipler);
                 landmark->should_marg = true;
+                PRINT_DEBUG("SLAM update remove feature: %d\n", landmark->_featid);
+
             }
             (*it2)->to_delete = true;
             it2 = feature_vec.erase(it2);
+            PRINT_DEBUG("feature_vec.erase %d\n", landmark->_featid);
+
             continue;
         }
 
@@ -485,6 +496,7 @@ void UpdaterSLAM::update(std::shared_ptr<State> state, std::vector<std::shared_p
     PRINT_DEBUG("[SLAM-UP]: %.4f seconds to update (%d feats of %d size)\n", (rT3 - rT2).total_microseconds() * 1e-6,
                 (int)feature_vec.size(), (int)Hx_big.rows());
     PRINT_DEBUG("[SLAM-UP]: %.4f seconds total\n", (rT3 - rT1).total_microseconds() * 1e-6);
+    PRINT_DEBUG("DBs: %d vs %d\n", feature_vec.size(), state->_features_SLAM.size());
 }
 
 void UpdaterSLAM::change_anchors(std::shared_ptr<State> state) {

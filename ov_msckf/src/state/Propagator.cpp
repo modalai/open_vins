@@ -219,7 +219,7 @@ bool Propagator::fast_state_propagate(std::shared_ptr<State> state, double times
     }
     if (prop_data.size() < 2)
     {
-    	//printf("fast_state_propagate: no IMU readings: %f <--> %f (%d) \n", time0, time1, prop_data.size());
+    	printf("fast_state_propagate: no IMU readings: %f <--> %f (%d) \n", time0, time1, prop_data.size());
         return false;
     }
 

@@ -407,18 +407,14 @@ void VioManager::feed_measurement_processed_camera(const ov_core::ProcessedCamer
 
 Eigen::MatrixXd VioManager::get_feature_covariances(){
 
-    Eigen::MatrixXd cov = StateHelper::get_full_covariance(state);
-    Eigen::MatrixXd feat_cov;
+    if (state->_features_SLAM.empty()) 
+	return StateHelper::get_full_covariance(state);
 
-    if (state->_features_SLAM.empty()) return cov;
-
-    int feat_cov_index = 0;
-    for (auto &f : state->_features_SLAM) {
-        int id = f.second->id();
-        // block into the feat_cov matrix
-        // feat_cov.at() = cov.block(0, id, f.second->size(), f.second->size());
+    std::vector<std::shared_ptr<ov_type::Type>> statevars;
+    for (std::pair<const size_t, std::shared_ptr<Landmark>> &landmark : state->_features_SLAM) {
+		statevars.push_back(landmark.second);
     }
-
+    Eigen::MatrixXd feat_cov = StateHelper::get_marginal_covariance(state, statevars);
     return feat_cov;
 }
 
@@ -586,7 +582,7 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
             std::find(message.sensor_ids.begin(), message.sensor_ids.end(), landmark.second->_unique_camera_id) != message.sensor_ids.end();
         if (feat2 == nullptr && current_unique_cam) {
             landmark.second->should_marg = true;
-            // fprintf(stderr, "marginalizing feat id %d\n", landmark.second->_featid);
+            PRINT_DEBUG(BLUE "VIOMANAGER marginalizing feat id %d\n" RESET, landmark.second->_featid);
         }
     }
 
