@@ -321,7 +321,7 @@ struct VioManagerOptions {
     // TRACKERS ===============================
 
     /// If we should process two cameras are being stereo or binocular. If binocular, we do monocular feature tracking on each image.
-    bool use_stereo = true;
+    bool use_stereo = false;
 
     /// If we should use KLT tracking, or descriptor matcher
     bool use_klt = true;
@@ -336,7 +336,7 @@ struct VioManagerOptions {
     bool downsample_cameras = false;
 
     /// Threads our front-end should try to use (opencv uses this also)
-    int num_opencv_threads = 4;
+    int num_opencv_threads = 6;
 
     /// If our ROS image publisher should be async (if sim this should be no!)
     bool use_multi_threading_pubs = true;
@@ -345,7 +345,7 @@ struct VioManagerOptions {
     bool use_multi_threading_subs = true;
 
     /// The number of points we should extract and track in *each* image frame. This highly effects the computation required for tracking.
-    int num_pts = 40;
+    int num_pts = 45;
 
     /// Fast extraction threshold
     int fast_threshold = 20;
@@ -357,7 +357,7 @@ struct VioManagerOptions {
     int grid_y = 5;
 
     /// Will check after doing KLT track and remove any features closer than this
-    int min_px_dist = 10;
+    int min_px_dist = 5; //10
 
     /// What type of pre-processing histogram method should be applied to images
     ov_core::TrackBase::HistogramMethod histogram_method = ov_core::TrackBase::HistogramMethod::NONE;
@@ -366,7 +366,7 @@ struct VioManagerOptions {
     double knn_ratio = 0.85;
 
     /// Frequency we want to track images at (higher freq ones will be dropped)
-    double track_frequency = 20.0;
+    double track_frequency = 12.0;  //20
 
     /// Parameters used by our feature initialize / triangulator
     ov_core::FeatureInitializerOptions featinit_options;

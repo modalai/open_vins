@@ -257,10 +257,11 @@ void UpdaterSLAM::delayed_init(std::shared_ptr<State> state, std::vector<std::sh
 }
 
 void UpdaterSLAM::update(std::shared_ptr<State> state, std::vector<std::shared_ptr<Feature>> &feature_vec) {
-
     // Return if no features
     if (feature_vec.empty())
+    {
         return;
+    }
 
     // Start timing
     boost::posix_time::ptime rT0, rT1, rT2, rT3;
@@ -420,12 +421,20 @@ void UpdaterSLAM::update(std::shared_ptr<State> state, std::vector<std::shared_p
                               chi2_multipler * chi2_check);
             } else {
                 // fprintf(stderr, "SELECTING LANDMARK FOR MARG WITH CHI2 OF %f vs %f\n", chi2, chi2_check * chi2_multipler);
-                landmark->should_marg = true;
+//                landmark->should_marg = true;
+                landmark->update_fail_count++;
             }
             (*it2)->to_delete = true;
+
+            //fprintf(stderr, "REMOVE %d %f %f %f %f\n", (*it2)->featid, chi2, chi2_check,  chi2_multipler, chi2_multipler * chi2_check);
+
             it2 = feature_vec.erase(it2);
+
             continue;
         }
+
+
+        //fprintf(stderr, "%d %f %f %f %f\n", (*it2)->featid, chi2, chi2_check,  chi2_multipler, chi2_multipler * chi2_check);
 
         // Debug print when we are going to update the aruco tags
         if ((int)feat.featid < state->_options.max_aruco_features) {

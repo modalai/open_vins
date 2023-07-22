@@ -422,6 +422,367 @@ Eigen::MatrixXd VioManager::get_feature_covariances(){
     return feat_cov;
 }
 
+
+void VioManager::do_feature_propagate_update(const ov_core::CameraData &message) {
+
+  //===================================================================================
+  // State propagation, and clone augmentation
+  //===================================================================================
+
+  // Return if the camera measurement is out of order
+  if (state->_timestamp > message.timestamp) {
+    PRINT_WARNING(YELLOW "image received out of order, unable to do anything (prop dt = %3f)\n" RESET,
+                  (message.timestamp - state->_timestamp));
+    return;
+  }
+
+  // Propagate the state forward to the current update time
+  // Also augment it with a new clone!
+  // NOTE: if the state is already at the given time (can happen in sim)
+  // NOTE: then no need to prop since we already are at the desired timestep
+  if (state->_timestamp != message.timestamp) {
+    propagator->propagate_and_clone(state, message.timestamp);
+  }
+  rT3 = boost::posix_time::microsec_clock::local_time();
+
+  // If we have not reached max clones, we should just return...
+  // This isn't super ideal, but it keeps the logic after this easier...
+  // We can start processing things when we have at least 5 clones since we can start triangulating things...
+  if ((int)state->_clones_IMU.size() < std::min(state->_options.max_clone_size, 5)) {
+    PRINT_DEBUG("waiting for enough clone states (%d of %d)....\n", (int)state->_clones_IMU.size(),
+                std::min(state->_options.max_clone_size, 5));
+    return;
+  }
+
+  // Return if we where unable to propagate
+  if (state->_timestamp != message.timestamp) {
+    PRINT_WARNING(RED "[PROP]: Propagator unable to propagate the state forward in time!\n" RESET);
+    PRINT_WARNING(RED "[PROP]: It has been %.3f since last time we propagated\n" RESET, message.timestamp - state->_timestamp);
+    return;
+  }
+  has_moved_since_zupt = true;
+
+  //===================================================================================
+  // MSCKF features and KLT tracks that are SLAM features
+  //===================================================================================
+
+  // Now, lets get all features that should be used for an update that are lost in the newest frame
+  // We explicitly request features that have not been deleted (used) in another update step
+  std::vector<std::shared_ptr<Feature>> feats_lost, feats_marg, feats_slam;
+  feats_lost = trackFEATS->get_feature_database()->features_not_containing_newer(state->_timestamp, false, true);
+
+  // Don't need to get the oldest features until we reach our max number of clones
+  if ((int)state->_clones_IMU.size() > state->_options.max_clone_size || (int)state->_clones_IMU.size() > 5) {
+    feats_marg = trackFEATS->get_feature_database()->features_containing(state->margtimestep(), false, true);
+    if (trackARUCO != nullptr && message.timestamp - startup_time >= params.dt_slam_delay) {
+      feats_slam = trackARUCO->get_feature_database()->features_containing(state->margtimestep(), false, true);
+    }
+  }
+
+  // Remove any lost features that were from other image streams
+  // E.g: if we are cam1 and cam0 has not processed yet, we don't want to try to use those in the update yet
+  // E.g: thus we wait until cam0 process its newest image to remove features which were seen from that camera
+  auto it1 = feats_lost.begin();
+  while (it1 != feats_lost.end()) {
+    bool found_current_message_camid = false;
+    for (const auto &camuvpair : (*it1)->uvs) {
+      if (std::find(message.sensor_ids.begin(), message.sensor_ids.end(), camuvpair.first) != message.sensor_ids.end()) {
+        found_current_message_camid = true;
+        break;
+      }
+    }
+    if (found_current_message_camid) {
+      it1++;
+    } else {
+      it1 = feats_lost.erase(it1);
+    }
+  }
+
+  // We also need to make sure that the max tracks does not contain any lost features
+  // This could happen if the feature was lost in the last frame, but has a measurement at the marg timestep
+  it1 = feats_lost.begin();
+  while (it1 != feats_lost.end()) {
+    if (std::find(feats_marg.begin(), feats_marg.end(), (*it1)) != feats_marg.end()) {
+      // PRINT_WARNING(YELLOW "FOUND FEATURE THAT WAS IN BOTH feats_lost and feats_marg!!!!!!\n" RESET);
+      it1 = feats_lost.erase(it1);
+    } else {
+      it1++;
+    }
+  }
+
+  // Find tracks that have reached max length, these can be made into SLAM features
+  std::vector<std::shared_ptr<Feature>> feats_maxtracks;
+  auto it2 = feats_marg.begin();
+  while (it2 != feats_marg.end()) {
+    // See if any of our camera's reached max track
+    bool reached_max = false;
+    for (const auto &cams : (*it2)->timestamps) {
+      if ((int)cams.second.size() > state->_options.max_clone_size) {
+        reached_max = true;
+        break;
+      }
+    }
+    // If max track, then add it to our possible slam feature list
+    if (reached_max) {
+      feats_maxtracks.push_back(*it2);
+      it2 = feats_marg.erase(it2);
+    } else {
+      it2++;
+    }
+  }
+
+  // Count how many aruco tags we have in our state
+  int curr_aruco_tags = 0;
+  auto it0 = state->_features_SLAM.begin();
+  while (it0 != state->_features_SLAM.end()) {
+    if ((int)(*it0).second->_featid <= 4 * state->_options.max_aruco_features)
+      curr_aruco_tags++;
+    it0++;
+  }
+
+  // Append a new SLAM feature if we have the room to do so
+  // Also check that we have waited our delay amount (normally prevents bad first set of slam points)
+  if (state->_options.max_slam_features > 0 && message.timestamp - startup_time >= params.dt_slam_delay &&
+      (int)state->_features_SLAM.size() < state->_options.max_slam_features + curr_aruco_tags) {
+    // Get the total amount to add, then the max amount that we can add given our marginalize feature array
+    int amount_to_add = (state->_options.max_slam_features + curr_aruco_tags) - (int)state->_features_SLAM.size();
+    int valid_amount = (amount_to_add > (int)feats_maxtracks.size()) ? (int)feats_maxtracks.size() : amount_to_add;
+    // If we have at least 1 that we can add, lets add it!
+    // Note: we remove them from the feat_marg array since we don't want to reuse information...
+    if (valid_amount > 0) {
+      feats_slam.insert(feats_slam.end(), feats_maxtracks.end() - valid_amount, feats_maxtracks.end());
+      feats_maxtracks.erase(feats_maxtracks.end() - valid_amount, feats_maxtracks.end());
+    }
+  }
+
+  // Loop through current SLAM features, we have tracks of them, grab them for this update!
+  // NOTE: if we have a slam feature that has lost tracking, then we should marginalize it out
+  // NOTE: we only enforce this if the current camera message is where the feature was seen from
+  // NOTE: if you do not use FEJ, these types of slam features *degrade* the estimator performance....
+  // NOTE: we will also marginalize SLAM features if they have failed their update a couple times in a row
+  for (std::pair<const size_t, std::shared_ptr<Landmark>> &landmark : state->_features_SLAM) {
+    if (trackARUCO != nullptr) {
+      std::shared_ptr<Feature> feat1 = trackARUCO->get_feature_database()->get_feature(landmark.second->_featid);
+      if (feat1 != nullptr)
+        feats_slam.push_back(feat1);
+    }
+    std::shared_ptr<Feature> feat2 = trackFEATS->get_feature_database()->get_feature(landmark.second->_featid);
+    if (feat2 != nullptr)
+      feats_slam.push_back(feat2);
+    assert(landmark.second->_unique_camera_id != -1);
+    bool current_unique_cam =
+        std::find(message.sensor_ids.begin(), message.sensor_ids.end(), landmark.second->_unique_camera_id) != message.sensor_ids.end();
+    if (feat2 == nullptr && current_unique_cam)
+      landmark.second->should_marg = true;
+    if (landmark.second->update_fail_count > 1)
+      landmark.second->should_marg = true;
+  }
+
+  // Lets marginalize out all old SLAM features here
+  // These are ones that where not successfully tracked into the current frame
+  // We do *NOT* marginalize out our aruco tags landmarks
+  StateHelper::marginalize_slam(state);
+
+  // Separate our SLAM features into new ones, and old ones
+  std::vector<std::shared_ptr<Feature>> feats_slam_DELAYED, feats_slam_UPDATE;
+  for (size_t i = 0; i < feats_slam.size(); i++) {
+    if (state->_features_SLAM.find(feats_slam.at(i)->featid) != state->_features_SLAM.end()) {
+      feats_slam_UPDATE.push_back(feats_slam.at(i));
+      // PRINT_DEBUG("[UPDATE-SLAM]: found old feature %d (%d
+      // measurements)\n",(int)feats_slam.at(i)->featid,(int)feats_slam.at(i)->timestamps_left.size());
+    } else {
+      feats_slam_DELAYED.push_back(feats_slam.at(i));
+      // PRINT_DEBUG("[UPDATE-SLAM]: new feature ready %d (%d
+      // measurements)\n",(int)feats_slam.at(i)->featid,(int)feats_slam.at(i)->timestamps_left.size());
+    }
+  }
+
+  // Concatenate our MSCKF feature arrays (i.e., ones not being used for slam updates)
+  std::vector<std::shared_ptr<Feature>> featsup_MSCKF = feats_lost;
+  featsup_MSCKF.insert(featsup_MSCKF.end(), feats_marg.begin(), feats_marg.end());
+  featsup_MSCKF.insert(featsup_MSCKF.end(), feats_maxtracks.begin(), feats_maxtracks.end());
+
+  //===================================================================================
+  // Now that we have a list of features, lets do the EKF update for MSCKF and SLAM!
+  //===================================================================================
+
+  // Sort based on track length
+  // TODO: we should have better selection logic here (i.e. even feature distribution in the FOV etc..)
+  // TODO: right now features that are "lost" are at the front of this vector, while ones at the end are long-tracks
+  auto compare_feat = [](const std::shared_ptr<Feature> &a, const std::shared_ptr<Feature> &b) -> bool {
+    size_t asize = 0;
+    size_t bsize = 0;
+    for (const auto &pair : a->timestamps)
+      asize += pair.second.size();
+    for (const auto &pair : b->timestamps)
+      bsize += pair.second.size();
+    return asize < bsize;
+  };
+  std::sort(featsup_MSCKF.begin(), featsup_MSCKF.end(), compare_feat);
+
+  // Pass them to our MSCKF updater
+  // NOTE: if we have more then the max, we select the "best" ones (i.e. max tracks) for this update
+  // NOTE: this should only really be used if you want to track a lot of features, or have limited computational resources
+  if ((int)featsup_MSCKF.size() > state->_options.max_msckf_in_update)
+    featsup_MSCKF.erase(featsup_MSCKF.begin(), featsup_MSCKF.end() - state->_options.max_msckf_in_update);
+  updaterMSCKF->update(state, featsup_MSCKF);
+  rT4 = boost::posix_time::microsec_clock::local_time();
+
+  // Perform SLAM delay init and update
+  // NOTE: that we provide the option here to do a *sequential* update
+  // NOTE: this will be a lot faster but won't be as accurate.
+  std::vector<std::shared_ptr<Feature>> feats_slam_UPDATE_TEMP;
+  while (!feats_slam_UPDATE.empty()) {
+    // Get sub vector of the features we will update with
+    std::vector<std::shared_ptr<Feature>> featsup_TEMP;
+    featsup_TEMP.insert(featsup_TEMP.begin(), feats_slam_UPDATE.begin(),
+                        feats_slam_UPDATE.begin() + std::min(state->_options.max_slam_in_update, (int)feats_slam_UPDATE.size()));
+    feats_slam_UPDATE.erase(feats_slam_UPDATE.begin(),
+                            feats_slam_UPDATE.begin() + std::min(state->_options.max_slam_in_update, (int)feats_slam_UPDATE.size()));
+    // Do the update
+    updaterSLAM->update(state, featsup_TEMP);
+    feats_slam_UPDATE_TEMP.insert(feats_slam_UPDATE_TEMP.end(), featsup_TEMP.begin(), featsup_TEMP.end());
+  }
+  feats_slam_UPDATE = feats_slam_UPDATE_TEMP;
+  rT5 = boost::posix_time::microsec_clock::local_time();
+  updaterSLAM->delayed_init(state, feats_slam_DELAYED);
+  rT6 = boost::posix_time::microsec_clock::local_time();
+
+  //===================================================================================
+  // Update our visualization feature set, and clean up the old features
+  //===================================================================================
+
+  // Re-triangulate all current tracks in the current frame
+  if (message.sensor_ids.at(0) == 0) {
+
+    // Re-triangulate features
+    retriangulate_active_tracks(message);
+
+    // Clear the MSCKF features only on the base camera
+    // Thus we should be able to visualize the other unique camera stream
+    // MSCKF features as they will also be appended to the vector
+    good_features_MSCKF.clear();
+  }
+
+  // Save all the MSCKF features used in the update
+  for (auto const &feat : featsup_MSCKF) {
+    good_features_MSCKF.push_back(feat->p_FinG);
+    feat->to_delete = true;
+  }
+
+  //===================================================================================
+  // Cleanup, marginalize out what we don't need any more...
+  //===================================================================================
+
+  // Remove features that where used for the update from our extractors at the last timestep
+  // This allows for measurements to be used in the future if they failed to be used this time
+  // Note we need to do this before we feed a new image, as we want all new measurements to NOT be deleted
+  trackFEATS->get_feature_database()->cleanup();
+  if (trackARUCO != nullptr) {
+    trackARUCO->get_feature_database()->cleanup();
+  }
+
+  // First do anchor change if we are about to lose an anchor pose
+  updaterSLAM->change_anchors(state);
+
+  // Cleanup any features older than the marginalization time
+  if ((int)state->_clones_IMU.size() > state->_options.max_clone_size) {
+    trackFEATS->get_feature_database()->cleanup_measurements(state->margtimestep());
+    if (trackARUCO != nullptr) {
+      trackARUCO->get_feature_database()->cleanup_measurements(state->margtimestep());
+    }
+  }
+
+  // Finally marginalize the oldest clone if needed
+  StateHelper::marginalize_old_clone(state);
+  rT7 = boost::posix_time::microsec_clock::local_time();
+
+  //===================================================================================
+  // Debug info, and stats tracking
+  //===================================================================================
+
+  // Get timing statitics information
+  double time_track = (rT2 - rT1).total_microseconds() * 1e-6;
+  double time_prop = (rT3 - rT2).total_microseconds() * 1e-6;
+  double time_msckf = (rT4 - rT3).total_microseconds() * 1e-6;
+  double time_slam_update = (rT5 - rT4).total_microseconds() * 1e-6;
+  double time_slam_delay = (rT6 - rT5).total_microseconds() * 1e-6;
+  double time_marg = (rT7 - rT6).total_microseconds() * 1e-6;
+  double time_total = (rT7 - rT1).total_microseconds() * 1e-6;
+
+  // Timing information
+  PRINT_DEBUG(BLUE "[TIME]: %.4f seconds for tracking\n" RESET, time_track);
+  PRINT_DEBUG(BLUE "[TIME]: %.4f seconds for propagation\n" RESET, time_prop);
+  PRINT_DEBUG(BLUE "[TIME]: %.4f seconds for MSCKF update (%d feats)\n" RESET, time_msckf, (int)featsup_MSCKF.size());
+  if (state->_options.max_slam_features > 0) {
+    PRINT_DEBUG(BLUE "[TIME]: %.4f seconds for SLAM update (%d feats)\n" RESET, time_slam_update, (int)state->_features_SLAM.size());
+    PRINT_DEBUG(BLUE "[TIME]: %.4f seconds for SLAM delayed init (%d feats)\n" RESET, time_slam_delay, (int)feats_slam_DELAYED.size());
+  }
+  PRINT_DEBUG(BLUE "[TIME]: %.4f seconds for re-tri & marg (%d clones in state)\n" RESET, time_marg, (int)state->_clones_IMU.size());
+
+  std::stringstream ss;
+  ss << "[TIME]: " << std::setprecision(4) << time_total << " seconds for total (camera";
+  for (const auto &id : message.sensor_ids) {
+    ss << " " << id;
+  }
+  ss << ")" << std::endl;
+  PRINT_DEBUG(BLUE "%s" RESET, ss.str().c_str());
+
+  // Finally if we are saving stats to file, lets save it to file
+  if (params.record_timing_information && of_statistics.is_open()) {
+    // We want to publish in the IMU clock frame
+    // The timestamp in the state will be the last camera time
+    double t_ItoC = state->_calib_dt_CAMtoIMU->value()(0);
+    double timestamp_inI = state->_timestamp + t_ItoC;
+    // Append to the file
+    of_statistics << std::fixed << std::setprecision(15) << timestamp_inI << "," << std::fixed << std::setprecision(5) << time_track << ","
+                  << time_prop << "," << time_msckf << ",";
+    if (state->_options.max_slam_features > 0) {
+      of_statistics << time_slam_update << "," << time_slam_delay << ",";
+    }
+    of_statistics << time_marg << "," << time_total << std::endl;
+    of_statistics.flush();
+  }
+
+  // Update our distance traveled
+  if (timelastupdate != -1 && state->_clones_IMU.find(timelastupdate) != state->_clones_IMU.end()) {
+    Eigen::Matrix<double, 3, 1> dx = state->_imu->pos() - state->_clones_IMU.at(timelastupdate)->pos();
+    distance += dx.norm();
+  }
+  timelastupdate = message.timestamp;
+
+  // Debug, print our current state
+  PRINT_INFO("q_GtoI = %.3f,%.3f,%.3f,%.3f | p_IinG = %.3f,%.3f,%.3f | dist = %.2f (meters)\n", state->_imu->quat()(0),
+             state->_imu->quat()(1), state->_imu->quat()(2), state->_imu->quat()(3), state->_imu->pos()(0), state->_imu->pos()(1),
+             state->_imu->pos()(2), distance);
+  PRINT_INFO("bg = %.4f,%.4f,%.4f | ba = %.4f,%.4f,%.4f\n", state->_imu->bias_g()(0), state->_imu->bias_g()(1), state->_imu->bias_g()(2),
+             state->_imu->bias_a()(0), state->_imu->bias_a()(1), state->_imu->bias_a()(2));
+
+  // Debug for camera imu offset
+  if (state->_options.do_calib_camera_timeoffset) {
+    PRINT_INFO("camera-imu timeoffset = %.5f\n", state->_calib_dt_CAMtoIMU->value()(0));
+  }
+
+  // Debug for camera intrinsics
+  if (state->_options.do_calib_camera_intrinsics) {
+    for (int i = 0; i < state->_options.num_cameras; i++) {
+      std::shared_ptr<Vec> calib = state->_cam_intrinsics.at(i);
+      PRINT_INFO("cam%d intrinsics = %.3f,%.3f,%.3f,%.3f | %.3f,%.3f,%.3f,%.3f\n", (int)i, calib->value()(0), calib->value()(1),
+                 calib->value()(2), calib->value()(3), calib->value()(4), calib->value()(5), calib->value()(6), calib->value()(7));
+    }
+  }
+
+  // Debug for camera extrinsics
+  if (state->_options.do_calib_camera_pose) {
+    for (int i = 0; i < state->_options.num_cameras; i++) {
+      std::shared_ptr<PoseJPL> calib = state->_calib_IMUtoCAM.at(i);
+      PRINT_INFO("cam%d extrinsics = %.3f,%.3f,%.3f,%.3f | %.3f,%.3f,%.3f\n", (int)i, calib->quat()(0), calib->quat()(1), calib->quat()(2),
+                 calib->quat()(3), calib->pos()(0), calib->pos()(1), calib->pos()(2));
+    }
+  }
+}
+
+#ifdef NOT_USED
 void VioManager::do_feature_propagate_update(const ov_core::CameraData &message) {
     //===================================================================================
     // State propagation, and clone augmentation
@@ -826,3 +1187,4 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
         }
     }
 }
+#endif

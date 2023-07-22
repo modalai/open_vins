@@ -65,6 +65,9 @@ class Landmark : public Vec {
 
     //
     bool was_lost = false;
+   
+    /// Number of times the update has failed for this feature (we should remove if it fails a couple times!)
+    int update_fail_count = 0;
 
     /// First normalized uv coordinate bearing of this measurement (used for single depth representation)
     Eigen::Vector3d uv_norm_zero;

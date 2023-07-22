@@ -574,6 +574,10 @@ void Propagator::predict_and_compute(std::shared_ptr<State> state, const ov_core
     else
         predict_mean_discrete(state, dt, w_hat, a_hat, w_hat2, a_hat2, new_q, new_v, new_p);
 
+//    printf("(%f %f %f) (%f %f %f)\n",
+//    		state->_imu->pos()(0),  state->_imu->pos()(1),  state->_imu->pos()(2),
+//    		state->_imu->vel()(0),  state->_imu->vel()(1),  state->_imu->vel()(2));
+
     // Get the locations of each entry of the imu state
     int th_id = state->_imu->q()->id() - state->_imu->id();
     int p_id = state->_imu->p()->id() - state->_imu->id();
@@ -660,6 +664,13 @@ void Propagator::predict_and_compute(std::shared_ptr<State> state, const ov_core
     imu_x.block(7, 0, 3, 1) = new_v;
     state->_imu->set_value(imu_x);
     state->_imu->set_fej(imu_x);
+
+    // This is Global FLU space
+//	printf("(%f %f %f %f) (%f %f %f) (%f %f %f)\n",
+//			new_q(0),  new_q(1),  new_q(2), new_q(3),
+//			new_p(0),  new_p(1),  new_p(2),
+//			new_v(0),  new_v(1),  new_v(2));
+
 }
 
 void Propagator::predict_mean_discrete(std::shared_ptr<State> state, double dt, const Eigen::Vector3d &w_hat1,
