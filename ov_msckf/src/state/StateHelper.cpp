@@ -177,7 +177,7 @@ void StateHelper::EKFUpdate(std::shared_ptr<State> state, const std::vector<std:
             state->error_flag = OV_STATE_FAILED;
         }
     }
-    // removing assertion TURI
+    // removing assertion MODALAI VOXL 
     // open vins should never kill itself, rather should report error status and let the user deal with it
     // assert_r(!found_neg);
 

@@ -324,6 +324,9 @@ void VioManager::track_image_and_update(const ov_core::CameraData &message_const
         if (state->_timestamp != message.timestamp) {
             did_zupt_update = updaterZUPT->try_update(state, message.timestamp);
         }
+
+        retriangulate_active_tracks(message);
+
         if (did_zupt_update) {
             return;
         }
@@ -688,6 +691,8 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
   // Cleanup any features older than the marginalization time
   if ((int)state->_clones_IMU.size() > state->_options.max_clone_size) {
     trackFEATS->get_feature_database()->cleanup_measurements(state->margtimestep());
+    trackDATABASE->cleanup_measurements(state->margtimestep());
+
     if (trackARUCO != nullptr) {
       trackARUCO->get_feature_database()->cleanup_measurements(state->margtimestep());
     }

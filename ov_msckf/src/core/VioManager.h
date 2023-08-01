@@ -114,6 +114,12 @@ class VioManager {
 
     bool initialized() { return is_initialized_vio; }
 
+    // throttle zero updater
+    bool is_moving() { return has_moved_since_zupt; }
+
+    //
+    void force_moving() { has_moved_since_zupt = true; }
+
     /// Get a nice visualization image of what tracks we have
     cv::Mat get_historical_viz_image();
 
