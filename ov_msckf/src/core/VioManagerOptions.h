@@ -217,6 +217,9 @@ struct VioManagerOptions {
             parser->parse_config("gravity_mag", gravity_mag);
             parser->parse_config("max_cameras", state_options.num_cameras); // might be redundant
             parser->parse_config("downsample_cameras", downsample_cameras); // might be redundant
+
+            printf("Number of Camera: %d\n" , state_options.num_cameras);
+
             for (int i = 0; i < state_options.num_cameras; i++) {
 
                 // Time offset (use the first one)

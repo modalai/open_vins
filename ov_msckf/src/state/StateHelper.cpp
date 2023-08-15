@@ -33,8 +33,11 @@ using namespace ov_core;
 using namespace ov_type;
 using namespace ov_msckf;
 
-void StateHelper::EKFPropagation(std::shared_ptr<State> state, const std::vector<std::shared_ptr<Type>> &order_NEW,
-                                 const std::vector<std::shared_ptr<Type>> &order_OLD, const Eigen::MatrixXd &Phi,
+void StateHelper::EKFPropagation(
+								std::shared_ptr<State> state,
+								const std::vector<std::shared_ptr<Type>> &order_NEW,
+                                 const std::vector<std::shared_ptr<Type>> &order_OLD,
+								 const Eigen::MatrixXd &Phi,
                                  const Eigen::MatrixXd &Q) {
 
     // We need at least one old and new variable
@@ -110,6 +113,87 @@ void StateHelper::EKFPropagation(std::shared_ptr<State> state, const std::vector
     }
     assert_r(!found_neg);
 }
+
+// VOXL
+// Add in altitude barometer constraint to the covariance
+void StateHelper::add_alt_constrain(std::shared_ptr<State> state, double z, double vel_z)
+{
+
+	if (z == -9999)
+		return;
+
+	// TODO eventually add get rate and use velocity
+
+	  // add constraints -- TODO: may need to perform before cloning
+	const int vel_id  = state->_imu->v()->id();
+
+	 // get position and calc residual
+	 Eigen::Matrix<double, 3, 1> pos_residual = state->_imu->pos();
+	 Eigen::Matrix<double, 3, 1> vel_residual = state->_imu->vel();
+	 Eigen::MatrixXd vel_cov = Eigen::MatrixXd::Zero(3, 3);
+	 vel_cov.block(0, 0, 3, 3) = state->_Cov.block(vel_id, vel_id,3,3);
+
+
+//	 std::cout << "P: " << pos_residual(2) << "\t(" << z << ") \t\tvel: " << vel_residual (2) <<  "\t(" << vel_z << ")" << std::endl;
+
+	 // update cov with residual
+
+	 double vz_res = (vel_residual(2) - vel_z);
+	 Eigen::MatrixXd res_vz_vec  = Eigen::MatrixXd::Zero(1, 1);
+	 res_vz_vec(0) = sqrt(vz_res * vz_res) * 0.1;
+	 vel_cov.block(2,2,1,1) += res_vz_vec;
+	 // don't allow negs
+	 Eigen::VectorXd diags = vel_cov.diagonal();
+	 for (int i = 0; i < diags.rows(); i++)
+	 {
+		 if (diags(i) < 0.0) {
+	            printf( "[BARO]: vel covariance with residual was negative! Skipping\n" );
+	            PRINT_WARNING(RED "[BARO]: vel covariance with residual was negative! Skipping\n" RESET);
+			 return;
+	     }
+	 }
+
+	 // looks good, constrain the EKF
+//	 state->_Cov.block(vel_id, vel_id,3,3) = vel_cov;
+
+#ifdef POS
+	const int pos_id  = state->_imu->p()->id();
+
+	 // get position and calc residual
+	 Eigen::Matrix<double, 3, 1> pos_residual = state->_imu->pos();
+	 Eigen::MatrixXd pos_cov = Eigen::MatrixXd::Zero(3, 3);
+	 pos_cov.block(0, 0, 3, 3) = state->_Cov.block(pos_id, pos_id,3,3);
+
+	 // update cov with residual
+
+	 double z_res = (pos_residual(2) - z);
+	 Eigen::MatrixXd res_z_vec  = Eigen::MatrixXd::Zero(1, 1);
+	 res_z_vec(0) = sqrt(z_res * z_res) * 0.1;
+	 pos_cov.block(2,2,1,1) += res_z_vec;
+
+//	 pos_residual(2) -= alt;
+//     pos_cov += pos_residual * pos_residual.transpose();
+
+//	 printf("[BARO]: IMU: %f Baro :%f Residual: %f\n",  state->_imu->p()->value()(2) , alt, pos_residual(2));
+//	 std::cout << "[BARO]: New COV: " <<  pos_cov << std::endl;
+
+	 // don't allow negs
+	 Eigen::VectorXd diags = pos_cov.diagonal();
+	 for (int i = 0; i < diags.rows(); i++)
+	 {
+		 if (diags(i) < 0.0) {
+	            printf( "[BARO]: covariance with residual was negative! Skipping\n" );
+	            PRINT_WARNING(RED "[BARO]: covariance with residual was negative! Skipping\n" RESET);
+			 return;
+	     }
+	 }
+
+	 // looks good, constrain the EKF
+	 state->_Cov.block(pos_id, pos_id,3,3) = pos_cov;
+#endif
+
+}
+
 
 void StateHelper::EKFUpdate(std::shared_ptr<State> state, const std::vector<std::shared_ptr<Type>> &H_order, const Eigen::MatrixXd &H,
                             const Eigen::VectorXd &res, const Eigen::MatrixXd &R) {
@@ -241,8 +325,10 @@ Eigen::MatrixXd StateHelper::get_marginal_covariance(std::shared_ptr<State> stat
     for (size_t i = 0; i < small_variables.size(); i++) {
         int k_index = 0;
         for (size_t k = 0; k < small_variables.size(); k++) {
-            Small_cov.block(i_index, k_index, small_variables[i]->size(), small_variables[k]->size()) = state->_Cov.block(
-                small_variables[i]->id(), small_variables[k]->id(), small_variables[i]->size(), small_variables[k]->size());
+            Small_cov.block(i_index, k_index, small_variables[i]->size(), small_variables[k]->size()) =
+					state->_Cov.block(small_variables[i]->id(), small_variables[k]->id(),
+														small_variables[i]->size(), small_variables[k]->size());
+
             k_index += small_variables[k]->size();
         }
         i_index += small_variables[i]->size();

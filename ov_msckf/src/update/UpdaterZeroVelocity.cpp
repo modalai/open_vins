@@ -246,6 +246,7 @@ bool UpdaterZeroVelocity::try_update(std::shared_ptr<State> state, double timest
     // This is because we will not clone at this timestep and instead do our zero velocity update
     // We want to keep the tracks from the previous timestep, thus only delete measurements from the current timestep
     if (last_zupt_state_timestamp > 0.0) {
+	//printf("DB cleanup feature measurements\n");
         _db->cleanup_measurements_exact(last_zupt_state_timestamp);
     }
 

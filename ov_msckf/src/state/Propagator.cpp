@@ -138,6 +138,7 @@ void Propagator::propagate_and_clone(std::shared_ptr<State> state, double timest
     // Get what our IMU-camera offset should be (t_imu = t_cam + calib_dt)
     double t_off_new = state->_calib_dt_CAMtoIMU->value()(0);
 
+
     // First lets construct an IMU vector of measurements we need
     double time0 = state->_timestamp + last_prop_time_offset;
     double time1 = timestamp + t_off_new;

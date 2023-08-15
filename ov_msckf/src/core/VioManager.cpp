@@ -432,6 +432,7 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
   // State propagation, and clone augmentation
   //===================================================================================
 
+
   // Return if the camera measurement is out of order
   if (state->_timestamp > message.timestamp) {
     PRINT_WARNING(YELLOW "image received out of order, unable to do anything (prop dt = %3f)\n" RESET,
@@ -447,6 +448,11 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
     propagator->propagate_and_clone(state, message.timestamp);
   }
   rT3 = boost::posix_time::microsec_clock::local_time();
+
+  // VOXL
+  // Baro constraint, it appears feature residuals are used in the EKF update call, so set IMU/position constraints beforehand
+  // It will be used in the next loop cycle when the state is propagated.
+  StateHelper::add_alt_constrain(state, alt_from_baro, vel_from_baro);
 
   // If we have not reached max clones, we should just return...
   // This isn't super ideal, but it keeps the logic after this easier...
@@ -642,6 +648,8 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
                         feats_slam_UPDATE.begin() + std::min(state->_options.max_slam_in_update, (int)feats_slam_UPDATE.size()));
     feats_slam_UPDATE.erase(feats_slam_UPDATE.begin(),
                             feats_slam_UPDATE.begin() + std::min(state->_options.max_slam_in_update, (int)feats_slam_UPDATE.size()));
+
+
     // Do the update
     updaterSLAM->update(state, featsup_TEMP);
     feats_slam_UPDATE_TEMP.insert(feats_slam_UPDATE_TEMP.end(), featsup_TEMP.begin(), featsup_TEMP.end());

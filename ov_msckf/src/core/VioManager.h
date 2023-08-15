@@ -135,6 +135,9 @@ class VioManager {
     /// Returns 3d features used in the last update in global frame
     std::vector<Eigen::Vector3d> get_good_features_MSCKF() { return good_features_MSCKF; }
 
+    /// Add Barometer Constraint
+    void  add_constraint_baro(double height, double vel_z) { alt_from_baro = height; vel_from_baro  = vel_z; }
+
     int DescriptorDistance(const cv::Mat &a, const cv::Mat &b);
     int pickup_lost_slam_feats(std::vector<std::shared_ptr<ov_core::Feature>> &new_feats);
 
@@ -262,6 +265,9 @@ class VioManager {
     // last index will store depth error
     std::unordered_map<size_t, Eigen::Vector4d> active_tracks_uvd;
     cv::Mat active_image;
+
+    double alt_from_baro = -9999;
+    double vel_from_baro = 0;
 };
 
 } // namespace ov_msckf
