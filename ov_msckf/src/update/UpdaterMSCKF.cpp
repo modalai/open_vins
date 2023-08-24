@@ -225,11 +225,11 @@ void UpdaterMSCKF::update(std::shared_ptr<State> state, std::vector<std::shared_
         if (chi2 > _options.chi2_multipler * chi2_check) {
             (*it2)->to_delete = true;
             it2 = feature_vec.erase(it2);
-            // PRINT_DEBUG("featid = %d\n", feat.featid);
-            // PRINT_DEBUG("chi2 = %f > %f\n", chi2, _options.chi2_multipler*chi2_check);
-            // std::stringstream ss;
-            // ss << "res = " << std::endl << res.transpose() << std::endl;
-            // PRINT_DEBUG(ss.str().c_str());
+//             printf("featid = %d\n", feat.featid);
+//             printf("chi2 = %f > %f\n", chi2, _options.chi2_multipler*chi2_check);
+//             std::stringstream ss;
+//             ss << "res = " << std::endl << res.transpose() << std::endl;
+//             printf(ss.str().c_str());
             continue;
         }
 
