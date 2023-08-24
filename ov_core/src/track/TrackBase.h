@@ -48,6 +48,10 @@ typedef enum feat_quality{
     OV_RE_HIGH
 } feat_quality;
 
+// WARNING :
+// TODO this is a copy of VOXL MPA pipe's vio_feature_t and is
+// assumed the same data size in a memcpy. If this changes it will break libmodalpipe.
+//
 typedef struct output_feature {
     uint32_t  id;               ///< unique ID for feature point
     int32_t cam_id;            ///< ID of camera which the point was seen from (typically first), -1 if unknown

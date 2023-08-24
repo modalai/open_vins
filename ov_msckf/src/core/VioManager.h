@@ -110,7 +110,8 @@ class VioManager {
     std::shared_ptr<Propagator> get_propagator() { return propagator; }
 
     // features
-    std::vector<output_feature> get_pixel_loc_features();
+    //std::vector<output_feature> get_pixel_loc_features();
+    int get_pixel_loc_features(std::vector<output_feature> &feats);
 
     bool initialized() { return is_initialized_vio; }
 

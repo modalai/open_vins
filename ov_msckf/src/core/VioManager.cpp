@@ -172,6 +172,19 @@ void VioManager::feed_measurement_imu(const ov_core::ImuData &message) {
   if (!is_initialized_vio) {
     oldest_time = message.timestamp - params.init_options.init_window_time + state->_calib_dt_CAMtoIMU->value()(0) - 0.10;
   }
+  // VOXL
+  else if (params.limit_imu_propagation)
+  {
+
+//	oldest_time = message.timestamp - (params.init_options.init_window_time * 0.5);
+	oldest_time = message.timestamp - 0.5;
+	if (oldest_time < 0.01)
+		oldest_time = 0.01;
+
+  }
+
+//  printf("propagator->feed_imu incoming %f vs oldest time %f\n", message.timestamp,  oldest_time);
+//  auto rT0 = boost::posix_time::microsec_clock::local_time();
   propagator->feed_imu(message, oldest_time);
 
   // Push back to our initializer

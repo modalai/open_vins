@@ -431,7 +431,10 @@ std::vector<Eigen::Vector3d> VioManager::get_features_SLAM() {
     return slam_feats;
 }
 
-std::vector<output_feature> VioManager::get_pixel_loc_features() {
+int VioManager::get_pixel_loc_features(std::vector<output_feature> &feats ) {
+
+	static int tmp_id = -1;
+	static double _last_dt = 0;
 
     // Build an id-list of our "in state" features
     // i.e. SLAM and last msckf update features
@@ -457,9 +460,17 @@ std::vector<output_feature> VioManager::get_pixel_loc_features() {
     feats_to_draw =  trackDATABASE->features_containing(state->_timestamp);
     // trackFEATS->get_feature_database()->features_containing_older(state->_timestamp, false, true);
 
-    std::vector<output_feature> feats(feats_to_draw.size());
+  	feats.clear();
+
     int feats_pushed = 0;
     feats.reserve(feats_to_draw.size());
+
+    double _dt = 0;
+    if (_last_dt != 0)
+    {
+    	_dt = state->_timestamp - _last_dt;
+    }
+    _last_dt =  state->_timestamp;
 
     // For each feature found in KLT, see if it was used in SLAM (DB). If so then it's a HIGH quality feature
     for (size_t i = 0; i < feats_to_draw.size(); i++) {
@@ -473,8 +484,9 @@ std::vector<output_feature> VioManager::get_pixel_loc_features() {
         of.id = feats_to_draw[i]->featid;
         if (feats_to_draw[i]->uvs.empty() || feats_to_draw[i]->uvs.at(of.cam_id).empty()) continue;
         Eigen::Vector2f pt_e = feats_to_draw[i]->uvs.at(of.cam_id).back();
-        of.pix_loc[0] = pt_e[0];
-        of.pix_loc[1] = pt_e[1];
+
+		of.pix_loc[0] = pt_e[0];
+		of.pix_loc[1] = pt_e[1];
 
         of.point_quality = OV_MEDIUM;
 
@@ -542,11 +554,13 @@ std::vector<output_feature> VioManager::get_pixel_loc_features() {
         }
 
         // special case: we are using feats for zupt state updates rather than msckf
-        if (!has_moved_since_zupt && did_zupt_update && of.point_quality == OV_LOW) of.point_quality = OV_MEDIUM;
+        if (!has_moved_since_zupt && did_zupt_update && of.point_quality == OV_LOW)
+        	of.point_quality = OV_MEDIUM;
+
         feats.push_back(of);
     }
 
-    return feats;
+    return feats.size();
 }
 
 int VioManager::pickup_lost_slam_feats(std::vector<std::shared_ptr<Feature>> &new_feats){

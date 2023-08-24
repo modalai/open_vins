@@ -140,7 +140,7 @@ void StateHelper::add_alt_constrain(std::shared_ptr<State> state, double z, doub
 
 	 double vz_res = (vel_residual(2) - vel_z);
 	 Eigen::MatrixXd res_vz_vec  = Eigen::MatrixXd::Zero(1, 1);
-	 res_vz_vec(0) = sqrt(vz_res * vz_res) * 0.1;
+	 res_vz_vec(0) = sqrt(vz_res * vz_res);
 	 vel_cov.block(2,2,1,1) += res_vz_vec;
 	 // don't allow negs
 	 Eigen::VectorXd diags = vel_cov.diagonal();

@@ -374,6 +374,9 @@ struct VioManagerOptions {
     /// Parameters used by our feature initialize / triangulator
     ov_core::FeatureInitializerOptions featinit_options;
 
+   /// VOXL
+    bool limit_imu_propagation = true;
+
     /**
      * @brief This function will load print out all parameters related to visual tracking
      * This allows for visual checking that everything was loaded properly from ROS/CMD parsers.
@@ -390,6 +393,10 @@ struct VioManagerOptions {
             parser->parse_config("num_opencv_threads", num_opencv_threads);
             parser->parse_config("multi_threading_pubs", use_multi_threading_pubs, false);
             parser->parse_config("multi_threading_subs", use_multi_threading_subs, false);
+
+            // VOXL
+            parser->parse_config("limit_imu_propagation", limit_imu_propagation, true);
+
             parser->parse_config("num_pts", num_pts);
             parser->parse_config("fast_threshold", fast_threshold);
             parser->parse_config("grid_x", grid_x);
@@ -429,6 +436,9 @@ struct VioManagerOptions {
         PRINT_DEBUG("  - hist method: %d\n", (int)histogram_method);
         PRINT_DEBUG("  - knn ratio: %.3f\n", knn_ratio);
         PRINT_DEBUG("  - track frequency: %.1f\n", track_frequency);
+        PRINT_DEBUG("  - limit imu propagation (windows based on init_imu+cam-imu delay): %d\n", limit_imu_propagation);
+
+
         featinit_options.print(parser);
     }
 
