@@ -684,6 +684,8 @@ void StateHelper::augment_clone(std::shared_ptr<State> state, Eigen::Matrix<doub
         std::exit(EXIT_FAILURE);
     }
 
+    PRINT_DEBUG("new augment clone at timestamp: %f\n",state->_timestamp);
+     
     // Append the new clone to our clone vector
     state->_clones_IMU[state->_timestamp] = pose;
 

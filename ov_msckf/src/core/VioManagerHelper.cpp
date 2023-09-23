@@ -190,6 +190,8 @@ bool VioManager::try_to_initialize(const ov_core::CameraData &message) {
     return false;
 }
 
+
+#ifdef WIP
 void VioManager::retriangulate_active_tracks(const ov_core::CameraData &message) {
     // Start timing
     boost::posix_time::ptime retri_rT1, retri_rT2, retri_rT3, retri_rT4, retri_rT5;
@@ -197,7 +199,6 @@ void VioManager::retriangulate_active_tracks(const ov_core::CameraData &message)
 
     // Clear old active track data
     active_tracks_time = state->_timestamp;
-    // active_image = message.images.at(0).clone();
     active_tracks_posinG.clear();
     active_tracks_uvd.clear();
 
@@ -376,6 +377,205 @@ void VioManager::retriangulate_active_tracks(const ov_core::CameraData &message)
     PRINT_DEBUG(CYAN "[RETRI-TIME]: %.4f seconds for triangulation\n" RESET, (retri_rT4 - retri_rT3).total_microseconds() * 1e-6);
     PRINT_DEBUG(CYAN "[RETRI-TIME]: %.4f seconds for re-projection\n" RESET, (retri_rT5 - retri_rT4).total_microseconds() * 1e-6);
     PRINT_DEBUG(CYAN "[RETRI-TIME]: %.4f seconds total\n" RESET, (retri_rT5 - retri_rT1).total_microseconds() * 1e-6);
+}
+#endif
+
+
+void VioManager::retriangulate_active_tracks(const ov_core::CameraData &message) {
+
+  // Start timing
+  boost::posix_time::ptime retri_rT1, retri_rT2, retri_rT3, retri_rT4, retri_rT5;
+  retri_rT1 = boost::posix_time::microsec_clock::local_time();
+
+  // Clear old active track data
+  active_tracks_time = state->_timestamp;
+  active_image = message.images.at(0).clone();
+  active_tracks_posinG.clear();
+  active_tracks_uvd.clear();
+
+  // Get all features which are tracked in the current frame
+  // NOTE: This database should have all features from all trackers already in it
+  // NOTE: it also has the complete history so we shouldn't see jumps from deleting measurements
+  std::vector<std::shared_ptr<Feature>> active_features = trackDATABASE->features_containing_older(state->_timestamp);
+
+
+  // 0. Get all timestamps our clones are at (and thus valid measurement times)
+  std::vector<double> clonetimes;
+  for (const auto &clone_imu : state->_clones_IMU) {
+    clonetimes.emplace_back(clone_imu.first);
+  }
+
+  // 1. Clean all feature measurements and make sure they all have valid clone times
+  //    Also remove any that we are unable to triangulate (due to not having enough measurements)
+  auto it0 = active_features.begin();
+  while (it0 != active_features.end()) {
+
+    // Skip if it is a SLAM feature since it already is already going to be added
+    if (state->_features_SLAM.find((*it0)->featid) != state->_features_SLAM.end()) {
+      it0 = active_features.erase(it0);
+      continue;
+    }
+
+    // Clean the feature
+    (*it0)->clean_old_measurements(clonetimes);
+
+    // Count how many measurements
+    int ct_meas = 0;
+    for (const auto &pair : (*it0)->timestamps) {
+      ct_meas += (*it0)->timestamps[pair.first].size();
+    }
+
+    // Remove if we don't have enough and am not a SLAM feature which doesn't need triangulation
+    if (ct_meas < (int)std::max(4.0, std::floor(state->_options.max_clone_size * 2.0 / 5.0))) {
+      it0 = active_features.erase(it0);
+    } else {
+      it0++;
+    }
+  }
+  retri_rT2 = boost::posix_time::microsec_clock::local_time();
+
+  // Return if no features
+  if (active_features.empty() && state->_features_SLAM.empty())
+    return;
+
+  // 2. Create vector of cloned *CAMERA* poses at each of our clone timesteps
+  std::unordered_map<size_t, std::unordered_map<double, FeatureInitializer::ClonePose>> clones_cam;
+  for (const auto &clone_calib : state->_calib_IMUtoCAM) {
+
+    // For this camera, create the vector of camera poses
+    std::unordered_map<double, FeatureInitializer::ClonePose> clones_cami;
+    for (const auto &clone_imu : state->_clones_IMU) {
+
+      // Get current camera pose
+      Eigen::Matrix3d R_GtoCi = clone_calib.second->Rot() * clone_imu.second->Rot();
+      Eigen::Vector3d p_CioinG = clone_imu.second->pos() - R_GtoCi.transpose() * clone_calib.second->pos();
+
+      // Append to our map
+      clones_cami.insert({clone_imu.first, FeatureInitializer::ClonePose(R_GtoCi, p_CioinG)});
+    }
+
+    // Append to our map
+    clones_cam.insert({clone_calib.first, clones_cami});
+  }
+  retri_rT3 = boost::posix_time::microsec_clock::local_time();
+
+  // 3. Try to triangulate all features that have measurements
+  auto it1 = active_features.begin();
+  while (it1 != active_features.end()) {
+
+    // Triangulate the feature and remove if it fails
+    bool success_tri = true;
+    if (active_tracks_initializer->config().triangulate_1d) {
+      success_tri = active_tracks_initializer->single_triangulation_1d(*it1, clones_cam);
+    } else {
+      success_tri = active_tracks_initializer->single_triangulation(*it1, clones_cam);
+    }
+
+    // Remove the feature if not a success
+    if (!success_tri) {
+      it1 = active_features.erase(it1);
+      continue;
+    }
+    it1++;
+  }
+  retri_rT4 = boost::posix_time::microsec_clock::local_time();
+
+  // Return if no features
+  if (active_features.empty() && state->_features_SLAM.empty())
+    return;
+
+
+  // Points which we have in the global frame
+  for (const auto &feat : active_features) {
+    active_tracks_posinG[feat->featid] = feat->p_FinG;
+  }
+  
+
+  for (const auto &feat : state->_features_SLAM) {
+    Eigen::Vector3d p_FinG = feat.second->get_xyz(false);
+    if (LandmarkRepresentation::is_relative_representation(feat.second->_feat_representation)) {
+      // Assert that we have an anchor pose for this feature
+      assert(feat.second->_anchor_cam_id != -1);
+      // Get calibration for our anchor camera
+      Eigen::Matrix3d R_ItoC = state->_calib_IMUtoCAM.at(feat.second->_anchor_cam_id)->Rot();
+      Eigen::Vector3d p_IinC = state->_calib_IMUtoCAM.at(feat.second->_anchor_cam_id)->pos();
+      // Anchor pose orientation and position
+      Eigen::Matrix3d R_GtoI = state->_clones_IMU.at(feat.second->_anchor_clone_timestamp)->Rot();
+      Eigen::Vector3d p_IinG = state->_clones_IMU.at(feat.second->_anchor_clone_timestamp)->pos();
+      // Feature in the global frame
+      p_FinG = R_GtoI.transpose() * R_ItoC.transpose() * (feat.second->get_xyz(false) - p_IinC) + p_IinG;
+    }
+    active_tracks_posinG[feat.second->_featid] = p_FinG;
+  }
+
+
+  // Calibration of the first camera (cam0)
+  std::shared_ptr<Vec> distortion = state->_cam_intrinsics.at(0);
+  std::shared_ptr<PoseJPL> calibration = state->_calib_IMUtoCAM.at(0);
+  Eigen::Matrix<double, 3, 3> R_ItoC = calibration->Rot();
+  Eigen::Matrix<double, 3, 1> p_IinC = calibration->pos();
+  
+  // Get current IMU clone state
+  std::shared_ptr<PoseJPL> clone_Ii;
+  try
+  {
+  	clone_Ii = state->_clones_IMU.at(active_tracks_time);
+  }
+  catch (const std::out_of_range& e)
+  {
+    	printf("WARNING: db_size: %d req_time: %f\n",(int) state->_clones_IMU.size(), active_tracks_time);
+  	std::cout << "Clone not found in DB -- Exception: " << e.what() << std::endl;
+	int l = 0;
+  	for (auto & kys : state->_clones_IMU) {
+  		printf("DB (_clones_IMU) idx: [%d] time: %f\n", l++, kys.first);
+	}
+
+	printf("wait for clone augmentation catch up.\n");
+  	return;
+  }
+
+  Eigen::Matrix3d R_GtoIi = clone_Ii->Rot();
+  Eigen::Vector3d p_IiinG = clone_Ii->pos();
+  
+  // 4. Next we can update our variable with the global position
+  //    We also will project the features into the current frame
+  for (const auto &feat : active_tracks_posinG) {
+
+    // Project the current feature into the current frame of reference
+    Eigen::Vector3d p_FinIi = R_GtoIi * (feat.second - p_IiinG);
+    Eigen::Vector3d p_FinCi = R_ItoC * p_FinIi + p_IinC;
+    double depth = p_FinCi(2);
+    Eigen::Vector2d uv_norm, uv_dist;
+    uv_norm << p_FinCi(0) / depth, p_FinCi(1) / depth;
+    uv_dist = state->_cam_intrinsics_cameras.at(0)->distort_d(uv_norm);
+
+    // Skip if not valid (i.e. negative depth, or outside of image)
+    if (depth < 0.1) {
+      continue;
+    }
+
+    // Skip if not valid (i.e. negative depth, or outside of image)
+    int width = state->_cam_intrinsics_cameras.at(0)->w();
+    int height = state->_cam_intrinsics_cameras.at(0)->h();
+    if (uv_dist(0) < 0 || (int)uv_dist(0) >= width || uv_dist(1) < 0 || (int)uv_dist(1) >= height) {
+      // PRINT_DEBUG("feat %zu -> depth = %.2f | u_d = %.2f | v_d = %.2f\n",(*it2)->featid,depth,uv_dist(0),uv_dist(1));
+      continue;
+    }
+
+    // Finally construct the uv and depth
+    Eigen::Vector4d uvd;
+    uvd << uv_dist, depth, 0;
+
+    active_tracks_uvd.insert({feat.first, uvd});
+  }
+  retri_rT5 = boost::posix_time::microsec_clock::local_time();
+
+  // Timing information
+  // PRINT_DEBUG(CYAN "[RETRI-TIME]: %.4f seconds for cleaning\n" RESET, (retri_rT2-retri_rT1).total_microseconds() * 1e-6);
+  // PRINT_DEBUG(CYAN "[RETRI-TIME]: %.4f seconds for triangulate setup\n" RESET, (retri_rT3-retri_rT2).total_microseconds() * 1e-6);
+  // PRINT_DEBUG(CYAN "[RETRI-TIME]: %.4f seconds for triangulation\n" RESET, (retri_rT4-retri_rT3).total_microseconds() * 1e-6);
+  // PRINT_DEBUG(CYAN "[RETRI-TIME]: %.4f seconds for re-projection\n" RESET, (retri_rT5-retri_rT4).total_microseconds() * 1e-6);
+  // PRINT_DEBUG(CYAN "[RETRI-TIME]: %.4f seconds total\n" RESET, (retri_rT5-retri_rT1).total_microseconds() * 1e-6);
 }
 
 cv::Mat VioManager::get_historical_viz_image() {
