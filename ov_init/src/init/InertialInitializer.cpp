@@ -120,9 +120,9 @@ bool InertialInitializer::initialize(double &timestamp, Eigen::MatrixXd &covaria
             return false;
         }
 
-        // Check if it passed our check!
+    // Check if it passed our check!
 	// VOXL
-	params.init_max_disparity = 1.5;
+	//params.init_max_disparity = 1.5;
         PRINT_INFO(YELLOW "[init]: *** disparity is %.3f,%.3f (%.2f thresh)\n" RESET, avg_disp0, avg_disp1, params.init_max_disparity);
         disparity_detected_moving_1to0 = (avg_disp0 > params.init_max_disparity);
         disparity_detected_moving_2to1 = (avg_disp1 > params.init_max_disparity);
