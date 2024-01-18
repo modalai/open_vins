@@ -359,6 +359,9 @@ struct VioManagerOptions {
     /// Number of grids we should split row-wise to do feature extraction in
     int grid_y = 5;
 
+    /// Number of grids we should split row-wise to do feature extraction in
+    int pyramid_levels = 5;
+
     /// Will check after doing KLT track and remove any features closer than this
     int min_px_dist = 5; //10
 

@@ -133,14 +133,14 @@ void StateHelper::add_alt_constrain(std::shared_ptr<State> state, double z, doub
 	 Eigen::MatrixXd vel_cov = Eigen::MatrixXd::Zero(3, 3);
 	 vel_cov.block(0, 0, 3, 3) = state->_Cov.block(vel_id, vel_id,3,3);
 
-
-//	 std::cout << "P: " << pos_residual(2) << "\t(" << z << ") \t\tvel: " << vel_residual (2) <<  "\t(" << vel_z << ")" << std::endl;
-
 	 // update cov with residual
-
 	 double vz_res = (vel_residual(2) - vel_z);
 	 Eigen::MatrixXd res_vz_vec  = Eigen::MatrixXd::Zero(1, 1);
-	 res_vz_vec(0) = sqrt(vz_res * vz_res);
+	 res_vz_vec(0) = vz_res * vz_res;
+
+//	 std::cout << "P: " << pos_residual(2) << "\t(" << z << ") \t\tvel: " << vel_residual (2) <<  "\t(" << vel_z << ")"  << std::endl;
+//	 std::cout << "\tcov_v:" << vel_cov.block(2,2,1,1) << " with res: " << res_vz_vec << std::endl;
+
 	 vel_cov.block(2,2,1,1) += res_vz_vec;
 	 // don't allow negs
 	 Eigen::VectorXd diags = vel_cov.diagonal();
@@ -152,10 +152,9 @@ void StateHelper::add_alt_constrain(std::shared_ptr<State> state, double z, doub
 			 return;
 	     }
 	 }
-
 	 // looks good, constrain the EKF
-//	 state->_Cov.block(vel_id, vel_id,3,3) = vel_cov;
-
+	 state->_Cov.block(vel_id, vel_id,3,3) = vel_cov;
+	 
 #ifdef POS
 	const int pos_id  = state->_imu->p()->id();
 

@@ -124,9 +124,23 @@ VioManager::VioManager(VioManagerOptions &params_) : thread_init_running(false),
         params.init_options
             .init_max_features; // std::floor((double)params.init_options.init_max_features / (double)params.state_options.num_cameras);
     if (params.use_klt) {
-        trackFEATS = std::shared_ptr<TrackBase>(new TrackKLT(state->_cam_intrinsics_cameras, init_max_features,
-                                                             state->_options.max_aruco_features, params.use_stereo, params.histogram_method,
-                                                             params.fast_threshold, params.grid_x, params.grid_y, params.min_px_dist));
+	
+	TrackKLT * klt = new TrackKLT(	state->_cam_intrinsics_cameras, 
+					init_max_features,
+                                        state->_options.max_aruco_features, 
+					params.use_stereo, 
+					params.histogram_method,
+                                        params.fast_threshold, 
+					params.grid_x, 
+					params.grid_y, 
+					params.min_px_dist);
+
+    	// update pyramid levels for feature tracking
+    	klt->set_pyramid_levels(params.pyramid_levels);
+
+        trackFEATS = std::shared_ptr<TrackBase>(klt);
+
+
     } else {
         trackFEATS = std::shared_ptr<TrackBase>(new TrackDescriptor(
             state->_cam_intrinsics_cameras, params.init_options.init_max_features, state->_options.max_aruco_features, params.use_stereo,
@@ -465,8 +479,13 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
   // VOXL
   // Baro constraint, it appears feature residuals are used in the EKF update call, so set IMU/position constraints beforehand
   // It will be used in the next loop cycle when the state is propagated.
-  StateHelper::add_alt_constrain(state, alt_from_baro, vel_from_baro);
-
+  if (alt_from_baro > 0.0 || vel_from_baro > 0.0)
+  {
+	  StateHelper::add_alt_constrain(state, alt_from_baro, vel_from_baro);
+	  alt_from_baro = 0;
+	  vel_from_baro = 0;
+  }
+  
   // If we have not reached max clones, we should just return...
   // This isn't super ideal, but it keeps the logic after this easier...
   // We can start processing things when we have at least 5 clones since we can start triangulating things...

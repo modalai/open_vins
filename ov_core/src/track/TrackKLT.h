@@ -62,6 +62,12 @@ class TrackKLT : public TrackBase {
      */
     void feed_new_camera(const CameraData &message) override;
 
+    /**
+     * @brief set pyramid levels
+     */
+    void set_pyramid_levels(int levels) { pyr_levels = levels; };
+
+
   protected:
     /**
      * @brief Process a new monocular image
