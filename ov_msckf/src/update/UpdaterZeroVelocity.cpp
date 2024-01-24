@@ -211,6 +211,7 @@ bool UpdaterZeroVelocity::try_update(std::shared_ptr<State> state, double timest
     bool disparity_passed = false;
     if (override_with_disparity_check) {
 
+    	static uint8_t zupt_state_changed = 0;
         // Get the disparity statistics from this image to the previous
         double time0_cam = state->_timestamp;
         double time1_cam = timestamp;
@@ -225,6 +226,12 @@ bool UpdaterZeroVelocity::try_update(std::shared_ptr<State> state, double timest
             PRINT_INFO(CYAN "[ZUPT]: passed disparity (%.3f < %.3f, %d features)\n" RESET, average_disparity, _zupt_max_disparity,
                        (int)num_features);
         } else {
+        	if (zupt_state_changed < 2)
+        	{
+        		zupt_state_changed++;
+        		printf("[INFO] TAKEOFF: DISPARITY disturbed, possible motion detected. Avg: %f (%f)\t# feats: %d (20).\n", average_disparity, _zupt_max_disparity, num_features);
+        	}
+        	
             PRINT_DEBUG(YELLOW "[ZUPT]: failed disparity (%.3f > %.3f, %d features)\n" RESET, average_disparity, _zupt_max_disparity,
                         (int)num_features);
         }

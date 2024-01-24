@@ -128,6 +128,7 @@ bool VioManager::try_to_initialize(const ov_core::CameraData &message) {
 
             // If we are moving then don't do zero velocity update4
             if (state->_imu->vel().norm() > params.zupt_max_velocity) {
+            	printf("[INFO] TAKEOFF: IMU velocity exceeded ZUPT max vel param, considered motion detected.\n");
                 has_moved_since_zupt = true;
             }
 
