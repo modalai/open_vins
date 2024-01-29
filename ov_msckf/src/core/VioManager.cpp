@@ -501,7 +501,7 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
     PRINT_WARNING(RED "[PROP]: It has been %.3f since last time we propagated\n" RESET, message.timestamp - state->_timestamp);
     return;
   }
-  has_moved_since_zupt = true;
+//  has_moved_since_zupt = true;
 
   //===================================================================================
   // MSCKF features and KLT tracks that are SLAM features

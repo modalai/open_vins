@@ -221,6 +221,12 @@ bool UpdaterZeroVelocity::try_update(std::shared_ptr<State> state, double timest
         FeatureHelper::compute_disparity(_db, time0_cam, time1_cam, average_disparity, variance_disparity, num_features);
 
         // Check if this disparity is enough to be classified as moving
+        if (std::isnan(average_disparity))
+        {
+            return true;
+        }		
+        
+        // Check if this disparity is enough to be classified as moving
         disparity_passed = (average_disparity < _zupt_max_disparity && num_features > 20);
         if (disparity_passed) {
             PRINT_INFO(CYAN "[ZUPT]: passed disparity (%.3f < %.3f, %d features)\n" RESET, average_disparity, _zupt_max_disparity,
