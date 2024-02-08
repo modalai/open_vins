@@ -48,8 +48,8 @@ using namespace ov_core;
 using namespace ov_type;
 using namespace ov_msckf;
 
-VioManager::VioManager(VioManagerOptions &params_) : thread_init_running(false), thread_init_success(false) {
-
+VioManager::VioManager(VioManagerOptions &params_, std::shared_ptr<ov_init::InertialInitializer> &vins_initializer) : thread_init_running(false), thread_init_success(false) 
+{
     // Nice startup message
     PRINT_DEBUG("=======================================\n");
     PRINT_DEBUG("OPENVINS ON-MANIFOLD EKF IS STARTING\n");
@@ -156,9 +156,19 @@ VioManager::VioManager(VioManagerOptions &params_) : thread_init_running(false),
     // Initialize our state propagator
     propagator = std::make_shared<Propagator>(params.imu_noises, params.gravity_mag);
 
-    // Our state initialize
-    initializer = std::make_shared<ov_init::InertialInitializer>(params.init_options, trackFEATS->get_feature_database());
-
+    if (vins_initializer == nullptr)
+    {
+    	printf("====> Creating zero-ref initializer! <====\n");
+    	vins_initializer = std::make_shared<ov_init::InertialInitializer>(params.init_options, trackFEATS->get_feature_database());
+    }
+    else
+    {
+    	is_initialized_vio = true;
+    	printf("====> REUSING zero-ref initializer for state management! <====\n");
+    }
+    
+    initializer = vins_initializer;
+    
     // Make the updater!
     updaterMSCKF = std::make_shared<UpdaterMSCKF>(params.msckf_options, params.featinit_options);
     updaterSLAM = std::make_shared<UpdaterSLAM>(params.slam_options, params.aruco_options, params.featinit_options);
@@ -174,6 +184,11 @@ VioManager::VioManager(VioManagerOptions &params_) : thread_init_running(false),
     active_tracks_initializer = std::make_shared<FeatureInitializer>(params.featinit_options);
 }
 
+
+VioManager::VioManager(VioManagerOptions &params_) 
+{
+	VioManager(params_, initializer);
+}
 
 void VioManager::feed_measurement_imu(const ov_core::ImuData &message) {
 

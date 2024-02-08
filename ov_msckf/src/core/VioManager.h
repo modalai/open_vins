@@ -62,19 +62,25 @@ class Propagator;
  */
 class VioManager {
   public:
+
     /**
      * @brief Default constructor, will load all configuration variables
      * @param params_ Parameters loaded from either ROS or CMDLINE
      */
     VioManager(VioManagerOptions &params_);
 
+    // VOXL
+    VioManager(VioManagerOptions &params_, std::shared_ptr<ov_init::InertialInitializer> &vins_initializer);
+
+    // VOXL
+    void feed_measurement_processed_camera(const ov_core::ProcessedCameraData &message);
+
+    
     /**
      * @brief Feed function for camera measurements
      * @param message Contains our timestamp, images, and camera ids
      */
     void feed_measurement_camera(const ov_core::CameraData &message) { track_image_and_update(message); }
-
-    void feed_measurement_processed_camera(const ov_core::ProcessedCameraData &message);
 
     /**
      * @brief Feed function for inertial data
