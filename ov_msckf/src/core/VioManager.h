@@ -68,6 +68,9 @@ class VioManager {
      */
     VioManager(VioManagerOptions &params_);
 
+    
+    void zero_state();
+    
     /**
      * @brief Feed function for camera measurements
      * @param message Contains our timestamp, images, and camera ids
@@ -270,6 +273,7 @@ class VioManager {
     // VOXL: contraint values used by state
     double alt_from_baro = -9999;
     double vel_from_baro = 0;
+
 };
 
 } // namespace ov_msckf

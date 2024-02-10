@@ -97,6 +97,7 @@ class InertialInitializer {
     bool initialize(double &timestamp, Eigen::MatrixXd &covariance, std::vector<std::shared_ptr<ov_type::Type>> &order,
                     std::shared_ptr<ov_type::IMU> t_imu, bool wait_for_jerk = true);
 
+        
   protected:
     /// Initialization parameters
     InertialInitializerOptions params;

@@ -50,12 +50,6 @@ using namespace ov_msckf;
 
 VioManager::VioManager(VioManagerOptions &params_) : thread_init_running(false), thread_init_success(false) {
 
-    // Nice startup message
-    PRINT_DEBUG("=======================================\n");
-    PRINT_DEBUG("OPENVINS ON-MANIFOLD EKF IS STARTING\n");
-    PRINT_DEBUG("=======================================\n");
-
-    // Nice debug
     this->params = params_;
     params.print_and_load_estimator();
     params.print_and_load_noise();
@@ -119,7 +113,6 @@ VioManager::VioManager(VioManagerOptions &params_) : thread_init_running(false),
     // NOTE: after we initialize we will increase the total number of feature tracks
     // NOTE: we will split the total number of features over all cameras uniformly
     trackDATABASE = std::make_shared<FeatureDatabase>();
-    // TURI -> this is bad logic, as we need a decent amount of features to properly match
     int init_max_features =
         params.init_options
             .init_max_features; // std::floor((double)params.init_options.init_max_features / (double)params.state_options.num_cameras);
@@ -172,8 +165,85 @@ VioManager::VioManager(VioManagerOptions &params_) : thread_init_running(false),
 
     // Feature initializer for active tracks
     active_tracks_initializer = std::make_shared<FeatureInitializer>(params.featinit_options);
+    
+    std::cout << ">>>>>>>>>> Current reference counts: "
+                << "\ntrackDB: " << trackDATABASE.use_count()
+                        << "\ntrackFEATS: "<< trackFEATS.use_count()
+                        << "\npropagator: "<< propagator.use_count()
+                        << "\nupdaterMSCKF: "<< updaterMSCKF.use_count()
+                        << "\nupdaterSLAM: "<< updaterSLAM.use_count()
+                        << "\nactive_tracks_initializer: "<< active_tracks_initializer.use_count()
+                        << "\ninitializer: "<< initializer.use_count()
+                        << std::endl; // Output: 1
+
 }
 
+void VioManager::zero_state()
+{
+	printf("\n\nZERO STATE\n\n");
+	
+	state.reset();
+	trackFEATS.reset();
+//	propagator.reset();
+	updaterMSCKF.reset();
+	updaterSLAM.reset();
+	active_tracks_initializer.reset();
+
+	state = std::make_shared<State>(params.state_options);
+	
+	// Timeoffset from camera to IMU
+	Eigen::VectorXd temp_camimu_dt;
+	temp_camimu_dt.resize(1);
+	temp_camimu_dt(0) = params.calib_camimu_dt;
+	state->_calib_dt_CAMtoIMU->set_value(temp_camimu_dt);
+	state->_calib_dt_CAMtoIMU->set_fej(temp_camimu_dt);
+	
+	// Loop through and load each of the cameras
+	printf("Set camera intrinsics and extrinsics\n");
+	state->_cam_intrinsics_cameras = params.camera_intrinsics;
+	for (int i = 0; i < state->_options.num_cameras; i++) {
+	state->_cam_intrinsics.at(i)->set_value(params.camera_intrinsics.at(i)->get_value());
+	state->_cam_intrinsics.at(i)->set_fej(params.camera_intrinsics.at(i)->get_value());
+	state->_calib_IMUtoCAM.at(i)->set_value(params.camera_extrinsics.at(i));
+	state->_calib_IMUtoCAM.at(i)->set_fej(params.camera_extrinsics.at(i));
+	}
+
+	TrackKLT * klt = new TrackKLT(	state->_cam_intrinsics_cameras, 
+			params.init_options
+			            .init_max_features,
+									state->_options.max_aruco_features, 
+				params.use_stereo, 
+				params.histogram_method,
+									params.fast_threshold, 
+				params.grid_x, 
+				params.grid_y, 
+				params.min_px_dist);
+	
+	// update pyramid levels for feature tracking
+	klt->set_pyramid_levels(params.pyramid_levels);
+	
+	trackFEATS = std::shared_ptr<TrackBase>(klt);
+	
+//	propagator = std::make_shared<Propagator>(params.imu_noises, params.gravity_mag);
+		
+	// Make the updater!
+	updaterMSCKF = std::make_shared<UpdaterMSCKF>(params.msckf_options, params.featinit_options);
+	updaterSLAM = std::make_shared<UpdaterSLAM>(params.slam_options, params.aruco_options, params.featinit_options);
+    active_tracks_initializer = std::make_shared<FeatureInitializer>(params.featinit_options);
+
+    std::cout << ">>>>>>>>>> Current reference counts: "
+                << "\ntrackDB: " << trackDATABASE.use_count()
+                        << "\ntrackFEATS: "<< trackFEATS.use_count()
+                        << "\npropagator: "<< propagator.use_count()
+                        << "\nupdaterMSCKF: "<< updaterMSCKF.use_count()
+                        << "\nupdaterSLAM: "<< updaterSLAM.use_count()
+                        << "\nactive_tracks_initializer: "<< active_tracks_initializer.use_count()
+                        << "\ninitializer: "<< initializer.use_count()
+                        << std::endl; // Output: 1
+
+    
+    
+}
 
 void VioManager::feed_measurement_imu(const ov_core::ImuData &message) {
 
