@@ -78,6 +78,15 @@ struct CameraData {
     }
 };
 
+typedef struct ExtFeature {
+    size_t id;
+    size_t cam_id;
+    float u;
+    float v;
+    unsigned char descriptor[32] = {0};
+} __attribute((packed))__ExtFeature;
+
+//TODO ============= DEPRECATED
 typedef struct MaiFeature {
     size_t id;
     size_t cam_id;
@@ -111,6 +120,8 @@ struct ProcessedCameraData {
         }
     }
 };
+//TODO ============= DEPRECATED
+
 
 } // namespace ov_core
 

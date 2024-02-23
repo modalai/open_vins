@@ -444,6 +444,72 @@ void VioManager::track_image_and_update(const ov_core::CameraData &message_const
     do_feature_propagate_update(message);
 }
 
+void VioManager::feed_measurement_feature(const int cam_id, const int64_t ts,  std::vector<ov_core::ExtFeature> feats)
+{
+
+    if (feats.empty()){
+        return;
+    }
+   
+    for (size_t i = 0; i < feats.size(); i++) {
+    	
+    	// oonvert to uv coorindates
+    	cv::Point2f uv_pt(feats[i].u, feats[i].v);
+    	
+        cv::Point2f norm_pt = state->_cam_intrinsics_cameras.at(cam_id)->undistort_cv(uv_pt);
+
+        trackFEATS->get_feature_database()->update_feature(
+        													feats[i].id, 
+															ts,
+                                                         	cam_id, 
+															uv_pt.x,
+															uv_pt.y, 
+														   norm_pt.x, 
+														   norm_pt.y,
+                                                           cv::Mat(1, 32, CV_8UC1, const_cast<unsigned char *>(feats[i].descriptor)).clone());
+    }
+
+    // create a fake camera packet and pass that to functions expecting a CameraData packet
+    // should only need the timestamp and sensor ids
+    ov_core::CameraData fake_packet;
+    fake_packet.timestamp = ts;
+    fake_packet.sensor_ids.push_back(cam_id);
+
+    // put them in our global db
+    if (is_initialized_vio) {
+        trackDATABASE->append_new_measurements(trackFEATS->get_feature_database());
+    }
+
+    // Check if we should do zero-velocity, if so update the state with it
+    // Note that in the case that we only use in the beginning initialization phase
+    // If we have since moved, then we should never try to do a zero velocity update!
+    if (is_initialized_vio && updaterZUPT != nullptr && (!params.zupt_only_at_beginning || !has_moved_since_zupt)) {
+        // If the same state time, use the previous timestep decision
+        if (state->_timestamp != ts) {
+            did_zupt_update = updaterZUPT->try_update(state, ts);
+        }
+
+        retriangulate_active_tracks(fake_packet);
+
+        if (did_zupt_update) {
+            return;
+        }
+    }
+
+    // If we do not have VIO initialization, then try to initialize
+    // TODO: Or if we are trying to reset the system, then do that here!
+    if (!is_initialized_vio) {
+        is_initialized_vio = try_to_initialize(fake_packet);
+        if (!is_initialized_vio) {
+            return;
+        }
+    }
+
+    // Call on our propagate and update function
+    do_feature_propagate_update(fake_packet);
+}
+
+
 void VioManager::feed_measurement_processed_camera(const ov_core::ProcessedCameraData &message_const) {
 
     if (message_const.sensor_ids.empty()){

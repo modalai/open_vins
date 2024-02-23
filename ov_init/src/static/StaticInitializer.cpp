@@ -39,6 +39,7 @@ bool StaticInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarianc
 
     // Return if we don't have any measurements
     if (imu_data->size() < 2) {
+    	printf("Not enough imu points\n");
         return false;
     }
 
