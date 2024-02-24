@@ -73,19 +73,26 @@ bool InertialInitializer::initialize(double &timestamp, Eigen::MatrixXd &covaria
                                      std::shared_ptr<ov_type::IMU> t_imu, bool wait_for_jerk) {
 
     // fprintf(stderr, "initializing\n");
-
     // Get the newest and oldest timestamps we will try to initialize between!
     double newest_cam_time = -1;
+    double oldest_cam_time = -1;
     for (auto const &feat : _db->get_internal_data()) {
         for (auto const &camtimepair : feat.second->timestamps) {
             for (auto const &time : camtimepair.second) {
                 newest_cam_time = std::max(newest_cam_time, time);
+                
+                if (oldest_cam_time == -1)
+                	oldest_cam_time = time;
+                oldest_cam_time = std::min(oldest_cam_time, time);
             }
         }
     }
+    
+//	printf("TIMESTAMP: %f vs %f\n", oldest_cam_time, newest_cam_time);
+	
     double oldest_time = newest_cam_time - params.init_window_time - 0.01;
     if (newest_cam_time < 0 || oldest_time < 0) {
-        // fprintf(stderr, "returning with times %6.5f and %6.5f\n", oldest_time, newest_cam_time);
+         fprintf(stderr, "returning with times %6.5f and %6.5f\n", oldest_time, newest_cam_time);
         return false;
     }
 
@@ -93,7 +100,7 @@ bool InertialInitializer::initialize(double &timestamp, Eigen::MatrixXd &covaria
     // Then we will try to use all features that are in the feature database!
     _db->cleanup_measurements(oldest_time);
     auto it_imu = imu_data->begin();
-    while (it_imu != imu_data->end() && it_imu->timestamp < oldest_time + params.calib_camimu_dt) {
+    while (it_imu != imu_data->end() && it_imu->timestamp < oldest_time + params.calib_camimu_dt) {    	
         it_imu = imu_data->erase(it_imu);
     }
 
@@ -110,6 +117,7 @@ bool InertialInitializer::initialize(double &timestamp, Eigen::MatrixXd &covaria
         int num_features1 = 0;
         double avg_disp0, avg_disp1;
         double var_disp0, var_disp1;
+        
         FeatureHelper::compute_disparity(_db, avg_disp0, var_disp0, num_features0, newest_time_allowed);
         FeatureHelper::compute_disparity(_db, avg_disp1, var_disp1, num_features1, newest_cam_time, newest_time_allowed);
 

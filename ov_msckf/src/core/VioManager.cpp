@@ -254,7 +254,7 @@ void VioManager::feed_measurement_imu(const ov_core::ImuData &message) {
     oldest_time = -1;
   }
   if (!is_initialized_vio) {
-    oldest_time = message.timestamp - params.init_options.init_window_time + state->_calib_dt_CAMtoIMU->value()(0) - 0.10;
+	    oldest_time = message.timestamp - params.init_options.init_window_time + state->_calib_dt_CAMtoIMU->value()(0) - 0.10;
   }
   // VOXL
   else if (params.limit_imu_propagation)
@@ -263,8 +263,10 @@ void VioManager::feed_measurement_imu(const ov_core::ImuData &message) {
 //	oldest_time = message.timestamp - (params.init_options.init_window_time * 0.5);
 	oldest_time = message.timestamp - 0.5;
 	if (oldest_time < 0.01)
+	{
+		printf("old IMU tie too small\n");
 		oldest_time = 0.01;
-
+	}
   }
 
 //  printf("propagator->feed_imu incoming %f vs oldest time %f\n", message.timestamp,  oldest_time);
@@ -444,23 +446,23 @@ void VioManager::track_image_and_update(const ov_core::CameraData &message_const
     do_feature_propagate_update(message);
 }
 
-void VioManager::feed_measurement_feature(const int cam_id, const int64_t ts,  std::vector<ov_core::ExtFeature> feats)
+void VioManager::feed_measurement_feature(const int cam_id, const float ts,  std::vector<ov_core::ExtFeature> feats)
 {
 
     if (feats.empty()){
         return;
     }
-   
+      
     for (size_t i = 0; i < feats.size(); i++) {
     	
     	// oonvert to uv coorindates
     	cv::Point2f uv_pt(feats[i].u, feats[i].v);
     	
         cv::Point2f norm_pt = state->_cam_intrinsics_cameras.at(cam_id)->undistort_cv(uv_pt);
-
+        
         trackFEATS->get_feature_database()->update_feature(
         													feats[i].id, 
-															ts,
+															(float)ts,
                                                          	cam_id, 
 															uv_pt.x,
 															uv_pt.y, 
@@ -489,7 +491,7 @@ void VioManager::feed_measurement_feature(const int cam_id, const int64_t ts,  s
             did_zupt_update = updaterZUPT->try_update(state, ts);
         }
 
-        retriangulate_active_tracks(fake_packet);
+//        retriangulate_active_tracks(fake_packet);
 
         if (did_zupt_update) {
             return;
@@ -831,9 +833,11 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
   // Update our visualization feature set, and clean up the old features
   //===================================================================================
 
+#ifdef ROS_VIZ
   // Re-triangulate all current tracks in the current frame
   if (message.sensor_ids.at(0) == 0) {
 
+	  
     // Re-triangulate features
     retriangulate_active_tracks(message);
 
@@ -842,7 +846,8 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
     // MSCKF features as they will also be appended to the vector
     good_features_MSCKF.clear();
   }
-
+#endif
+  
   // Save all the MSCKF features used in the update
   for (auto const &feat : featsup_MSCKF) {
     good_features_MSCKF.push_back(feat->p_FinG);
