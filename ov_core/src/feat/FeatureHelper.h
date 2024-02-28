@@ -141,18 +141,14 @@ class FeatureHelper {
                 for (size_t idx = 0; idx < feat.second->timestamps.at(camid).size(); idx++) {
                     double time = feat.second->timestamps.at(camid).at(idx);
 
-//                    printf("%f < %f < %f\n", oldest_time, time, newest_time);
-
                     if ((oldest_time == -1 || time > oldest_time) && !found0) {
                         uv0 = feat.second->uvs.at(camid).at(idx).block(0, 0, 2, 1);
                         found0 = true;
-//                        printf("-- found feat 1: %f %f\n", uv0(0), uv0(1));
                         continue;
                     }
                     if ((newest_time == -1 || time < newest_time) && found0) {
                         uv1 = feat.second->uvs.at(camid).at(idx).block(0, 0, 2, 1);
                         found1 = true;
-//                        printf(" -- found feat 2: %f %f\n", uv1(0), uv1(1));
                         continue;
                     }
                 }

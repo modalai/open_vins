@@ -76,7 +76,7 @@ class VioManager {
      * @param message Contains our timestamp, images, and camera ids
      */
     void feed_measurement_camera(const ov_core::CameraData &message) { track_image_and_update(message); }
-    void feed_measurement_feature(const int cam_id, const float  time_ns,  std::vector<ov_core::ExtFeature> feats);
+    void feed_measurement_feature(const float  time_ns,  std::vector<ov_core::ExtFeature> feats);
     
 
     void feed_measurement_processed_camera(const ov_core::ProcessedCameraData &message);

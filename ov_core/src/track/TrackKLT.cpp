@@ -176,13 +176,6 @@ void TrackKLT::feed_monocular(const CameraData &message, size_t msg_id) {
         cv::Point2f npt_l = camera_calib.at(cam_id)->undistort_cv(good_left.at(i).pt);
         database->update_feature(good_ids_left.at(i), message.timestamp, cam_id, good_left.at(i).pt.x, good_left.at(i).pt.y, npt_l.x,
                                  npt_l.y);
-        
-//        printf("KLT %d -- uv: %f %f uv_norm: %f %f\n", 
-//        		(int)cam_id, 
-//        		good_left.at(i).pt.x, 
-//				good_left.at(i).pt.y, 
-//				npt_l.x,
-//                npt_l.y);
     }
 
     // Move forward in time

@@ -446,37 +446,55 @@ void VioManager::track_image_and_update(const ov_core::CameraData &message_const
     do_feature_propagate_update(message);
 }
 
-void VioManager::feed_measurement_feature(const int cam_id, const float ts,  std::vector<ov_core::ExtFeature> feats)
+void VioManager::feed_measurement_feature(const float ts,  std::vector<ov_core::ExtFeature> feats)
 {
 
     if (feats.empty()){
         return;
     }
       
+    std::vector<int> cams_used;
+    
     for (size_t i = 0; i < feats.size(); i++) {
     	
     	// oonvert to uv coorindates
     	cv::Point2f uv_pt(feats[i].u, feats[i].v);
     	
-        cv::Point2f norm_pt = state->_cam_intrinsics_cameras.at(cam_id)->undistort_cv(uv_pt);
+        cv::Point2f norm_pt = state->_cam_intrinsics_cameras.at(feats[i].cam_id)->undistort_cv(uv_pt);
         
         trackFEATS->get_feature_database()->update_feature(
         													feats[i].id, 
 															(float)ts,
-                                                         	cam_id, 
+															feats[i].cam_id, 
 															uv_pt.x,
 															uv_pt.y, 
 														   norm_pt.x, 
 														   norm_pt.y,
                                                            cv::Mat(1, 32, CV_8UC1, const_cast<unsigned char *>(feats[i].descriptor)).clone());
+        
+        if (std::find(cams_used.begin(), cams_used.end(), feats[i].cam_id) != cams_used.end())
+        {
+        	printf("Adding cam: %d\n", (int) feats[i].cam_id);
+        	cams_used.push_back(feats[i].cam_id);
+        }
     }
 
-    // create a fake camera packet and pass that to functions expecting a CameraData packet
-    // should only need the timestamp and sensor ids
-    ov_core::CameraData fake_packet;
-    fake_packet.timestamp = ts;
-    fake_packet.sensor_ids.push_back(cam_id);
+     ov_core::CameraData message;
+     message.sensor_ids = cams_used;
+     message.timestamp = ts;
 
+//     for (size_t i = 0; i < message.sensor_ids.size() && params.downsample_cameras; i++) {
+//         cv::Mat img = message.images.at(i);
+//         cv::Mat mask = message.masks.at(i);
+//         cv::Mat img_temp, mask_temp;
+//         cv::pyrDown(img, img_temp, cv::Size(img.cols / 2.0, img.rows / 2.0));
+//         message.images.at(i) = img_temp;
+//         cv::pyrDown(mask, mask_temp, cv::Size(mask.cols / 2.0, mask.rows / 2.0));
+//         message.masks.at(i) = mask_temp;
+//     }
+
+     
+     
     // put them in our global db
     if (is_initialized_vio) {
         trackDATABASE->append_new_measurements(trackFEATS->get_feature_database());
@@ -501,14 +519,14 @@ void VioManager::feed_measurement_feature(const int cam_id, const float ts,  std
     // If we do not have VIO initialization, then try to initialize
     // TODO: Or if we are trying to reset the system, then do that here!
     if (!is_initialized_vio) {
-        is_initialized_vio = try_to_initialize(fake_packet);
+        is_initialized_vio = try_to_initialize(message);
         if (!is_initialized_vio) {
             return;
         }
     }
 
     // Call on our propagate and update function
-    do_feature_propagate_update(fake_packet);
+    do_feature_propagate_update(message);
 }
 
 
@@ -819,11 +837,11 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
     feats_slam_UPDATE.erase(feats_slam_UPDATE.begin(),
                             feats_slam_UPDATE.begin() + std::min(state->_options.max_slam_in_update, (int)feats_slam_UPDATE.size()));
 
-
     // Do the update
     updaterSLAM->update(state, featsup_TEMP);
     feats_slam_UPDATE_TEMP.insert(feats_slam_UPDATE_TEMP.end(), featsup_TEMP.begin(), featsup_TEMP.end());
   }
+  
   feats_slam_UPDATE = feats_slam_UPDATE_TEMP;
   rT5 = boost::posix_time::microsec_clock::local_time();
   updaterSLAM->delayed_init(state, feats_slam_DELAYED);
