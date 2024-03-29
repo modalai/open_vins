@@ -116,7 +116,9 @@ VioManager::VioManager(VioManagerOptions &params_) : thread_init_running(false),
     int init_max_features =
         params.init_options
             .init_max_features; // std::floor((double)params.init_options.init_max_features / (double)params.state_options.num_cameras);
+        
     if (params.use_klt) {
+    	printf("\n====> Using Internal KLT feature tracker <==== \n");
 	
 	TrackKLT * klt = new TrackKLT(	state->_cam_intrinsics_cameras, 
 					init_max_features,
@@ -135,6 +137,9 @@ VioManager::VioManager(VioManagerOptions &params_) : thread_init_running(false),
 
 
     } else {
+    	
+    	printf("\n====> Using EXTERNAL feature tracker <==== \n");
+
         trackFEATS = std::shared_ptr<TrackBase>(new TrackDescriptor(
             state->_cam_intrinsics_cameras, params.init_options.init_max_features, state->_options.max_aruco_features, params.use_stereo,
             params.histogram_method, params.fast_threshold, params.grid_x, params.grid_y, params.min_px_dist, params.knn_ratio));
@@ -208,9 +213,11 @@ void VioManager::zero_state()
 	state->_calib_IMUtoCAM.at(i)->set_fej(params.camera_extrinsics.at(i));
 	}
 
-	TrackKLT * klt = new TrackKLT(	state->_cam_intrinsics_cameras, 
-			params.init_options
-			            .init_max_features,
+	
+    if (params.use_klt) {
+    	TrackKLT * klt = new TrackKLT(	
+    			state->_cam_intrinsics_cameras, 
+    			params.init_options.init_max_features,
 									state->_options.max_aruco_features, 
 				params.use_stereo, 
 				params.histogram_method,
@@ -223,6 +230,13 @@ void VioManager::zero_state()
 	klt->set_pyramid_levels(params.pyramid_levels);
 	
 	trackFEATS = std::shared_ptr<TrackBase>(klt);
+    } 
+    else 
+    {
+        trackFEATS = std::shared_ptr<TrackBase>(new TrackDescriptor(
+            state->_cam_intrinsics_cameras, params.init_options.init_max_features, state->_options.max_aruco_features, params.use_stereo,
+            params.histogram_method, params.fast_threshold, params.grid_x, params.grid_y, params.min_px_dist, params.knn_ratio));
+    }
 	
 //	propagator = std::make_shared<Propagator>(params.imu_noises, params.gravity_mag);
 		
@@ -472,9 +486,8 @@ void VioManager::feed_measurement_feature(const float ts,  std::vector<ov_core::
 														   norm_pt.y,
                                                            cv::Mat(1, 32, CV_8UC1, const_cast<unsigned char *>(feats[i].descriptor)).clone());
         
-        if (std::find(cams_used.begin(), cams_used.end(), feats[i].cam_id) != cams_used.end())
+        if (std::find(cams_used.begin(), cams_used.end(), feats[i].cam_id) == cams_used.end())
         {
-        	printf("Adding cam: %d\n", (int) feats[i].cam_id);
         	cams_used.push_back(feats[i].cam_id);
         }
     }
