@@ -92,7 +92,7 @@ bool InertialInitializer::initialize(double &timestamp, Eigen::MatrixXd &covaria
 	
     double oldest_time = newest_cam_time - params.init_window_time - 0.01;
     if (newest_cam_time < 0 || oldest_time < 0) {
-         fprintf(stderr, "returning with times %6.5f and %6.5f\n", oldest_time, newest_cam_time);
+        //fprintf(stderr, "returning with times %6.5f and %6.5f\n", oldest_time, newest_cam_time);
         return false;
     }
 

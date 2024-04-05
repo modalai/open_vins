@@ -468,12 +468,11 @@ void VioManager::feed_measurement_feature(const float ts,  std::vector<ov_core::
     }
       
     std::vector<int> cams_used;
-    
+        
     for (size_t i = 0; i < feats.size(); i++) {
     	
     	// oonvert to uv coorindates
     	cv::Point2f uv_pt(feats[i].u, feats[i].v);
-    	
         cv::Point2f norm_pt = state->_cam_intrinsics_cameras.at(feats[i].cam_id)->undistort_cv(uv_pt);
         
         trackFEATS->get_feature_database()->update_feature(
@@ -485,9 +484,9 @@ void VioManager::feed_measurement_feature(const float ts,  std::vector<ov_core::
 														   norm_pt.x, 
 														   norm_pt.y,
                                                            cv::Mat(1, 32, CV_8UC1, const_cast<unsigned char *>(feats[i].descriptor)).clone());
-        
+
         if (std::find(cams_used.begin(), cams_used.end(), feats[i].cam_id) == cams_used.end())
-        {
+        {            
         	cams_used.push_back(feats[i].cam_id);
         }
     }
@@ -506,8 +505,6 @@ void VioManager::feed_measurement_feature(const float ts,  std::vector<ov_core::
 //         message.masks.at(i) = mask_temp;
 //     }
 
-     
-     
     // put them in our global db
     if (is_initialized_vio) {
         trackDATABASE->append_new_measurements(trackFEATS->get_feature_database());
