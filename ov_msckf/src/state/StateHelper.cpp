@@ -723,32 +723,13 @@ void StateHelper::marginalize_slam(std::shared_ptr<State> state) {
     while (it0 != state->_features_SLAM.end()) {
         if ((*it0).second->should_marg) {
             StateHelper::marginalize(state, (*it0).second);
+//            printf("state->_features_SLAM.erase  1\n");
             it0 = state->_features_SLAM.erase(it0);
             // fprintf(stderr, "marginalizing slam feature\n");
         } else {
             it0++;
         }
     }
-}
-
-// todo: fancy slam pickup
-// instead of marginalizing and forgetting everything, we need to marginalize and remember some of its info?
-void StateHelper::marginalize_mai_slam(std::shared_ptr<State> state) {
-    // Remove SLAM features that have their marginalization flag set
-    // We also check that we do not remove any aruoctag landmarks
-    auto it0 = state->_features_SLAM.begin();
-    while (it0 != state->_features_SLAM.end()) {
-        if ((*it0).second->should_marg) {
-            (*it0).second->timestamp_lost = state->_timestamp;
-            if (state->_features_SLAM_lost.size() < state->_options.max_slam_features)
-                state->_features_SLAM_lost.push_back((*it0).second);
-            StateHelper::marginalize(state, (*it0).second);
-            it0 = state->_features_SLAM.erase(it0);
-        } else {
-            it0++;
-        }
-    }
-    marginalize_lost_slam(state);
 }
 
 void StateHelper::marginalize_lost_slam(std::shared_ptr<State> state){

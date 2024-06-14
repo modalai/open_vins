@@ -102,11 +102,10 @@ bool FeatureInitializer::single_triangulation(std::shared_ptr<Feature> feat,
     // Then set the flag for bad (i.e. set z-axis to nan)
     if (std::abs(condA) > _options.max_cond_number || p_f(2, 0) < _options.min_dist || p_f(2, 0) > _options.max_dist ||
         std::isnan(p_f.norm())) {
-        //     fprintf(stderr, "CHECKS:\n");
-
-        //     fprintf(stderr, "cond: %6.5f\n", condA);
-        //     fprintf(stderr, "dist: %6.5f\n", p_f(2, 0));
-        //     fprintf(stderr, "norm: %d\n", std::isnan(p_f.norm()));
+//        fprintf(stderr, "CHECKS:\n");
+//        fprintf(stderr, "cond: %6.5f > %f\n", condA, _options.max_cond_number);
+//        fprintf(stderr, "dist: %6.5f < %f or %6.5f > %f\n", p_f(2, 0), _options.min_dist, p_f(2, 0),  _options.max_dist);
+//        fprintf(stderr, "nan? norm: %d\n", std::isnan(p_f.norm()));
         return false;
     }
 

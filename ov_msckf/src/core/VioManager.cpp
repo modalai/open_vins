@@ -462,6 +462,11 @@ void VioManager::track_image_and_update(const ov_core::CameraData &message_const
 
 void VioManager::feed_measurement_feature(const float ts,  std::vector<ov_core::ExtFeature> feats)
 {
+//	static int skip_ctn_f = 0;
+//	if (skip_ctn_f++ % 4 != 0)
+//	{
+//		feats.clear();
+//	}
 
     if (feats.empty()){
         return;
@@ -507,6 +512,7 @@ void VioManager::feed_measurement_feature(const float ts,  std::vector<ov_core::
 
     // put them in our global db
     if (is_initialized_vio) {
+//    	printf("trackFEATS Input size: %d\n", trackFEATS->get_feature_database()->size());
         trackDATABASE->append_new_measurements(trackFEATS->get_feature_database());
     }
 
@@ -632,6 +638,7 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
                   (message.timestamp - state->_timestamp));
     return;
   }
+//  printf("Step 0. state->_features_SLAM %d\n", state->_features_SLAM.size());
 
   // Propagate the state forward to the current update time
   // Also augment it with a new clone!
@@ -641,6 +648,9 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
     propagator->propagate_and_clone(state, message.timestamp);
   }
   rT3 = boost::posix_time::microsec_clock::local_time();
+
+//  printf("Step 1. state->_features_SLAM %d (%d)\n", state->_features_SLAM.size(),
+//		  trackFEATS->get_feature_database()->size());
 
   // VOXL
   // Baro constraint, it appears feature residuals are used in the EKF update call, so set IMU/position constraints beforehand
@@ -656,13 +666,14 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
   // This isn't super ideal, but it keeps the logic after this easier...
   // We can start processing things when we have at least 5 clones since we can start triangulating things...
   if ((int)state->_clones_IMU.size() < std::min(state->_options.max_clone_size, 5)) {
-    PRINT_DEBUG("waiting for enough clone states (%d of %d)....\n", (int)state->_clones_IMU.size(),
+    printf("waiting for enough clone states (%d of %d)....\n", (int)state->_clones_IMU.size(),
                 std::min(state->_options.max_clone_size, 5));
     return;
   }
 
   // Return if we where unable to propagate
   if (state->_timestamp != message.timestamp) {
+//	printf("UNABLE TO PROP\n");
     PRINT_WARNING(RED "[PROP]: Propagator unable to propagate the state forward in time!\n" RESET);
     PRINT_WARNING(RED "[PROP]: It has been %.3f since last time we propagated\n" RESET, message.timestamp - state->_timestamp);
     return;
@@ -686,6 +697,8 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
     }
   }
 
+//  printf("A. Maginalized feats: %d\n", feats_marg.size());
+
   // Remove any lost features that were from other image streams
   // E.g: if we are cam1 and cam0 has not processed yet, we don't want to try to use those in the update yet
   // E.g: thus we wait until cam0 process its newest image to remove features which were seen from that camera
@@ -705,6 +718,8 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
     }
   }
 
+
+
   // We also need to make sure that the max tracks does not contain any lost features
   // This could happen if the feature was lost in the last frame, but has a measurement at the marg timestep
   it1 = feats_lost.begin();
@@ -719,6 +734,7 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
 
   // Find tracks that have reached max length, these can be made into SLAM features
   std::vector<std::shared_ptr<Feature>> feats_maxtracks;
+//  printf("B. Maginalized feats: %d\n", feats_marg.size());
   auto it2 = feats_marg.begin();
   while (it2 != feats_marg.end()) {
     // See if any of our camera's reached max track
@@ -740,20 +756,29 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
 
   // Count how many aruco tags we have in our state
   int curr_aruco_tags = 0;
-  auto it0 = state->_features_SLAM.begin();
-  while (it0 != state->_features_SLAM.end()) {
-    if ((int)(*it0).second->_featid <= 4 * state->_options.max_aruco_features)
-      curr_aruco_tags++;
-    it0++;
-  }
+//  auto it0 = state->_features_SLAM.begin();
+//  while (it0 != state->_features_SLAM.end()) {
+//    if ((int)(*it0).second->_featid <= 4 * state->_options.max_aruco_features)
+//      curr_aruco_tags++;
+//    it0++;
+//  }
 
   // Append a new SLAM feature if we have the room to do so
   // Also check that we have waited our delay amount (normally prevents bad first set of slam points)
   if (state->_options.max_slam_features > 0 && message.timestamp - startup_time >= params.dt_slam_delay &&
       (int)state->_features_SLAM.size() < state->_options.max_slam_features + curr_aruco_tags) {
+
+//	  printf("Step 2. state->_features_SLAM %d %d\n", state->_features_SLAM.size(), feats_slam.size());
+
+
     // Get the total amount to add, then the max amount that we can add given our marginalize feature array
     int amount_to_add = (state->_options.max_slam_features + curr_aruco_tags) - (int)state->_features_SLAM.size();
     int valid_amount = (amount_to_add > (int)feats_maxtracks.size()) ? (int)feats_maxtracks.size() : amount_to_add;
+
+//	  printf("amount_to_add: %d (%d/%d) feats_maxtracks: %d valid_amount %d\n" , amount_to_add, state->_options.max_slam_features,
+//			  curr_aruco_tags, feats_maxtracks.size(), valid_amount);
+
+
     // If we have at least 1 that we can add, lets add it!
     // Note: we remove them from the feat_marg array since we don't want to reuse information...
     if (valid_amount > 0) {
@@ -761,6 +786,9 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
       feats_maxtracks.erase(feats_maxtracks.end() - valid_amount, feats_maxtracks.end());
     }
   }
+
+//  printf("Step 3. state->_features_SLAM %d %d\n", state->_features_SLAM.size(), feats_slam.size());
+
 
   // Loop through current SLAM features, we have tracks of them, grab them for this update!
   // NOTE: if we have a slam feature that has lost tracking, then we should marginalize it out
@@ -771,24 +799,34 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
     if (trackARUCO != nullptr) {
       std::shared_ptr<Feature> feat1 = trackARUCO->get_feature_database()->get_feature(landmark.second->_featid);
       if (feat1 != nullptr)
+      {
         feats_slam.push_back(feat1);
+    }
     }
     std::shared_ptr<Feature> feat2 = trackFEATS->get_feature_database()->get_feature(landmark.second->_featid);
     if (feat2 != nullptr)
+    {
+// 	  printf("**feats_slam.push_back\n");
       feats_slam.push_back(feat2);
+    }
     assert(landmark.second->_unique_camera_id != -1);
     bool current_unique_cam =
         std::find(message.sensor_ids.begin(), message.sensor_ids.end(), landmark.second->_unique_camera_id) != message.sensor_ids.end();
     if (feat2 == nullptr && current_unique_cam)
       landmark.second->should_marg = true;
-    if (landmark.second->update_fail_count > 1)
-      landmark.second->should_marg = true;
+//    if (landmark.second->update_fail_count > 1)
+//      landmark.second->should_marg = true;
   }
+
+
+//  printf("Step 4. state->_features_SLAM %d %d\n", state->_features_SLAM.size(), feats_slam.size());
 
   // Lets marginalize out all old SLAM features here
   // These are ones that where not successfully tracked into the current frame
   // We do *NOT* marginalize out our aruco tags landmarks
   StateHelper::marginalize_slam(state);
+
+//  printf("Step 5. state->_features_SLAM %d %d\n", state->_features_SLAM.size(), feats_slam.size());
 
   // Separate our SLAM features into new ones, and old ones
   std::vector<std::shared_ptr<Feature>> feats_slam_DELAYED, feats_slam_UPDATE;
@@ -803,6 +841,14 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
       // measurements)\n",(int)feats_slam.at(i)->featid,(int)feats_slam.at(i)->timestamps_left.size());
     }
   }
+
+  // add found features to our update array since they are still in state
+  // std::vector<std::shared_ptr<Feature>> lost_feat_vec;
+  // pickup_lost_slam_feats(lost_feat_vec);
+  // feats_slam_UPDATE.insert(feats_slam_UPDATE.end(), lost_feat_vec.begin(), lost_feat_vec.end());
+
+//  printf("Step 6. state->_features_SLAM %d %d\n", state->_features_SLAM.size(), feats_slam_DELAYED.size());
+//  printf("feats_slam_UPDATE %d\n", feats_slam_UPDATE.size());
 
   // Concatenate our MSCKF feature arrays (i.e., ones not being used for slam updates)
   std::vector<std::shared_ptr<Feature>> featsup_MSCKF = feats_lost;
@@ -852,10 +898,15 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
     feats_slam_UPDATE_TEMP.insert(feats_slam_UPDATE_TEMP.end(), featsup_TEMP.begin(), featsup_TEMP.end());
   }
   
+//  printf("Step 7. state->_features_SLAM %d\n", state->_features_SLAM.size());
+
+
   feats_slam_UPDATE = feats_slam_UPDATE_TEMP;
   rT5 = boost::posix_time::microsec_clock::local_time();
   updaterSLAM->delayed_init(state, feats_slam_DELAYED);
   rT6 = boost::posix_time::microsec_clock::local_time();
+
+//  printf("Step 8. state->_features_SLAM %d\n", state->_features_SLAM.size());
 
   //===================================================================================
   // Update our visualization feature set, and clean up the old features
@@ -876,9 +927,12 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
   }
 #endif
   
+  MSCKF_ids.clear();
+
   // Save all the MSCKF features used in the update
   for (auto const &feat : featsup_MSCKF) {
     good_features_MSCKF.push_back(feat->p_FinG);
+    MSCKF_ids.push_back(feat->featid);
     feat->to_delete = true;
   }
 
@@ -894,8 +948,12 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
     trackARUCO->get_feature_database()->cleanup();
   }
 
+//  printf("Step 9. state->_features_SLAM %d\n", state->_features_SLAM.size());
+
   // First do anchor change if we are about to lose an anchor pose
   updaterSLAM->change_anchors(state);
+
+//  printf("Step 10. state->_features_SLAM %d\n", state->_features_SLAM.size());
 
   // Cleanup any features older than the marginalization time
   if ((int)state->_clones_IMU.size() > state->_options.max_clone_size) {
@@ -994,5 +1052,8 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
                  calib->quat()(3), calib->pos()(0), calib->pos()(1), calib->pos()(2));
     }
   }
+
+//  printf("Step Done. state->_features_SLAM %d\n", state->_features_SLAM.size());
+
 }
 
