@@ -726,7 +726,7 @@ int VioManager::get_pixel_loc_features(std::vector<output_feature> &feats ) {
         }
         // msckf
         else if (iter2 != msckf_ids.end()){
-        	std::cout << "msckf_ids found" << std::endl;
+//        	std::cout << "msckf_ids found" << std::endl;
             auto index = std::distance(msckf_ids.begin(), iter2);
             of.point_quality = OV_HIGH;
             of.tsf[0] = good_features_MSCKF_clone[index](0);
@@ -877,6 +877,8 @@ int VioManager::pickup_lost_slam_feats(std::vector<std::shared_ptr<Feature>> &ne
             (*it0)->was_lost = false;
             (*it0)->_anchor_cam_id = i;
             (*it0)->_unique_camera_id = i;
+
+//            printf("_features_SLAM.insert A\n");
 
             // need a pair, with first being featid??_ and second the landmark
             state->_features_SLAM.insert({best_id, (*it0)});

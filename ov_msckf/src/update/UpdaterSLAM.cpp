@@ -60,6 +60,8 @@ UpdaterSLAM::UpdaterSLAM(UpdaterOptions &options_slam, UpdaterOptions &options_a
 
 void UpdaterSLAM::delayed_init(std::shared_ptr<State> state, std::vector<std::shared_ptr<Feature>> &feature_vec) {
 
+//	printf("start vec: %d\n", feature_vec.size());
+
     // Return if no features
     if (feature_vec.empty())
         return;
@@ -90,6 +92,7 @@ void UpdaterSLAM::delayed_init(std::shared_ptr<State> state, std::vector<std::sh
         // Remove if we don't have enough
         if (ct_meas < 2) {
             (*it0)->to_delete = true;
+//            printf("feature_vec.erase(it0);\n");
             it0 = feature_vec.erase(it0);
         } else {
             it0++;
@@ -125,8 +128,9 @@ void UpdaterSLAM::delayed_init(std::shared_ptr<State> state, std::vector<std::sh
         bool success_tri = true;
         if (initializer_feat->config().triangulate_1d) {
             success_tri = initializer_feat->single_triangulation_1d(*it1, clones_cam);
-        } else {
-            success_tri = initializer_feat->single_triangulation(*it1, clones_cam);
+        }
+        else {
+        	success_tri = initializer_feat->single_triangulation(*it1, clones_cam);
         }
 
         // Gauss-newton refine the feature
@@ -137,7 +141,7 @@ void UpdaterSLAM::delayed_init(std::shared_ptr<State> state, std::vector<std::sh
 
         // Remove the feature if not a success
         if (!success_tri || !success_refine) {
-            // fprintf(stderr, "FAILED TRAINGULATION\n");
+//            printf("FAILED TRAINGULATION %d %d\n", success_tri, success_refine);
             (*it1)->to_delete = true;
             it1 = feature_vec.erase(it1);
             continue;
@@ -145,6 +149,8 @@ void UpdaterSLAM::delayed_init(std::shared_ptr<State> state, std::vector<std::sh
         it1++;
     }
     rT2 = boost::posix_time::microsec_clock::local_time();
+
+//	printf("mid vec: %d\n", feature_vec.size());
 
     // 4. Compute linear system for each feature, nullspace project, and reject
     auto it2 = feature_vec.begin();
@@ -233,13 +239,15 @@ void UpdaterSLAM::delayed_init(std::shared_ptr<State> state, std::vector<std::sh
         double chi2_multipler =
             ((int)feat.featid < state->_options.max_aruco_features) ? _options_aruco.chi2_multipler : _options_slam.chi2_multipler;
         if (StateHelper::initialize(state, landmark, Hx_order, H_x, H_f, R, res, chi2_multipler)) {
+//            printf("state->_features_SLAM.insert B\n");
+
             state->_features_SLAM.insert({(*it2)->featid, landmark});
             (*it2)->to_delete = true;
             it2++;
         } else {
+//            printf("FAILED INIT on fet %d\n", (*it2)->featid);
             (*it2)->to_delete = true;
             it2 = feature_vec.erase(it2);
-            // fprintf(stderr, "FAILED INIT AGAIN\n");
         }
     }
     rT3 = boost::posix_time::microsec_clock::local_time();
