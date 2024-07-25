@@ -230,8 +230,8 @@ void VioManager::zero_state()
 	klt->set_pyramid_levels(params.pyramid_levels);
 	
 	trackFEATS = std::shared_ptr<TrackBase>(klt);
-    } 
-    else 
+    }
+    else
     {
         trackFEATS = std::shared_ptr<TrackBase>(new TrackDescriptor(
             state->_cam_intrinsics_cameras, params.init_options.init_max_features, state->_options.max_aruco_features, params.use_stereo,
@@ -460,6 +460,74 @@ void VioManager::track_image_and_update(const ov_core::CameraData &message_const
     do_feature_propagate_update(message);
 }
 
+
+void VioManager::feed_measurement_feature_cached(const float ts,  std::vector<ov_core::ExtFeature> feats)
+{
+    if (feats.empty()){
+        return;
+    }
+
+    for (size_t i = 0; i < feats.size(); i++) {
+
+    	// oonvert to uv coorindates
+    	cv::Point2f uv_pt(feats[i].u, feats[i].v);
+        cv::Point2f norm_pt = state->_cam_intrinsics_cameras.at(feats[i].cam_id)->undistort_cv(uv_pt);
+
+        trackFEATS->get_feature_database()->update_feature(
+        													feats[i].id,
+															(float)ts,
+															feats[i].cam_id,
+															uv_pt.x,
+															uv_pt.y,
+														   norm_pt.x,
+														   norm_pt.y,
+                                                           cv::Mat(1, 32, CV_8UC1, const_cast<unsigned char *>(feats[i].descriptor)).clone());
+
+    }
+}
+
+void VioManager::update_state(const float ts, std::vector<int> cams_used)
+{
+
+	ov_core::CameraData message;
+    message.sensor_ids = cams_used;
+    message.timestamp = ts;
+
+   // put them in our global db
+   if (is_initialized_vio) {
+//    	printf("trackFEATS Input size: %d\n", trackFEATS->get_feature_database()->size());
+       trackDATABASE->append_new_measurements(trackFEATS->get_feature_database());
+   }
+
+   // Check if we should do zero-velocity, if so update the state with it
+   // Note that in the case that we only use in the beginning initialization phase
+   // If we have since moved, then we should never try to do a zero velocity update!
+   if (is_initialized_vio && updaterZUPT != nullptr && (!params.zupt_only_at_beginning || !has_moved_since_zupt)) {
+       // If the same state time, use the previous timestep decision
+       if (state->_timestamp != ts) {
+           did_zupt_update = updaterZUPT->try_update(state, ts);
+       }
+
+//        retriangulate_active_tracks(fake_packet);
+
+       if (did_zupt_update) {
+           return;
+       }
+   }
+
+   // If we do not have VIO initialization, then try to initialize
+   // TODO: Or if we are trying to reset the system, then do that here!
+   if (!is_initialized_vio) {
+       is_initialized_vio = try_to_initialize(message);
+       if (!is_initialized_vio) {
+           return;
+       }
+   }
+
+   // Call on our propagate and update function
+   do_feature_propagate_update(message);
+}
+
 void VioManager::feed_measurement_feature(const float ts,  std::vector<ov_core::ExtFeature> feats)
 {
 //	static int skip_ctn_f = 0;
@@ -473,7 +541,7 @@ void VioManager::feed_measurement_feature(const float ts,  std::vector<ov_core::
     }
       
     std::vector<int> cams_used;
-        
+      
     for (size_t i = 0; i < feats.size(); i++) {
     	
     	// oonvert to uv coorindates
@@ -493,7 +561,7 @@ void VioManager::feed_measurement_feature(const float ts,  std::vector<ov_core::
         if (std::find(cams_used.begin(), cams_used.end(), feats[i].cam_id) == cams_used.end())
         {            
         	cams_used.push_back(feats[i].cam_id);
-        }
+    	}
     }
 
      ov_core::CameraData message;
@@ -636,6 +704,7 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
   if (state->_timestamp > message.timestamp) {
     PRINT_WARNING(YELLOW "image received out of order, unable to do anything (prop dt = %3f)\n" RESET,
                   (message.timestamp - state->_timestamp));
+//    printf(" (%d / %d) %f > %f\n", message.sensor_ids.size(), message.sensor_ids[0], state->_timestamp, message.timestamp);
     return;
   }
 //  printf("Step 0. state->_features_SLAM %d\n", state->_features_SLAM.size());
@@ -645,8 +714,15 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
   // NOTE: if the state is already at the given time (can happen in sim)
   // NOTE: then no need to prop since we already are at the desired timestep
   if (state->_timestamp != message.timestamp) {
+    //printf("propagate_and_clone  before  %f == %f\n", state->_timestamp, message.timestamp);
     propagator->propagate_and_clone(state, message.timestamp);
+    //printf("propagate_and_clone  after  %f == %f\n", state->_timestamp, message.timestamp);
   }
+//  else
+//  {
+//	    printf("not propagate_and_clone  %f == %f\n", state->_timestamp, message.timestamp);
+//  }
+
   rT3 = boost::posix_time::microsec_clock::local_time();
 
 //  printf("Step 1. state->_features_SLAM %d (%d)\n", state->_features_SLAM.size(),
@@ -668,6 +744,7 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
   if ((int)state->_clones_IMU.size() < std::min(state->_options.max_clone_size, 5)) {
     printf("waiting for enough clone states (%d of %d)....\n", (int)state->_clones_IMU.size(),
                 std::min(state->_options.max_clone_size, 5));
+//    printf("2\n");
     return;
   }
 
@@ -676,6 +753,10 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
 //	printf("UNABLE TO PROP\n");
     PRINT_WARNING(RED "[PROP]: Propagator unable to propagate the state forward in time!\n" RESET);
     PRINT_WARNING(RED "[PROP]: It has been %.3f since last time we propagated\n" RESET, message.timestamp - state->_timestamp);
+
+ //   printf("unable to propagate  %f != %f\n", state->_timestamp, message.timestamp);
+
+
     return;
   }
 //  has_moved_since_zupt = true;
@@ -697,7 +778,7 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
     }
   }
 
-//  printf("A. Maginalized feats: %d\n", feats_marg.size());
+//  printf("A. Maginalized feats: %d lost %d at %f\n", feats_marg.size(), feats_lost.size(), (double)state->_timestamp);
 
   // Remove any lost features that were from other image streams
   // E.g: if we are cam1 and cam0 has not processed yet, we don't want to try to use those in the update yet

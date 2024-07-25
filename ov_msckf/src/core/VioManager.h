@@ -77,7 +77,9 @@ class VioManager {
      */
     void feed_measurement_camera(const ov_core::CameraData &message) { track_image_and_update(message); }
     void feed_measurement_feature(const float  time_ns,  std::vector<ov_core::ExtFeature> feats);
-    
+    void feed_measurement_feature_cached(const float  time_ns,  std::vector<ov_core::ExtFeature> feats);
+    void update_state(const float ts, std::vector<int> cams_used);
+
 
     void feed_measurement_processed_camera(const ov_core::ProcessedCameraData &message);
 
