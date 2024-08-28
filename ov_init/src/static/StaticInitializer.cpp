@@ -125,7 +125,8 @@ bool StaticInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarianc
     if ((a_var_1to0 > params.init_imu_thresh || a_var_2to1 > params.init_imu_thresh) && !wait_for_jerk) {
         PRINT_INFO(YELLOW "[init-s]: to much IMU excitation, above threshold %.3f,%.3f > %.3f\n" RESET, a_var_2to1, a_var_1to0,
                    params.init_imu_thresh);
-    	printf("Reading 1 & 2 too BIG (params.init_imu_thresh too small), also waiting for jerk enabled\n");
+    	printf("Reading 1 & 2 too BIG (params.init_imu_thresh too small), also waiting for jerk (%d) enabled %f vs %f or %f vs %f\n",
+    			wait_for_jerk, a_var_1to0, params.init_imu_thresh, a_var_2to1, params.init_imu_thresh);
 
         return false;
     }
