@@ -28,8 +28,14 @@
 #include "feat/FeatureDatabase.h"
 #include "utils/opencv_lambda_body.h"
 #include "utils/print.h"
+#include "ocl_tracking.h"
 
 using namespace ov_core;
+
+static float float_frame[3][1280 * 800];
+static bool use_gpu = true;
+
+static OCLManager ocl_manager;
 
 void TrackKLT::feed_new_camera(const CameraData &message) {
 
@@ -54,21 +60,32 @@ void TrackKLT::feed_new_camera(const CameraData &message) {
         std::lock_guard<std::mutex> lck(mtx_feeds.at(cam_id));
 
         // Histogram equalize
-        cv::Mat img;
-        if (histogram_method == HistogramMethod::HISTOGRAM) {
-            cv::equalizeHist(message.images.at(msg_id), img);
-        } else if (histogram_method == HistogramMethod::CLAHE) {
-            double eq_clip_limit = 10.0;
-            cv::Size eq_win_size = cv::Size(8, 8);
-            cv::Ptr<cv::CLAHE> clahe = cv::createCLAHE(eq_clip_limit, eq_win_size);
-            clahe->apply(message.images.at(msg_id), img);
+        cv::Mat img;// = message.images.at(msg_id);
+
+        if (!use_gpu) {
+
+            if (histogram_method == HistogramMethod::HISTOGRAM) {
+                cv::equalizeHist(message.images.at(msg_id), img);
+            } else if (histogram_method == HistogramMethod::CLAHE) {
+                double eq_clip_limit = 10.0;
+                cv::Size eq_win_size = cv::Size(8, 8);
+                cv::Ptr<cv::CLAHE> clahe = cv::createCLAHE(eq_clip_limit, eq_win_size);
+                clahe->apply(message.images.at(msg_id), img);
+            } else {
+                img = message.images.at(msg_id);
+            }
+
         } else {
             img = message.images.at(msg_id);
         }
 
         // Extract image pyramid
         std::vector<cv::Mat> imgpyr;
-        cv::buildOpticalFlowPyramid(img, imgpyr, win_size, pyr_levels);
+        if (use_gpu) {
+            imgpyr.push_back(img);
+        } else {
+            cv::buildOpticalFlowPyramid(img, imgpyr, win_size, pyr_levels);
+        }
 
         // Save!
         img_curr[cam_id] = img;
@@ -119,7 +136,27 @@ void TrackKLT::feed_monocular(const CameraData &message, size_t msg_id) {
         img_mask_last[cam_id] = mask;
         pts_last[cam_id] = good_left;
         ids_last[cam_id] = good_ids_left;
+
+        if (use_gpu)
+        {
+            for(size_t i = 0; i < 1280 * 800; i++) 
+            {
+                float_frame[cam_id][i] = (float)message.images[msg_id].data[i];
+            }
+
+            ocl_manager.cam_track[cam_id]->build_pyramid(&float_frame[cam_id], ocl_manager.cam_track[cam_id]->next_pyr);
+        } 
+
         return;
+    }
+
+    if (use_gpu) {
+        for(size_t i = 0; i < 1280 * 800; i++) {
+            float_frame[cam_id][i] = (float)message.images[msg_id].data[i];
+        }
+
+        std::swap(ocl_manager.cam_track[cam_id]->next_pyr, ocl_manager.cam_track[cam_id]->prev_pyr);
+        ocl_manager.cam_track[cam_id]->build_pyramid(&float_frame[cam_id], ocl_manager.cam_track[cam_id]->next_pyr);
     }
 
     // First we should make that the last images have enough features so we can do KLT
@@ -834,9 +871,14 @@ void TrackKLT::perform_matching(const std::vector<cv::Mat> &img0pyr, const std::
 
     // Convert keypoints into points (stupid opencv stuff)
     std::vector<cv::Point2f> pts0, pts1;
+    std::vector<float> pts_out;
     for (size_t i = 0; i < kpts0.size(); i++) {
         pts0.push_back(kpts0.at(i).pt);
         pts1.push_back(kpts1.at(i).pt);
+
+        // for gpu run
+        pts_out.push_back(kpts0.at(i).pt.x);
+        pts_out.push_back(kpts0.at(i).pt.y);
     }
 
     // If we don't have enough points for ransac just return empty
@@ -850,8 +892,45 @@ void TrackKLT::perform_matching(const std::vector<cv::Mat> &img0pyr, const std::
     // Now do KLT tracking to get the valid new points
     std::vector<uchar> mask_klt;
     std::vector<float> error;
+
+    if (use_gpu) {
+        int n_points = pts0.size();
+
+        // gpu option
+        // track_ocl.run_tracking_step(track_ocl.prev_pyr, track_ocl.next_pyr, &track_ocl.tracking_buf, 3, n_points, (float*)pts_out.data());
+        ocl_manager.cam_track[id0]->run_tracking_step(  ocl_manager.cam_track[id0]->prev_pyr,
+                                                        ocl_manager.cam_track[id0]->next_pyr,
+                                                        &ocl_manager.cam_track[id0]->tracking_buf,
+                                                        3, n_points, (float*)pts_out.data());
+
+        size_t buffer_size = n_points * sizeof(float) * 2;
+        std::vector<uchar> status;
+        std::vector<float> errors;
+        std::vector<float> tracked_pts;
+        status.resize(n_points);
+        errors.resize(n_points);
+        tracked_pts.resize(n_points * 2);
+
+        cl_int err;
+        err  = clEnqueueReadBuffer(ocl_manager.cam_track[id0]->queue, ocl_manager.cam_track[id0]->tracking_buf.next_pts_buf, CL_TRUE, 0, buffer_size, tracked_pts.data(), 0, nullptr, nullptr);
+        err |= clEnqueueReadBuffer(ocl_manager.cam_track[id0]->queue, ocl_manager.cam_track[id0]->tracking_buf.status_buf, CL_TRUE, 0, n_points * sizeof(uchar), status.data(), 0, nullptr, nullptr);
+        err |= clEnqueueReadBuffer(ocl_manager.cam_track[id0]->queue, ocl_manager.cam_track[id0]->tracking_buf.error_buf, CL_TRUE, 0, n_points * sizeof(float), errors.data(), 0, nullptr, nullptr);
+
+        for (int i = 0; i < n_points; i++) {
+            cv::Point2f pt = (cv::Point2f){tracked_pts[i*2], tracked_pts[i*2+1]};
+            pts1[i] = pt;
+        }
+        mask_klt = status;
+        
+        // for (int i = 0; i < 4; i++) {
+        //     printf("cam_id: %d, (%4.2f, %4.2f), mask_klt: %d\n", id0, pts1[i].x, pts1[i].y, mask_klt[i]);
+        // }
+    }
+    
     cv::TermCriteria term_crit = cv::TermCriteria(cv::TermCriteria::COUNT | cv::TermCriteria::EPS, 30, 0.01);
-    cv::calcOpticalFlowPyrLK(img0pyr, img1pyr, pts0, pts1, mask_klt, error, win_size, pyr_levels, term_crit, cv::OPTFLOW_USE_INITIAL_FLOW);
+    if (!use_gpu) {
+        cv::calcOpticalFlowPyrLK(img0pyr, img1pyr, pts0, pts1, mask_klt, error, win_size, pyr_levels, term_crit, cv::OPTFLOW_USE_INITIAL_FLOW);
+    }
 
     // Normalize these points, so we can then do ransac
     // We don't want to do ransac on distorted image uvs since the mapping is nonlinear

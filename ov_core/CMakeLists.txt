@@ -20,6 +20,16 @@ else ()
     add_definitions(-DENABLE_ARUCO_TAGS=1)
 endif ()
 
+# Find OpenCL
+find_package(OpenCL REQUIRED)
+if (OpenCL_FOUND)
+    message(STATUS "OpenCL found: ${OpenCL_VERSION}")
+    include_directories(${OpenCL_INCLUDE_DIRS})
+    list(APPEND thirdparty_libraries ${OpenCL_LIBRARIES})
+else()
+    message(FATAL_ERROR "OpenCL not found")
+endif()
+
 # check if we have our python libs files (will search for python3 then python2 installs)
 # sudo apt-get install python-matplotlib python-numpy python-dev
 # https://cmake.org/cmake/help/v3.10/module/FindPythonLibs.html

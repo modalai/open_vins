@@ -44,6 +44,7 @@ list(APPEND LIBRARY_SOURCES
         src/feat/FeatureDatabase.cpp
         src/feat/FeatureInitializer.cpp
         src/utils/print.cpp
+        src/track/ocl_tracking.cpp
 )
 file(GLOB_RECURSE LIBRARY_HEADERS "src/*.h")
 add_library(ov_core_lib SHARED ${LIBRARY_SOURCES} ${LIBRARY_HEADERS})
