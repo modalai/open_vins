@@ -104,7 +104,7 @@ int OCLManager::init(void)
         cl_image_format format;
         format.image_channel_order = CL_R;
         format.image_channel_data_type = CL_FLOAT;
-        cam_track[i]->create_pyramids(4, 1280, 800, format);
+        cam_track[i]->create_pyramids(6, 1280, 800, format);
         cam_track[i]->create_tracking_buffers(100);
     }
 
@@ -1012,7 +1012,8 @@ int TrackOCL::build_pyramid(void* frame, ocl_pyramid* pyramid)
         return -1;
     }
 
-    cl_sampler sampler = clCreateSampler(context, CL_FALSE, CL_ADDRESS_CLAMP, CL_FILTER_NEAREST, &err);
+    cl_sampler sampler = clCreateSampler(context, CL_FALSE, CL_ADDRESS_CLAMP_TO_EDGE, CL_FILTER_LINEAR, &err);
+    // CLK_NORMALIZED_COORDS_FALSE | CLK_ADDRESS_CLAMP_TO_EDGE | CLK_FILTER_LINEAR
 
     for (int i = 1; i < pyramid->levels; ++i) 
     {

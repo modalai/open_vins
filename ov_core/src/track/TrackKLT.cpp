@@ -143,6 +143,7 @@ void TrackKLT::feed_monocular(const CameraData &message, size_t msg_id) {
             {
                 float_frame[cam_id][i] = (float)message.images[msg_id].data[i];
             }
+            // memcpy(float_frame[cam_id], message.images[msg_id].data, 1280 * 800 * sizeof(float));
 
             ocl_manager.cam_track[cam_id]->build_pyramid(&float_frame[cam_id], ocl_manager.cam_track[cam_id]->next_pyr);
         } 
@@ -154,6 +155,7 @@ void TrackKLT::feed_monocular(const CameraData &message, size_t msg_id) {
         for(size_t i = 0; i < 1280 * 800; i++) {
             float_frame[cam_id][i] = (float)message.images[msg_id].data[i];
         }
+        // memcpy(float_frame[cam_id], message.images[msg_id].data, 1280 * 800 * sizeof(float));
 
         std::swap(ocl_manager.cam_track[cam_id]->next_pyr, ocl_manager.cam_track[cam_id]->prev_pyr);
         ocl_manager.cam_track[cam_id]->build_pyramid(&float_frame[cam_id], ocl_manager.cam_track[cam_id]->next_pyr);
@@ -896,12 +898,17 @@ void TrackKLT::perform_matching(const std::vector<cv::Mat> &img0pyr, const std::
     if (use_gpu) {
         int n_points = pts0.size();
 
+        if (n_points > 100)
+        {
+            printf("too many points are being tracked\n");        
+        }
+
         // gpu option
         // track_ocl.run_tracking_step(track_ocl.prev_pyr, track_ocl.next_pyr, &track_ocl.tracking_buf, 3, n_points, (float*)pts_out.data());
         ocl_manager.cam_track[id0]->run_tracking_step(  ocl_manager.cam_track[id0]->prev_pyr,
                                                         ocl_manager.cam_track[id0]->next_pyr,
                                                         &ocl_manager.cam_track[id0]->tracking_buf,
-                                                        3, n_points, (float*)pts_out.data());
+                                                        5, n_points, (float*)pts_out.data());
 
         size_t buffer_size = n_points * sizeof(float) * 2;
         std::vector<uchar> status;
@@ -916,21 +923,31 @@ void TrackKLT::perform_matching(const std::vector<cv::Mat> &img0pyr, const std::
         err |= clEnqueueReadBuffer(ocl_manager.cam_track[id0]->queue, ocl_manager.cam_track[id0]->tracking_buf.status_buf, CL_TRUE, 0, n_points * sizeof(uchar), status.data(), 0, nullptr, nullptr);
         err |= clEnqueueReadBuffer(ocl_manager.cam_track[id0]->queue, ocl_manager.cam_track[id0]->tracking_buf.error_buf, CL_TRUE, 0, n_points * sizeof(float), errors.data(), 0, nullptr, nullptr);
 
-        for (int i = 0; i < n_points; i++) {
+        for (int i = 0; i < n_points; i++) 
+        {
             cv::Point2f pt = (cv::Point2f){tracked_pts[i*2], tracked_pts[i*2+1]};
             pts1[i] = pt;
+            // if (errors[i] > 10.f) {
+            //     status[i] = 0;
+            // }
         }
         mask_klt = status;
         
         // for (int i = 0; i < 4; i++) {
-        //     printf("cam_id: %d, (%4.2f, %4.2f), mask_klt: %d\n", id0, pts1[i].x, pts1[i].y, mask_klt[i]);
+        //     printf("i: %d, after  prev (%4.2f, %4.2f) next (%4.2f, %4.2f), err: %f\n", i, pts0[i].x, pts0[i].y, pts1[i].x, pts1[i].y, errors[i]);
         // }
+
     }
+
     
     cv::TermCriteria term_crit = cv::TermCriteria(cv::TermCriteria::COUNT | cv::TermCriteria::EPS, 30, 0.01);
     if (!use_gpu) {
+        for (int i = 0; i < 4; i++) {
+            printf("i: %d, before prev (%4.2f, %4.2f) next (%4.2f, %4.2f), mask_klt: %d\n", i, pts0[i].x, pts0[i].y, pts1[i].x, pts1[i].y, mask_klt[i]);
+        }
         cv::calcOpticalFlowPyrLK(img0pyr, img1pyr, pts0, pts1, mask_klt, error, win_size, pyr_levels, term_crit, cv::OPTFLOW_USE_INITIAL_FLOW);
     }
+
 
     // Normalize these points, so we can then do ransac
     // We don't want to do ransac on distorted image uvs since the mapping is nonlinear
