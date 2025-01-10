@@ -1,29 +1,20 @@
-#include "ocl_tracking.h"
-
-// cl_device_id      device;
-// cl_context        context;
-// cl_command_queue  queue;
-
-
-using namespace ov_core;
+#include "TrackOCLUtils.h"
 
 
 OCLManager::OCLManager()
 {
-    init();
+    
 }
 
 
 OCLManager::~OCLManager() 
 {
-    clReleaseKernel(track_kernel);
-    clReleaseKernel(downfilter_kernel);
-    clReleaseProgram(ocl_program);
-    clReleaseContext(context);
+    if (ocl_program) clReleaseProgram(ocl_program);
+    if (context)     clReleaseContext(context);
 }
 
 
-int OCLManager::init(void)
+int OCLManager::init(int n_cams, int width, int height, int pyr_levels)
 {
     cl_int err;
     cl_uint num_platforms = 0;
@@ -94,18 +85,17 @@ int OCLManager::init(void)
         printf("Error building kernel: %s\n", build_log.data());
     }
 
+    num_cams = n_cams;
+
     // initialize tracking for cameras
     for (int i = 0; i < num_cams; ++i) 
     {
-        cam_track[i] = new TrackOCL();
-        cam_track[i]->create_queue(device, context);
-        cam_track[i]->build_ocl_kernels(ocl_program);
-
         cl_image_format format;
         format.image_channel_order = CL_R;
         format.image_channel_data_type = CL_FLOAT;
-        cam_track[i]->create_pyramids(6, 1280, 800, format);
-        cam_track[i]->create_tracking_buffers(100);
+
+        cam_track[i] = new OCLTracker();
+        cam_track[i]->init(context, device, ocl_program, pyr_levels+1, width, height, format);
     }
 
 
@@ -717,138 +707,35 @@ __kernel void pyrDown(
 }
 
 
-/*
-
-// should only be called once when being used
-int TrackOCL::init_opencl(void)
+int OCLTracker::init(cl_context context, cl_device_id device, cl_program program, 
+                   int pyr_levels, int base_width, int base_height, cl_image_format format)
 {
-    cl_int err;
-    cl_uint num_platforms = 0;
-
-    // check available platforms
-    err = clGetPlatformIDs(0, nullptr, &num_platforms);
-    if (err != CL_SUCCESS || num_platforms == 0) 
-    {
-        printf("No OpenCL platforms found!\n");
-        return 1;
-    }
-
-    // get platforms
-    std::vector<cl_platform_id> platforms(num_platforms);
-    err = clGetPlatformIDs(num_platforms, platforms.data(), nullptr);
-
-    // select the first platform
-    cl_platform_id platform = platforms[0];
-
-    // get available GPU devices
-    cl_uint num_devices = 0;
-    err = clGetDeviceIDs(platform, CL_DEVICE_TYPE_GPU, 0, nullptr, &num_devices);
-    if (err != CL_SUCCESS || num_devices == 0) 
-    {
-        printf("No devices found!\n");
-        return 1;
-    }
-
-    // select the first available device
-    std::vector<cl_device_id> devices(num_devices);
-    err = clGetDeviceIDs(platform, CL_DEVICE_TYPE_GPU, num_devices, devices.data(), nullptr);
-    device = devices[0];
-
-    // create context
-    context = clCreateContext(nullptr, 1, &device, nullptr, nullptr, &err);
-    if (err != CL_SUCCESS)
-    {
-        printf("Could not create context!\n");
-        return 1;
-    }
-
-    // create command queue
-#if CL_TARGET_OPENCL_VERSION >= 200
-    // for OpenCL 2.0 and above, use clCreateCommandQueueWithProperties
-    cl_command_queue_properties props[] = {0}; // No special properties
-    queue = clCreateCommandQueueWithProperties(context, device, props, &err);
-#else
-    queue = clCreateCommandQueue(context, device, 0, &err);
-#endif
-
-    if (err != CL_SUCCESS) 
-    {
-        printf("Could not create command queue!\n");
-        return 1;
-    }
-
+    this->context = context;
+    build_ocl_kernels(program);
+    create_queue(device, context);
+    create_pyramids(pyr_levels, base_width, base_height, format);
+    create_tracking_buffers(100);
+    
     return 0;
 }
 
-
-cl_program TrackOCL::build_cl_program_from_file(std::string file_path, const std::string& build_options)
-{
-    // load kernel file
-    std::ifstream kernelFile(file_path);
-    if (!kernelFile.is_open()) 
-    {
-        printf("Failed to open kernel file %s\n", file_path.c_str());
-        return nullptr;
-    }
-
-    // read code
-    std::string kernelCode((std::istreambuf_iterator<char>(kernelFile)),
-                           std::istreambuf_iterator<char>());
-    kernelFile.close();
-
-    const char* code_ptr = kernelCode.c_str();
-    size_t code_length   = kernelCode.size();
-
-    cl_int err;
-    cl_program program = clCreateProgramWithSource(context, 1, &code_ptr, &code_length, &err);
-    if (err != CL_SUCCESS) 
-    {
-        printf("Error creating program from source.\n");
-        return nullptr;
-    }
-
-    // build program
-    err = clBuildProgram(program, 1, &device, build_options.c_str(), nullptr, nullptr);
-    if (err != CL_SUCCESS) 
-    {
-        // Print build log
-        size_t log_size;
-        clGetProgramBuildInfo(program, device, CL_PROGRAM_BUILD_LOG, 0, nullptr, &log_size);
-
-        std::vector<char> build_log(log_size);
-        clGetProgramBuildInfo(program, device, CL_PROGRAM_BUILD_LOG, log_size, build_log.data(), nullptr);
-
-        printf("Error building kernel: %s\n", build_log.data());
-    }
-
-    return program;
-}
-*/
-
-
-int TrackOCL::create_queue(cl_device_id device, cl_context context)
+int OCLTracker::create_queue(cl_device_id device, cl_context context)
 {
     cl_int err;
 
-    // this->device = device;
     this->context = context;
-    
     this->queue = clCreateCommandQueue(context, device, 0, &err);
    
     if (err != CL_SUCCESS) 
     {
-        printf("Failed to create command queue for TrackOCL\n");
-    } 
-    else 
-    {
-        printf("created TrackOCL instance for id: %d\n", cam_id);
+        printf("Failed to create command queue for OCLTracker\n");
     }
 
     return 0;
 }
 
 
-int TrackOCL::build_ocl_kernels(cl_program program)
+int OCLTracker::build_ocl_kernels(cl_program program)
 {
     cl_int err;
 
@@ -870,7 +757,7 @@ int TrackOCL::build_ocl_kernels(cl_program program)
 }
 
 
-ocl_image TrackOCL::create_ocl_image(int w, int h, cl_image_format format)
+ocl_image OCLTracker::create_ocl_image(int w, int h, cl_image_format format)
 {
     cl_int err;
     ocl_image image;
@@ -885,7 +772,7 @@ ocl_image TrackOCL::create_ocl_image(int w, int h, cl_image_format format)
     desc.image_height = h;
     desc.image_row_pitch = 0; // Let OpenCL handle row pitch
 
-    image.image_mem = clCreateImage(context, CL_MEM_READ_WRITE, &format, &desc, nullptr, &err);
+    image.img_mem = clCreateImage(context, CL_MEM_READ_WRITE, &format, &desc, nullptr, &err);
 
     if (err != CL_SUCCESS) 
     {
@@ -896,13 +783,13 @@ ocl_image TrackOCL::create_ocl_image(int w, int h, cl_image_format format)
 }
 
 
-cv::Mat TrackOCL::save_ocl_image(ocl_image* image, std::string output_path)
+cv::Mat OCLTracker::save_ocl_image(ocl_image* image, std::string output_path)
 {
     size_t origin[3] = {0, 0, 0};
     size_t region[3] = {image->w, image->h, 1};
     cv::Mat output(image->h, image->w, CV_32F);
 
-    cl_int err = clEnqueueReadImage(this->queue, image->image_mem, CL_TRUE, origin, region, 0, 0, output.data, 0, nullptr, nullptr);
+    cl_int err = clEnqueueReadImage(this->queue, image->img_mem, CL_TRUE, origin, region, 0, 0, output.data, 0, nullptr, nullptr);
     if (err != CL_SUCCESS) {
         std::cerr << "Failed to read OpenCL image: " << err << std::endl;
         return cv::Mat();
@@ -913,13 +800,13 @@ cv::Mat TrackOCL::save_ocl_image(ocl_image* image, std::string output_path)
 }
 
 
-int TrackOCL::destroy_ocl_image(ocl_image* image)
+int OCLTracker::destroy_ocl_image(ocl_image* image)
 {
     if (image) 
     {
-        if (image->image_mem) 
+        if (image->img_mem) 
         {
-            clReleaseMemObject(image->image_mem);
+            clReleaseMemObject(image->img_mem);
         }
 
         free(image);
@@ -929,7 +816,7 @@ int TrackOCL::destroy_ocl_image(ocl_image* image)
 }
 
 
-int TrackOCL::create_pyramids(int levels, int base_w, int base_h, cl_image_format format)
+int OCLTracker::create_pyramids(int levels, int base_w, int base_h, cl_image_format format)
 {
     // allocate memory for prev_pyr
     prev_pyr = (ocl_pyramid*)malloc(sizeof(ocl_pyramid));
@@ -997,31 +884,30 @@ int TrackOCL::create_pyramids(int levels, int base_w, int base_h, cl_image_forma
 }
 
 
-int TrackOCL::build_pyramid(void* frame, ocl_pyramid* pyramid)
+int OCLTracker::build_next_pyramid(const void* frame)
 {
     size_t origin[3] = {0, 0, 0};
-    size_t region[3] = {pyramid->base_w, pyramid->base_h, 1};
+    size_t region[3] = {next_pyr->base_w, next_pyr->base_h, 1};
 
     cl_int err = clEnqueueWriteImage(this->queue, 
-                                     pyramid->images[0].image_mem,
+                                     next_pyr->images[0].img_mem,
                                      CL_TRUE, origin, region, 0, 0, 
                                      frame, 0, nullptr, nullptr);
     if (err != CL_SUCCESS) 
     {
-        std::cerr << "Failed to write image to pyramid level 0: " << err << std::endl;
+        std::cerr << "Failed to write image to next_pyr level 0: " << err << std::endl;
         return -1;
     }
 
-    cl_sampler sampler = clCreateSampler(context, CL_FALSE, CL_ADDRESS_CLAMP_TO_EDGE, CL_FILTER_LINEAR, &err);
-    // CLK_NORMALIZED_COORDS_FALSE | CLK_ADDRESS_CLAMP_TO_EDGE | CLK_FILTER_LINEAR
+    cl_sampler sampler = clCreateSampler(context, CL_FALSE, CL_ADDRESS_CLAMP, CL_FILTER_NEAREST, &err);
 
-    for (int i = 1; i < pyramid->levels; ++i) 
+    for (int i = 1; i < next_pyr->levels; ++i) 
     {
-        clSetKernelArg(this->downfilter_kernel, 0, sizeof(cl_mem), &pyramid->images[i-1].image_mem);
-        clSetKernelArg(this->downfilter_kernel, 1, sizeof(cl_mem), &pyramid->images[i].image_mem);
+        clSetKernelArg(this->downfilter_kernel, 0, sizeof(cl_mem), &next_pyr->images[i-1].img_mem);
+        clSetKernelArg(this->downfilter_kernel, 1, sizeof(cl_mem), &next_pyr->images[i].img_mem);
         clSetKernelArg(this->downfilter_kernel, 2, sizeof(cl_sampler), &sampler);
 
-        size_t global_size[2] = {pyramid->images[i].w, pyramid->images[i].h};
+        size_t global_size[2] = {next_pyr->images[i].w, next_pyr->images[i].h};
         err = clEnqueueNDRangeKernel(this->queue, this->downfilter_kernel, 2, nullptr, global_size, nullptr, 0, nullptr, nullptr);
         if (err != CL_SUCCESS) 
         {
@@ -1034,7 +920,7 @@ int TrackOCL::build_pyramid(void* frame, ocl_pyramid* pyramid)
 }
 
 
-int TrackOCL::destroy_pyramid(ocl_pyramid* pyramid)
+int OCLTracker::destroy_pyramid(ocl_pyramid* pyramid)
 {
     if (pyramid) 
     {
@@ -1055,7 +941,7 @@ int TrackOCL::destroy_pyramid(ocl_pyramid* pyramid)
 }
 
 
-int TrackOCL::create_tracking_buffers(int n_points)
+int OCLTracker::create_tracking_buffers(int n_points)
 {
     this->tracking_buf.n_points = n_points;
 
@@ -1075,19 +961,14 @@ int TrackOCL::create_tracking_buffers(int n_points)
 }
 
 
-int TrackOCL::run_tracking_step(ocl_pyramid* prev_pyr, ocl_pyramid* next_pyr, ocl_tracking_buffer* tracking_buf, 
-                      int pyr_levels, int n_points, float* prev_pts)
+int OCLTracker::run_tracking_step(int n_points, float* prev_pts)
 {
     size_t pts_buf_size = n_points * sizeof(float) * 2;
     size_t status_buf_size = n_points * sizeof(uchar);
-    uchar ones[n_points];
-    for(int i = 0; i < n_points; i++) {
-        ones[i] = 1;
-    }
 
-    // write previous points to GPU
-    clEnqueueWriteBuffer(this->queue, this->tracking_buf.prev_pts_buf, CL_TRUE, 0, pts_buf_size, prev_pts, 0, nullptr, nullptr);
-    clEnqueueWriteBuffer(this->queue, this->tracking_buf.status_buf, CL_TRUE, 0, pts_buf_size, ones, 0, nullptr, nullptr);
+    uchar status[n_points];
+
+    int pyr_levels = prev_pyr->levels - 1;
 
     // next points need to start as prev points scaled to smallest pyramid level
     float* next_pts = (float*)malloc(pts_buf_size);
@@ -1095,25 +976,14 @@ int TrackOCL::run_tracking_step(ocl_pyramid* prev_pyr, ocl_pyramid* next_pyr, oc
     {
         next_pts[i*2]   = (prev_pts[i*2]   / (1 << pyr_levels)) / 2.f;
         next_pts[i*2+1] = (prev_pts[i*2+1] / (1 << pyr_levels)) / 2.f;
-        // printf("prev_pts (%4.2f, %4.2f) --> (%4.2f, %4.2f)\n", prev_pts[i*2], prev_pts[i*2+1], next_pts[i*2], next_pts[i*2+1]);
+        status[i] = 1;
     }
 
-
-    // write next points to GPU
-    clEnqueueWriteBuffer(this->queue, this->tracking_buf.next_pts_buf, CL_TRUE, 0, pts_buf_size, next_pts, 0, nullptr, nullptr);
+    // write tracking input to GPU
+    clEnqueueWriteBuffer(this->queue, this->tracking_buf.prev_pts_buf, CL_TRUE, 0, pts_buf_size,    prev_pts, 0, nullptr, nullptr);
+    clEnqueueWriteBuffer(this->queue, this->tracking_buf.next_pts_buf, CL_TRUE, 0, pts_buf_size,    next_pts, 0, nullptr, nullptr);
+    clEnqueueWriteBuffer(this->queue, this->tracking_buf.status_buf,   CL_TRUE, 0, status_buf_size, status,   0, nullptr, nullptr);
     free(next_pts);
-
-    uchar* next_status = (uchar*)malloc(n_points * sizeof(uchar));
-    for (int i = 0; i < n_points; i++) {
-        next_status[i] = 1;
-    }
-    cl_int err = clEnqueueWriteBuffer(this->queue, this->tracking_buf.status_buf, CL_TRUE, 0, n_points * sizeof(uchar), next_status, 0, nullptr, nullptr);
-    if (err != CL_SUCCESS) 
-    {
-        printf("Error setting status buf: %d\n", err);
-    }
-    free(next_status);
-
     
     int patch_x = 8;
     int patch_y = 8;
@@ -1121,7 +991,6 @@ int TrackOCL::run_tracking_step(ocl_pyramid* prev_pyr, ocl_pyramid* next_pyr, oc
     int c_winSize_y = 21;
     int c_iters = 30;
 
-    float* host_next_pts = (float*)malloc(pts_buf_size);
 
     // run tracking step for number of pyramid levels
     for (int level = pyr_levels; level >= 0; level--)
@@ -1130,15 +999,13 @@ int TrackOCL::run_tracking_step(ocl_pyramid* prev_pyr, ocl_pyramid* next_pyr, oc
         size_t globalThreads[3] = {n_points * 8, 8};
         char calcErr = (0 == level) ? 1 : 0;
 
-        // printf("level: %d, ptcount: %d, rows; %d, cols: %d\n", level, n_points, prev_pyr->images[level].h, prev_pyr->images[level].w);
-
         cl_int err;
-        err  = clSetKernelArg(this->track_kernel, 0,  sizeof(cl_mem), &prev_pyr->images[level].image_mem);
-        err |= clSetKernelArg(this->track_kernel, 1,  sizeof(cl_mem), &next_pyr->images[level].image_mem);
-        err |= clSetKernelArg(this->track_kernel, 2,  sizeof(cl_mem), &tracking_buf->prev_pts_buf);
-        err |= clSetKernelArg(this->track_kernel, 3,  sizeof(cl_mem), &tracking_buf->next_pts_buf);
-        err |= clSetKernelArg(this->track_kernel, 4,  sizeof(cl_mem), &tracking_buf->status_buf);
-        err |= clSetKernelArg(this->track_kernel, 5,  sizeof(cl_mem), &tracking_buf->error_buf);
+        err  = clSetKernelArg(this->track_kernel, 0,  sizeof(cl_mem), &prev_pyr->images[level].img_mem);
+        err |= clSetKernelArg(this->track_kernel, 1,  sizeof(cl_mem), &next_pyr->images[level].img_mem);
+        err |= clSetKernelArg(this->track_kernel, 2,  sizeof(cl_mem), &tracking_buf.prev_pts_buf);
+        err |= clSetKernelArg(this->track_kernel, 3,  sizeof(cl_mem), &tracking_buf.next_pts_buf);
+        err |= clSetKernelArg(this->track_kernel, 4,  sizeof(cl_mem), &tracking_buf.status_buf);
+        err |= clSetKernelArg(this->track_kernel, 5,  sizeof(cl_mem), &tracking_buf.error_buf);
         err |= clSetKernelArg(this->track_kernel, 6,  sizeof(int),    &level);
         err |= clSetKernelArg(this->track_kernel, 7,  sizeof(int),    &prev_pyr->images[level].h);
         err |= clSetKernelArg(this->track_kernel, 8,  sizeof(int),    &prev_pyr->images[level].w);
@@ -1161,44 +1028,34 @@ int TrackOCL::run_tracking_step(ocl_pyramid* prev_pyr, ocl_pyramid* next_pyr, oc
         }
 
         clFinish(this->queue);
-
-        // // Read back the next_pts_buf to host memory
-        // err = clEnqueueReadBuffer(queue, tracking_buf->next_pts_buf, CL_TRUE, 0, pts_buf_size, host_next_pts, 0, nullptr, nullptr);
-        // if (err != CL_SUCCESS) 
-        // {
-        //     printf("Error reading back next_pts_buf: %d\n", err);
-        //     continue;
-        // }
-
-        // // Print the x, y coordinates for each point
-        // printf("Coordinates at level %d:\n", level);
-        // for (int i = 0; i < 3; i++)
-        // {
-        //     float x = host_next_pts[i * 2];
-        //     float y = host_next_pts[i * 2 + 1];
-        //     printf("lvl: %d, Point %d: (%4.2f, %4.2f)\n", level, i, x, y);
-        // }
-
     }
-
-    free(host_next_pts);
 
     return 0;
 }
 
 
-void TrackOCL::swap_pyr_pointers(ocl_pyramid* pyr1, ocl_pyramid* pyr2)
+int OCLTracker::read_results(int n_points, float* next_pts_out, uchar* status_out, float* err_out)
 {
-    ocl_pyramid* temp = pyr1;
-    pyr1 = pyr2;
-    pyr2 = temp;
+    size_t pts_buf_size    = n_points * sizeof(float) * 2;
+    size_t status_buf_size = n_points * sizeof(uchar);
+    size_t err_buf_size    = n_points * sizeof(float);
 
-    return;
+    cl_int err;
+    err  = clEnqueueReadBuffer(queue, tracking_buf.next_pts_buf, CL_TRUE, 0, pts_buf_size,    next_pts_out, 0, nullptr, nullptr);
+    err |= clEnqueueReadBuffer(queue, tracking_buf.status_buf,   CL_TRUE, 0, status_buf_size, status_out,   0, nullptr, nullptr);
+    err |= clEnqueueReadBuffer(queue, tracking_buf.error_buf,    CL_TRUE, 0, err_buf_size,    err_out,      0, nullptr, nullptr);
+
+    if (err != CL_SUCCESS) 
+    {
+        printf("Error reading buffer for results: %d\n", err);
+        return -1;
+    }
+
+    return 0;
 }
 
-// void TrackOCL::swap_pyr_pointers(ocl_pyramid*& pyr1, ocl_pyramid*& pyr2)
-// {
-//     ocl_pyramid* temp = pyr1;
-//     pyr1 = pyr2;
-//     pyr2 = temp;
-// }
+
+void OCLTracker::swap_pyr_pointers()
+{
+    std::swap(prev_pyr, next_pyr);
+}
