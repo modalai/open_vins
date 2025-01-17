@@ -124,7 +124,7 @@ VioManager::VioManager(VioManagerOptions &params_) : thread_init_running(false),
 
     	  printf("\n====> Using Internal KLT feature tracker (w/ GPU) <==== \n");
 
-        TrackOCL * klt = new TrackOCL(	state->_cam_intrinsics_cameras, 
+        TrackOCL * klt_ocl = new TrackOCL(	state->_cam_intrinsics_cameras, 
                                         init_max_features,
                                         state->_options.max_aruco_features, 
                                         params.fast_threshold, 
@@ -133,8 +133,8 @@ VioManager::VioManager(VioManagerOptions &params_) : thread_init_running(false),
                                         params.min_px_dist);
 
         // update pyramid levels for feature tracking
-        klt->set_pyramid_levels(params.pyramid_levels);
-        trackFEATS = std::shared_ptr<TrackBase>(klt);
+        // klt_ocl->set_pyramid_levels(params.pyramid_levels);
+        trackFEATS = std::shared_ptr<TrackBase>(klt_ocl);
 
       } else {
 

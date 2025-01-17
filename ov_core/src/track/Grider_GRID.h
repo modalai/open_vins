@@ -112,6 +112,7 @@ class Grider_GRID {
                               auto grid = valid_locs.at(r);
                               int x = grid.first * size_x;
                               int y = grid.second * size_y;
+                            //   printf("grid (%d, %d), size_x: %d, size_y: %d\n", grid.first, grid.second, size_x, size_y);
 
                               // Skip if we are out of bounds
                               if (x + size_x > img.cols || y + size_y > img.rows)
