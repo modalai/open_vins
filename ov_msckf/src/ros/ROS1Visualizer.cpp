@@ -619,8 +619,13 @@ void ROS1Visualizer::publish_features() {
         return;
 
     // Get our good MSCKF features
-    std::vector<Eigen::Vector3d> feats_msckf = _app->get_good_features_MSCKF();
-    sensor_msgs::PointCloud2 cloud = ROSVisualizerHelper::get_ros_pointcloud(feats_msckf);
+    std::vector<Eigen::Vector4d> feats_msckf = _app->get_good_features_MSCKF();
+    //DON'T BREAK THE CODE... 
+    std::vector<Eigen::Vector3d> feats_msckf_3d;
+    for (const auto& feat : feats_msckf) {
+        feats_msckf_3d.push_back(feat.head<3>());
+    }
+    sensor_msgs::PointCloud2 cloud = ROSVisualizerHelper::get_ros_pointcloud(feats_msckf_3d);
     pub_points_msckf.publish(cloud);
 
     // Get our good SLAM features

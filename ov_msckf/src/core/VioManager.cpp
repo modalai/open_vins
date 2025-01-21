@@ -27,6 +27,7 @@
 #include "track/TrackAruco.h"
 #include "track/TrackDescriptor.h"
 #include "track/TrackKLT.h"
+#include "track/TrackOCL/TrackOCL.h"
 
 #include "track/TrackSIM.h"
 #include "types/Landmark.h"
@@ -118,22 +119,43 @@ VioManager::VioManager(VioManagerOptions &params_) : thread_init_running(false),
             .init_max_features; // std::floor((double)params.init_options.init_max_features / (double)params.state_options.num_cameras);
         
     if (params.use_klt) {
-    	printf("\n====> Using Internal KLT feature tracker <==== \n");
-	
-	TrackKLT * klt = new TrackKLT(	state->_cam_intrinsics_cameras, 
-					init_max_features,
+
+      if (params.use_gpu) {
+
+    	  printf("\n====> Using Internal KLT feature tracker (w/ GPU) <==== \n");
+
+        TrackOCL * klt = new TrackOCL(	state->_cam_intrinsics_cameras, 
+                                        init_max_features,
                                         state->_options.max_aruco_features, 
-					params.use_stereo, 
-					params.histogram_method,
                                         params.fast_threshold, 
-					params.grid_x, 
-					params.grid_y, 
-					params.min_px_dist);
+                                        params.grid_x, 
+                                        params.grid_y, 
+                                        params.min_px_dist);
 
-    	// update pyramid levels for feature tracking
-    	klt->set_pyramid_levels(params.pyramid_levels);
-
+        // update pyramid levels for feature tracking
+        klt->set_pyramid_levels(params.pyramid_levels);
         trackFEATS = std::shared_ptr<TrackBase>(klt);
+
+      } else {
+
+    	  printf("\n====> Using Internal KLT feature tracker <==== \n");
+	
+        TrackKLT * klt = new TrackKLT(	state->_cam_intrinsics_cameras, 
+                                        init_max_features,
+                                        state->_options.max_aruco_features, 
+                                        params.use_stereo, 
+                                        params.histogram_method,
+                                        params.fast_threshold, 
+                                        params.grid_x, 
+                                        params.grid_y, 
+                                        params.min_px_dist);
+        
+        // update pyramid levels for feature tracking
+        klt->set_pyramid_levels(params.pyramid_levels);
+        trackFEATS = std::shared_ptr<TrackBase>(klt);
+
+      }
+
 
 
     } else {
@@ -215,21 +237,41 @@ void VioManager::zero_state()
 
 	
     if (params.use_klt) {
-    	TrackKLT * klt = new TrackKLT(	
-    			state->_cam_intrinsics_cameras, 
-    			params.init_options.init_max_features,
-									state->_options.max_aruco_features, 
-				params.use_stereo, 
-				params.histogram_method,
-									params.fast_threshold, 
-				params.grid_x, 
-				params.grid_y, 
-				params.min_px_dist);
+          if (params.use_gpu) {
+
+    	  printf("\n====> Using Internal KLT feature tracker (w/ GPU) <==== \n");
+
+        TrackOCL * klt = new TrackOCL(	state->_cam_intrinsics_cameras, 
+                                        params.init_options.init_max_features,
+                                        state->_options.max_aruco_features, 
+                                        params.fast_threshold, 
+                                        params.grid_x, 
+                                        params.grid_y, 
+                                        params.min_px_dist);
+
+        // update pyramid levels for feature tracking
+        klt->set_pyramid_levels(params.pyramid_levels);
+        trackFEATS = std::shared_ptr<TrackBase>(klt);
+
+      } else {
+
+    	  printf("\n====> Using Internal KLT feature tracker <==== \n");
 	
-	// update pyramid levels for feature tracking
-	klt->set_pyramid_levels(params.pyramid_levels);
-	
-	trackFEATS = std::shared_ptr<TrackBase>(klt);
+        TrackKLT * klt = new TrackKLT(	state->_cam_intrinsics_cameras, 
+                                        params.init_options.init_max_features,
+                                        state->_options.max_aruco_features, 
+                                        params.use_stereo, 
+                                        params.histogram_method,
+                                        params.fast_threshold, 
+                                        params.grid_x, 
+                                        params.grid_y, 
+                                        params.min_px_dist);
+        
+        // update pyramid levels for feature tracking
+        klt->set_pyramid_levels(params.pyramid_levels);
+        trackFEATS = std::shared_ptr<TrackBase>(klt);
+
+      }
     }
     else
     {
@@ -1012,7 +1054,19 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
 
   // Save all the MSCKF features used in the update
   for (auto const &feat : featsup_MSCKF) {
-    good_features_MSCKF.push_back(feat->p_FinG);
+  //JOAO ADDS
+    //==================================================================================
+    //CHANGE THIS TO INCLUDE THE RAANSAC QUALITY FOR THE "GOOD" MSCKF FEATURES
+    // good_features_MSCKF.push_back(feat->p_FinG);
+
+    //SYNTAX SYNTAX SYNTAX, USING EIGEN INLINE CONSTRUCTOR
+    good_features_MSCKF.push_back(Eigen::Vector4d(
+    feat->p_FinG(0),
+    feat->p_FinG(1),
+    feat->p_FinG(2),
+    feat->ransac_quality));
+    //==================================================================================
+
     MSCKF_ids.push_back(feat->featid);
     feat->to_delete = true;
   }

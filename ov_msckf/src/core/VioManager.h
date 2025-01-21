@@ -141,7 +141,7 @@ class VioManager {
     std::vector<Eigen::Vector3d> get_features_ARUCO();
 
     /// Returns 3d features used in the last update in global frame
-    std::vector<Eigen::Vector3d> get_good_features_MSCKF() { return good_features_MSCKF; }
+    std::vector<Eigen::Vector4d> get_good_features_MSCKF() { return good_features_MSCKF; }
 
     /// VOXL: Add Barometer Constraint
     void  add_constraint_baro(double height, double vel_z) { alt_from_baro = height; vel_from_baro  = vel_z; }
@@ -260,7 +260,10 @@ class VioManager {
     bool has_moved_since_zupt = false;
 
     // Good features that where used in the last update (used in visualization)
-    std::vector<Eigen::Vector3d> good_features_MSCKF;
+  //JOAO ADDS
+    //MAKE A VEC DIM = 4, ADDING RAANSAC QUALITY --> SO WE CAN GRAB IT IN OV-SERVER
+    // std::vector<Eigen::Vector3d> good_features_MSCKF;
+    std::vector<Eigen::Vector4d> good_features_MSCKF;
     // store the pixel representation as well, so we can draw with them
     std::vector<size_t> MSCKF_ids;
 

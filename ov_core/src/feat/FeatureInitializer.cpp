@@ -25,11 +25,18 @@
 #include "utils/print.h"
 #include "utils/quat_ops.h"
 
+#define RANSAAC_THRESHOLD 0.02f //SUBJECT TO CHANGE 0.5 0.1 
+
 using namespace ov_core;
 
 bool FeatureInitializer::single_triangulation(std::shared_ptr<Feature> feat,
                                               std::unordered_map<size_t, std::unordered_map<double, ClonePose>> &clonesCAM) {
-
+//JOAO ADDS
+//==============================================================================================================
+//NOTE: THIS ADDS A SECOND FOR-LOOP FOR COMPUTING THE INLIERS AFTER SOLVING THE LINEAR SYSTEM.
+//      ARGUABLY, WE CAN COMPUTE THE QUALITY AS WE BUILD THE LINEAR SYSTEM INSTEAD,
+//      BUT THE REPROJECTION ERROR WON'T BE AS GOOD SINCE WE DON'T HAVE THE FINAL FEATURE 3D GLOBAL POSITION YET.
+//==============================================================================================================
     // Total number of measurements
     // Also set the first measurement to be the anchor frame
     int total_meas = 0;
@@ -48,6 +55,13 @@ bool FeatureInitializer::single_triangulation(std::shared_ptr<Feature> feat,
     // Our linear system matrices
     Eigen::Matrix3d A = Eigen::Matrix3d::Zero();
     Eigen::Vector3d b = Eigen::Vector3d::Zero();
+//JOAO ADDS
+//=====================================================================================
+    //CAN ONLY PICK ONE
+    if (raansac_gn && raansac_tri){
+        raansac_gn = false;
+    }
+//=====================================================================================
 
     // Get the position of the anchor pose
     ClonePose anchorclone = clonesCAM.at(feat->anchor_cam_id).at(feat->anchor_clone_timestamp);
@@ -59,7 +73,7 @@ bool FeatureInitializer::single_triangulation(std::shared_ptr<Feature> feat,
 
         // Add CAM_I features
         for (size_t m = 0; m < feat->timestamps.at(pair.first).size(); m++) {
-
+        
             // Get the position of this clone in the global
             const Eigen::Matrix<double, 3, 3> &R_GtoCi = clonesCAM.at(pair.first).at(feat->timestamps.at(pair.first).at(m)).Rot();
             const Eigen::Matrix<double, 3, 1> &p_CiinG = clonesCAM.at(pair.first).at(feat->timestamps.at(pair.first).at(m)).pos();
@@ -112,6 +126,42 @@ bool FeatureInitializer::single_triangulation(std::shared_ptr<Feature> feat,
     // Store it in our feature object
     feat->p_FinA = p_f;
     feat->p_FinG = R_GtoA.transpose() * feat->p_FinA + p_AinG;
+//JOAO ADDS
+//=====================================================================================
+    //RANSAAC TEST
+    if (raansac_tri){
+        int inliers = 0;
+        int total_obs = 0;
+
+        for (auto const &pair : feat->timestamps) {
+            for (size_t m = 0; m < feat->timestamps.at(pair.first).size(); m++) {
+                
+                total_obs++;
+
+                //CLONE POSITION IN G
+                const Eigen::Matrix<double, 3, 3> &R_GtoCi = clonesCAM.at(pair.first).at(feat->timestamps.at(pair.first).at(m)).Rot();
+                const Eigen::Matrix<double, 3, 1> &p_CiinG = clonesCAM.at(pair.first).at(feat->timestamps.at(pair.first).at(m)).pos();
+
+                //CONVERT LATEST Pf INTO CLONE CAMERA FRAME
+                Eigen::Matrix<double, 3, 1> p_FinCi = R_GtoCi * (feat->p_FinG - p_CiinG);
+
+                //PROJECT
+                Eigen::Vector2d reproj_uv(p_FinCi(0) / p_FinCi(2), p_FinCi(1) / p_FinCi(2));
+
+                //OBSERVED
+                Eigen::Vector2d observed_uv(feat->uvs_norm.at(pair.first).at(m)(0), feat->uvs_norm.at(pair.first).at(m)(1));
+
+                //REPROJECTION ERROR
+                double reprojection_error = (reproj_uv - observed_uv).norm();
+
+                if (reprojection_error < RANSAAC_THRESHOLD) {
+                    inliers++;
+                }
+            }
+        }
+        feat->ransac_quality =  static_cast<float>(inliers) / total_obs;
+    }
+//=====================================================================================
     return true;
 }
 
@@ -198,8 +248,15 @@ bool FeatureInitializer::single_triangulation_1d(std::shared_ptr<Feature> feat,
     return true;
 }
 
+
+
 bool FeatureInitializer::single_gaussnewton(std::shared_ptr<Feature> feat,
                                             std::unordered_map<size_t, std::unordered_map<double, ClonePose>> &clonesCAM) {
+//JOAO ADD
+//=====================================================================================
+//NOTE: ADDING RAANSAC HERE CHECKS INLIER METRIC DURING OPTIMIZATION POST-TRIANGULATION
+//      IN ESSENCE, FEATURES THAT CONVERGE FASTER ARE LIKELY TO BE INLIERS
+//=====================================================================================
 
     // Get into inverse depth
     double rho = 1 / feat->p_FinA(2);
@@ -216,6 +273,12 @@ bool FeatureInitializer::single_gaussnewton(std::shared_ptr<Feature> feat,
     Eigen::Matrix<double, 3, 3> Hess = Eigen::Matrix<double, 3, 3>::Zero();
     Eigen::Matrix<double, 3, 1> grad = Eigen::Matrix<double, 3, 1>::Zero();
 
+//JOAO ADDS
+//=====================================================================================
+    //RANSAAC TEST
+        int inliers = 0;
+        int total_obs = 0;
+//=====================================================================================
     // Cost at the last iteration
     double cost_old = compute_error(clonesCAM, feat, alpha, beta, rho);
 
@@ -285,6 +348,17 @@ bool FeatureInitializer::single_gaussnewton(std::shared_ptr<Feature> feat,
                     err += std::pow(res.norm(), 2);
                     grad.noalias() += H.transpose() * res.cast<double>();
                     Hess.noalias() += H.transpose() * H;
+
+                //JOAO ADDS
+                //=====================================================================================
+                    //RANSAAC THRESHOLD
+                    if (raansac_gn){
+                        total_obs++;
+                        if (res.norm() < RANSAAC_THRESHOLD){
+                            inliers++;
+                        }
+                    }
+                //=====================================================================================
                 }
             }
         }
@@ -375,6 +449,17 @@ bool FeatureInitializer::single_gaussnewton(std::shared_ptr<Feature> feat,
 
     // Finally get position in global frame
     feat->p_FinG = R_GtoA.transpose() * feat->p_FinA + p_AinG;
+
+//JOAO ADDS
+    //=====================================================================================
+    //NOTE: THIS ONLY ADDS THE LATEST RAANSAC QUALITY METRIC
+    //      WE COULD HAVE A HISTORY OF RAANSAC QUALITY METRICS FOR EACH FEATURE,
+    //      BUT I DON'T THINK IT'S NECESSARY
+    if (raansac_gn){
+    //ADD RANSAC QUALITY METRIC
+        feat->ransac_quality =  static_cast<float>(inliers) / total_obs;
+    }
+    //=====================================================================================
     return true;
 }
 

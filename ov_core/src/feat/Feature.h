@@ -75,6 +75,10 @@ class Feature {
     cv::Mat descriptor;
 
     bool refound = false;
+    
+   //JOAO ADDS
+    //LATEST RANSAC quality metric -- AFTER WINDOW OPTIMIZATION
+    float ransac_quality;
 
     /**
      * @brief Remove measurements that do not occur at passed timestamps.
