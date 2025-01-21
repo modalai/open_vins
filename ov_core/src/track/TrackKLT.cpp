@@ -55,6 +55,7 @@ void TrackKLT::feed_new_camera(const CameraData &message) {
 
         // Histogram equalize
         cv::Mat img;
+
         if (histogram_method == HistogramMethod::HISTOGRAM) {
             cv::equalizeHist(message.images.at(msg_id), img);
         } else if (histogram_method == HistogramMethod::CLAHE) {
@@ -119,6 +120,7 @@ void TrackKLT::feed_monocular(const CameraData &message, size_t msg_id) {
         img_mask_last[cam_id] = mask;
         pts_last[cam_id] = good_left;
         ids_last[cam_id] = good_ids_left;
+
         return;
     }
 
@@ -834,9 +836,14 @@ void TrackKLT::perform_matching(const std::vector<cv::Mat> &img0pyr, const std::
 
     // Convert keypoints into points (stupid opencv stuff)
     std::vector<cv::Point2f> pts0, pts1;
+    std::vector<float> pts_out;
     for (size_t i = 0; i < kpts0.size(); i++) {
         pts0.push_back(kpts0.at(i).pt);
         pts1.push_back(kpts1.at(i).pt);
+
+        // for gpu run
+        pts_out.push_back(kpts0.at(i).pt.x);
+        pts_out.push_back(kpts0.at(i).pt.y);
     }
 
     // If we don't have enough points for ransac just return empty
@@ -850,6 +857,7 @@ void TrackKLT::perform_matching(const std::vector<cv::Mat> &img0pyr, const std::
     // Now do KLT tracking to get the valid new points
     std::vector<uchar> mask_klt;
     std::vector<float> error;
+    
     cv::TermCriteria term_crit = cv::TermCriteria(cv::TermCriteria::COUNT | cv::TermCriteria::EPS, 30, 0.01);
     cv::calcOpticalFlowPyrLK(img0pyr, img1pyr, pts0, pts1, mask_klt, error, win_size, pyr_levels, term_crit, cv::OPTFLOW_USE_INITIAL_FLOW);
 

@@ -276,7 +276,7 @@ class VioManager {
     // last index will store depth error
     std::unordered_map<size_t, Eigen::Vector4d> active_tracks_uvd;
     cv::Mat active_image;
-
+       
     // VOXL: contraint values used by state
     double alt_from_baro = -9999;
     double vel_from_baro = 0;

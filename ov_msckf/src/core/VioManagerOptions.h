@@ -329,6 +329,9 @@ struct VioManagerOptions {
     /// If we should use KLT tracking, or descriptor matcher
     bool use_klt = true;
 
+    // If we should offload KLT tracking to an available GPU device
+    bool use_gpu = false;
+
     /// If should extract aruco tags and estimate them
     bool use_aruco = true;
 
