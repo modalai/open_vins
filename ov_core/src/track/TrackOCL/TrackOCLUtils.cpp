@@ -113,17 +113,9 @@ int OCLManager::init(int n_cams, int width, int height, int pyr_levels)
         printf("Error building kernel: %s\n", build_log.data());
     }
 
-    num_cams = n_cams;
 
-    // initialize tracking for cameras
-    for (int i = 0; i < num_cams; ++i) 
-    {
-        cl_image_format format;
-        format.image_channel_order = CL_R;
-        format.image_channel_data_type = CL_FLOAT;
-
-        cam_track[i] = new OCLTracker();
         cam_track[i]->init(context, device, ocl_program, detect_program, pyr_levels+1, width, height, format);
+
     }
 
 
@@ -914,6 +906,7 @@ int OCLTracker::init(cl_context context, cl_device_id device, cl_program program
     create_pyramids(pyr_levels, base_width, base_height, format);
     create_ocl_buf(base_width, base_height, format);
     create_detection_buffer(10000);
+
     create_tracking_buffers(100);
     
     return 0;
@@ -936,6 +929,7 @@ int OCLTracker::create_queue(cl_device_id device, cl_context context)
 
 
 int OCLTracker::build_ocl_kernels(cl_program program, cl_program detect_program)
+
 {
     cl_int err;
 
@@ -966,6 +960,7 @@ int OCLTracker::build_ocl_kernels(cl_program program, cl_program detect_program)
         printf("Error creating nms_kernel from program!\n");
         return 1;
     }
+
 
     return 0;
 }
@@ -1186,6 +1181,7 @@ int OCLTracker::create_tracking_buffers(int n_points)
     tracking_buf.status_buf   = clCreateBuffer(context, CL_MEM_READ_WRITE, n_points * sizeof(cl_uchar),  nullptr, &err);
     tracking_buf.error_buf    = clCreateBuffer(context, CL_MEM_READ_WRITE, n_points * sizeof(cl_float),  nullptr, &err);
 
+
     if (err != CL_SUCCESS) 
     {
         printf("Failed to create buffers for tracking: %d\n", err);
@@ -1282,6 +1278,7 @@ int OCLTracker::run_tracking_step(int n_points, float* prev_pts)
     }
 
     clFinish(this->queue);
+
 
     return 0;
 }

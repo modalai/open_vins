@@ -18,6 +18,7 @@ struct ocl_image
     cl_mem          img_mem = nullptr;
     unsigned int    w       = 0;
     unsigned int    h       = 0;
+
     cl_image_format image_format = {0};
 };
 
@@ -29,6 +30,7 @@ struct ocl_buffer
     cl_mem          buf_mem = nullptr;
     unsigned int    w       = 0;
     unsigned int    h       = 0;
+
     cl_image_format image_format = {0}; 
 };
 
@@ -83,6 +85,7 @@ public:
     cl_kernel extract_kernel = nullptr;
     cl_kernel nms_kernel     = nullptr;
 
+
     // Pointers to pyramids for the "previous" and "next" frames
     ocl_pyramid* prev_pyr = nullptr;
     ocl_pyramid* next_pyr = nullptr;
@@ -111,6 +114,7 @@ public:
              cl_device_id device,
              cl_program program,
              cl_program detect_program,
+
              int pyr_levels,
              int base_width,
              int base_height,
@@ -136,6 +140,7 @@ private:
     int create_tracking_buffers(int n_points);
     int create_detection_buffer(int max_points);
 
+
     int destroy_ocl_image(ocl_image* image);
     int destroy_pyramid(ocl_pyramid* pyramid);
 };
@@ -155,6 +160,7 @@ class OCLManager
         cl_program      ocl_program = nullptr;
         cl_program      detect_program = nullptr;
 
+
         std::string     kernel_code;
 
         
@@ -169,6 +175,7 @@ class OCLManager
     private:
         int load_kernel_code(std::string& dst_str);
         int load_detection_kernel(std::string& dst_str);
+
 
 };
 

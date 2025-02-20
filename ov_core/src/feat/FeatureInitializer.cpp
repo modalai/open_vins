@@ -58,6 +58,7 @@ bool FeatureInitializer::single_triangulation(std::shared_ptr<Feature> feat,
 //JOAO ADDS
 //=====================================================================================
     //CAN ONLY PICK ONE
+
     if (_options.raansac_gn && _options.raansac_tri){
         _options.raansac_gn = false;
     }
@@ -129,6 +130,7 @@ bool FeatureInitializer::single_triangulation(std::shared_ptr<Feature> feat,
 //JOAO ADDS
 //=====================================================================================
     //RANSAAC TEST
+
     if (_options.raansac_tri){
         int inliers = 0;
         int total_obs = 0;
@@ -352,6 +354,7 @@ bool FeatureInitializer::single_gaussnewton(std::shared_ptr<Feature> feat,
                 //JOAO ADDS
                 //=====================================================================================
                     //RANSAAC THRESHOLD
+
                     if (_options.raansac_gn){
                         total_obs++;
                         if (res.norm() < RANSAAC_THRESHOLD){
