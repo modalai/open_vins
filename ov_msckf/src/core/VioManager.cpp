@@ -124,7 +124,7 @@ VioManager::VioManager(VioManagerOptions &params_) : thread_init_running(false),
 
     	  printf("\n====> Using Internal KLT feature tracker (w/ GPU) <==== \n");
 
-        TrackOCL * klt_ocl = new TrackOCL(	state->_cam_intrinsics_cameras, 
+        TrackOCL * klt = new TrackOCL(	state->_cam_intrinsics_cameras, 
                                         init_max_features,
                                         state->_options.max_aruco_features, 
                                         params.fast_threshold, 
@@ -133,8 +133,8 @@ VioManager::VioManager(VioManagerOptions &params_) : thread_init_running(false),
                                         params.min_px_dist);
 
         // update pyramid levels for feature tracking
-        // klt_ocl->set_pyramid_levels(params.pyramid_levels);
-        trackFEATS = std::shared_ptr<TrackBase>(klt_ocl);
+        klt->set_pyramid_levels(params.pyramid_levels);
+        trackFEATS = std::shared_ptr<TrackBase>(klt);
 
       } else {
 
@@ -1054,7 +1054,19 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
 
   // Save all the MSCKF features used in the update
   for (auto const &feat : featsup_MSCKF) {
-    good_features_MSCKF.push_back(feat->p_FinG);
+  //JOAO ADDS
+    //==================================================================================
+    //CHANGE THIS TO INCLUDE THE RAANSAC QUALITY FOR THE "GOOD" MSCKF FEATURES
+    // good_features_MSCKF.push_back(feat->p_FinG);
+
+    //SYNTAX SYNTAX SYNTAX, USING EIGEN INLINE CONSTRUCTOR
+    good_features_MSCKF.push_back(Eigen::Vector4d(
+    feat->p_FinG(0),
+    feat->p_FinG(1),
+    feat->p_FinG(2),
+    feat->ransac_quality));
+    //==================================================================================
+
     MSCKF_ids.push_back(feat->featid);
     feat->to_delete = true;
   }

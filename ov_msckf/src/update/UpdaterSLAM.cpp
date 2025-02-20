@@ -220,6 +220,12 @@ void UpdaterSLAM::delayed_init(std::shared_ptr<State> state, std::vector<std::sh
         landmark->_feat_representation = feat_rep;
         landmark->_unique_camera_id = (*it2)->anchor_cam_id;
         landmark->descriptor = (*it2)->descriptor;
+    //JOAO ADDS
+        //=======================================================================================
+        //NOTE: WE NEED TO ADD THE RANSAC QUALITY METRIC INSIDE THE LANDMARK STRUCTURE
+        //      SO IT CAN BE USED BY THE OV<=>OV-SERVER FUNCTIONS WHEN GRABBIG STATE SLAM FEATURES
+        landmark->ransac_quality = (*it2)->ransac_quality;
+        //=======================================================================================
         if (LandmarkRepresentation::is_relative_representation(feat.feat_representation)) {
             landmark->_anchor_cam_id = feat.anchor_cam_id;
             landmark->_anchor_clone_timestamp = feat.anchor_clone_timestamp;
