@@ -81,10 +81,6 @@ class Landmark : public Vec {
     // descriptor given to us by external tracker
     cv::Mat descriptor;
 
-  //JOAO ADDS
-    //LATEST RANSAC quality metric -- AFTER WINDOW OPTIMIZATION
-    float ransac_quality;
-
 
     /**
      * @brief Overrides the default vector update rule

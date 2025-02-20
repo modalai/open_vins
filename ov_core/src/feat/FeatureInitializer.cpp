@@ -58,8 +58,8 @@ bool FeatureInitializer::single_triangulation(std::shared_ptr<Feature> feat,
 //JOAO ADDS
 //=====================================================================================
     //CAN ONLY PICK ONE
-    if (raansac_gn && raansac_tri){
-        raansac_gn = false;
+    if (_options.raansac_gn && _options.raansac_tri){
+        _options.raansac_gn = false;
     }
 //=====================================================================================
 
@@ -129,7 +129,7 @@ bool FeatureInitializer::single_triangulation(std::shared_ptr<Feature> feat,
 //JOAO ADDS
 //=====================================================================================
     //RANSAAC TEST
-    if (raansac_tri){
+    if (_options.raansac_tri){
         int inliers = 0;
         int total_obs = 0;
 
@@ -352,7 +352,7 @@ bool FeatureInitializer::single_gaussnewton(std::shared_ptr<Feature> feat,
                 //JOAO ADDS
                 //=====================================================================================
                     //RANSAAC THRESHOLD
-                    if (raansac_gn){
+                    if (_options.raansac_gn){
                         total_obs++;
                         if (res.norm() < RANSAAC_THRESHOLD){
                             inliers++;
@@ -455,7 +455,7 @@ bool FeatureInitializer::single_gaussnewton(std::shared_ptr<Feature> feat,
     //NOTE: THIS ONLY ADDS THE LATEST RAANSAC QUALITY METRIC
     //      WE COULD HAVE A HISTORY OF RAANSAC QUALITY METRICS FOR EACH FEATURE,
     //      BUT I DON'T THINK IT'S NECESSARY
-    if (raansac_gn){
+    if (_options.raansac_gn){
     //ADD RANSAC QUALITY METRIC
         feat->ransac_quality =  static_cast<float>(inliers) / total_obs;
     }

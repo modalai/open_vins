@@ -38,7 +38,8 @@ class TrackOCL : public TrackBase {
             int height = cameras.at(0)->h();
 
             // Initialize OpenCL manager
-            this->ocl_manager.init(cameras.size(), width, height, pyr_levels);  
+            int err = this->ocl_manager.init(cameras.size(), width, height, pyr_levels); 
+            printf("initialized ocl manager\n"); 
           }
 
     /**
@@ -74,7 +75,7 @@ class TrackOCL : public TrackBase {
      * Passed images should already be grayscaled.
      */
     void perform_detection_monocular(const std::vector<cv::Mat> &img0pyr, const cv::Mat &mask0, std::vector<cv::KeyPoint> &pts0,
-                                     std::vector<size_t> &ids0);
+                                     std::vector<size_t> &ids0, int id);
                                      
 
     /**

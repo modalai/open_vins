@@ -141,15 +141,6 @@ class FeatureInitializer {
     double compute_error(std::unordered_map<size_t, std::unordered_map<double, ClonePose>> &clonesCAM, std::shared_ptr<Feature> feat,
                          double alpha, double beta, double rho);
 
-    /**
-     * @brief This flag indicates whether the RANSAC-GN algorithm is enabled or not.
-     */
-    bool raansac_gn = false;
-
-    /**
-     * @brief This flag indicates whether the RANSAC-TRI algorithm is enabled or not.
-     */
-    bool raansac_tri = true;
   protected:
     /// Contains options for the initializer process
     FeatureInitializerOptions _options;
