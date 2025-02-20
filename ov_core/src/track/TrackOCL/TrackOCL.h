@@ -77,7 +77,6 @@ class TrackOCL : public TrackBase {
      */
     void perform_detection_monocular(const std::vector<cv::Mat> &img0pyr, const cv::Mat &mask0, std::vector<cv::KeyPoint> &pts0,
                                      std::vector<size_t> &ids0, int id);
-                     
 
     /**
      * @brief KLT track between two images, and do RANSAC afterwards

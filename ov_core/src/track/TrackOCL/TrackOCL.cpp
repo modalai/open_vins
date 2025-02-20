@@ -24,6 +24,7 @@
 #include "../Grider_FAST.h"
 #include "../Grider_GRID.h"
 
+
 #include "Grider_OCL.h"
 
 
@@ -40,12 +41,6 @@ void TrackOCL::feed_new_camera(const CameraData &message) {
         PRINT_ERROR(RED "[ERROR]:   - message.masks.size() = %zu\n" RESET, message.masks.size());
         std::exit(EXIT_FAILURE);
     }
-
-    // static bool first_run = true;
-    // if (first_run) {
-    //     ocl_manager.init();
-    //     first_run = false;
-    // }
 
     // Preprocessing steps that we do not parallelize
     // NOTE: DO NOT PARALLELIZE THESE!
@@ -87,7 +82,6 @@ void TrackOCL::feed_new_camera(const CameraData &message) {
 }
 
 void TrackOCL::feed_monocular(const CameraData &message, size_t msg_id) {
-
     // Lock this data feed for this camera
     size_t cam_id = message.sensor_ids.at(msg_id);
     std::lock_guard<std::mutex> lck(mtx_feeds.at(cam_id));
@@ -120,6 +114,7 @@ void TrackOCL::feed_monocular(const CameraData &message, size_t msg_id) {
 
 
 
+
         return;
     }
 
@@ -136,7 +131,6 @@ void TrackOCL::feed_monocular(const CameraData &message, size_t msg_id) {
 
     ocl_manager.cam_track[cam_id]->swap_pyr_pointers();
     ocl_manager.cam_track[cam_id]->build_next_pyramid(img_float.data);
-
 
     // Our return success masks, and predicted new features
     std::vector<uchar> mask_ll;
@@ -209,6 +203,7 @@ void TrackOCL::feed_monocular(const CameraData &message, size_t msg_id) {
 
 void TrackOCL::perform_detection_monocular(const std::vector<cv::Mat> &img0pyr, const cv::Mat &mask0, std::vector<cv::KeyPoint> &pts0,
                                            std::vector<size_t> &ids0, int cam_id) {
+
 
 
     // Create a 2D occupancy grid for this current image

@@ -15,10 +15,9 @@
  */
 struct ocl_image
 {
-    cl_mem          img_mem = nullptr;
-    unsigned int    w       = 0;
-    unsigned int    h       = 0;
-
+    cl_mem         img_mem = nullptr;
+    unsigned int   w       = 0;
+    unsigned int   h       = 0;
     cl_image_format image_format = {0};
 };
 
@@ -27,10 +26,9 @@ struct ocl_image
  */
 struct ocl_buffer 
 {
-    cl_mem          buf_mem = nullptr;
-    unsigned int    w       = 0;
-    unsigned int    h       = 0;
-
+    cl_mem         buf_mem = nullptr;
+    unsigned int   w       = 0;
+    unsigned int   h       = 0;
     cl_image_format image_format = {0}; 
 };
 
@@ -58,13 +56,6 @@ struct ocl_tracking_buffer
     cl_mem error_buf    = nullptr;
 };
 
-struct ocl_detection_buffer
-{
-    int    max_points  = 0;
-    cl_mem xy_pts_buf  = nullptr;
-    cl_mem xyz_pts_buf = nullptr;
-};
-
 /**
  * @class OCLTracker
  * @brief Manages OpenCL-based tracking (LK optical flow).
@@ -81,11 +72,6 @@ public:
     cl_kernel track_kernel      = nullptr;
     cl_kernel downfilter_kernel = nullptr;
 
-    // Kernels used for feature point extraction 
-    cl_kernel extract_kernel = nullptr;
-    cl_kernel nms_kernel     = nullptr;
-
-
     // Pointers to pyramids for the "previous" and "next" frames
     ocl_pyramid* prev_pyr = nullptr;
     ocl_pyramid* next_pyr = nullptr;
@@ -93,12 +79,6 @@ public:
     // Buffers to store tracking data (points, status, etc.)
     ocl_tracking_buffer tracking_buf;
     
-    // Buffer to store default img
-    ocl_buffer img_buf;
-
-    // Buffer to store 
-    ocl_detection_buffer detection_buf;
-
     // Constructor
     OCLTracker() = default;
 
@@ -113,8 +93,6 @@ public:
     int init(cl_context context,
              cl_device_id device,
              cl_program program,
-             cl_program detect_program,
-
              int pyr_levels,
              int base_width,
              int base_height,
@@ -131,15 +109,11 @@ public:
 
 private:
     int create_queue(cl_device_id device, cl_context context);
-    int build_ocl_kernels(cl_program ocl_program, cl_program detect_program);
+    int build_ocl_kernels(cl_program ocl_program);
 
-    void create_ocl_buf(int w, int h, cl_image_format format);
     ocl_image create_ocl_image(int w, int h, cl_image_format format);
-
     int create_pyramids(int levels, int base_w, int base_h, cl_image_format format);  
     int create_tracking_buffers(int n_points);
-    int create_detection_buffer(int max_points);
-
 
     int destroy_ocl_image(ocl_image* image);
     int destroy_pyramid(ocl_pyramid* pyramid);
@@ -158,8 +132,6 @@ class OCLManager
         cl_device_id    device  = nullptr;
         cl_context      context = nullptr;
         cl_program      ocl_program = nullptr;
-        cl_program      detect_program = nullptr;
-
 
         std::string     kernel_code;
 
@@ -174,8 +146,6 @@ class OCLManager
 
     private:
         int load_kernel_code(std::string& dst_str);
-        int load_detection_kernel(std::string& dst_str);
-
 
 };
 
