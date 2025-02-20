@@ -23,13 +23,14 @@
 
 #include "../Grider_FAST.h"
 #include "../Grider_GRID.h"
-
-
 #include "Grider_OCL.h"
-
+#include "cam/CamBase.h"
+#include "feat/Feature.h"
+#include "feat/FeatureDatabase.h"
+#include "utils/opencv_lambda_body.h"
+#include "utils/print.h"
 
 using namespace ov_core;
-
 
 void TrackOCL::feed_new_camera(const CameraData &message) {
 
@@ -99,7 +100,6 @@ void TrackOCL::feed_monocular(const CameraData &message, size_t msg_id) {
         std::vector<cv::KeyPoint> good_left;
         std::vector<size_t> good_ids_left;
         perform_detection_monocular(imgpyr, mask, good_left, good_ids_left, cam_id);
-
         // Save the current image and pyramid
         std::lock_guard<std::mutex> lckv(mtx_last_vars);
         img_last[cam_id] = img;
@@ -112,15 +112,11 @@ void TrackOCL::feed_monocular(const CameraData &message, size_t msg_id) {
         message.images[msg_id].convertTo(img_float, CV_32F);
         ocl_manager.cam_track[cam_id]->build_next_pyramid(img_float.data);
 
-
-
-
         return;
     }
 
     cv::Mat img_float;
 	message.images[msg_id].convertTo(img_float, CV_32F);
-
 
     // First we should make that the last images have enough features so we can do KLT
     // This will "top-off" our number of tracks so always have a constant number
@@ -204,15 +200,12 @@ void TrackOCL::feed_monocular(const CameraData &message, size_t msg_id) {
 void TrackOCL::perform_detection_monocular(const std::vector<cv::Mat> &img0pyr, const cv::Mat &mask0, std::vector<cv::KeyPoint> &pts0,
                                            std::vector<size_t> &ids0, int cam_id) {
 
-
-
     // Create a 2D occupancy grid for this current image
     // Note that we scale this down, so that each grid point is equal to a set of pixels
     // This means that we will reject points that less than grid_px_size points away then existing features
 
     
     auto rT1 = boost::posix_time::microsec_clock::local_time();
-
 
     cv::Size size_close((int)((float)img0pyr.at(0).cols / (float)min_px_dist),
                         (int)((float)img0pyr.at(0).rows / (float)min_px_dist)); // width x height
@@ -282,14 +275,12 @@ void TrackOCL::perform_detection_monocular(const std::vector<cv::Mat> &img0pyr, 
     auto rT2 = boost::posix_time::microsec_clock::local_time();
     PRINT_DEBUG("[TIME-DTCT]: %.4f seconds for grid creation\n", (rT2 - rT1).total_microseconds() * 1e-6);    
 
-
     // First compute how many more features we need to extract from this image
     // If we don't need any features, just return
     double min_feat_percent = 0.50;
     int num_featsneeded = num_features - (int)pts0.size();
     if (num_featsneeded < std::min(20, (int)(min_feat_percent * num_features)))
         return;
-
 
     // We also check a downsampled mask such that we don't extract in areas where it is all masked!
     cv::Mat mask0_grid;
@@ -313,7 +304,6 @@ void TrackOCL::perform_detection_monocular(const std::vector<cv::Mat> &img0pyr, 
 
     auto rT3 = boost::posix_time::microsec_clock::local_time();
     PRINT_DEBUG("[TIME-DTCT]: %.4f seconds for grid detection\n", (rT3 - rT2).total_microseconds() * 1e-6);   
-
 
     // Now, reject features that are close a current feature
     std::vector<cv::KeyPoint> kpts0_new;
@@ -349,7 +339,6 @@ void TrackOCL::perform_detection_monocular(const std::vector<cv::Mat> &img0pyr, 
     }
     auto rT4 = boost::posix_time::microsec_clock::local_time();
     PRINT_DEBUG("[TIME-DTCT]: %.4f seconds for feature rejection\n", (rT4 - rT3).total_microseconds() * 1e-6);   
-
 }
 
 void TrackOCL::perform_matching(const std::vector<cv::Mat> &img0pyr, const std::vector<cv::Mat> &img1pyr, std::vector<cv::KeyPoint> &kpts0,
