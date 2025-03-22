@@ -78,6 +78,9 @@ public:
     // Kernels used for pyramid construction and point tracking
     cl_kernel track_kernel      = nullptr;
     cl_kernel downfilter_kernel = nullptr;
+    //EXPERIEMENTAL PIXEL REFINENMENT WITH GPU
+    cl_kernel refine_kernel = nullptr; 
+    cl_mem refined_pts_buf = nullptr;
 
     // Kernels used for feature point extraction 
     cl_kernel extract_kernel = nullptr;
@@ -103,14 +106,23 @@ public:
         if (queue) clReleaseCommandQueue(queue);
         if (track_kernel) clReleaseKernel(track_kernel);
         if (downfilter_kernel) clReleaseKernel(downfilter_kernel);
+        //EXPERIEMENTAL PIXEL REFINENMENT WITH GPU
+        destroy_tracking_buffers();
+            
+        destroy_detection_buffers();
+
+
+        if (refine_kernel) clReleaseKernel(refine_kernel);
         if (prev_pyr) destroy_pyramid(prev_pyr);
         if (next_pyr) destroy_pyramid(next_pyr);
+
     }
 
     int init(cl_context context,
              cl_device_id device,
              cl_program program,
              cl_program detect_program,
+             cl_program refine_program,
              int pyr_levels,
              int base_width,
              int base_height,
@@ -121,13 +133,17 @@ public:
     void swap_pyr_pointers();
     int build_next_pyramid(const void* frame);
     int run_tracking_step(int n_points, float* prev_pts);
+    
+
+
+int refine_points_subpixel(int n_points, int win_size, int max_iters, float epsilon);
 
     int read_results(int n_points, float* next_pts_out, uchar* status_out, float* err_out);
 
 
 private:
     int create_queue(cl_device_id device, cl_context context);
-    int build_ocl_kernels(cl_program ocl_program, cl_program detect_program);
+    int build_ocl_kernels(cl_program ocl_program, cl_program detect_program, cl_program refine_program);
 
     void create_ocl_buf(int w, int h, cl_image_format format);
     ocl_image create_ocl_image(int w, int h, cl_image_format format);
@@ -138,6 +154,10 @@ private:
 
     int destroy_ocl_image(ocl_image* image);
     int destroy_pyramid(ocl_pyramid* pyramid);
+
+    //EXP AVOID GPU LEAKS
+    void destroy_tracking_buffers();
+    void destroy_detection_buffers();
 };
 
 /**
@@ -154,6 +174,9 @@ class OCLManager
         cl_context      context = nullptr;
         cl_program      ocl_program = nullptr;
         cl_program      detect_program = nullptr;
+        //EXPERIEMENTAL PIXEL REFINENMENT WITH GPU
+        cl_program refine_program = nullptr;
+
 
         std::string     kernel_code;
 
@@ -169,6 +192,9 @@ class OCLManager
     private:
         int load_kernel_code(std::string& dst_str);
         int load_detection_kernel(std::string& dst_str);
+
+        //EXPERIEMENTAL PIXEL REFINENMENT WITH GPU
+        int load_subpixel_refinement_kernel(std::string& dst_str);
 
 };
 

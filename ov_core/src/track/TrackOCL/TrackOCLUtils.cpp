@@ -113,6 +113,30 @@ int OCLManager::init(int n_cams, int width, int height, int pyr_levels)
         printf("Error building kernel: %s\n", build_log.data());
     }
 
+    std::string refine_code;
+    load_subpixel_refinement_kernel(refine_code);
+    const char* refine_code_ptr = refine_code.c_str();
+    size_t refine_code_length = refine_code.size();
+
+    refine_program = clCreateProgramWithSource(context, 1, &refine_code_ptr, &refine_code_length, &err);
+    if (err != CL_SUCCESS) {
+        printf("Failed to create refine_program: %d\n", err);
+        return 1;
+    }
+
+    err = clBuildProgram(refine_program, 1, &device, nullptr, nullptr, nullptr);
+    if (err != CL_SUCCESS) {
+        // save build log
+        size_t log_size;
+        clGetProgramBuildInfo(refine_program, device, CL_PROGRAM_BUILD_LOG, 0, nullptr, &log_size);
+
+        std::vector<char> build_log(log_size);
+        clGetProgramBuildInfo(refine_program, device, CL_PROGRAM_BUILD_LOG, log_size, build_log.data(), nullptr);
+
+        printf("Error building refine kernel: %s\n", build_log.data());
+    }
+
+
     num_cams = n_cams;
 
     // initialize tracking for cameras
@@ -123,7 +147,7 @@ int OCLManager::init(int n_cams, int width, int height, int pyr_levels)
         format.image_channel_data_type = CL_FLOAT;
 
         cam_track[i] = new OCLTracker();
-        cam_track[i]->init(context, device, ocl_program, detect_program, pyr_levels+1, width, height, format);
+        cam_track[i]->init(context, device, ocl_program, detect_program, refine_program, pyr_levels+1, width, height, format);
     }
 
 
@@ -736,7 +760,7 @@ __kernel void pyrDown(
 
 int OCLManager::load_detection_kernel(std::string& dst_str)
 {
-    dst_str = dst_str = R"CLC(
+    dst_str =  R"CLC(
 // OpenCL port of the FAST corner detector.
 // Copyright (C) 2014, Itseez Inc. See the license at http://opencv.org
 
@@ -905,11 +929,95 @@ void FAST_nonmaxSupression(
     return 0;
 }
 
-int OCLTracker::init(cl_context context, cl_device_id device, cl_program program, cl_program detect_program, 
+//ITS LIKE LKSPARSE BUT ON THE SAME IMAGE 
+int OCLManager::load_subpixel_refinement_kernel(std::string& dst_str){
+
+    dst_str = R"CLC(
+// OpenCL kernel for subpixel refinement of corner locations
+__kernel void cornerSubRefine(
+    read_only image2d_t img,
+    __global const float2* points_in,
+    __global float2* points_out,
+    const int rows,
+    const int cols,
+    const int win_size,
+    const int max_iters,
+    const float epsilon)
+{
+    const int gid = get_global_id(0);
+
+    float2 pt = points_in[gid];
+    float2 refined = pt;
+
+    const int r = win_size / 2;
+    const sampler_t smp = CLK_NORMALIZED_COORDS_FALSE | CLK_ADDRESS_CLAMP | CLK_FILTER_LINEAR;
+
+    for (int iter = 0; iter < max_iters; ++iter) {
+
+        float2 grad = (float2)(0.0f, 0.0f);
+        float JtJ[2][2] = {{0, 0}, {0, 0}};
+        float Jte[2] = {0, 0};
+
+        bool out_of_bounds = false;
+
+        for (int dy = -r; dy <= r && !out_of_bounds; ++dy) {
+            for (int dx = -r; dx <= r && !out_of_bounds; ++dx) {
+                float x = refined.x + dx;
+                float y = refined.y + dy;
+
+                if (x < 1 || x >= cols - 1 || y < 1 || y >= rows - 1) {
+                    out_of_bounds = true;
+                    break;
+                }
+
+                float center = read_imagef(img, smp, (int2)(x, y)).x;
+                float gx = 0.5f * (read_imagef(img, smp, (int2)(x + 1, y)).x -
+                                   read_imagef(img, smp, (int2)(x - 1, y)).x);
+                float gy = 0.5f * (read_imagef(img, smp, (int2)(x, y + 1)).x -
+                                   read_imagef(img, smp, (int2)(x, y - 1)).x);
+
+                float diff = center - read_imagef(img, smp, (int2)(pt.x + dx, pt.y + dy)).x;
+
+                JtJ[0][0] += gx * gx;
+                JtJ[0][1] += gx * gy;
+                JtJ[1][1] += gy * gy;
+
+                Jte[0] += gx * diff;
+                Jte[1] += gy * diff;
+            }
+        }
+
+        if (out_of_bounds)
+            break;
+
+        JtJ[1][0] = JtJ[0][1];
+
+        float det = JtJ[0][0] * JtJ[1][1] - JtJ[0][1] * JtJ[1][0];
+        if (fabs(det) < 1e-7f)
+            break;
+
+        float2 delta;
+        delta.x = (-Jte[0] * JtJ[1][1] + Jte[1] * JtJ[0][1]) / det;
+        delta.y = (-Jte[1] * JtJ[0][0] + Jte[0] * JtJ[0][1]) / det;
+
+        refined += delta;
+
+        if (fabs(delta.x) < epsilon && fabs(delta.y) < epsilon)
+            break;
+    }
+
+    points_out[gid] = refined;
+}
+)CLC";
+
+    return 0;
+}
+
+int OCLTracker::init(cl_context context, cl_device_id device, cl_program program, cl_program detect_program, cl_program refine_program, 
                    int pyr_levels, int base_width, int base_height, cl_image_format format)
 {
     this->context = context;
-    build_ocl_kernels(program, detect_program);
+    build_ocl_kernels(program, detect_program, refine_program);
     create_queue(device, context);
     create_pyramids(pyr_levels, base_width, base_height, format);
     create_ocl_buf(base_width, base_height, format);
@@ -935,7 +1043,7 @@ int OCLTracker::create_queue(cl_device_id device, cl_context context)
 }
 
 
-int OCLTracker::build_ocl_kernels(cl_program program, cl_program detect_program)
+int OCLTracker::build_ocl_kernels(cl_program program, cl_program detect_program, cl_program refine_program)
 {
     cl_int err;
 
@@ -964,6 +1072,13 @@ int OCLTracker::build_ocl_kernels(cl_program program, cl_program detect_program)
     if (err != CL_SUCCESS) 
     {
         printf("Error creating nms_kernel from program!\n");
+        return 1;
+    }
+
+    this->refine_kernel = clCreateKernel(refine_program, "cornerSubRefine", &err);
+    if (err != CL_SUCCESS) 
+    {
+        printf("Error creating refine_kernel from program!\n");
         return 1;
     }
 
@@ -1050,6 +1165,22 @@ int OCLTracker::destroy_ocl_image(ocl_image* image)
     return -1;
 }
 
+//AVOID GPU LEAKS
+void OCLTracker::destroy_tracking_buffers() {
+    if (tracking_buf.prev_pts_buf) clReleaseMemObject(tracking_buf.prev_pts_buf);
+    if (tracking_buf.next_pts_buf) clReleaseMemObject(tracking_buf.next_pts_buf);
+    if (tracking_buf.status_buf)   clReleaseMemObject(tracking_buf.status_buf);
+    if (tracking_buf.error_buf)    clReleaseMemObject(tracking_buf.error_buf);
+    if (refined_pts_buf)           clReleaseMemObject(refined_pts_buf);
+    tracking_buf = {};
+    refined_pts_buf = nullptr;
+}
+
+void OCLTracker::destroy_detection_buffers() {
+    if (detection_buf.xy_pts_buf)  clReleaseMemObject(detection_buf.xy_pts_buf);
+    if (detection_buf.xyz_pts_buf) clReleaseMemObject(detection_buf.xyz_pts_buf);
+    detection_buf = {};
+}
 
 int OCLTracker::create_pyramids(int levels, int base_w, int base_h, cl_image_format format)
 {
@@ -1186,11 +1317,19 @@ int OCLTracker::create_tracking_buffers(int n_points)
     tracking_buf.status_buf   = clCreateBuffer(context, CL_MEM_READ_WRITE, n_points * sizeof(cl_uchar),  nullptr, &err);
     tracking_buf.error_buf    = clCreateBuffer(context, CL_MEM_READ_WRITE, n_points * sizeof(cl_float),  nullptr, &err);
 
-    if (err != CL_SUCCESS) 
+    if (err != CL_SUCCESS) //<JOAO> I believe we should check after each clCreateBuffer call, but for now we'll leave it like this
     {
         printf("Failed to create buffers for tracking: %d\n", err);
         return -1;
     }
+
+    refined_pts_buf = clCreateBuffer(context, CL_MEM_WRITE_ONLY, sizeof(cl_float2) * tracking_buf.n_points, nullptr, &err);
+    if (err != CL_SUCCESS) {
+        std::cerr << "Failed to create refined_pts_buf\n";
+        return -1;
+    }
+
+
 
     return 0;
 }
@@ -1311,4 +1450,38 @@ int OCLTracker::read_results(int n_points, float* next_pts_out, uchar* status_ou
 void OCLTracker::swap_pyr_pointers()
 {
     std::swap(prev_pyr, next_pyr);
+}
+
+int OCLTracker::refine_points_subpixel(int n_points, int win_size, int max_iters, float epsilon)
+{
+    if (!this->prev_pyr || !this->prev_pyr->images) return -1;
+
+    const int rows = this->prev_pyr->images[0].h;
+    const int cols = this->prev_pyr->images[0].w;
+    cl_mem img = this->prev_pyr->images[0].img_mem;
+
+    cl_int err;
+    err  = clSetKernelArg(this->refine_kernel, 0, sizeof(cl_mem), &img);
+    err |= clSetKernelArg(this->refine_kernel, 1, sizeof(cl_mem), &this->tracking_buf.next_pts_buf);
+    err |= clSetKernelArg(this->refine_kernel, 2, sizeof(cl_mem), &this->refined_pts_buf);
+    err |= clSetKernelArg(this->refine_kernel, 3, sizeof(int), &rows);
+    err |= clSetKernelArg(this->refine_kernel, 4, sizeof(int), &cols);
+    err |= clSetKernelArg(this->refine_kernel, 5, sizeof(int), &win_size);
+    err |= clSetKernelArg(this->refine_kernel, 6, sizeof(int), &max_iters);
+    err |= clSetKernelArg(this->refine_kernel, 7, sizeof(float), &epsilon);
+
+    if (err != CL_SUCCESS) {
+        std::cerr << "Error setting refine kernel args: " << err << std::endl;
+        return -1;
+    }
+
+    size_t global_size = n_points;
+    err = clEnqueueNDRangeKernel(this->queue, this->refine_kernel, 1, nullptr, &global_size, nullptr, 0, nullptr, nullptr);
+    if (err != CL_SUCCESS) {
+        std::cerr << "Failed to launch refine kernel: " << err << std::endl;
+        return -1;
+    }
+
+    clFinish(this->queue);
+    return 0;
 }

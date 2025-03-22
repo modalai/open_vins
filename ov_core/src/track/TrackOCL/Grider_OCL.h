@@ -266,6 +266,19 @@ class Grider_OCL {
 
         // Finally get sub-pixel for all extracted features
         // cv::cornerSubPix(img, pts_refined, win_size, zero_zone, term_crit);
+        // Upload initial keypoints to GPU
+        clEnqueueWriteBuffer(tracker->queue, tracker->tracking_buf.next_pts_buf, CL_TRUE, 0,
+                            pts.size() * sizeof(cl_float2), pts_refined.data(), 0, nullptr, nullptr);
+
+        // Run subpixel refinement
+        if (tracker->refine_points_subpixel((int)pts.size(), win_size.width, term_crit.maxCount, (float)term_crit.epsilon) != 0) {
+            std::cerr << "Subpixel refinement failed." << std::endl;
+            return;
+        }
+
+        // Read back refined results
+        clEnqueueReadBuffer(tracker->queue, tracker->refined_pts_buf, CL_TRUE, 0,
+                            pts.size() * sizeof(cl_float2), pts_refined.data(), 0, nullptr, nullptr);
 
         // Save the refined points!
         for (size_t i = 0; i < pts.size(); i++) {
