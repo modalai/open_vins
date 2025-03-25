@@ -38,7 +38,7 @@ class TrackOCL : public TrackBase {
             int height = cameras.at(0)->h();
 
             // Initialize OpenCL manager
-            int err = this->ocl_manager.init(cameras.size(), width, height, pyr_levels); 
+            int err = this->ocl_manager.init(cameras.size(), width, height, grid_x, grid_y, pyr_levels); 
             printf("initialized ocl manager\n"); 
           }
 
@@ -77,6 +77,8 @@ class TrackOCL : public TrackBase {
     void perform_detection_monocular(const std::vector<cv::Mat> &img0pyr, const cv::Mat &mask0, std::vector<cv::KeyPoint> &pts0,
                                      std::vector<size_t> &ids0, int id);
                                      
+    void perform_detection_monocular_gpu(const cl_mem img, const cv::Mat &mask0, int w, int h, std::vector<cv::KeyPoint> &pts0,
+                                                   std::vector<size_t> &ids0, int cam_id);
 
     /**
      * @brief KLT track between two images, and do RANSAC afterwards
@@ -94,6 +96,10 @@ class TrackOCL : public TrackBase {
      */
     void perform_matching(const std::vector<cv::Mat> &img0pyr, const std::vector<cv::Mat> &img1pyr, std::vector<cv::KeyPoint> &pts0,
                           std::vector<cv::KeyPoint> &pts1, size_t id0, size_t id1, std::vector<uchar> &mask_out);
+
+    void perform_matching_gpu(const cl_mem img, const cv::Mat &mask0, int w, int h, std::vector<cv::KeyPoint> &kpts0, 
+                              std::vector<cv::KeyPoint> &kpts1, size_t id0, size_t id1, std::vector<uchar> &mask_out);
+
 
     // Parameters for our FAST grid detector
     int threshold;

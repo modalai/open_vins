@@ -24,6 +24,7 @@
 
 #include <Eigen/Eigen>
 #include <opencv2/opencv.hpp>
+#include <CL/cl.h>
 #include <vector>
 
 namespace ov_core {
@@ -57,6 +58,8 @@ struct CameraData {
     /// Timestamp of the reading
     double timestamp;
 
+    int use_opencv_img = 1;
+
     /// Camera ids for each of the images collected
     std::vector<int> sensor_ids;
 
@@ -65,6 +68,10 @@ struct CameraData {
 
     /// Tracking masks for each camera we have
     std::vector<cv::Mat> masks;
+
+    /// Raw image we have collected for each camera
+    std::vector<cl_mem> cl_images;
+    std::vector<std::pair<int, int>> cl_img_dims;
 
     /// Sort function to allow for using of STL containers
     bool operator<(const CameraData &other) const {

@@ -123,7 +123,7 @@ VioManager::VioManager(VioManagerOptions &params_) : thread_init_running(false),
       if (params.use_gpu) {
 
     	  printf("\n====> Using Internal KLT feature tracker (w/ GPU) <==== \n");
-
+        printf("num_feats: %d\n", init_max_features);
         TrackOCL * klt_ocl = new TrackOCL(	state->_cam_intrinsics_cameras, 
                                         init_max_features,
                                         state->_options.max_aruco_features, 

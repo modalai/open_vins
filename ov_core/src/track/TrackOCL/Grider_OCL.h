@@ -177,13 +177,15 @@ class Grider_OCL {
                 return;
             }
 
-            int counter;
-            clEnqueueReadBuffer(tracker->queue, tracker->detection_buf.xy_pts_buf, CL_TRUE, 0, sizeof(int), &counter, 0, NULL, NULL);
-            counter = std::min(counter, tracker->detection_buf.max_points);
+            // int counter;
+            // clEnqueueReadBuffer(tracker->queue, tracker->detection_buf.xy_pts_buf, CL_TRUE, 0, sizeof(int), &counter, 0, NULL, NULL);
+            // counter = std::min(counter, tracker->detection_buf.max_points);
 
-            if (counter < 1) {
-                continue;
-            }
+            // if (counter < 1) {
+            //     continue;
+            // }
+
+            size_t offset = (max_keypoints * 3 + 1) * sizeof(int) * 0;
 
             err  = clSetKernelArg(tracker->nms_kernel, 0, sizeof(cl_mem), &tracker->detection_buf.xy_pts_buf);
             err |= clSetKernelArg(tracker->nms_kernel, 1, sizeof(cl_mem), &tracker->detection_buf.xyz_pts_buf);
@@ -192,14 +194,15 @@ class Grider_OCL {
             err |= clSetKernelArg(tracker->nms_kernel, 4, sizeof(int),    &img_offset);
             err |= clSetKernelArg(tracker->nms_kernel, 5, sizeof(int),    &size_y);
             err |= clSetKernelArg(tracker->nms_kernel, 6, sizeof(int),    &size_x);
-            err |= clSetKernelArg(tracker->nms_kernel, 7, sizeof(int),    &counter);
+            // err |= clSetKernelArg(tracker->nms_kernel, 7, sizeof(int),    &counter);
+            err |= clSetKernelArg(tracker->nms_kernel, 7, sizeof(int),    &offset);       // Offset
             err |= clSetKernelArg(tracker->nms_kernel, 8, sizeof(int),    &tracker->detection_buf.max_points);
             if (err != CL_SUCCESS) {
                 printf("Error setting nms_kernel arg: %d\n", err);
                 return;
             }
 
-            size_t work[] = { (size_t)counter };
+            size_t work[] = { (size_t)tracker->detection_buf.max_points };
             err = clEnqueueNDRangeKernel(tracker->queue, tracker->nms_kernel, 1, NULL, work, NULL, 0, NULL, NULL);
             if (err != CL_SUCCESS) {
                 printf("Error running nms_kernel: %d\n", err);
@@ -213,7 +216,7 @@ class Grider_OCL {
 
             std::vector<cv::KeyPoint> pts_new;
 
-            counter = std::min(counter, kp_out[0]);
+            int counter = kp_out[0];
             cv::Point3i* pt2 = (cv::Point3i*)(kp_out + 1);
             std::sort(pt2, pt2 + counter, cmp_pt<cv::Point3i>());
 
@@ -272,6 +275,375 @@ class Grider_OCL {
             pts.at(i).pt = pts_refined.at(i);
         }
     }
+
+    static void perform_griding_gpu(OCLTracker* tracker, const cl_mem img, const cv::Mat &mask, int w, int h, const std::vector<std::pair<int, int>> &valid_locs,
+                                std::vector<cv::KeyPoint> &pts, int num_features, int grid_x, int grid_y, int threshold,
+                                bool nonmaxSuppression) {
+
+        // Return if there is nothing to extract
+        if (valid_locs.empty())
+            return;
+
+        // We want to have equally distributed features
+        // NOTE: If we have more grids than number of total points, we calc the biggest grid we can do
+        // NOTE: Thus if we extract 1 point per grid we have
+        // NOTE:    -> 1 = num_features / (grid_x * grid_y)
+        // NOTE:    -> grid_x = ratio * grid_y (keep the original grid ratio)
+        // NOTE:    -> grid_y = sqrt(num_features / ratio)
+        if (num_features < grid_x * grid_y) {
+            double ratio = (double)grid_x / (double)grid_y;
+            grid_y = std::ceil(std::sqrt(num_features / ratio));
+            grid_x = std::ceil(grid_y * ratio);
+        }
+        int num_features_grid = (int)((double)num_features / (double)(grid_x * grid_y)) + 1;
+        assert(grid_x > 0);
+        assert(grid_y > 0);
+        assert(num_features_grid > 0);
+
+        // Calculate the size our extraction boxes should be
+        int size_x = w / grid_x;
+        int size_y = h / grid_y;
+
+        // Make sure our sizes are not zero
+        assert(size_x > 0);
+        assert(size_y > 0);
+
+        std::vector<std::vector<cv::KeyPoint>> collection(valid_locs.size());
+
+        cl_int err;
+
+        for (int r = 0 ; r < (int)valid_locs.size(); r++)
+        {
+            // Calculate what cell xy value we are in
+            auto grid = valid_locs.at(r);
+            int x = grid.first * size_x;
+            int y = grid.second * size_y;
+
+            // Skip if we are out of bounds
+            if (x + size_x > w || y + size_y > h) continue;
+
+            int reset_value = 0;
+            clEnqueueWriteBuffer(tracker->queue, tracker->detection_buf.xy_pts_buf,  CL_TRUE, 0, sizeof(int), &reset_value, 0, NULL, NULL);
+            if (err != CL_SUCCESS) {
+                printf("Error writing to buffer: %d\n", err);
+                return;
+            }
+
+            clEnqueueWriteBuffer(tracker->queue, tracker->detection_buf.xyz_pts_buf, CL_TRUE, 0, sizeof(int), &reset_value, 0, NULL, NULL);
+            if (err != CL_SUCCESS) {
+                printf("Error writing to buffer: %d\n", err);
+                return;
+            }
+
+            int step = w;
+            int img_offset = 0;
+            int max_keypoints = tracker->detection_buf.max_points;
+
+            err  = clSetKernelArg(tracker->extract_whole_img_kernel,  0, sizeof(cl_mem), &img);
+            err |= clSetKernelArg(tracker->extract_whole_img_kernel,  1, sizeof(int),    &step);
+            err |= clSetKernelArg(tracker->extract_whole_img_kernel,  2, sizeof(int),    &img_offset);
+            err |= clSetKernelArg(tracker->extract_whole_img_kernel,  3, sizeof(int),    &h);
+            err |= clSetKernelArg(tracker->extract_whole_img_kernel,  4, sizeof(int),    &w);
+            err |= clSetKernelArg(tracker->extract_whole_img_kernel,  5, sizeof(int),    &grid.first);
+            err |= clSetKernelArg(tracker->extract_whole_img_kernel,  6, sizeof(int),    &grid.second);
+            err |= clSetKernelArg(tracker->extract_whole_img_kernel,  7, sizeof(int),    &size_x);
+            err |= clSetKernelArg(tracker->extract_whole_img_kernel,  8, sizeof(int),    &size_y);
+            err |= clSetKernelArg(tracker->extract_whole_img_kernel,  9, sizeof(cl_mem), &tracker->detection_buf.xy_pts_buf);
+            err |= clSetKernelArg(tracker->extract_whole_img_kernel, 10, sizeof(int),    &tracker->detection_buf.max_points);
+            err |= clSetKernelArg(tracker->extract_whole_img_kernel, 11, sizeof(int),    &threshold);
+            if (err != CL_SUCCESS) {
+                printf("Error setting kernel arg: %d\n", err);
+                return;
+            }
+
+
+            size_t global_work_size[2] = { size_x - 6, size_y - 6 };
+            err = clEnqueueNDRangeKernel(tracker->queue, tracker->extract_whole_img_kernel, 2, NULL, global_work_size, NULL, 0, NULL, NULL);
+            if (err != CL_SUCCESS) {
+                printf("Error running extract_kernel: %d\n", err);
+                return;
+            }
+
+            int counter;
+            clEnqueueReadBuffer(tracker->queue, tracker->detection_buf.xy_pts_buf, CL_TRUE, 0, sizeof(int), &counter, 0, NULL, NULL);
+            counter = std::min(counter, tracker->detection_buf.max_points);
+
+            if (counter < 1) {
+                continue;
+            }
+
+            err  = clSetKernelArg(tracker->nms_kernel, 0, sizeof(cl_mem), &tracker->detection_buf.xy_pts_buf);
+            err |= clSetKernelArg(tracker->nms_kernel, 1, sizeof(cl_mem), &tracker->detection_buf.xyz_pts_buf);
+            err |= clSetKernelArg(tracker->nms_kernel, 2, sizeof(cl_mem), &img);
+            err |= clSetKernelArg(tracker->nms_kernel, 3, sizeof(int),    &step);
+            err |= clSetKernelArg(tracker->nms_kernel, 4, sizeof(int),    &img_offset);
+            err |= clSetKernelArg(tracker->nms_kernel, 5, sizeof(int),    &h);
+            err |= clSetKernelArg(tracker->nms_kernel, 6, sizeof(int),    &w);
+            err |= clSetKernelArg(tracker->nms_kernel, 7, sizeof(int),    &counter);
+            err |= clSetKernelArg(tracker->nms_kernel, 8, sizeof(int),    &tracker->detection_buf.max_points);
+            if (err != CL_SUCCESS) {
+                printf("Error setting nms_kernel arg: %d\n", err);
+                return;
+            }
+
+            size_t work[] = { (size_t)counter };
+            err = clEnqueueNDRangeKernel(tracker->queue, tracker->nms_kernel, 1, NULL, work, NULL, 0, NULL, NULL);
+            if (err != CL_SUCCESS) {
+                printf("Error running nms_kernel: %d\n", err);
+                return;
+            }
+
+
+            int* kp_out = (int*)malloc((max_keypoints * 3 + 1) * sizeof(int));
+            clEnqueueReadBuffer(tracker->queue, tracker->detection_buf.xyz_pts_buf, CL_TRUE, 0, (max_keypoints * 3 + 1) * sizeof(int), kp_out, 0, NULL, NULL);
+            clFinish(tracker->queue); 
+
+            std::vector<cv::KeyPoint> pts_new;
+
+            counter = std::min(counter, kp_out[0]);
+            cv::Point3i* pt2 = (cv::Point3i*)(kp_out + 1);
+            std::sort(pt2, pt2 + counter, cmp_pt<cv::Point3i>());
+
+            for( int i = 0; i < counter; i++ )
+                pts_new.push_back(cv::KeyPoint((float)pt2[i].x, (float)pt2[i].y, 7.f, -1, (float)pt2[i].z));
+            
+            std::sort(pts_new.begin(), pts_new.end(), Grider_FAST::compare_response);
+            free(kp_out);
+
+            for (size_t i = 0; i < (size_t)num_features_grid && i < pts_new.size(); i++) {
+
+                // Create keypoint
+                cv::KeyPoint pt_cor = pts_new.at(i);
+
+                // Reject if out of bounds (shouldn't be possible...)
+                if ((int)pt_cor.pt.x < 0 || (int)pt_cor.pt.x > w || (int)pt_cor.pt.y < 0 ||
+                    (int)pt_cor.pt.y > h)
+                    continue;
+
+                // Check if it is in the mask region
+                // NOTE: mask has max value of 255 (white) if it should be removed
+                if (mask.at<uint8_t>((int)pt_cor.pt.y, (int)pt_cor.pt.x) > 127)
+                    continue;
+
+                collection.at(r).push_back(pt_cor);
+            }
+        }
+
+        // Combine all the collections into our single vector
+        for (size_t r = 0; r < collection.size(); r++) {
+            pts.insert(pts.end(), collection.at(r).begin(), collection.at(r).end());
+        }
+
+        // Return if no points
+        if (pts.empty())
+            return;
+
+        // Sub-pixel refinement parameters
+        // cv::Size win_size = cv::Size(5, 5);
+        // cv::Size zero_zone = cv::Size(-1, -1);
+        // cv::TermCriteria term_crit = cv::TermCriteria(cv::TermCriteria::COUNT + cv::TermCriteria::EPS, 20, 0.001);
+
+        // Get vector of points
+        // std::vector<cv::Point2f> pts_refined;
+        // for (size_t i = 0; i < pts.size(); i++) {
+        //     pts_refined.push_back(pts.at(i).pt);
+        // }
+
+        // Finally get sub-pixel for all extracted features
+        // cv::cornerSubPix(img, pts_refined, win_size, zero_zone, term_crit);
+
+        // Save the refined points!
+        // for (size_t i = 0; i < pts.size(); i++) {
+        //     pts.at(i).pt = pts_refined.at(i);
+        // }
+    };
+
+
+    static void perform_griding_gpu2(OCLTracker* tracker, const cl_mem img, const cv::Mat &mask, int w, int h, const std::vector<std::pair<int, int>> &valid_locs,
+                                std::vector<cv::KeyPoint> &pts, int num_features, int grid_x, int grid_y, int threshold,
+                                bool nonmaxSuppression) {
+
+        // Return if there is nothing to extract
+        if (valid_locs.empty())
+            return;
+
+        // We want to have equally distributed features
+        // NOTE: If we have more grids than number of total points, we calc the biggest grid we can do
+        // NOTE: Thus if we extract 1 point per grid we have
+        // NOTE:    -> 1 = num_features / (grid_x * grid_y)
+        // NOTE:    -> grid_x = ratio * grid_y (keep the original grid ratio)
+        // NOTE:    -> grid_y = sqrt(num_features / ratio)
+        if (num_features < grid_x * grid_y) {
+            double ratio = (double)grid_x / (double)grid_y;
+            grid_y = std::ceil(std::sqrt(num_features / ratio));
+            grid_x = std::ceil(grid_y * ratio);
+        }
+        int num_features_grid = (int)((double)num_features / (double)(grid_x * grid_y)) + 1;
+        assert(grid_x > 0);
+        assert(grid_y > 0);
+        assert(num_features_grid > 0);
+
+        // Calculate the size our extraction boxes should be
+        int size_x = w / grid_x;
+        int size_y = h / grid_y;
+
+        // Make sure our sizes are not zero
+        assert(size_x > 0);
+        assert(size_y > 0);
+
+        std::vector<std::vector<cv::KeyPoint>> collection(valid_locs.size());
+
+        cl_int err;
+
+        int max_keypoints = tracker->detection_buf.max_points;
+
+        int step = w;
+        int img_offset = 0;
+
+        err  = clSetKernelArg(tracker->extract_whole_img_kernel,  0, sizeof(cl_mem), &img);
+        err |= clSetKernelArg(tracker->extract_whole_img_kernel,  1, sizeof(int),    &step);
+        err |= clSetKernelArg(tracker->extract_whole_img_kernel,  2, sizeof(int),    &img_offset);
+        err |= clSetKernelArg(tracker->extract_whole_img_kernel,  3, sizeof(int),    &h);
+        err |= clSetKernelArg(tracker->extract_whole_img_kernel,  4, sizeof(int),    &w);
+        err |= clSetKernelArg(tracker->extract_whole_img_kernel,  7, sizeof(int),    &size_x);
+        err |= clSetKernelArg(tracker->extract_whole_img_kernel,  8, sizeof(int),    &size_y);
+        err |= clSetKernelArg(tracker->extract_whole_img_kernel,  9, sizeof(cl_mem), &tracker->detection_buf.xy_pts_buf);
+        err |= clSetKernelArg(tracker->extract_whole_img_kernel, 10, sizeof(int),    &max_keypoints);
+        err |= clSetKernelArg(tracker->extract_whole_img_kernel, 11, sizeof(int),    &threshold);
+
+        err  = clSetKernelArg(tracker->nms_kernel, 0, sizeof(cl_mem), &tracker->detection_buf.xy_pts_buf);
+        err |= clSetKernelArg(tracker->nms_kernel, 1, sizeof(cl_mem), &tracker->detection_buf.xyz_pts_buf);
+        err |= clSetKernelArg(tracker->nms_kernel, 2, sizeof(cl_mem), &img);
+        err |= clSetKernelArg(tracker->nms_kernel, 3, sizeof(int),    &step);
+        err |= clSetKernelArg(tracker->nms_kernel, 4, sizeof(int),    &img_offset);
+        err |= clSetKernelArg(tracker->nms_kernel, 5, sizeof(int),    &h);
+        err |= clSetKernelArg(tracker->nms_kernel, 6, sizeof(int),    &w);
+        err |= clSetKernelArg(tracker->nms_kernel, 8, sizeof(int),    &max_keypoints);
+
+
+        std::vector<cl_event> keypoints_events(valid_locs.size()); // Stores keypoints extraction events
+        std::vector<cl_event> nonmax_events(valid_locs.size()); // Stores non-max suppression events
+        cl_event read_event;
+
+        for (int r = 0 ; r < (int)valid_locs.size(); r++)
+        {
+            // Calculate what cell xy value we are in
+            auto grid = valid_locs.at(r);
+            int x = grid.first * size_x;
+            int y = grid.second * size_y;
+
+            // Skip if we are out of bounds
+            if (x + size_x > w || y + size_y > h) continue;
+
+
+            err |= clSetKernelArg(tracker->extract_whole_img_kernel,  5, sizeof(int),    &grid.first);
+            err |= clSetKernelArg(tracker->extract_whole_img_kernel,  6, sizeof(int),    &grid.second);
+            if (err != CL_SUCCESS) {
+                printf("Error setting kernel arg: %d\n", err);
+                return;
+            }
+
+
+            size_t global_work_size[2] = { size_x - 6, size_y - 6 };
+            err = clEnqueueNDRangeKernel(tracker->queue, tracker->extract_whole_img_kernel, 2, NULL, global_work_size, NULL, 0, NULL, &keypoints_events[r]);
+            if (err != CL_SUCCESS) {
+                printf("Error running extract_kernel: %d\n", err);
+                return;
+            }
+
+            size_t offset = (max_keypoints * 3 + 1) * sizeof(int) * r;
+
+            err |= clSetKernelArg(tracker->nms_kernel, 7, sizeof(int),    &offset);       // Offset
+            if (err != CL_SUCCESS) {
+                printf("Error setting nms_kernel arg: %d\n", err);
+                return;
+            }
+
+            size_t work[] = { (size_t)max_keypoints };
+            err = clEnqueueNDRangeKernel(tracker->queue, tracker->nms_kernel, 1, NULL, work, NULL, 1, &keypoints_events[r], &nonmax_events[r]);
+            if (err != CL_SUCCESS) {
+                printf("Error running nms_kernel: %d\n", err);
+                return;
+            }
+        }
+
+        int* kp_out = (int*)malloc((max_keypoints * 3 + 1) * sizeof(int) * (int)valid_locs.size());
+
+        clEnqueueReadBuffer(tracker->queue, tracker->detection_buf.xyz_pts_buf, CL_FALSE, 0, (max_keypoints * 3 + 1) * sizeof(int) * (int)valid_locs.size(), kp_out, nonmax_events.size(), nonmax_events.data(), &read_event);
+        clWaitForEvents(1, &read_event);
+
+        for (int r = 0; r < (int)valid_locs.size(); r++)
+        {
+            std::vector<cv::KeyPoint> pts_new;
+
+            int offset = (max_keypoints * 3 + 1) * sizeof(int) * r;
+            int counter = std::max(0, *(kp_out + (offset / sizeof(int))));
+
+
+            cv::Point3i* pt2 = (cv::Point3i*)(kp_out + (offset / sizeof(int)) + 1);
+            std::sort(pt2, pt2 + counter, cmp_pt<cv::Point3i>());
+
+            for( int i = 0; i < counter; i++ )
+                pts_new.push_back(cv::KeyPoint((float)pt2[i].x, (float)pt2[i].y, 7.f, -1, (float)pt2[i].z));
+
+            std::sort(pts_new.begin(), pts_new.end(), Grider_FAST::compare_response);
+
+            for (size_t i = 0; i < (size_t)num_features_grid && i < pts_new.size(); i++) {
+
+                // Create keypoint
+                cv::KeyPoint pt_cor = pts_new.at(i);
+
+                // Reject if out of bounds (shouldn't be possible...)
+                if ((int)pt_cor.pt.x < 0 || (int)pt_cor.pt.x > w || (int)pt_cor.pt.y < 0 ||
+                    (int)pt_cor.pt.y > h)
+                    continue;
+
+                // Check if it is in the mask region
+                // NOTE: mask has max value of 255 (white) if it should be removed
+                if (mask.at<uint8_t>((int)pt_cor.pt.y, (int)pt_cor.pt.x) > 127)
+                    continue;
+
+                collection.at(r).push_back(pt_cor);
+            }
+        }
+        for (auto event : keypoints_events) {
+            clReleaseEvent(event);
+        }
+        for (auto event : nonmax_events) {
+            clReleaseEvent(event);
+        }
+        clReleaseEvent(read_event);
+        free(kp_out);
+
+        // Combine all the collections into our single vector
+        for (size_t r = 0; r < collection.size(); r++) {
+            pts.insert(pts.end(), collection.at(r).begin(), collection.at(r).end());
+        }
+
+        // Return if no points
+        if (pts.empty())
+            return;
+
+        // Sub-pixel refinement parameters
+        // cv::Size win_size = cv::Size(5, 5);
+        // cv::Size zero_zone = cv::Size(-1, -1);
+        // cv::TermCriteria term_crit = cv::TermCriteria(cv::TermCriteria::COUNT + cv::TermCriteria::EPS, 20, 0.001);
+
+        // Get vector of points
+        // std::vector<cv::Point2f> pts_refined;
+        // for (size_t i = 0; i < pts.size(); i++) {
+        //     pts_refined.push_back(pts.at(i).pt);
+        // }
+
+        // Finally get sub-pixel for all extracted features
+        // cv::cornerSubPix(img, pts_refined, win_size, zero_zone, term_crit);
+
+        // Save the refined points!
+        // for (size_t i = 0; i < pts.size(); i++) {
+        //     pts.at(i).pt = pts_refined.at(i);
+        // }
+    };
+
 };
 
 } // namespace ov_core

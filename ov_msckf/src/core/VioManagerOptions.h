@@ -366,7 +366,7 @@ struct VioManagerOptions {
     int pyramid_levels = 5;
 
     /// Will check after doing KLT track and remove any features closer than this
-    int min_px_dist = 5; //10
+    int min_px_dist = 30; //10
 
     /// What type of pre-processing histogram method should be applied to images
     ov_core::TrackBase::HistogramMethod histogram_method = ov_core::TrackBase::HistogramMethod::NONE;
@@ -442,7 +442,7 @@ struct VioManagerOptions {
         PRINT_DEBUG("  - hist method: %d\n", (int)histogram_method);
         PRINT_DEBUG("  - knn ratio: %.3f\n", knn_ratio);
         PRINT_DEBUG("  - track frequency: %.1f\n", track_frequency);
-        PRINT_DEBUG("  - limit imu propagation (windows based on init_imu+cam-imu delay): %d\n", limit_imu_propagation);
+        PRINT_DEBUG("  - limit imu propagation (wi  ndows based on init_imu+cam-imu delay): %d\n", limit_imu_propagation);
 
 
         featinit_options.print(parser);

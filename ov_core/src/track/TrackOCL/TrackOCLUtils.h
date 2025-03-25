@@ -78,10 +78,12 @@ public:
     // Kernels used for pyramid construction and point tracking
     cl_kernel track_kernel      = nullptr;
     cl_kernel downfilter_kernel = nullptr;
+    cl_kernel copy_kernel       = nullptr;
 
     // Kernels used for feature point extraction 
     cl_kernel extract_kernel = nullptr;
     cl_kernel nms_kernel     = nullptr;
+    cl_kernel extract_whole_img_kernel = nullptr;
 
     // Pointers to pyramids for the "previous" and "next" frames
     ocl_pyramid* prev_pyr = nullptr;
@@ -114,12 +116,14 @@ public:
              int pyr_levels,
              int base_width,
              int base_height,
+             int grid_x, int grid_y,
              cl_image_format format);
 
     cv::Mat save_ocl_image(ocl_image* image, std::string output_path);
 
     void swap_pyr_pointers();
     int build_next_pyramid(const void* frame);
+    int build_next_pyramid_gpu(const cl_mem frame);
     int run_tracking_step(int n_points, float* prev_pts);
 
     int read_results(int n_points, float* next_pts_out, uchar* status_out, float* err_out);
@@ -134,7 +138,7 @@ private:
 
     int create_pyramids(int levels, int base_w, int base_h, cl_image_format format);  
     int create_tracking_buffers(int n_points);
-    int create_detection_buffer(int max_points);
+    int create_detection_buffer(int max_points, int grid_x, int grid_y);
 
     int destroy_ocl_image(ocl_image* image);
     int destroy_pyramid(ocl_pyramid* pyramid);
@@ -164,7 +168,9 @@ class OCLManager
         OCLManager();
         ~OCLManager();
 
-        int init(int n_cams, int width, int height, int pyr_levels);
+        int init(int n_cams, int width, int height, 
+                 int grid_x, int grid_y,
+                 int pyr_levels);
 
     private:
         int load_kernel_code(std::string& dst_str);

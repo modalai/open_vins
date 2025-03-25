@@ -56,16 +56,17 @@ void TrackKLT::feed_new_camera(const CameraData &message) {
         // Histogram equalize
         cv::Mat img;
 
-        if (histogram_method == HistogramMethod::HISTOGRAM) {
-            cv::equalizeHist(message.images.at(msg_id), img);
-        } else if (histogram_method == HistogramMethod::CLAHE) {
-            double eq_clip_limit = 10.0;
-            cv::Size eq_win_size = cv::Size(8, 8);
-            cv::Ptr<cv::CLAHE> clahe = cv::createCLAHE(eq_clip_limit, eq_win_size);
-            clahe->apply(message.images.at(msg_id), img);
-        } else {
-            img = message.images.at(msg_id);
-        }
+        // if (histogram_method == HistogramMethod::HISTOGRAM) {
+        //     cv::equalizeHist(message.images.at(msg_id), img);
+        // } else if (histogram_method == HistogramMethod::CLAHE) {
+        //     double eq_clip_limit = 10.0;
+        //     cv::Size eq_win_size = cv::Size(8, 8);
+        //     cv::Ptr<cv::CLAHE> clahe = cv::createCLAHE(eq_clip_limit, eq_win_size);
+        //     clahe->apply(message.images.at(msg_id), img);
+        // } else {
+        //     img = message.images.at(msg_id);
+        // }
+        img = message.images.at(msg_id);
 
         // Extract image pyramid
         std::vector<cv::Mat> imgpyr;

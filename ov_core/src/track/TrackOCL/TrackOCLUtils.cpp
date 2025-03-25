@@ -14,7 +14,7 @@ OCLManager::~OCLManager()
 }
 
 
-int OCLManager::init(int n_cams, int width, int height, int pyr_levels)
+int OCLManager::init(int n_cams, int width, int height, int grid_x, int grid_y, int pyr_levels)
 {
     cl_int err;
     cl_uint num_platforms = 0;
@@ -123,7 +123,7 @@ int OCLManager::init(int n_cams, int width, int height, int pyr_levels)
         format.image_channel_data_type = CL_FLOAT;
 
         cam_track[i] = new OCLTracker();
-        cam_track[i]->init(context, device, ocl_program, detect_program, pyr_levels+1, width, height, format);
+        cam_track[i]->init(context, device, ocl_program, detect_program, pyr_levels+1, width, height, grid_x, grid_y, format);
     }
 
 
@@ -729,6 +729,25 @@ __kernel void pyrDown(
     write_imagef(dst, dst_coords, (float4)(sum, 0.0f, 0.0f, 1.0f));
 }
 
+__kernel void copyBufferU8ToImageFloat(
+    __global const uchar *src_buffer,  // Source buffer (uint8_t pixel values)
+    __write_only image2d_t dst_image,  // Destination image (float pixels)
+    int img_width, int img_height)
+{
+    int x = get_global_id(0);
+    int y = get_global_id(1);
+
+    if (x >= img_width || y >= img_height) return;
+
+    // Compute buffer index
+    int buffer_index = y * img_width + x;
+
+    float pixel_value = (float)src_buffer[buffer_index];
+
+    // Write to image
+    write_imagef(dst_image, (int2)(x, y), (float4)(pixel_value, 0.f, 0.f, 1.0f));
+}
+
 )CLC";
         
     return 0;
@@ -860,6 +879,91 @@ void FAST_findKeypoints(
     }
 }
 
+
+__kernel
+void FAST_findKeypoints_wholeImg(
+    __global const uchar * _img, int step, int img_offset,
+    int img_rows, int img_cols,
+    int grid_x, int grid_y,
+    int grid_size_x, int grid_size_y,
+    volatile __global int* kp_loc,
+    int max_keypoints, int threshold )
+{
+    if (get_global_id(0) == 0 && get_global_id(1) == 0)
+    {
+        kp_loc[0] = 0;
+    }
+    barrier(CLK_GLOBAL_MEM_FENCE);
+
+
+    int j = get_global_id(0) + 3;
+    int i = get_global_id(1) + 3;
+
+    int abs_j = j + grid_x * grid_size_x;
+    int abs_i = i + grid_y * grid_size_y;
+
+    if (abs_i < img_rows - 3 && abs_j < img_cols - 3)
+    {
+        __global const uchar* img = _img + mad24(abs_i, step, abs_j + img_offset);
+        int v = img[0], t0 = v - threshold, t1 = v + threshold;
+        int k, tofs, v0, v1;
+        int m0 = 0, m1 = 0;
+
+        #define UPDATE_MASK(idx, ofs) \
+            tofs = ofs; v0 = img[tofs]; v1 = img[-tofs]; \
+            m0 |= ((v0 < t0) << idx) | ((v1 < t0) << (8 + idx)); \
+            m1 |= ((v0 > t1) << idx) | ((v1 > t1) << (8 + idx))
+
+        UPDATE_MASK(0, 3);
+        if( (m0 | m1) == 0 )
+            return;
+
+        UPDATE_MASK(2, -step*2+2);
+        UPDATE_MASK(4, -step*3);
+        UPDATE_MASK(6, -step*2-2);
+
+        #define EVEN_MASK (1+4+16+64)
+
+        if( ((m0 | (m0 >> 8)) & EVEN_MASK) != EVEN_MASK &&
+            ((m1 | (m1 >> 8)) & EVEN_MASK) != EVEN_MASK )
+            return;
+
+        UPDATE_MASK(1, -step+3);
+        UPDATE_MASK(3, -step*3+1);
+        UPDATE_MASK(5, -step*3-1);
+        UPDATE_MASK(7, -step-3);
+        if( ((m0 | (m0 >> 8)) & 255) != 255 &&
+            ((m1 | (m1 >> 8)) & 255) != 255 )
+            return;
+
+        m0 |= m0 << 16;
+        m1 |= m1 << 16;
+
+        #define CHECK0(i) ((m0 & (511 << i)) == (511 << i))
+        #define CHECK1(i) ((m1 & (511 << i)) == (511 << i))
+
+        if( CHECK0(0) + CHECK0(1) + CHECK0(2) + CHECK0(3) +
+            CHECK0(4) + CHECK0(5) + CHECK0(6) + CHECK0(7) +
+            CHECK0(8) + CHECK0(9) + CHECK0(10) + CHECK0(11) +
+            CHECK0(12) + CHECK0(13) + CHECK0(14) + CHECK0(15) +
+
+            CHECK1(0) + CHECK1(1) + CHECK1(2) + CHECK1(3) +
+            CHECK1(4) + CHECK1(5) + CHECK1(6) + CHECK1(7) +
+            CHECK1(8) + CHECK1(9) + CHECK1(10) + CHECK1(11) +
+            CHECK1(12) + CHECK1(13) + CHECK1(14) + CHECK1(15) == 0 )
+            return;
+
+        {
+            int idx = atomic_inc(kp_loc);
+            if( idx < max_keypoints )
+            {
+                kp_loc[1 + 2*idx] = abs_j;
+                kp_loc[2 + 2*idx] = abs_i;
+            }
+        }
+    }
+}
+
 ///////////////////////////////////////////////////////////////////////////
 // nonmaxSupression
 
@@ -869,6 +973,12 @@ void FAST_nonmaxSupression(
     __global const uchar * _img, int step, int img_offset,
     int rows, int cols, int counter, int max_keypoints)
 {
+    if (get_global_id(0) == 0)
+    {
+        kp_out[0] = 0;
+    }
+    barrier(CLK_GLOBAL_MEM_FENCE);
+
     const int idx = get_global_id(0);
 
     if (idx < counter)
@@ -900,22 +1010,67 @@ void FAST_nonmaxSupression(
     }
 }
 
+__kernel
+void FAST_nonmaxSupression2(
+    __global const int* kp_in, volatile __global int* kp_out,
+    __global const uchar * _img, int step, int img_offset,
+    int rows, int cols, int offset, int max_keypoints)
+{
+    __global volatile int* kp_out_offset = (__global volatile int*)((__global char*)kp_out + (size_t)offset);
+    if (get_global_id(0) == 0)
+    {
+        kp_out_offset[0] = 0;
+    }
+    barrier(CLK_GLOBAL_MEM_FENCE);
+
+    int counter = kp_in[0];
+    const int idx = get_global_id(0);
+    
+    if (idx < counter)
+    {
+        int x = kp_in[1 + 2*idx];
+        int y = kp_in[2 + 2*idx];
+        __global const uchar* img = _img + mad24(y, step, x + img_offset);
+
+        int s = cornerScore(img, step);
+
+        if( (x < 4 || s > cornerScore(img-1, step)) +
+            (y < 4 || s > cornerScore(img-step, step)) != 2 )
+            return;
+        if( (x >= cols - 4 || s > cornerScore(img+1, step)) +
+            (y >= rows - 4 || s > cornerScore(img+step, step)) +
+            (x < 4 || y < 4 || s > cornerScore(img-step-1, step)) +
+            (x >= cols - 4 || y < 4 || s > cornerScore(img-step+1, step)) +
+            (x < 4 || y >= rows - 4 || s > cornerScore(img+step-1, step)) +
+            (x >= cols - 4 || y >= rows - 4 || s > cornerScore(img+step+1, step)) == 6)
+        {
+            int new_idx = atomic_inc(kp_out_offset);
+            if( new_idx < max_keypoints )
+            {
+                kp_out_offset[1 + 3*new_idx] = x;
+                kp_out_offset[2 + 3*new_idx] = y;
+                kp_out_offset[3 + 3*new_idx] = s;
+            }
+        }
+    }
+}
+
 )CLC";
         
     return 0;
 }
 
 int OCLTracker::init(cl_context context, cl_device_id device, cl_program program, cl_program detect_program, 
-                   int pyr_levels, int base_width, int base_height, cl_image_format format)
+                   int pyr_levels, int base_width, int base_height, int grid_x, int grid_y, cl_image_format format)
 {
     this->context = context;
     build_ocl_kernels(program, detect_program);
     create_queue(device, context);
     create_pyramids(pyr_levels, base_width, base_height, format);
     create_ocl_buf(base_width, base_height, format);
-    create_detection_buffer(10000);
+    create_detection_buffer(400, grid_x, grid_y);
     create_tracking_buffers(100);
-    
+
     return 0;
 }
 
@@ -953,6 +1108,13 @@ int OCLTracker::build_ocl_kernels(cl_program program, cl_program detect_program)
         return 1;
     }
 
+    this->copy_kernel = clCreateKernel(program, "copyBufferU8ToImageFloat", &err);
+    if(err != CL_SUCCESS)
+    {
+        printf("Error creating copy_kernel from program!\n");
+        return 1;
+    }
+
     this->extract_kernel = clCreateKernel(detect_program, "FAST_findKeypoints", &err);
     if (err != CL_SUCCESS) 
     {
@@ -960,7 +1122,14 @@ int OCLTracker::build_ocl_kernels(cl_program program, cl_program detect_program)
         return 1;
     }
 
-    this->nms_kernel = clCreateKernel(detect_program, "FAST_nonmaxSupression", &err);
+    this->extract_whole_img_kernel = clCreateKernel(detect_program, "FAST_findKeypoints_wholeImg", &err);
+    if (err != CL_SUCCESS) 
+    {
+        printf("Error creating extract_kernel from program!\n");
+        return 1;
+    }
+
+    this->nms_kernel = clCreateKernel(detect_program, "FAST_nonmaxSupression2", &err);
     if (err != CL_SUCCESS) 
     {
         printf("Error creating nms_kernel from program!\n");
@@ -1155,6 +1324,53 @@ int OCLTracker::build_next_pyramid(const void* frame)
 }
 
 
+int OCLTracker::build_next_pyramid_gpu(const cl_mem frame)
+{
+    // copy frame into tracker pyramid as float32
+    size_t global_size[2] = { next_pyr->base_w, next_pyr->base_h };
+
+    cl_int err;
+    err  = clSetKernelArg(this->copy_kernel, 0, sizeof(cl_mem), &frame);
+    if (err != CL_SUCCESS) printf("cl_mem 'frame' was invalid: %d\n", err);
+    err = clSetKernelArg(this->copy_kernel, 1, sizeof(cl_mem), &next_pyr->images[0].img_mem);
+    err |= clSetKernelArg(this->copy_kernel, 2, sizeof(int), &next_pyr->base_w);
+    err |= clSetKernelArg(this->copy_kernel, 3, sizeof(int), &next_pyr->base_h);
+    // err |= clSetKernelArg(this->copy_kernel, 4, sizeof(int), &buffer_pitch);
+    if (err != CL_SUCCESS) {
+        printf("Error setting kernel args for copy_kernel: %d\n", err);
+        return err;
+    }
+
+    err = clEnqueueNDRangeKernel(this->queue, copy_kernel, 2, NULL, global_size, NULL, 0, NULL, NULL);
+    if (err != CL_SUCCESS) {
+        printf("Error launching copy kernel: %d\n", err);
+        return err;
+    }
+
+    clFinish(this->queue);
+
+    // build the pyramids
+    cl_sampler sampler = clCreateSampler(context, CL_FALSE, CL_ADDRESS_CLAMP, CL_FILTER_NEAREST, &err);
+
+    for (int i = 1; i < next_pyr->levels; ++i) 
+    {
+        clSetKernelArg(this->downfilter_kernel, 0, sizeof(cl_mem), &next_pyr->images[i-1].img_mem);
+        clSetKernelArg(this->downfilter_kernel, 1, sizeof(cl_mem), &next_pyr->images[i].img_mem);
+        clSetKernelArg(this->downfilter_kernel, 2, sizeof(cl_sampler), &sampler);
+
+        size_t global_size[2] = {next_pyr->images[i].w, next_pyr->images[i].h};
+        err = clEnqueueNDRangeKernel(this->queue, this->downfilter_kernel, 2, nullptr, global_size, nullptr, 0, nullptr, nullptr);
+        if (err != CL_SUCCESS) 
+        {
+            std::cerr << "Failed to run downsample kernel for level " << i << ": " << err << std::endl;
+            return -1;
+        }
+    }
+
+    return 0;
+}
+
+
 int OCLTracker::destroy_pyramid(ocl_pyramid* pyramid)
 {
     if (pyramid) 
@@ -1196,16 +1412,19 @@ int OCLTracker::create_tracking_buffers(int n_points)
 }
 
 
-int OCLTracker::create_detection_buffer(int max_points)
+int OCLTracker::create_detection_buffer(int max_points, int grid_x, int grid_y)
 {
     detection_buf.max_points = max_points;
 
     cl_int err;
     detection_buf.xy_pts_buf  = clCreateBuffer(context, CL_MEM_READ_WRITE, (max_points * 2 + 1) * sizeof(int), NULL, &err);
-    detection_buf.xyz_pts_buf = clCreateBuffer(context, CL_MEM_READ_WRITE, (max_points * 3 + 1) * sizeof(int), NULL, &err);
+    if (err != CL_SUCCESS) {
+        printf("Failed to create buffers for detection: %d\n", err);
+        return -1;
+    }
 
-    if (err != CL_SUCCESS) 
-    {
+    detection_buf.xyz_pts_buf = clCreateBuffer(context, CL_MEM_READ_WRITE, (max_points * 3 + 1) * sizeof(int) * grid_x * grid_y, NULL, &err);
+    if (err != CL_SUCCESS) {
         printf("Failed to create buffers for detection: %d\n", err);
         return -1;
     }
@@ -1244,6 +1463,16 @@ int OCLTracker::run_tracking_step(int n_points, float* prev_pts)
     int c_winSize_y = 21;
     int c_iters = 30;
 
+    cl_int err;
+    err |= clSetKernelArg(this->track_kernel, 2,  sizeof(cl_mem), &tracking_buf.prev_pts_buf);
+    err |= clSetKernelArg(this->track_kernel, 3,  sizeof(cl_mem), &tracking_buf.next_pts_buf);
+    err |= clSetKernelArg(this->track_kernel, 4,  sizeof(cl_mem), &tracking_buf.status_buf);
+    err |= clSetKernelArg(this->track_kernel, 5,  sizeof(cl_mem), &tracking_buf.error_buf);
+    err |= clSetKernelArg(this->track_kernel, 9,  sizeof(int),    &patch_x);
+    err |= clSetKernelArg(this->track_kernel, 10, sizeof(int),    &patch_y);
+    err |= clSetKernelArg(this->track_kernel, 11, sizeof(int),    &c_winSize_x);
+    err |= clSetKernelArg(this->track_kernel, 12, sizeof(int),    &c_winSize_y);
+    err |= clSetKernelArg(this->track_kernel, 13, sizeof(int),    &c_iters);
 
     // run tracking step for number of pyramid levels
     for (int level = pyr_levels; level >= 0; level--)
@@ -1252,26 +1481,16 @@ int OCLTracker::run_tracking_step(int n_points, float* prev_pts)
         size_t globalThreads[3] = {n_points * 8, 8};
         char calcErr = (0 == level) ? 1 : 0;
 
-        cl_int err;
         err  = clSetKernelArg(this->track_kernel, 0,  sizeof(cl_mem), &prev_pyr->images[level].img_mem);
         err |= clSetKernelArg(this->track_kernel, 1,  sizeof(cl_mem), &next_pyr->images[level].img_mem);
-        err |= clSetKernelArg(this->track_kernel, 2,  sizeof(cl_mem), &tracking_buf.prev_pts_buf);
-        err |= clSetKernelArg(this->track_kernel, 3,  sizeof(cl_mem), &tracking_buf.next_pts_buf);
-        err |= clSetKernelArg(this->track_kernel, 4,  sizeof(cl_mem), &tracking_buf.status_buf);
-        err |= clSetKernelArg(this->track_kernel, 5,  sizeof(cl_mem), &tracking_buf.error_buf);
         err |= clSetKernelArg(this->track_kernel, 6,  sizeof(int),    &level);
         err |= clSetKernelArg(this->track_kernel, 7,  sizeof(int),    &prev_pyr->images[level].h);
         err |= clSetKernelArg(this->track_kernel, 8,  sizeof(int),    &prev_pyr->images[level].w);
-        err |= clSetKernelArg(this->track_kernel, 9,  sizeof(int),    &patch_x);
-        err |= clSetKernelArg(this->track_kernel, 10, sizeof(int),    &patch_y);
-        err |= clSetKernelArg(this->track_kernel, 11, sizeof(int),    &c_winSize_x);
-        err |= clSetKernelArg(this->track_kernel, 12, sizeof(int),    &c_winSize_y);
-        err |= clSetKernelArg(this->track_kernel, 13, sizeof(int),    &c_iters);
         err |= clSetKernelArg(this->track_kernel, 14, sizeof(char),   &calcErr);
 
         if (err != CL_SUCCESS) 
         {
-            printf("Error setting kernel args: %d\n", err);
+            printf("Error setting kernel args for track_kernel: %d\n", err);
         }
 
         err = clEnqueueNDRangeKernel(this->queue, this->track_kernel, 2, nullptr, globalThreads, localThreads, 0, nullptr, nullptr);

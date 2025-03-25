@@ -99,7 +99,12 @@ void TrackOCL::feed_monocular(const CameraData &message, size_t msg_id) {
         // Detect new features
         std::vector<cv::KeyPoint> good_left;
         std::vector<size_t> good_ids_left;
-        perform_detection_monocular(imgpyr, mask, good_left, good_ids_left, cam_id);
+        if (message.use_opencv_img){
+            perform_detection_monocular(imgpyr, mask, good_left, good_ids_left, cam_id);
+        }
+        else{
+            perform_detection_monocular_gpu(message.cl_images[msg_id], mask, 1280, 800, good_left, good_ids_left, cam_id);
+        }
         // Save the current image and pyramid
         std::lock_guard<std::mutex> lckv(mtx_last_vars);
         img_last[cam_id] = img;
@@ -110,7 +115,13 @@ void TrackOCL::feed_monocular(const CameraData &message, size_t msg_id) {
 
         cv::Mat img_float;
         message.images[msg_id].convertTo(img_float, CV_32F);
-        ocl_manager.cam_track[cam_id]->build_next_pyramid(img_float.data);
+
+        if (message.use_opencv_img){
+            ocl_manager.cam_track[cam_id]->build_next_pyramid(img_float.data);
+        }
+        else{
+            ocl_manager.cam_track[cam_id]->build_next_pyramid_gpu(message.cl_images[msg_id]);
+        }
 
         return;
     }
@@ -122,11 +133,19 @@ void TrackOCL::feed_monocular(const CameraData &message, size_t msg_id) {
     // This will "top-off" our number of tracks so always have a constant number
     auto pts_left_old = pts_last[cam_id];
     auto ids_left_old = ids_last[cam_id];
-    perform_detection_monocular(img_pyramid_last[cam_id], img_mask_last[cam_id], pts_left_old, ids_left_old, cam_id);
+    if (message.use_opencv_img){
+        perform_detection_monocular(img_pyramid_last[cam_id], img_mask_last[cam_id], pts_left_old, ids_left_old, cam_id);
+    }else{
+        perform_detection_monocular_gpu(message.cl_images[msg_id], mask, 1280, 800, pts_left_old, ids_left_old, cam_id);
+    }
     rT3 = boost::posix_time::microsec_clock::local_time();
 
     ocl_manager.cam_track[cam_id]->swap_pyr_pointers();
-    ocl_manager.cam_track[cam_id]->build_next_pyramid(img_float.data);
+    if(message.use_opencv_img){
+        ocl_manager.cam_track[cam_id]->build_next_pyramid(img_float.data);
+    }else{
+        ocl_manager.cam_track[cam_id]->build_next_pyramid_gpu(message.cl_images[msg_id]);
+    }
 
     // Our return success masks, and predicted new features
     std::vector<uchar> mask_ll;
@@ -156,9 +175,10 @@ void TrackOCL::feed_monocular(const CameraData &message, size_t msg_id) {
     // Loop through all left points
     for (size_t i = 0; i < pts_left_new.size(); i++) {
         // Ensure we do not have any bad KLT tracks (i.e., points are negative)
-        if (pts_left_new.at(i).pt.x < 0 || pts_left_new.at(i).pt.y < 0 || (int)pts_left_new.at(i).pt.x >= img.cols ||
-            (int)pts_left_new.at(i).pt.y >= img.rows)
-            continue;
+        if (pts_left_new.at(i).pt.x < 0 || pts_left_new.at(i).pt.y < 0 || (int)pts_left_new.at(i).pt.x >= 1280 ||
+            (int)pts_left_new.at(i).pt.y >= 800){
+                continue;
+            }
         // Check if it is in the mask
         // NOTE: mask has max value of 255 (white) if it should be
         if ((int)message.masks.at(msg_id).at<uint8_t>((int)pts_left_new.at(i).pt.y, (int)pts_left_new.at(i).pt.x) > 127)
@@ -215,6 +235,10 @@ void TrackOCL::perform_detection_monocular(const std::vector<cv::Mat> &img0pyr, 
     cv::Size size_grid(grid_x, grid_y); // width x height
     cv::Mat grid_2d_grid = cv::Mat::zeros(size_grid, CV_8UC1);
     cv::Mat mask0_updated = mask0.clone();
+
+    std::vector<int> grid_count; 
+    grid_count.resize(grid_x * grid_y); 
+
     auto it0 = pts0.begin();
     auto it1 = ids0.begin();
     while (it0 != pts0.end()) {
@@ -268,9 +292,41 @@ void TrackOCL::perform_detection_monocular(const std::vector<cv::Mat> &img0pyr, 
             cv::Point pt2(x + min_px_dist, y + min_px_dist);
             cv::rectangle(mask0_updated, pt1, pt2, cv::Scalar(255));
         }
+
+        grid_count[x_grid + grid_x * y_grid]++;
+
         it0++;
         it1++;
     }
+
+    int active_grids = 0;
+    for(int i = 0; i < grid_count.size(); i++) {
+        if (grid_count[i] > 0) {
+            active_grids++;
+        }
+    }
+
+    double min_grid_fill_percent = 0.70;
+    int num_gridsneeded = (int)std::round(min_grid_fill_percent * grid_x * grid_y);
+
+    printf("p: %2d grids: %2d(%2d),  ", num_features, active_grids, (int)pts0.size());
+
+    // if (active_grids < num_gridsneeded) {
+
+    //     it0 = pts0.begin();
+    //     it1 = ids0.begin();
+    //     int half_size = pts0.size() / 2;
+
+    //     for (size_t i = 0; i < half_size; ++i) {
+    //         it0 = pts0.erase(it0);
+    //         it1 = ids0.erase(it1);
+    //     }
+    // }
+
+    // if the active grid_s value is less than 40% (guess for now) of the total total grids (grid_x * grid_y)
+    // then we need to get more points for a better distribution
+    // set valid locs where the unpopulated grids are
+    //  
 
     auto rT2 = boost::posix_time::microsec_clock::local_time();
     PRINT_DEBUG("[TIME-DTCT]: %.4f seconds for grid creation\n", (rT2 - rT1).total_microseconds() * 1e-6);    
@@ -340,6 +396,181 @@ void TrackOCL::perform_detection_monocular(const std::vector<cv::Mat> &img0pyr, 
     auto rT4 = boost::posix_time::microsec_clock::local_time();
     PRINT_DEBUG("[TIME-DTCT]: %.4f seconds for feature rejection\n", (rT4 - rT3).total_microseconds() * 1e-6);   
 }
+
+
+void TrackOCL::perform_detection_monocular_gpu(const cl_mem img, const cv::Mat &mask0, int w, int h, std::vector<cv::KeyPoint> &pts0,
+                                           std::vector<size_t> &ids0, int cam_id) {
+
+    // Create a 2D occupancy grid for this current image
+    // Note that we scale this down, so that each grid point is equal to a set of pixels
+    // This means that we will reject points that less than grid_px_size points away then existing features
+    
+    auto rT1 = boost::posix_time::microsec_clock::local_time();
+
+    cv::Size size_close((int)((float)w / (float)min_px_dist),
+                        (int)((float)h / (float)min_px_dist)); // width x height
+    cv::Mat grid_2d_close = cv::Mat::zeros(size_close, CV_8UC1);
+    float size_x = (float)w / (float)grid_x;
+    float size_y = (float)h / (float)grid_y;
+    cv::Size size_grid(grid_x, grid_y); // width x height
+    cv::Mat grid_2d_grid = cv::Mat::zeros(size_grid, CV_8UC1);
+
+    cv::Mat mask0_updated = mask0.clone();
+
+    std::vector<int> grid_count; 
+    grid_count.resize(grid_x * grid_y); 
+    
+    auto it0 = pts0.begin();
+    auto it1 = ids0.begin();
+    while (it0 != pts0.end()) {
+        // Get current left keypoint, check that it is in bounds
+        cv::KeyPoint kpt = *it0;
+        int x = (int)kpt.pt.x;
+        int y = (int)kpt.pt.y;
+        int edge = 10;
+        if (x < edge || x >= w - edge || y < edge || y >= h - edge) {
+            it0 = pts0.erase(it0);
+            it1 = ids0.erase(it1);
+            continue;
+        }
+        // Calculate mask coordinates for close points
+        int x_close = (int)(kpt.pt.x / (float)min_px_dist);
+        int y_close = (int)(kpt.pt.y / (float)min_px_dist);
+        if (x_close < 0 || x_close >= size_close.width || y_close < 0 || y_close >= size_close.height) {
+            it0 = pts0.erase(it0);
+            it1 = ids0.erase(it1);
+            continue;
+        }
+        // Calculate what grid cell this feature is in
+        int x_grid = std::floor(kpt.pt.x / size_x);
+        int y_grid = std::floor(kpt.pt.y / size_y);
+        if (x_grid < 0 || x_grid >= size_grid.width || y_grid < 0 || y_grid >= size_grid.height) {
+            it0 = pts0.erase(it0);
+            it1 = ids0.erase(it1);
+            continue;
+        }
+        // Check if this keypoint is near another point
+        if (grid_2d_close.at<uint8_t>(y_close, x_close) > 127) {
+            it0 = pts0.erase(it0);
+            it1 = ids0.erase(it1);
+            continue;
+        }
+        // Now check if it is in a mask area or not
+        // NOTE: mask has max value of 255 (white) if it should be
+        if (mask0.at<uint8_t>(y, x) > 127) {
+            it0 = pts0.erase(it0);
+            it1 = ids0.erase(it1);
+            continue;
+        }
+        // Else we are good, move forward to the next point
+        grid_2d_close.at<uint8_t>(y_close, x_close) = 255;
+        if (grid_2d_grid.at<uint8_t>(y_grid, x_grid) < 255) {
+            grid_2d_grid.at<uint8_t>(y_grid, x_grid) += 1;
+        }
+        // Append this to the local mask of the image
+        if (x - min_px_dist >= 0 && x + min_px_dist < w && y - min_px_dist >= 0 && y + min_px_dist < h) {
+            cv::Point pt1(x - min_px_dist, y - min_px_dist);
+            cv::Point pt2(x + min_px_dist, y + min_px_dist);
+
+            cv::rectangle(mask0_updated, pt1, pt2, cv::Scalar(255));
+        }
+
+        grid_count[x_grid + grid_x * y_grid]++;
+
+        it0++;
+        it1++;
+    }
+
+    int active_grids = 0;
+    for(int i = 0; i < grid_count.size(); i++) {
+        if (grid_count[i] > 0) {
+            active_grids++;
+        }
+    }
+    printf("grids: %2d(%2d),  ", active_grids, (int)pts0.size());
+    
+    double min_grid_fill_percent = 0.50;
+    int num_gridsneeded = (int)std::round(min_grid_fill_percent * grid_x * grid_y);
+
+    // if (active_grids < num_gridsneeded) {
+    //     it0 = pts0.begin();
+    //     it1 = ids0.begin();
+    //     int half_size = pts0.size() / 2;
+
+    //     for (size_t i = 0; i < half_size; ++i) {
+    //         it0 = pts0.erase(it0);
+    //         it1 = ids0.erase(it1);
+    //     }
+    // }
+
+    auto rT2 = boost::posix_time::microsec_clock::local_time();
+    PRINT_DEBUG("[TIME-DTCT]: %.4f seconds for grid creation\n", (rT2 - rT1).total_microseconds() * 1e-6);    
+
+    // First compute how many more features we need to extract from this image
+    // If we don't need any features, just return
+    double min_feat_percent = 0.50;
+    int num_featsneeded = num_features - (int)pts0.size();
+    if (num_featsneeded < std::min(20, (int)(min_feat_percent * num_features)))
+        return;
+
+    // We also check a downsampled mask such that we don't extract in areas where it is all masked!
+    cv::Mat mask0_grid;
+    cv::resize(mask0, mask0_grid, size_grid, 0.0, 0.0, cv::INTER_NEAREST);
+
+    // Create grids we need to extract from and then extract our features (use fast with griding)
+    int num_features_grid = (int)((double)num_features / (double)(grid_x * grid_y)) + 1;
+    int num_features_grid_req = std::max(1, (int)(min_feat_percent * num_features_grid));
+    std::vector<std::pair<int, int>> valid_locs;
+    for (int x = 0; x < grid_2d_grid.cols; x++) {
+        for (int y = 0; y < grid_2d_grid.rows; y++) {
+            if ((int)grid_2d_grid.at<uint8_t>(y, x) < num_features_grid_req && (int)mask0_grid.at<uint8_t>(y, x) != 255) {
+                valid_locs.emplace_back(x, y);
+            }
+        }
+    }
+    std::vector<cv::KeyPoint> pts0_ext;
+    // printf("performing_griding_gpu\n");
+    Grider_OCL::perform_griding_gpu2(this->ocl_manager.cam_track[cam_id], img, mask0_updated, w, h, valid_locs, pts0_ext, num_features, grid_x, grid_y, threshold, true);
+
+    auto rT3 = boost::posix_time::microsec_clock::local_time();
+    PRINT_DEBUG("[TIME-DTCT]: %.4f seconds for grid detection\n", (rT3 - rT2).total_microseconds() * 1e-6);   
+
+    // Now, reject features that are close a current feature
+    std::vector<cv::KeyPoint> kpts0_new;
+    std::vector<cv::Point2f> pts0_new;
+    for (auto &kpt : pts0_ext) {
+        // Check that it is in bounds
+        int x_grid = (int)(kpt.pt.x / (float)min_px_dist);
+        int y_grid = (int)(kpt.pt.y / (float)min_px_dist);
+        if (x_grid < 0 || x_grid >= size_close.width || y_grid < 0 || y_grid >= size_close.height)
+            continue;
+        // See if there is a point at this location
+        if (grid_2d_close.at<uint8_t>(y_grid, x_grid) > 127)
+            continue;
+        // Else lets add it!
+        kpts0_new.push_back(kpt);
+        pts0_new.push_back(kpt.pt);
+        grid_2d_close.at<uint8_t>(y_grid, x_grid) = 255;
+    }
+
+    // Loop through and record only ones that are valid
+    // NOTE: if we multi-thread this atomic can cause some randomness due to multiple thread detecting features
+    // NOTE: this is due to the fact that we select update features based on feat id
+    // NOTE: thus the order will matter since we try to select oldest (smallest id) to update with
+    // NOTE: not sure how to remove... maybe a better way?
+    for (size_t i = 0; i < pts0_new.size(); i++) {
+        // update the uv coordinates
+        kpts0_new.at(i).pt = pts0_new.at(i);
+        // append the new uv coordinate
+        pts0.push_back(kpts0_new.at(i));
+        // move id foward and append this new point
+        size_t temp = ++currid;
+        ids0.push_back(temp);
+    }
+    auto rT4 = boost::posix_time::microsec_clock::local_time();
+    PRINT_DEBUG("[TIME-DTCT]: %.4f seconds for feature rejection\n", (rT4 - rT3).total_microseconds() * 1e-6);   
+}
+
 
 void TrackOCL::perform_matching(const std::vector<cv::Mat> &img0pyr, const std::vector<cv::Mat> &img1pyr, std::vector<cv::KeyPoint> &kpts0,
                                 std::vector<cv::KeyPoint> &kpts1, size_t id0, size_t id1, std::vector<uchar> &mask_out) {
