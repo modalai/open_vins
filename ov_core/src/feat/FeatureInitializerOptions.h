@@ -67,6 +67,16 @@ struct FeatureInitializerOptions {
 
     /// Max condition number of linear triangulation matrix accept triangulated features
     double max_cond_number = 10000;
+    
+    /**
+     * @brief This flag indicates whether the RANSAC-GN algorithm is enabled or not.
+     */
+    bool raansac_gn = false;
+
+    /**
+     * @brief This flag indicates whether the RANSAC-TRI algorithm is enabled or not.
+     */
+    bool raansac_tri = true;
 
     /// Nice print function of what parameters we have loaded
     void print(const std::shared_ptr<ov_core::YamlParser> &parser = nullptr) {
@@ -83,6 +93,8 @@ struct FeatureInitializerOptions {
             parser->parse_config("fi_max_dist", max_dist, false);
             parser->parse_config("fi_max_baseline", max_baseline, false);
             parser->parse_config("fi_max_cond_number", max_cond_number, false);
+            parser->parse_config("raansac_gn", raansac_gn, false);
+            parser->parse_config("raansac_tri", raansac_tri, false);
         }
         PRINT_DEBUG("\t- triangulate_1d: %d\n", triangulate_1d);
         PRINT_DEBUG("\t- refine_features: %d\n", refine_features);
@@ -96,6 +108,8 @@ struct FeatureInitializerOptions {
         PRINT_DEBUG("\t- max_dist: %.3f\n", max_dist);
         PRINT_DEBUG("\t- max_baseline: %.3f\n", max_baseline);
         PRINT_DEBUG("\t- max_cond_number: %.3f\n", max_cond_number);
+        PRINT_DEBUG("\t- raansac_gn: %d\n", raansac_gn);
+        PRINT_DEBUG("\t- raansac_tri: %d\n", raansac_tri);
     }
 };
 

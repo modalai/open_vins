@@ -123,7 +123,7 @@ VioManager::VioManager(VioManagerOptions &params_) : thread_init_running(false),
       if (params.use_gpu) {
 
     	  printf("\n====> Using Internal KLT feature tracker (w/ GPU) <==== \n");
-        printf("num_feats: %d\n", init_max_features);
+
         TrackOCL * klt_ocl = new TrackOCL(	state->_cam_intrinsics_cameras, 
                                         init_max_features,
                                         state->_options.max_aruco_features, 
@@ -1054,7 +1054,11 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
 
   // Save all the MSCKF features used in the update
   for (auto const &feat : featsup_MSCKF) {
-    good_features_MSCKF.push_back(feat->p_FinG);
+    Eigen::Vector4d vec4;
+    vec4.head<3>() = feat->p_FinG;  // Copy the 3D coordinates
+    vec4(3) = 1.0;                  // Set the fourth element (homogeneous coordinate or a default value)
+
+    good_features_MSCKF.push_back(vec4);
     MSCKF_ids.push_back(feat->featid);
     feat->to_delete = true;
   }

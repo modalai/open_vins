@@ -640,14 +640,18 @@ int VioManager::get_pixel_loc_features(std::vector<output_feature> &feats ) {
     // Build an id-list of our "in state" features
     // i.e. SLAM and last msckf update features
     std::vector<size_t> msckf_ids(MSCKF_ids);
-    std::vector<Eigen::Vector3d> good_features_MSCKF_clone(good_features_MSCKF);
+    std::vector<Eigen::Vector4d> good_features_MSCKF_clone(good_features_MSCKF);
     std::vector<size_t> slam_ids;
+//JOAO ADDS
+    // NOTE: THIS IS A WORKAROUND TO GET THE RAANSAC QUALITY WIHTOUT BREAKING THE GETTER get_features_SLAM()
+    std::vector<float> slam_raansac_quality_vec;
 
     std::vector<std::shared_ptr<ov_type::Type>> statevars;
 
     for (const auto &feat : state->_features_SLAM) {
         slam_ids.push_back(feat.second->_featid);
     	statevars.push_back(feat.second);
+        slam_raansac_quality_vec.push_back((feat.second->ransac_quality));
     }
 
     Eigen::MatrixXd feat_cov = StateHelper::get_marginal_covariance(state, statevars);
@@ -716,9 +720,14 @@ int VioManager::get_pixel_loc_features(std::vector<output_feature> &feats ) {
             of.tsf[0] = slam_feats_clone[index](0);
             of.tsf[1] = slam_feats_clone[index](1);
             of.tsf[2] = slam_feats_clone[index](2);
-            double cov_val = feat_cov(index);
-            if (cov_val > 0)
-            	of.depth_error_stddev = sqrt(cov_val);
+        //JOAO ADDS
+            //=======================================================================================
+            // NOTE: WE ARE USING THE DEPTH ERROR FIELD TO PASS THE RAANSAC QUALITY
+            of.depth_error_stddev = slam_raansac_quality_vec[index];
+            //=======================================================================================
+            // double cov_val = feat_cov(index);
+            // if (cov_val > 0)
+            // 	of.depth_error_stddev = sqrt(cov_val);
 
             // as of now, only the slam features have a recoverable covariance
             // TODO fix this call, causing malloc issues
@@ -732,6 +741,11 @@ int VioManager::get_pixel_loc_features(std::vector<output_feature> &feats ) {
             of.tsf[0] = good_features_MSCKF_clone[index](0);
             of.tsf[1] = good_features_MSCKF_clone[index](1);
             of.tsf[2] = good_features_MSCKF_clone[index](2);
+        //JOAO ADDS
+            //=======================================================================================
+            // NOTE: WE ARE USING THE DEPTH ERROR FIELD TO PASS THE RAANSAC QUALITY
+            of.depth_error_stddev = good_features_MSCKF_clone[index](3);
+            //=======================================================================================
         }
         // oos, no 3d projections yet
         else {
