@@ -306,7 +306,7 @@ void TrackOCL::perform_detection_monocular(const std::vector<cv::Mat> &img0pyr, 
         }
     }
 
-    double min_grid_fill_percent = 0.70;
+    double min_grid_fill_percent = 0.80;
     int num_gridsneeded = (int)std::round(min_grid_fill_percent * grid_x * grid_y);
 
     printf("p: %2d grids: %2d(%2d),  ", num_features, active_grids, (int)pts0.size());
