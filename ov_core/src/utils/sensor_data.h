@@ -1,8 +1,8 @@
 /*
  * OpenVINS: An Open Platform for Visual-Inertial Research
- * Copyright (C) 2018-2022 Patrick Geneva
- * Copyright (C) 2018-2022 Guoquan Huang
- * Copyright (C) 2018-2022 OpenVINS Contributors
+ * Copyright (C) 2018-2023 Patrick Geneva
+ * Copyright (C) 2018-2023 Guoquan Huang
+ * Copyright (C) 2018-2023 OpenVINS Contributors
  * Copyright (C) 2018-2019 Kevin Eckenhoff
  *
  * This program is free software: you can redistribute it and/or modify
@@ -33,17 +33,17 @@ namespace ov_core {
  */
 struct ImuData {
 
-    /// Timestamp of the reading
-    double timestamp;
+  /// Timestamp of the reading
+  double timestamp;
 
-    /// Gyroscope reading, angular velocity (rad/s)
-    Eigen::Matrix<double, 3, 1> wm;
+  /// Gyroscope reading, angular velocity (rad/s)
+  Eigen::Matrix<double, 3, 1> wm;
 
-    /// Accelerometer reading, linear acceleration (m/s^2)
-    Eigen::Matrix<double, 3, 1> am;
+  /// Accelerometer reading, linear acceleration (m/s^2)
+  Eigen::Matrix<double, 3, 1> am;
 
-    /// Sort function to allow for using of STL containers
-    bool operator<(const ImuData &other) const { return timestamp < other.timestamp; }
+  /// Sort function to allow for using of STL containers
+  bool operator<(const ImuData &other) const { return timestamp < other.timestamp; }
 };
 
 /**
@@ -54,74 +54,29 @@ struct ImuData {
  */
 struct CameraData {
 
-    /// Timestamp of the reading
-    double timestamp;
+  /// Timestamp of the reading
+  double timestamp;
 
-    /// Camera ids for each of the images collected
-    std::vector<int> sensor_ids;
+  /// Camera ids for each of the images collected
+  std::vector<int> sensor_ids;
 
-    /// Raw image we have collected for each camera
-    std::vector<cv::Mat> images;
+  /// Raw image we have collected for each camera
+  std::vector<cv::Mat> images;
 
-    /// Tracking masks for each camera we have
-    std::vector<cv::Mat> masks;
+  /// Tracking masks for each camera we have
+  std::vector<cv::Mat> masks;
 
-    /// Sort function to allow for using of STL containers
-    bool operator<(const CameraData &other) const {
-        if (timestamp == other.timestamp) {
-            int id = *std::min_element(sensor_ids.begin(), sensor_ids.end());
-            int id_other = *std::min_element(other.sensor_ids.begin(), other.sensor_ids.end());
-            return id < id_other;
-        } else {
-            return timestamp < other.timestamp;
-        }
+  /// Sort function to allow for using of STL containers
+  bool operator<(const CameraData &other) const {
+    if (timestamp == other.timestamp) {
+      int id = *std::min_element(sensor_ids.begin(), sensor_ids.end());
+      int id_other = *std::min_element(other.sensor_ids.begin(), other.sensor_ids.end());
+      return id < id_other;
+    } else {
+      return timestamp < other.timestamp;
     }
+  }
 };
-
-typedef struct ExtFeature {
-    size_t id;
-    size_t cam_id;
-    float u;
-    float v;
-    unsigned char descriptor[32] = {0};
-} __attribute((packed))__ExtFeature;
-
-//TODO ============= DEPRECATED
-typedef struct MaiFeature {
-    size_t id;
-    size_t cam_id;
-    float x;
-    float y;
-    float u;
-    float v;
-    unsigned char descriptor[32] = {0};
-} __attribute((packed))__MaiFeature;
-
-struct ProcessedCameraData {
-    /// Timestamp of the reading
-    double timestamp;
-
-    /// Camera ids for each of the images collected
-    std::vector<int> sensor_ids;
-
-    // no mask or image for now
-
-    /// Features Extracted per cam
-    std::vector<MaiFeature> feats;
-
-    /// Sort function to allow for using of STL containers
-    bool operator<(const ProcessedCameraData &other) const {
-        if (timestamp == other.timestamp) {
-            int id = *std::min_element(sensor_ids.begin(), sensor_ids.end());
-            int id_other = *std::min_element(other.sensor_ids.begin(), other.sensor_ids.end());
-            return id < id_other;
-        } else {
-            return timestamp < other.timestamp;
-        }
-    }
-};
-//TODO ============= DEPRECATED
-
 
 } // namespace ov_core
 

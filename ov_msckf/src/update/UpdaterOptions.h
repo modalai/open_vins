@@ -1,8 +1,8 @@
 /*
  * OpenVINS: An Open Platform for Visual-Inertial Research
- * Copyright (C) 2018-2022 Patrick Geneva
- * Copyright (C) 2018-2022 Guoquan Huang
- * Copyright (C) 2018-2022 OpenVINS Contributors
+ * Copyright (C) 2018-2023 Patrick Geneva
+ * Copyright (C) 2018-2023 Guoquan Huang
+ * Copyright (C) 2018-2023 OpenVINS Contributors
  * Copyright (C) 2018-2019 Kevin Eckenhoff
  *
  * This program is free software: you can redistribute it and/or modify
@@ -31,20 +31,20 @@ namespace ov_msckf {
  */
 struct UpdaterOptions {
 
-    /// What chi-squared multipler we should apply
-    double chi2_multipler = 5;
+  /// What chi-squared multipler we should apply
+  double chi2_multipler = 5;
 
-    /// Noise sigma for our raw pixel measurements
-    double sigma_pix = 1;
+  /// Noise sigma for our raw pixel measurements
+  double sigma_pix = 1;
 
-    /// Covariance for our raw pixel measurements
-    double sigma_pix_sq = 1;
+  /// Covariance for our raw pixel measurements
+  double sigma_pix_sq = 1;
 
-    /// Nice print function of what parameters we have loaded
-    void print() {
-        PRINT_DEBUG("    - chi2_multipler: %.1f\n", chi2_multipler);
-        PRINT_DEBUG("    - sigma_pix: %.2f\n", sigma_pix);
-    }
+  /// Nice print function of what parameters we have loaded
+  void print() {
+    PRINT_DEBUG("    - chi2_multipler: %.1f\n", chi2_multipler);
+    PRINT_DEBUG("    - sigma_pix: %.2f\n", sigma_pix);
+  }
 };
 
 } // namespace ov_msckf

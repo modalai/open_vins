@@ -1,8 +1,8 @@
 /*
  * OpenVINS: An Open Platform for Visual-Inertial Research
- * Copyright (C) 2018-2022 Patrick Geneva
- * Copyright (C) 2018-2022 Guoquan Huang
- * Copyright (C) 2018-2022 OpenVINS Contributors
+ * Copyright (C) 2018-2023 Patrick Geneva
+ * Copyright (C) 2018-2023 Guoquan Huang
+ * Copyright (C) 2018-2023 OpenVINS Contributors
  * Copyright (C) 2018-2019 Kevin Eckenhoff
  *
  * This program is free software: you can redistribute it and/or modify
@@ -27,7 +27,7 @@
 
 namespace ov_core {
 
-/**
+/*
  * @brief Helper class to do OpenCV parallelization
  *
  * This is a utility class required to build with older version of opencv
@@ -35,12 +35,12 @@ namespace ov_core {
  * https://answers.opencv.org/question/65800/how-to-use-lambda-as-a-parameter-to-parallel_for_/?answer=130691#post-id-130691
  */
 class LambdaBody : public cv::ParallelLoopBody {
-  public:
-    explicit LambdaBody(const std::function<void(const cv::Range &)> &body) { _body = body; }
-    void operator()(const cv::Range &range) const override { _body(range); }
+public:
+  explicit LambdaBody(const std::function<void(const cv::Range &)> &body) { _body = body; }
+  void operator()(const cv::Range &range) const override { _body(range); }
 
-  private:
-    std::function<void(const cv::Range &)> _body;
+private:
+  std::function<void(const cv::Range &)> _body;
 };
 
 } /* namespace ov_core */

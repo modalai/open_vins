@@ -1,8 +1,8 @@
 /*
  * OpenVINS: An Open Platform for Visual-Inertial Research
- * Copyright (C) 2018-2022 Patrick Geneva
- * Copyright (C) 2018-2022 Guoquan Huang
- * Copyright (C) 2018-2022 OpenVINS Contributors
+ * Copyright (C) 2018-2023 Patrick Geneva
+ * Copyright (C) 2018-2023 Guoquan Huang
+ * Copyright (C) 2018-2023 OpenVINS Contributors
  * Copyright (C) 2018-2019 Kevin Eckenhoff
  *
  * This program is free software: you can redistribute it and/or modify
@@ -47,35 +47,35 @@ class State;
  */
 class UpdaterMSCKF {
 
-  public:
-    /**
-     * @brief Default constructor for our MSCKF updater
-     *
-     * Our updater has a feature initializer which we use to initialize features as needed.
-     * Also the options allow for one to tune the different parameters for update.
-     *
-     * @param options Updater options (include measurement noise value)
-     * @param feat_init_options Feature initializer options
-     */
-    UpdaterMSCKF(UpdaterOptions &options, ov_core::FeatureInitializerOptions &feat_init_options);
+public:
+  /**
+   * @brief Default constructor for our MSCKF updater
+   *
+   * Our updater has a feature initializer which we use to initialize features as needed.
+   * Also the options allow for one to tune the different parameters for update.
+   *
+   * @param options Updater options (include measurement noise value)
+   * @param feat_init_options Feature initializer options
+   */
+  UpdaterMSCKF(UpdaterOptions &options, ov_core::FeatureInitializerOptions &feat_init_options);
 
-    /**
-     * @brief Given tracked features, this will try to use them to update the state.
-     *
-     * @param state State of the filter
-     * @param feature_vec Features that can be used for update
-     */
-    void update(std::shared_ptr<State> state, std::vector<std::shared_ptr<ov_core::Feature>> &feature_vec);
+  /**
+   * @brief Given tracked features, this will try to use them to update the state.
+   *
+   * @param state State of the filter
+   * @param feature_vec Features that can be used for update
+   */
+  void update(std::shared_ptr<State> state, std::vector<std::shared_ptr<ov_core::Feature>> &feature_vec);
 
-  protected:
-    /// Options used during update
-    UpdaterOptions _options;
+protected:
+  /// Options used during update
+  UpdaterOptions _options;
 
-    /// Feature initializer class object
-    std::shared_ptr<ov_core::FeatureInitializer> initializer_feat;
+  /// Feature initializer class object
+  std::shared_ptr<ov_core::FeatureInitializer> initializer_feat;
 
-    /// Chi squared 95th percentile table (lookup would be size of residual)
-    std::map<int, double> chi_squared_table;
+  /// Chi squared 95th percentile table (lookup would be size of residual)
+  std::map<int, double> chi_squared_table;
 };
 
 } // namespace ov_msckf
