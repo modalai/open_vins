@@ -27,6 +27,8 @@
 #include "track/TrackAruco.h"
 #include "track/TrackDescriptor.h"
 #include "track/TrackKLT.h"
+#include "track/TrackOCL/TrackOCL.h"
+
 #include "track/TrackSIM.h"
 #include "types/Landmark.h"
 #include "types/LandmarkRepresentation.h"
@@ -49,10 +51,7 @@ using namespace ov_msckf;
 
 VioManager::VioManager(VioManagerOptions &params_) : thread_init_running(false), thread_init_success(false) {
 
-  // Nice startup message
-  PRINT_DEBUG("=======================================\n");
-  PRINT_DEBUG("OPENVINS ON-MANIFOLD EKF IS STARTING\n");
-  PRINT_DEBUG("=======================================\n");
+
 
   // Nice debug
   this->params = params_;
@@ -128,16 +127,58 @@ VioManager::VioManager(VioManagerOptions &params_) : thread_init_running(false),
   // Let's make a feature extractor
   // NOTE: after we initialize we will increase the total number of feature tracks
   // NOTE: we will split the total number of features over all cameras uniformly
-  int init_max_features = std::floor((double)params.init_options.init_max_features / (double)params.state_options.num_cameras);
-  if (params.use_klt) {
-    trackFEATS = std::shared_ptr<TrackBase>(new TrackKLT(state->_cam_intrinsics_cameras, init_max_features,
-                                                         state->_options.max_aruco_features, params.use_stereo, params.histogram_method,
-                                                         params.fast_threshold, params.grid_x, params.grid_y, params.min_px_dist));
-  } else {
-    trackFEATS = std::shared_ptr<TrackBase>(new TrackDescriptor(
-        state->_cam_intrinsics_cameras, init_max_features, state->_options.max_aruco_features, params.use_stereo, params.histogram_method,
-        params.fast_threshold, params.grid_x, params.grid_y, params.min_px_dist, params.knn_ratio));
-  }
+    int init_max_features =
+        params.init_options
+            .init_max_features; // std::floor((double)params.init_options.init_max_features / (double)params.state_options.num_cameras);
+        
+    if (params.use_klt) {
+
+      if (params.use_gpu) {
+
+    	  printf("\n====> Using Internal KLT feature tracker (w/ GPU) <==== \n");
+
+        TrackOCL * klt = new TrackOCL(	state->_cam_intrinsics_cameras, 
+                                        init_max_features,
+                                        state->_options.max_aruco_features, 
+                                        params.fast_threshold, 
+                                        params.grid_x, 
+                                        params.grid_y, 
+                                        params.min_px_dist);
+
+        // update pyramid levels for feature tracking
+        klt->set_pyramid_levels(params.pyramid_levels);
+        trackFEATS = std::shared_ptr<TrackBase>(klt);
+
+      } else {
+
+    	  printf("\n====> Using Internal KLT feature tracker <==== \n");
+	
+        TrackKLT * klt = new TrackKLT(	state->_cam_intrinsics_cameras, 
+                                        init_max_features,
+                                        state->_options.max_aruco_features, 
+                                        params.use_stereo, 
+                                        params.histogram_method,
+                                        params.fast_threshold, 
+                                        params.grid_x, 
+                                        params.grid_y, 
+                                        params.min_px_dist);
+        
+        // update pyramid levels for feature tracking
+        klt->set_pyramid_levels(params.pyramid_levels);
+        trackFEATS = std::shared_ptr<TrackBase>(klt);
+
+      }
+
+
+
+    } else {
+    	
+    	printf("\n====> Using EXTERNAL feature tracker <==== \n");
+
+        trackFEATS = std::shared_ptr<TrackBase>(new TrackDescriptor(
+            state->_cam_intrinsics_cameras, params.init_options.init_max_features, state->_options.max_aruco_features, params.use_stereo,
+            params.histogram_method, params.fast_threshold, params.grid_x, params.grid_y, params.min_px_dist, params.knn_ratio));
+    }
 
   // Initialize our aruco tag extractor
   if (params.use_aruco) {
@@ -162,6 +203,88 @@ VioManager::VioManager(VioManagerOptions &params_) : thread_init_running(false),
                                                         params.zupt_noise_multiplier, params.zupt_max_disparity);
   }
 }
+void VioManager::zero_state()
+{
+	printf("\n\nZERO STATE\n\n");
+	
+	state.reset();
+	trackFEATS.reset();
+//	propagator.reset();
+	updaterMSCKF.reset();
+	updaterSLAM.reset();
+	// active_tracks_initializer.reset();
+
+	state = std::make_shared<State>(params.state_options);
+	
+	// Timeoffset from camera to IMU
+	Eigen::VectorXd temp_camimu_dt;
+	temp_camimu_dt.resize(1);
+	temp_camimu_dt(0) = params.calib_camimu_dt;
+	state->_calib_dt_CAMtoIMU->set_value(temp_camimu_dt);
+	state->_calib_dt_CAMtoIMU->set_fej(temp_camimu_dt);
+	
+	// Loop through and load each of the cameras
+	printf("Set camera intrinsics and extrinsics\n");
+	state->_cam_intrinsics_cameras = params.camera_intrinsics;
+	for (int i = 0; i < state->_options.num_cameras; i++) {
+	state->_cam_intrinsics.at(i)->set_value(params.camera_intrinsics.at(i)->get_value());
+	state->_cam_intrinsics.at(i)->set_fej(params.camera_intrinsics.at(i)->get_value());
+	state->_calib_IMUtoCAM.at(i)->set_value(params.camera_extrinsics.at(i));
+	state->_calib_IMUtoCAM.at(i)->set_fej(params.camera_extrinsics.at(i));
+	}
+
+	
+    if (params.use_klt) {
+          if (params.use_gpu) {
+
+    	  printf("\n====> Using Internal KLT feature tracker (w/ GPU) <==== \n");
+
+        TrackOCL * klt = new TrackOCL(	state->_cam_intrinsics_cameras, 
+                                        params.init_options.init_max_features,
+                                        state->_options.max_aruco_features, 
+                                        params.fast_threshold, 
+                                        params.grid_x, 
+                                        params.grid_y, 
+                                        params.min_px_dist);
+
+        // update pyramid levels for feature tracking
+        klt->set_pyramid_levels(params.pyramid_levels);
+        trackFEATS = std::shared_ptr<TrackBase>(klt);
+
+      } else {
+
+    	  printf("\n====> Using Internal KLT feature tracker <==== \n");
+	
+        TrackKLT * klt = new TrackKLT(	state->_cam_intrinsics_cameras, 
+                                        params.init_options.init_max_features,
+                                        state->_options.max_aruco_features, 
+                                        params.use_stereo, 
+                                        params.histogram_method,
+                                        params.fast_threshold, 
+                                        params.grid_x, 
+                                        params.grid_y, 
+                                        params.min_px_dist);
+        
+        // update pyramid levels for feature tracking
+        klt->set_pyramid_levels(params.pyramid_levels);
+        trackFEATS = std::shared_ptr<TrackBase>(klt);
+
+      }
+    }
+    else
+    {
+        trackFEATS = std::shared_ptr<TrackBase>(new TrackDescriptor(
+            state->_cam_intrinsics_cameras, params.init_options.init_max_features, state->_options.max_aruco_features, params.use_stereo,
+            params.histogram_method, params.fast_threshold, params.grid_x, params.grid_y, params.min_px_dist, params.knn_ratio));
+    }
+	
+//	propagator = std::make_shared<Propagator>(params.imu_noises, params.gravity_mag);
+		
+	// Make the updater!
+	updaterMSCKF = std::make_shared<UpdaterMSCKF>(params.msckf_options, params.featinit_options);
+	updaterSLAM = std::make_shared<UpdaterSLAM>(params.slam_options, params.aruco_options, params.featinit_options);
+  }
+    
 
 void VioManager::feed_measurement_imu(const ov_core::ImuData &message) {
 
@@ -173,6 +296,18 @@ void VioManager::feed_measurement_imu(const ov_core::ImuData &message) {
   }
   if (!is_initialized_vio) {
     oldest_time = message.timestamp - params.init_options.init_window_time + state->_calib_dt_CAMtoIMU->value()(0) - 0.10;
+  }
+  // VOXL
+  else if (params.limit_imu_propagation)
+  {
+
+//	oldest_time = message.timestamp - (params.init_options.init_window_time * 0.5);
+	oldest_time = message.timestamp - 0.5;
+	if (oldest_time < 0.01)
+	{
+		printf("old IMU tie too small\n");
+		oldest_time = 0.01;
+	}
   }
   propagator->feed_imu(message, oldest_time);
 
@@ -551,6 +686,7 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
   // Update our visualization feature set, and clean up the old features
   //===================================================================================
 
+#ifdef ROS_VIZ
   // Re-triangulate all current tracks in the current frame
   if (message.sensor_ids.at(0) == 0) {
 
@@ -562,6 +698,9 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
     // MSCKF features as they will also be appended to the vector
     good_features_MSCKF.clear();
   }
+#endif
+  
+  // MSCKF_ids.clear();
 
   // Save all the MSCKF features used in the update
   for (auto const &feat : featsup_MSCKF) {

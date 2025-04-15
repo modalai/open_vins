@@ -393,11 +393,12 @@ struct VioManagerOptions {
 
   // TRACKERS ===============================
 
-  /// If we should process two cameras are being stereo or binocular. If binocular, we do monocular feature tracking on each image.
-  bool use_stereo = true;
+    /// If we should process two cameras are being stereo or binocular. If binocular, we do monocular feature tracking on each image.
+    bool use_stereo = false;
 
   /// If we should use KLT tracking, or descriptor matcher
   bool use_klt = true;
+  bool use_gpu =true; 
 
   /// If should extract aruco tags and estimate them
   bool use_aruco = true;
@@ -417,9 +418,10 @@ struct VioManagerOptions {
   /// If our ROS subscriber callbacks should be async (if sim and serial then this should be no!)
   bool use_multi_threading_subs = false;
 
-  /// The number of points we should extract and track in *each* image frame. This highly effects the computation required for tracking.
-  int num_pts = 150;
+    /// The number of points we should extract and track in *each* image frame. This highly effects the computation required for tracking.
+    int num_pts = 45;
 
+    int pyramid_levels = 5;
   /// Fast extraction threshold
   int fast_threshold = 20;
 
@@ -433,74 +435,84 @@ struct VioManagerOptions {
   int min_px_dist = 10;
 
   /// What type of pre-processing histogram method should be applied to images
-  ov_core::TrackBase::HistogramMethod histogram_method = ov_core::TrackBase::HistogramMethod::HISTOGRAM;
+  ov_core::TrackBase::HistogramMethod histogram_method = ov_core::TrackBase::HistogramMethod::NONE;
 
   /// KNN ration between top two descriptor matcher which is required to be a good match
   double knn_ratio = 0.85;
 
-  /// Frequency we want to track images at (higher freq ones will be dropped)
-  double track_frequency = 20.0;
+    /// Frequency we want to track images at (higher freq ones will be dropped)
+    double track_frequency = 12.0;  //20
 
   /// Parameters used by our feature initialize / triangulator
   ov_core::FeatureInitializerOptions featinit_options;
 
-  /**
-   * @brief This function will load print out all parameters related to visual tracking
-   * This allows for visual checking that everything was loaded properly from ROS/CMD parsers.
-   *
-   * @param parser If not null, this parser will be used to load our parameters
-   */
-  void print_and_load_trackers(const std::shared_ptr<ov_core::YamlParser> &parser = nullptr) {
-    if (parser != nullptr) {
-      parser->parse_config("use_stereo", use_stereo);
-      parser->parse_config("use_klt", use_klt);
-      parser->parse_config("use_aruco", use_aruco);
-      parser->parse_config("downsize_aruco", downsize_aruco);
-      parser->parse_config("downsample_cameras", downsample_cameras);
-      parser->parse_config("num_opencv_threads", num_opencv_threads);
-      parser->parse_config("multi_threading_pubs", use_multi_threading_pubs, false);
-      parser->parse_config("multi_threading_subs", use_multi_threading_subs, false);
-      parser->parse_config("num_pts", num_pts);
-      parser->parse_config("fast_threshold", fast_threshold);
-      parser->parse_config("grid_x", grid_x);
-      parser->parse_config("grid_y", grid_y);
-      parser->parse_config("min_px_dist", min_px_dist);
-      std::string histogram_method_str = "HISTOGRAM";
-      parser->parse_config("histogram_method", histogram_method_str);
-      if (histogram_method_str == "NONE") {
-        histogram_method = ov_core::TrackBase::NONE;
-      } else if (histogram_method_str == "HISTOGRAM") {
-        histogram_method = ov_core::TrackBase::HISTOGRAM;
-      } else if (histogram_method_str == "CLAHE") {
-        histogram_method = ov_core::TrackBase::CLAHE;
-      } else {
-        printf(RED "VioManager(): invalid feature histogram specified:\n" RESET);
-        printf(RED "\t- NONE\n" RESET);
-        printf(RED "\t- HISTOGRAM\n" RESET);
-        printf(RED "\t- CLAHE\n" RESET);
-        std::exit(EXIT_FAILURE);
-      }
-      parser->parse_config("knn_ratio", knn_ratio);
-      parser->parse_config("track_frequency", track_frequency);
+   /// VOXL
+    bool limit_imu_propagation = true;
+
+    /**
+     * @brief This function will load print out all parameters related to visual tracking
+     * This allows for visual checking that everything was loaded properly from ROS/CMD parsers.
+     *
+     * @param parser If not null, this parser will be used to load our parameters
+     */
+    void print_and_load_trackers(const std::shared_ptr<ov_core::YamlParser> &parser = nullptr) {
+        if (parser != nullptr) {
+            parser->parse_config("use_stereo", use_stereo);
+            parser->parse_config("use_klt", use_klt);
+            parser->parse_config("use_aruco", use_aruco);
+            parser->parse_config("downsize_aruco", downsize_aruco);
+            parser->parse_config("downsample_cameras", downsample_cameras);
+            parser->parse_config("num_opencv_threads", num_opencv_threads);
+            parser->parse_config("multi_threading_pubs", use_multi_threading_pubs, false);
+            parser->parse_config("multi_threading_subs", use_multi_threading_subs, false);
+
+            // VOXL
+            parser->parse_config("limit_imu_propagation", limit_imu_propagation, true);
+
+            parser->parse_config("num_pts", num_pts);
+            parser->parse_config("fast_threshold", fast_threshold);
+            parser->parse_config("grid_x", grid_x);
+            parser->parse_config("grid_y", grid_y);
+            parser->parse_config("min_px_dist", min_px_dist);
+            std::string histogram_method_str = "HISTOGRAM";
+            parser->parse_config("histogram_method", histogram_method_str);
+            if (histogram_method_str == "NONE") {
+                histogram_method = ov_core::TrackBase::NONE;
+            } else if (histogram_method_str == "HISTOGRAM") {
+                histogram_method = ov_core::TrackBase::HISTOGRAM;
+            } else if (histogram_method_str == "CLAHE") {
+                histogram_method = ov_core::TrackBase::CLAHE;
+            } else {
+                printf(RED "VioManager(): invalid feature histogram specified:\n" RESET);
+                printf(RED "\t- NONE\n" RESET);
+                printf(RED "\t- HISTOGRAM\n" RESET);
+                printf(RED "\t- CLAHE\n" RESET);
+                std::exit(EXIT_FAILURE);
+            }
+            parser->parse_config("knn_ratio", knn_ratio);
+            parser->parse_config("track_frequency", track_frequency);
+        }
+        PRINT_DEBUG("FEATURE TRACKING PARAMETERS:\n");
+        PRINT_DEBUG("  - use_stereo: %d\n", use_stereo);
+        PRINT_DEBUG("  - use_klt: %d\n", use_klt);
+        PRINT_DEBUG("  - use_aruco: %d\n", use_aruco);
+        PRINT_DEBUG("  - downsize aruco: %d\n", downsize_aruco);
+        PRINT_DEBUG("  - downsize cameras: %d\n", downsample_cameras);
+        PRINT_DEBUG("  - num opencv threads: %d\n", num_opencv_threads);
+        PRINT_DEBUG("  - use multi-threading pubs: %d\n", use_multi_threading_pubs);
+        PRINT_DEBUG("  - use multi-threading subs: %d\n", use_multi_threading_subs);
+        PRINT_DEBUG("  - num_pts: %d\n", num_pts);
+        PRINT_DEBUG("  - fast threshold: %d\n", fast_threshold);
+        PRINT_DEBUG("  - grid X by Y: %d by %d\n", grid_x, grid_y);
+        PRINT_DEBUG("  - min px dist: %d\n", min_px_dist);
+        PRINT_DEBUG("  - hist method: %d\n", (int)histogram_method);
+        PRINT_DEBUG("  - knn ratio: %.3f\n", knn_ratio);
+        PRINT_DEBUG("  - track frequency: %.1f\n", track_frequency);
+        PRINT_DEBUG("  - limit imu propagation (windows based on init_imu+cam-imu delay): %d\n", limit_imu_propagation);
+
+
+        featinit_options.print(parser);
     }
-    PRINT_DEBUG("FEATURE TRACKING PARAMETERS:\n");
-    PRINT_DEBUG("  - use_stereo: %d\n", use_stereo);
-    PRINT_DEBUG("  - use_klt: %d\n", use_klt);
-    PRINT_DEBUG("  - use_aruco: %d\n", use_aruco);
-    PRINT_DEBUG("  - downsize aruco: %d\n", downsize_aruco);
-    PRINT_DEBUG("  - downsize cameras: %d\n", downsample_cameras);
-    PRINT_DEBUG("  - num opencv threads: %d\n", num_opencv_threads);
-    PRINT_DEBUG("  - use multi-threading pubs: %d\n", use_multi_threading_pubs);
-    PRINT_DEBUG("  - use multi-threading subs: %d\n", use_multi_threading_subs);
-    PRINT_DEBUG("  - num_pts: %d\n", num_pts);
-    PRINT_DEBUG("  - fast threshold: %d\n", fast_threshold);
-    PRINT_DEBUG("  - grid X by Y: %d by %d\n", grid_x, grid_y);
-    PRINT_DEBUG("  - min px dist: %d\n", min_px_dist);
-    PRINT_DEBUG("  - hist method: %d\n", (int)histogram_method);
-    PRINT_DEBUG("  - knn ratio: %.3f\n", knn_ratio);
-    PRINT_DEBUG("  - track frequency: %.1f\n", track_frequency);
-    featinit_options.print(parser);
-  }
 
   // SIMULATOR ===============================
 

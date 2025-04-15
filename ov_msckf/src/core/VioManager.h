@@ -67,18 +67,23 @@ public:
    * @param params_ Parameters loaded from either ROS or CMDLINE
    */
   VioManager(VioManagerOptions &params_);
-
-  /**
+    /**
    * @brief Feed function for inertial data
    * @param message Contains our timestamp and inertial information
    */
   void feed_measurement_imu(const ov_core::ImuData &message);
 
-  /**
-   * @brief Feed function for camera measurements
-   * @param message Contains our timestamp, images, and camera ids
-   */
-  void feed_measurement_camera(const ov_core::CameraData &message) { track_image_and_update(message); }
+    
+  void zero_state();
+    
+    /**
+     * @brief Feed function for camera measurements
+     * @param message Contains our timestamp, images, and camera ids
+     */
+    void feed_measurement_camera(const ov_core::CameraData &message) { track_image_and_update(message); }
+    // void feed_measurement_feature(const float  time_ns,  std::vector<ov_core::ExtFeature> feats);
+    // void feed_measurement_feature_cached(const float  time_ns,  std::vector<ov_core::ExtFeature> feats);
+    void update_state(const float ts, std::vector<int> cams_used);
 
   /**
    * @brief Feed function for a synchronized simulated cameras
