@@ -104,15 +104,20 @@ public:
 
     ~OCLTracker() {
         if (queue) clReleaseCommandQueue(queue);
-        if (track_kernel) clReleaseKernel(track_kernel);
-        if (downfilter_kernel) clReleaseKernel(downfilter_kernel);
+
+        if (track_kernel)       clReleaseKernel(track_kernel);
+        if (downfilter_kernel)  clReleaseKernel(downfilter_kernel);
+        if (extract_kernel)     clReleaseKernel(extract_kernel);
+        if (nms_kernel)         clReleaseKernel(nms_kernel);
+        if (refine_kernel)      clReleaseKernel(refine_kernel);
+
         //EXPERIEMENTAL PIXEL REFINENMENT WITH GPU
         destroy_tracking_buffers();
-            
         destroy_detection_buffers();
 
+        if (img_buf.buf_mem) clReleaseMemObject(img_buf.buf_mem);
+        img_buf.buf_mem = nullptr;
 
-        if (refine_kernel) clReleaseKernel(refine_kernel);
         if (prev_pyr) destroy_pyramid(prev_pyr);
         if (next_pyr) destroy_pyramid(next_pyr);
 

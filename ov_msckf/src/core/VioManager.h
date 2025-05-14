@@ -68,6 +68,9 @@ class VioManager {
      */
     VioManager(VioManagerOptions &params_);
 
+    ~VioManager();
+
+    void shutdown();
     
     void zero_state();
     

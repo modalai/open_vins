@@ -3,14 +3,24 @@
 
 OCLManager::OCLManager()
 {
-    
+    for (int i = 0; i < 3; ++i)
+        cam_track[i] = nullptr;
 }
 
 
 OCLManager::~OCLManager() 
 {
-    if (ocl_program) clReleaseProgram(ocl_program);
-    if (context)     clReleaseContext(context);
+    for (int i = 0; i < num_cams; i++) {
+        if (cam_track[i]) {
+            delete cam_track[i];
+            cam_track[i] = nullptr;
+        }
+    }
+
+    if (refine_program) clReleaseProgram(refine_program);
+    if (detect_program) clReleaseProgram(detect_program);
+    if (ocl_program)    clReleaseProgram(ocl_program);
+    if (context)        clReleaseContext(context);
 }
 
 
@@ -1157,9 +1167,8 @@ int OCLTracker::destroy_ocl_image(ocl_image* image)
         if (image->img_mem) 
         {
             clReleaseMemObject(image->img_mem);
+            image->img_mem = nullptr;
         }
-
-        free(image);
         return 0;
     }
     return -1;
@@ -1281,6 +1290,8 @@ int OCLTracker::build_next_pyramid(const void* frame)
             return -1;
         }
     }
+
+    clReleaseSampler(sampler);
 
     return 0;
 }

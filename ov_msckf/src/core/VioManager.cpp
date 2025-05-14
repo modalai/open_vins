@@ -205,6 +205,23 @@ VioManager::VioManager(VioManagerOptions &params_) : thread_init_running(false),
 
 }
 
+VioManager::~VioManager() { }
+
+void VioManager::shutdown() {
+    thread_init_running = false;
+
+    state.reset();
+    trackFEATS.reset();
+    trackARUCO.reset();
+    propagator.reset();
+    trackDATABASE.reset();
+    initializer.reset();
+    updaterMSCKF.reset();
+    updaterSLAM.reset();
+    updaterZUPT.reset();
+    active_tracks_initializer.reset();
+}
+
 void VioManager::zero_state()
 {
 	printf("\n\nZERO STATE\n\n");
