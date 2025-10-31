@@ -55,6 +55,7 @@ void Propagator::propagate_and_clone(std::shared_ptr<State> state, double timest
     last_prop_time_offset = state->_calib_dt_CAMtoIMU->value()(0);
     have_last_prop_time_offset = true;
   }
+  state->_gravity = _gravity;
 
   // Get what our IMU-camera offset should be (t_imu = t_cam + calib_dt)
   double t_off_new = state->_calib_dt_CAMtoIMU->value()(0);
@@ -1013,4 +1014,20 @@ Eigen::MatrixXd Propagator::compute_H_Tg(std::shared_ptr<State> state, const Eig
   Eigen::MatrixXd H_Tg = Eigen::MatrixXd::Zero(3, 9);
   H_Tg << a_1 * I_3x3, a_2 * I_3x3, a_3 * I_3x3;
   return H_Tg;
+}
+
+void Propagator::feed_imu_batch(const std::vector<ov_core::ImuData>& messages, double oldest_time) {
+    if (messages.empty()) return;
+
+    // Insert all measurements at once with a single lock
+    std::lock_guard<std::mutex> lck(imu_data_mtx);
+    imu_data.reserve(imu_data.size() + messages.size()); // Pre-allocate space
+    for (const auto& msg : messages) {
+        imu_data.emplace_back(msg);
+    }
+
+    // Clean old measurements if needed
+    if (oldest_time != -1) {
+        clean_old_imu_measurements(oldest_time - 0.10);
+    }
 }

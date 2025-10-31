@@ -328,3 +328,18 @@ bool UpdaterZeroVelocity::try_update(std::shared_ptr<State> state, double timest
   last_zupt_count++;
   return true;
 }
+
+void UpdaterZeroVelocity::feed_imu_batch(const std::vector<ov_core::ImuData>& messages, double oldest_time) {
+    if (messages.empty()) return;
+
+    // Insert all measurements at once
+    imu_data.reserve(imu_data.size() + messages.size()); // Pre-allocate space
+    for (const auto& msg : messages) {
+        imu_data.emplace_back(msg);
+    }
+
+    // Clean old measurements if needed
+    if (oldest_time != -1) {
+        clean_old_imu_measurements(oldest_time - 0.10);
+    }
+}

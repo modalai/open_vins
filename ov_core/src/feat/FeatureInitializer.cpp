@@ -25,6 +25,7 @@
 #include "utils/print.h"
 #include "utils/quat_ops.h"
 
+#define RANSAAC_THRESHOLD 0.02f
 using namespace ov_core;
 
 bool FeatureInitializer::single_triangulation(std::shared_ptr<Feature> feat,
@@ -108,6 +109,39 @@ bool FeatureInitializer::single_triangulation(std::shared_ptr<Feature> feat,
   // Store it in our feature object
   feat->p_FinA = p_f;
   feat->p_FinG = R_GtoA.transpose() * feat->p_FinA + p_AinG;
+//===================================================================================
+//FOR NOW, ALWAYS COMPUTE QUALITY WITH TRIANGULATION
+  int inliers = 0;
+  int total_obs = 0;
+
+  for (auto const &pair : feat->timestamps) {
+      for (size_t m = 0; m < feat->timestamps.at(pair.first).size(); m++) {
+          
+          total_obs++;
+
+          //CLONE POSITION IN G
+          const Eigen::Matrix<double, 3, 3> &R_GtoCi = clonesCAM.at(pair.first).at(feat->timestamps.at(pair.first).at(m)).Rot();
+          const Eigen::Matrix<double, 3, 1> &p_CiinG = clonesCAM.at(pair.first).at(feat->timestamps.at(pair.first).at(m)).pos();
+
+          //CONVERT LATEST Pf INTO CLONE CAMERA FRAME
+          Eigen::Matrix<double, 3, 1> p_FinCi = R_GtoCi * (feat->p_FinG - p_CiinG);
+
+          //PROJECT
+          Eigen::Vector2d reproj_uv(p_FinCi(0) / p_FinCi(2), p_FinCi(1) / p_FinCi(2));
+
+          //OBSERVED
+          Eigen::Vector2d observed_uv(feat->uvs_norm.at(pair.first).at(m)(0), feat->uvs_norm.at(pair.first).at(m)(1));
+
+          //REPROJECTION ERROR
+          double reprojection_error = (reproj_uv - observed_uv).norm();
+
+          if (reprojection_error < RANSAAC_THRESHOLD) {
+              inliers++;
+          }
+      }
+  }
+  feat->quality =  static_cast<float>(inliers) / total_obs;
+//=====================================================================================
   return true;
 }
 
@@ -191,6 +225,23 @@ bool FeatureInitializer::single_triangulation_1d(std::shared_ptr<Feature> feat,
   // Store it in our feature object
   feat->p_FinA = p_f;
   feat->p_FinG = R_GtoA.transpose() * feat->p_FinA + p_AinG;
+
+  // compute quality as in main triangulation
+  {
+    int inliers = 0; int total_obs = 0;
+    for(auto const &pair: feat->timestamps){
+        for(size_t m=0;m<feat->timestamps.at(pair.first).size();m++){
+            total_obs++;
+            const auto &R_GtoCi = clonesCAM.at(pair.first).at(feat->timestamps.at(pair.first).at(m)).Rot();
+            const auto &p_CiinG = clonesCAM.at(pair.first).at(feat->timestamps.at(pair.first).at(m)).pos();
+            Eigen::Vector3d p_FinCi = R_GtoCi * (feat->p_FinG - p_CiinG);
+            Eigen::Vector2d reproj(p_FinCi(0)/p_FinCi(2), p_FinCi(1)/p_FinCi(2));
+            Eigen::Vector2d obs(feat->uvs_norm.at(pair.first).at(m)(0), feat->uvs_norm.at(pair.first).at(m)(1));
+            if( (reproj-obs).norm() < RANSAAC_THRESHOLD) inliers++;
+        }
+    }
+    feat->quality = static_cast<float>(inliers) / std::max(1, total_obs);
+  }
   return true;
 }
 

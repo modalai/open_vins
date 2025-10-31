@@ -178,6 +178,8 @@ public:
 
   /// Rotation from accelerometer to the "IMU" gyroscope frame frame (rpng model)
   std::shared_ptr<ov_type::JPLQuat> _calib_imu_ACCtoIMU;
+  
+  Eigen::Vector3d _gravity;
 
 private:
   // Define that the state helper is a friend class of this class

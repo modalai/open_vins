@@ -192,7 +192,7 @@ void TrackKLT::feed_monocular(const CameraData &message, size_t msg_id) {
   // Timing information
   PRINT_ALL("[TIME-KLT]: %.4f seconds for pyramid\n", (rT2 - rT1).total_microseconds() * 1e-6);
   PRINT_ALL("[TIME-KLT]: %.4f seconds for detection (%zu detected)\n", (rT3 - rT2).total_microseconds() * 1e-6,
-            (int)pts_last[cam_id].size() - pts_before_detect);
+            (int)pts_last[cam_id].size());
   PRINT_ALL("[TIME-KLT]: %.4f seconds for temporal klt\n", (rT4 - rT3).total_microseconds() * 1e-6);
   PRINT_ALL("[TIME-KLT]: %.4f seconds for feature DB update (%d features)\n", (rT5 - rT4).total_microseconds() * 1e-6,
             (int)good_left.size());

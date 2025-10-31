@@ -75,6 +75,13 @@ public:
   void feed_imu(const ov_core::ImuData &message, double oldest_time = -1);
 
   /**
+   * @brief Feed a batch of IMU measurements with a single lock
+   * @param messages Vector of IMU measurements to process
+   * @param oldest_time Oldest timestamp to keep measurements for
+   */
+  void feed_imu_batch(const std::vector<ov_core::ImuData>& messages, double oldest_time = -1);
+
+  /**
    * @brief Try to get the initialized system
    *
    *

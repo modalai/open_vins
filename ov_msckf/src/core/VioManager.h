@@ -67,23 +67,18 @@ public:
    * @param params_ Parameters loaded from either ROS or CMDLINE
    */
   VioManager(VioManagerOptions &params_);
-    /**
+
+  /**
    * @brief Feed function for inertial data
    * @param message Contains our timestamp and inertial information
    */
   void feed_measurement_imu(const ov_core::ImuData &message);
 
-    
-  void zero_state();
-    
-    /**
-     * @brief Feed function for camera measurements
-     * @param message Contains our timestamp, images, and camera ids
-     */
-    void feed_measurement_camera(const ov_core::CameraData &message) { track_image_and_update(message); }
-    // void feed_measurement_feature(const float  time_ns,  std::vector<ov_core::ExtFeature> feats);
-    // void feed_measurement_feature_cached(const float  time_ns,  std::vector<ov_core::ExtFeature> feats);
-    void update_state(const float ts, std::vector<int> cams_used);
+  /**
+   * @brief Feed function for camera measurements
+   * @param message Contains our timestamp, images, and camera ids
+   */
+  void feed_measurement_camera(const ov_core::CameraData &message) { track_image_and_update(message); }
 
   /**
    * @brief Feed function for a synchronized simulated cameras
@@ -93,6 +88,13 @@ public:
    */
   void feed_measurement_simulation(double timestamp, const std::vector<int> &camids,
                                    const std::vector<std::vector<std::pair<size_t, Eigen::VectorXf>>> &feats);
+
+  /**
+   * @brief Feed a batch of IMU measurements with optional downsampling
+   * @param messages Vector of IMU measurements to process
+   * @param target_freq_hz Target frequency to downsample to (0 for no downsampling)
+   */
+  void feed_measurement_batch_imu(const std::vector<ov_core::ImuData>& messages, double target_freq_hz = 0.0);
 
   /**
    * @brief Given a state, this will initialize our IMU state.
@@ -139,6 +141,58 @@ public:
     timestamp = active_tracks_time;
     feat_posinG = active_tracks_posinG;
     feat_tracks_uvd = active_tracks_uvd;
+  }
+
+  // Returns the OpenCL context if we are using the GPU for feature tracking 
+  cl_context get_ocl_context() const { return trackFEATS->get_ocl_context(); }
+
+  std::shared_ptr<ov_core::TrackBase> get_track_feats() { return trackFEATS; }
+
+  /// Returns used features map organized by timestamp
+  std::map<double, std::vector<std::shared_ptr<ov_core::Feature>>> get_used_features_map() { return used_features_map; }
+
+  /// Returns used features for a specific timestamp
+  std::vector<std::shared_ptr<ov_core::Feature>> get_used_features_at_timestamp(double timestamp) {
+    auto it = used_features_map.find(timestamp);
+    if (it != used_features_map.end()) {
+      return it->second;
+    }
+    return std::vector<std::shared_ptr<ov_core::Feature>>();
+  }
+
+  /// Returns all timestamps that have used features
+  std::vector<double> get_used_features_timestamps() {
+    std::vector<double> timestamps;
+    for (const auto& pair : used_features_map) {
+      timestamps.push_back(pair.first);
+    }
+    return timestamps;
+  }
+
+  /// Clear all used features from the map
+  void clear_used_features_map() { used_features_map.clear(); }
+
+  /// Get the number of timestamps with used features
+  size_t get_used_features_map_size() { return used_features_map.size(); }
+
+  /// Returns used features within a time range [start_time, end_time]
+  std::vector<std::shared_ptr<ov_core::Feature>> get_used_features_in_range(double start_time, double end_time) {
+    std::vector<std::shared_ptr<ov_core::Feature>> features_in_range;
+    for (const auto& pair : used_features_map) {
+      if (pair.first >= start_time && pair.first <= end_time) {
+        features_in_range.insert(features_in_range.end(), pair.second.begin(), pair.second.end());
+      }
+    }
+    return features_in_range;
+  }
+
+  /// Get the total number of features across all timestamps
+  size_t get_total_used_features_count() {
+    size_t total_count = 0;
+    for (const auto& pair : used_features_map) {
+      total_count += pair.second.size();
+    }
+    return total_count;
   }
 
 protected:
@@ -246,6 +300,9 @@ protected:
   std::map<size_t, Eigen::Matrix3d> active_feat_linsys_A;
   std::map<size_t, Eigen::Vector3d> active_feat_linsys_b;
   std::map<size_t, int> active_feat_linsys_count;
+
+  /// Map to store used features organized by timestamp
+  std::map<double, std::vector<std::shared_ptr<ov_core::Feature>>> used_features_map;
 };
 
 } // namespace ov_msckf

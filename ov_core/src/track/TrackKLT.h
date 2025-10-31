@@ -61,10 +61,6 @@ public:
    * @param message Contains our timestamp, images, and camera ids
    */
   void feed_new_camera(const CameraData &message) override;
-      /**
-   * @brief set pyramid levels
-   */
-  void set_pyramid_levels(int levels) { pyr_levels = levels; };
 
 protected:
   /**

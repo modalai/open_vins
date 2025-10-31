@@ -70,6 +70,29 @@ void InertialInitializer::feed_imu(const ov_core::ImuData &message, double oldes
   }
 }
 
+void InertialInitializer::feed_imu_batch(const std::vector<ov_core::ImuData>& messages, double oldest_time) {
+    
+    //ADDING THIS GUARD TO PREVENT CRASH FROM EMPTY VECTOR
+    if (messages.empty()) return;
+
+    
+    // Insert all measurements at once
+    //have to use insert...
+    imu_data->insert(imu_data->end(), messages.begin(), messages.end());
+    
+    // Clean old measurements if needed
+    if (oldest_time != -1) {
+        auto it = imu_data->begin();
+        while (it != imu_data->end()) {
+            if (it->timestamp < oldest_time) {
+                it = imu_data->erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+}
+
 bool InertialInitializer::initialize(double &timestamp, Eigen::MatrixXd &covariance, std::vector<std::shared_ptr<ov_type::Type>> &order,
                                      std::shared_ptr<ov_type::IMU> t_imu, bool wait_for_jerk) {
 

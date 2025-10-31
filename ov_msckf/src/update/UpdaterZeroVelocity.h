@@ -114,6 +114,13 @@ public:
    */
   bool try_update(std::shared_ptr<State> state, double timestamp);
 
+  /**
+   * @brief Feed a batch of IMU measurements with a single lock
+   * @param messages Vector of IMU measurements to process
+   * @param oldest_time Oldest timestamp to keep measurements for
+   */
+  void feed_imu_batch(const std::vector<ov_core::ImuData>& messages, double oldest_time = -1);
+
 protected:
   /// Options used during update (chi2 multiplier)
   UpdaterOptions _options;

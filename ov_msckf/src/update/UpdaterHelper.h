@@ -74,6 +74,9 @@ public:
     /// Timestamp of anchor clone
     double anchor_clone_timestamp = -1;
 
+    /// Quality of the feature
+    double quality = -1;
+
     /// Triangulated position of this feature, in the anchor frame
     Eigen::Vector3d p_FinA;
 

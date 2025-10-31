@@ -32,8 +32,9 @@
 #include <opencv2/opencv.hpp>
 
 #include "utils/opencv_lambda_body.h"
-#include "TrackOCLUtils.h"
-
+#include <modal_flow_track_manager.h>
+#include <modal_flow/ocl/ManagerCL.hpp>
+#include <modal_flow/Types.hpp>
 namespace ov_core {
 
 /**
@@ -79,7 +80,7 @@ class Grider_OCL {
      * Given a specified grid size, this will try to extract fast features from each grid.
      * It will then return the best from each grid in the return vector.
      */
-    static void perform_griding(OCLTracker* tracker, const cv::Mat &img, const cv::Mat &mask, const std::vector<std::pair<int, int>> &valid_locs,
+    static void perform_griding(VoxlTrackingManager* tracker, const cv::Mat &img, const cv::Mat &mask, const std::vector<std::pair<int, int>> &valid_locs,
                                 std::vector<cv::KeyPoint> &pts, int num_features, int grid_x, int grid_y, int threshold,
                                 bool nonmaxSuppression) {
 
@@ -112,6 +113,7 @@ class Grider_OCL {
         assert(size_y > 0);
 
         std::vector<std::vector<cv::KeyPoint>> collection(valid_locs.size());
+        int* kp_out = (int*)malloc((tracker->maxPointsExtracted() * 3 + 1) * sizeof(int));
 
         for (int r = 0 ; r < (int)valid_locs.size(); r++)
         {
@@ -131,89 +133,15 @@ class Grider_OCL {
             cv::Mat grid_img_roi(img(img_roi));
             cv::Mat grid_img = grid_img_roi.clone();
 
+            memset(kp_out, 0, (tracker->maxPointsExtracted() * 3 + 1) * sizeof(int));
 
-            cl_int err = clEnqueueWriteBuffer(tracker->queue, tracker->img_buf.buf_mem, CL_TRUE, 0, size_x * size_y, grid_img.data, 0, NULL, NULL);
-            if (err != CL_SUCCESS) {
-                printf("Error writing to buffer: %d\n", err);
-                return;
-            }
-
-            int reset_value = 0;
-            clEnqueueWriteBuffer(tracker->queue, tracker->detection_buf.xy_pts_buf,  CL_TRUE, 0, sizeof(int), &reset_value, 0, NULL, NULL);
-            if (err != CL_SUCCESS) {
-                printf("Error writing to buffer: %d\n", err);
-                return;
-            }
-
-            clEnqueueWriteBuffer(tracker->queue, tracker->detection_buf.xyz_pts_buf, CL_TRUE, 0, sizeof(int), &reset_value, 0, NULL, NULL);
-            if (err != CL_SUCCESS) {
-                printf("Error writing to buffer: %d\n", err);
-                return;
-            }
-
-
-            int step = size_x;
-            int img_offset = 0;
-            int max_keypoints = tracker->detection_buf.max_points;
-
-            err  = clSetKernelArg(tracker->extract_kernel, 0, sizeof(cl_mem), &tracker->img_buf.buf_mem);
-            err |= clSetKernelArg(tracker->extract_kernel, 1, sizeof(int),    &step);
-            err |= clSetKernelArg(tracker->extract_kernel, 2, sizeof(int),    &img_offset);
-            err |= clSetKernelArg(tracker->extract_kernel, 3, sizeof(int),    &size_y);
-            err |= clSetKernelArg(tracker->extract_kernel, 4, sizeof(int),    &size_x);
-            err |= clSetKernelArg(tracker->extract_kernel, 5, sizeof(cl_mem), &tracker->detection_buf.xy_pts_buf);
-            err |= clSetKernelArg(tracker->extract_kernel, 6, sizeof(int),    &tracker->detection_buf.max_points);
-            err |= clSetKernelArg(tracker->extract_kernel, 7, sizeof(int),    &threshold);
-            if (err != CL_SUCCESS) {
-                printf("Error setting kernel arg: %d\n", err);
-                return;
-            }
-
-
-            size_t global_work_size[2] = { size_x - 6, size_y - 6 };
-            err = clEnqueueNDRangeKernel(tracker->queue, tracker->extract_kernel, 2, NULL, global_work_size, NULL, 0, NULL, NULL);
-            if (err != CL_SUCCESS) {
-                printf("Error running extract_kernel: %d\n", err);
-                return;
-            }
-
-            int counter;
-            clEnqueueReadBuffer(tracker->queue, tracker->detection_buf.xy_pts_buf, CL_TRUE, 0, sizeof(int), &counter, 0, NULL, NULL);
-            counter = std::min(counter, tracker->detection_buf.max_points);
-
-            if (counter < 1) {
-                continue;
-            }
-
-            err  = clSetKernelArg(tracker->nms_kernel, 0, sizeof(cl_mem), &tracker->detection_buf.xy_pts_buf);
-            err |= clSetKernelArg(tracker->nms_kernel, 1, sizeof(cl_mem), &tracker->detection_buf.xyz_pts_buf);
-            err |= clSetKernelArg(tracker->nms_kernel, 2, sizeof(cl_mem), &tracker->img_buf.buf_mem);
-            err |= clSetKernelArg(tracker->nms_kernel, 3, sizeof(int),    &step);
-            err |= clSetKernelArg(tracker->nms_kernel, 4, sizeof(int),    &img_offset);
-            err |= clSetKernelArg(tracker->nms_kernel, 5, sizeof(int),    &size_y);
-            err |= clSetKernelArg(tracker->nms_kernel, 6, sizeof(int),    &size_x);
-            err |= clSetKernelArg(tracker->nms_kernel, 7, sizeof(int),    &counter);
-            err |= clSetKernelArg(tracker->nms_kernel, 8, sizeof(int),    &tracker->detection_buf.max_points);
-            if (err != CL_SUCCESS) {
-                printf("Error setting nms_kernel arg: %d\n", err);
-                return;
-            }
-
-            size_t work[] = { (size_t)counter };
-            err = clEnqueueNDRangeKernel(tracker->queue, tracker->nms_kernel, 1, NULL, work, NULL, 0, NULL, NULL);
-            if (err != CL_SUCCESS) {
-                printf("Error running nms_kernel: %d\n", err);
-                return;
-            }
-
-
-            int* kp_out = (int*)malloc((max_keypoints * 3 + 1) * sizeof(int));
-            clEnqueueReadBuffer(tracker->queue, tracker->detection_buf.xyz_pts_buf, CL_TRUE, 0, (max_keypoints * 3 + 1) * sizeof(int), kp_out, 0, NULL, NULL);
-            clFinish(tracker->queue); 
+            tracker->runExtraction(grid_img, size_x, size_y, threshold, kp_out);
 
             std::vector<cv::KeyPoint> pts_new;
 
-            counter = std::min(counter, kp_out[0]);
+            int counter = std::min(tracker->maxPointsExtracted(), kp_out[0]);
+            if (counter == 0) continue;
+
             cv::Point3i* pt2 = (cv::Point3i*)(kp_out + 1);
             std::sort(pt2, pt2 + counter, cmp_pt<cv::Point3i>());
 
@@ -221,7 +149,6 @@ class Grider_OCL {
                 pts_new.push_back(cv::KeyPoint((float)pt2[i].x, (float)pt2[i].y, 7.f, -1, (float)pt2[i].z));
             
             std::sort(pts_new.begin(), pts_new.end(), Grider_FAST::compare_response);
-            free(kp_out);
 
             for (size_t i = 0; i < (size_t)num_features_grid && i < pts_new.size(); i++) {
 
@@ -243,6 +170,7 @@ class Grider_OCL {
                 collection.at(r).push_back(pt_cor);
             }
         }
+        free(kp_out);
 
         // Combine all the collections into our single vector
         for (size_t r = 0; r < collection.size(); r++) {
@@ -264,26 +192,171 @@ class Grider_OCL {
             pts_refined.push_back(pts.at(i).pt);
         }
 
-        // Finally get sub-pixel for all extracted features
-        // cv::cornerSubPix(img, pts_refined, win_size, zero_zone, term_crit);
-        // Upload initial keypoints to GPU
-        clEnqueueWriteBuffer(tracker->queue, tracker->tracking_buf.next_pts_buf, CL_TRUE, 0,
-                            pts.size() * sizeof(cl_float2), pts_refined.data(), 0, nullptr, nullptr);
-
-        // Run subpixel refinement
-        if (tracker->refine_points_subpixel((int)pts.size(), win_size.width, term_crit.maxCount, (float)term_crit.epsilon) != 0) {
+        // Finally run sub pixel refinement (cv::cornerSubPix)
+        int res = tracker->refinePoints(static_cast<int>(pts_refined.size()),
+                                reinterpret_cast<float*>(pts_refined.data()),
+                                win_size.width,
+                                term_crit.maxCount,
+                                static_cast<float>(term_crit.epsilon));
+        if (res != 0) {
             std::cerr << "Subpixel refinement failed." << std::endl;
             return;
         }
-
-        // Read back refined results
-        clEnqueueReadBuffer(tracker->queue, tracker->refined_pts_buf, CL_TRUE, 0,
-                            pts.size() * sizeof(cl_float2), pts_refined.data(), 0, nullptr, nullptr);
 
         // Save the refined points!
         for (size_t i = 0; i < pts.size(); i++) {
             pts.at(i).pt = pts_refined.at(i);
         }
+    }
+
+    static void perform_griding_use_flow(modal_flow::ocl::ManagerCL& mgr, int cam_id, modal_flow::BufferId buf_id, const cv::Mat &mask, const std::vector<std::pair<int, int>> &valid_locs,
+                            std::vector<cv::KeyPoint> &pts, int num_features, int grid_x, int grid_y, int threshold,
+                            bool nonmaxSuppression) {
+
+        // Return if there is nothing to extract
+        if (valid_locs.empty())
+            return;
+
+        // We want to have equally distributed features
+        // NOTE: If we have more grids than number of total points, we calc the biggest grid we can do
+        // NOTE: Thus if we extract 1 point per grid we have
+        // NOTE:    -> 1 = num_features / (grid_x * grid_y)
+        // NOTE:    -> grid_x = ratio * grid_y (keep the original grid ratio)
+        // NOTE:    -> grid_y = sqrt(num_features / ratio)
+        if (num_features < grid_x * grid_y) {
+            double ratio = (double)grid_x / (double)grid_y;
+            grid_y = std::ceil(std::sqrt(num_features / ratio));
+            grid_x = std::ceil(grid_y * ratio);
+        }
+        int num_features_grid = (int)((double)num_features / (double)(grid_x * grid_y)) + 1;
+        assert(grid_x > 0);
+        assert(grid_y > 0);
+        assert(num_features_grid > 0);
+
+        int img_width  = mask.cols;
+        int img_height = mask.rows;
+
+        // Calculate the size our extraction boxes should be
+        int size_x = img_width  / grid_x;
+        int size_y = img_height / grid_y;
+
+        // Make sure our sizes are not zero
+        assert(size_x > 0);
+        assert(size_y > 0);
+
+        auto pack_cell = [&](int cx, int cy)
+        {
+            return size_t(cx) * size_t(grid_y) + size_t(cy);
+        };
+
+        // restrict to valid cells
+        std::unordered_set<size_t> valid_set;
+        valid_set.reserve(valid_locs.size());
+        for (auto &c : valid_locs) valid_set.insert(pack_cell(c.first, c.second));
+        
+        // run detection here        
+        modal_flow::DetectOptions dopt;
+        dopt.border_x = 3;
+        dopt.border_y = 3;
+        dopt.threshold = threshold;
+
+        dopt.use_grid_detect = true;
+        dopt.horizontal_grid_cells = grid_x;
+        dopt.vertical_grid_cells   = grid_y;
+        dopt.grid_cells_to_search.clear();
+        for (auto &c : valid_locs) dopt.grid_cells_to_search.push_back({c.first, c.second});
+
+        dopt.use_nms = nonmaxSuppression;
+
+        std::vector<modal_flow::DetectInput> detect_in(1);
+        detect_in[0].cam_id  = cam_id;
+        detect_in[0].img_buf = buf_id;
+        detect_in[0].opts = dopt;
+
+        // run the detection
+        auto results = mgr.detect_many(detect_in);
+        if (results.empty()) return;
+        auto& det = results[0];
+
+        // sort detections by score descending
+        std::sort(det.keypoints.begin(), det.keypoints.end(),
+                [](auto &a, auto &b) { return a.score > b.score; });
+
+        // printf("in grid flow function, points; %d, grid_x: %d, grid_y; %d, num_feats_per_grid: %d\n", det.keypoints.size(), grid_x, grid_y, num_features_grid);
+
+        std::unordered_map<size_t, int> picked_count;
+        picked_count.reserve(valid_set.size());
+
+        pts.clear();
+        pts.reserve(size_t(grid_x * grid_y * num_features_grid));
+
+        for (const auto& k : det.keypoints)
+        {
+            const int x = int(std::floor(k.x));
+            const int y = int(std::floor(k.y));
+            if (x <= 0 || x >= img_width || y <= 0 || y >= img_height) continue;
+
+            // mask reject (255 == remove)
+            if (!mask.empty() && mask.at<uint8_t>(y, x) > 127) continue;
+
+            const int cx = x / size_x;
+            const int cy = y / size_y;
+            if (cx < 0 || cx >= grid_x || cy < 0 || cy >= grid_y) continue;
+
+            const size_t cell = pack_cell(cx, cy);
+            if (!valid_set.count(cell)) continue;
+
+            int& cnt = picked_count[cell];
+            if (cnt >= num_features_grid) continue;
+
+            // accept
+            cv::KeyPoint kp;
+            kp.pt.x = float(x);
+            kp.pt.y = float(y);
+
+            // accept it
+            pts.push_back(kp);
+            ++cnt;
+
+            // early exit
+            if ((int)pts.size() >= int(valid_set.size()) * num_features_grid) break;
+        }
+
+        // Combine all the collections into our single vector
+        // for (size_t r = 0; r < collection.size(); r++) {
+        //     pts.insert(pts.end(), collection.at(r).begin(), collection.at(r).end());
+        // }
+
+        // Return if no points
+        if (pts.empty())
+            return;
+
+        // Sub-pixel refinement parameters
+        // cv::Size win_size = cv::Size(5, 5);
+        // cv::Size zero_zone = cv::Size(-1, -1);
+        // cv::TermCriteria term_crit = cv::TermCriteria(cv::TermCriteria::COUNT + cv::TermCriteria::EPS, 20, 0.001);
+
+        // // Get vector of points
+        // std::vector<cv::Point2f> pts_refined;
+        // for (size_t i = 0; i < pts.size(); i++) {
+        //     pts_refined.push_back(pts.at(i).pt);
+        // }
+
+        // // Finally run sub pixel refinement (cv::cornerSubPix)
+        // int res = tracker->refinePoints(static_cast<int>(pts_refined.size()),
+        //                         reinterpret_cast<float*>(pts_refined.data()),
+        //                         win_size.width,
+        //                         term_crit.maxCount,
+        //                         static_cast<float>(term_crit.epsilon));
+        // if (res != 0) {
+        //     std::cerr << "Subpixel refinement failed." << std::endl;
+        //     return;
+        // }
+
+        // Save the refined points!
+        // for (size_t i = 0; i < pts.size(); i++) {
+        //     pts.at(i).pt = pts_refined.at(i);
+        // }
     }
 };
 

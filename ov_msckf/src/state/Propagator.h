@@ -74,6 +74,13 @@ public:
   }
 
   /**
+   * @brief Feed a batch of IMU measurements with a single lock
+   * @param messages Vector of IMU measurements to process
+   * @param oldest_time Oldest timestamp to keep measurements for
+   */
+  void feed_imu_batch(const std::vector<ov_core::ImuData>& messages, double oldest_time = -1);
+
+  /**
    * @brief This will remove any IMU measurements that are older then the given measurement time
    * @param oldest_time Time that we can discard measurements before (in IMU clock)
    */
