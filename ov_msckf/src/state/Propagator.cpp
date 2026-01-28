@@ -1027,6 +1027,6 @@ void Propagator::feed_imu_batch(const std::vector<ov_core::ImuData>& messages, d
 
     // Clean old measurements if needed
     if (oldest_time != -1) {
-        clean_old_imu_measurements(oldest_time - 0.10);
+        clean_old_imu_measurements(oldest_time - 0.075);
     }
 }
