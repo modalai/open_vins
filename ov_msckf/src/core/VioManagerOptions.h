@@ -29,6 +29,8 @@
 #include <string>
 #include <vector>
 
+#include <modal_flow/StereoMatcher.hpp>
+
 #include "state/StateOptions.h"
 #include "update/UpdaterOptions.h"
 #include "utils/NoiseManager.h"
@@ -410,7 +412,20 @@ struct VioManagerOptions {
   bool use_klt = true;
 
   // If we should use GPU to run tracking functions
-  bool use_gpu = false; 
+  bool use_gpu = false;
+
+  // Session-static stereo calibration packed for libmodal-flow. Populated by
+  // VoxlConfigure (intrinsics + composed extrinsic) and marked valid once the
+  // full pack is filled in. VioManager passes it into TrackOCL via
+  // enable_zncc_stereo_matcher at startup.
+  modal_flow::StereoCalib stereo_calib{};
+  bool                    stereo_calib_valid = false;
+
+  // Depth-sweep bounds for the epipolar search. Defaults cover near-touch
+  // (0.10 m) out to effectively infinity (100 m) for a small-baseline rig.
+  // Operator-settable in voxl-open-vins-server.conf if desired.
+  float                   stereo_z_min = 0.10f;
+  float                   stereo_z_max = 100.0f;
 
   /// If should extract aruco tags and estimate them
   bool use_aruco = true;

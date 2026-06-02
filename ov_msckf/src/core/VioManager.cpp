@@ -134,9 +134,24 @@ VioManager::VioManager(VioManagerOptions &params_) : thread_init_running(false),
   int init_max_features = std::floor((double)params.init_options.init_max_features / (double)params.state_options.num_cameras);
   if (params.use_klt) {
     if (params.use_gpu) {
-      trackFEATS = std::shared_ptr<TrackBase>(new TrackOCL(state->_cam_intrinsics_cameras, init_max_features,
-                                                          state->_options.max_aruco_features,
-                                                          params.fast_threshold, params.grid_x, params.grid_y, params.min_px_dist));
+      auto track_ocl = std::make_shared<TrackOCL>(state->_cam_intrinsics_cameras, init_max_features,
+                                                  state->_options.max_aruco_features, params.use_stereo,
+                                                  params.fast_threshold, params.grid_x, params.grid_y, params.min_px_dist);
+      // Bind the ZNCC epipolar-band stereo matcher whenever stereo is on and
+      // the calibration has been packed by VoxlConfigure. It is the only
+      // stereo-projection path in TrackOCL; without it, stereo features stay
+      // mono-only.
+      printf("[VioManager] stereo: use_stereo=%d  calib_valid=%d\n",
+             (int)params.use_stereo, (int)params.stereo_calib_valid);
+      if (params.use_stereo && params.stereo_calib_valid) {
+        track_ocl->enable_zncc_stereo_matcher(params.stereo_calib,
+                                              params.stereo_z_min,
+                                              params.stereo_z_max);
+      } else if (params.use_stereo) {
+        fprintf(stderr, "[VioManager] stereo requested but stereo_calib not "
+                        "populated; stereo features will stay mono-only\n");
+      }
+      trackFEATS = std::static_pointer_cast<TrackBase>(track_ocl);
     } else {
 #ifndef DISABLE_TRACK_KLT
       trackFEATS = std::shared_ptr<TrackBase>(new TrackKLT(state->_cam_intrinsics_cameras, init_max_features,
