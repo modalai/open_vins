@@ -41,6 +41,37 @@ using namespace ov_core;
 using namespace ov_type;
 using namespace ov_init;
 
+// ===================================================================================
+// Backend selection for the dynamic-init MLE refinement + covariance recovery.
+// Default = Ceres. Define USE_CERES_FREE_INIT (CMake: -DOV_INIT_CERES_FREE=ON) to use
+// the in-tree, lock-free, RT-friendly ov_init::zbft_sfm solver instead. The shared graph
+// assembly below is written against these aliases; only the options / solve / Schur /
+// covariance steps diverge (guarded by #ifdef USE_CERES_FREE_INIT).
+// ===================================================================================
+#ifdef USE_CERES_FREE_INIT
+#include "ceres_free/Factor_GenericPrior.h"
+#include "ceres_free/Factor_ImageReprojCalib.h"
+#include "ceres_free/Factor_ImuCPIv1.h"
+#include "ceres_free/LossFunction.h"
+#include "ceres_free/Problem.h"
+#include "ceres_free/State_JPLQuatLocal.h"
+using MleProblem = ov_init::zbft_sfm::Problem;
+using MleJplQuat = ov_init::zbft_sfm::State_JPLQuatLocal;
+using MlePrior = ov_init::zbft_sfm::Factor_GenericPrior;
+using MleImuFactor = ov_init::zbft_sfm::Factor_ImuCPIv1;
+using MleReprojFactor = ov_init::zbft_sfm::Factor_ImageReprojCalib;
+using MleLoss = ov_init::zbft_sfm::LossFunction;
+using MleCauchy = ov_init::zbft_sfm::CauchyLoss;
+#else
+using MleProblem = ceres::Problem;
+using MleJplQuat = ov_init::State_JPLQuatLocal;
+using MlePrior = ov_init::Factor_GenericPrior;
+using MleImuFactor = ov_init::Factor_ImuCPIv1;
+using MleReprojFactor = ov_init::Factor_ImageReprojCalib;
+using MleLoss = ceres::LossFunction;
+using MleCauchy = ceres::CauchyLoss;
+#endif
+
 bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covariance, std::vector<std::shared_ptr<ov_type::Type>> &order,
                                     std::shared_ptr<ov_type::IMU> &_imu, std::map<double, std::shared_ptr<ov_type::PoseJPL>> &_clones_IMU,
                                     std::unordered_map<size_t, std::shared_ptr<ov_type::Landmark>> &_features_SLAM) {
@@ -581,9 +612,12 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
   // ======================================================
   // ======================================================
 
-  // Ceres problem stuff
-  // NOTE: By default the problem takes ownership of the memory
-  ceres::Problem problem;
+  // MLE problem (Ceres by default; ov_init::zbft_sfm when USE_CERES_FREE_INIT).
+  // NOTE: By default the problem takes ownership of the added factors/params.
+  MleProblem problem;
+#ifdef USE_CERES_FREE_INIT
+  problem.EnableOwnership(); // match Ceres: free the new'd factors/params on destruction
+#endif
 
   // Our system states (map from time to index)
   std::map<double, int> map_states;
@@ -631,6 +665,17 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
   // Set the optimization settings
   // NOTE: We use dense schur since after eliminating features we have a dense problem
   // NOTE: http://ceres-solver.org/solving_faqs.html#solving
+#ifdef USE_CERES_FREE_INIT
+  ov_init::zbft_sfm::SolverOptions options;
+  // Feature blocks are eliminated via the Schur complement by tagging them with
+  // SetSchurLandmark() below (there is no separate enable flag). Dogleg is the default
+  // trust-region strategy, matching the Ceres path.
+  options.num_threads = params.init_dyn_mle_max_threads;
+  options.max_solver_time_seconds = params.init_dyn_mle_max_time;
+  options.max_num_iterations = params.init_dyn_mle_max_iter;
+  options.function_tolerance = 1e-5;
+  options.gradient_tolerance = 1e-9;
+#else
   ceres::Solver::Options options;
   options.linear_solver_type = ceres::DENSE_SCHUR;
   options.trust_region_strategy_type = ceres::DOGLEG;
@@ -645,6 +690,7 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
   // options.linear_solver_ordering = ordering;
   options.function_tolerance = 1e-5;
   options.gradient_tolerance = 1e-4 * options.function_tolerance;
+#endif
 
   // Loop through each CPI integration and add its measurement to the problem
   double timestamp_k = -1;
@@ -681,7 +727,7 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
     }
 
     // Now actually create the parameter block in the ceres problem
-    auto ceres_jplquat = new State_JPLQuatLocal();
+    auto ceres_jplquat = new MleJplQuat();
     problem.AddParameterBlock(var_ori, 4, ceres_jplquat);
     problem.AddParameterBlock(var_pos, 3);
     problem.AddParameterBlock(var_vel, 3);
@@ -723,7 +769,7 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
       x_types.emplace_back("vec3");
 
       // Append it to the problem
-      auto *factor_prior = new Factor_GenericPrior(x_lin, x_types, prior_Info, prior_grad);
+      auto *factor_prior = new MlePrior(x_lin, x_types, prior_Info, prior_grad);
       problem.AddResidualBlock(factor_prior, nullptr, factor_params);
     }
 
@@ -753,8 +799,8 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
       factor_params.push_back(ceres_vars_vel.at(map_states.at(timestamp_k1)));
       factor_params.push_back(ceres_vars_bias_a.at(map_states.at(timestamp_k1)));
       factor_params.push_back(ceres_vars_pos.at(map_states.at(timestamp_k1)));
-      auto *factor_imu = new Factor_ImuCPIv1(cpi->DT, gravity, cpi->alpha_tau, cpi->beta_tau, cpi->q_k2tau, cpi->b_a_lin, cpi->b_w_lin,
-                                             cpi->J_q, cpi->J_b, cpi->J_a, cpi->H_b, cpi->H_a, cpi->P_meas);
+      auto *factor_imu = new MleImuFactor(cpi->DT, gravity, cpi->alpha_tau, cpi->beta_tau, cpi->q_k2tau, cpi->b_a_lin, cpi->b_w_lin,
+                                          cpi->J_q, cpi->J_b, cpi->J_a, cpi->H_b, cpi->H_a, cpi->P_meas);
       problem.AddResidualBlock(factor_imu, nullptr, factor_params);
     }
 
@@ -774,7 +820,7 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
       for (int j = 0; j < 3; j++) {
         var_calib_pos[j] = params.camera_extrinsics.at(cam_id)(4 + j, 0);
       }
-      auto ceres_calib_jplquat = new State_JPLQuatLocal();
+      auto ceres_calib_jplquat = new MleJplQuat();
       problem.AddParameterBlock(var_calib_ori, 4, ceres_calib_jplquat);
       problem.AddParameterBlock(var_calib_pos, 3);
       map_calib_cam2imu.insert({cam_id, (int)ceres_vars_calib_cam2imu_ori.size()});
@@ -801,7 +847,7 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
       x_types.emplace_back("quat");
       factor_params.push_back(var_calib_pos);
       x_types.emplace_back("vec3");
-      auto *factor_prior = new Factor_GenericPrior(x_lin, x_types, prior_Info, prior_grad);
+      auto *factor_prior = new MlePrior(x_lin, x_types, prior_Info, prior_grad);
       problem.AddResidualBlock(factor_prior, nullptr, factor_params);
       if (!params.init_dyn_mle_opt_calib) {
         problem.SetParameterBlockConstant(var_calib_ori);
@@ -832,7 +878,7 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
       std::vector<double *> factor_params;
       factor_params.push_back(var_calib_cam);
       x_types.emplace_back("vec8");
-      auto *factor_prior = new Factor_GenericPrior(x_lin, x_types, prior_Info, prior_grad);
+      auto *factor_prior = new MlePrior(x_lin, x_types, prior_Info, prior_grad);
       problem.AddResidualBlock(factor_prior, nullptr, factor_params);
       if (!params.init_dyn_mle_opt_calib) {
         problem.SetParameterBlockConstant(var_calib_cam);
@@ -876,6 +922,9 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
             var_feat[j] = features_inG.at(feat_id)(j);
           }
           problem.AddParameterBlock(var_feat, 3);
+#ifdef USE_CERES_FREE_INIT
+          problem.SetSchurLandmark(var_feat); // eliminate features via the Schur arrowhead
+#endif
           map_features.insert({feat_id, (int)ceres_vars_feat.size()});
           ceres_vars_feat.push_back(var_feat);
         }
@@ -888,9 +937,8 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
         factor_params.push_back(ceres_vars_calib_cam2imu_ori.at(map_calib_cam2imu.at(cam_id)));
         factor_params.push_back(ceres_vars_calib_cam2imu_pos.at(map_calib_cam2imu.at(cam_id)));
         factor_params.push_back(ceres_vars_calib_cam_intrinsics.at(map_calib_cam.at(cam_id)));
-        auto *factor_pinhole = new Factor_ImageReprojCalib(uv_raw, params.sigma_pix, is_fisheye);
-        // ceres::LossFunction *loss_function = nullptr;
-        ceres::LossFunction *loss_function = new ceres::CauchyLoss(1.0);
+        auto *factor_pinhole = new MleReprojFactor(uv_raw, params.sigma_pix, is_fisheye);
+        MleLoss *loss_function = new MleCauchy(1.0);
         problem.AddResidualBlock(factor_pinhole, loss_function, factor_params);
       }
     }
@@ -901,6 +949,20 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
   assert(ceres_vars_ori.size() == ceres_vars_pos.size());
   auto rT5 = boost::posix_time::microsec_clock::local_time();
 
+  // Optimize the graph
+#ifdef USE_CERES_FREE_INIT
+  ov_init::zbft_sfm::SolverSummary summary = problem.Solve(options);
+  PRINT_INFO("[init-d]: %d iterations | %zu states, %zu feats (%zu valid) | cost %.4e => %.4e\n", summary.iterations,
+             map_states.size(), map_features.size(), count_valid_features, summary.initial_cost, summary.final_cost);
+  auto rT6 = boost::posix_time::microsec_clock::local_time();
+  timestamp = newest_cam_time;
+  if (params.init_dyn_mle_max_iter != 0 && !summary.converged) {
+    PRINT_WARNING(YELLOW "[init-d]: opt failed: %s!\n" RESET, summary.message.c_str());
+    free_state_memory();
+    return false;
+  }
+  PRINT_DEBUG("[init-d]: %s\n", summary.message.c_str());
+#else
   // Optimize the ceres graph
   ceres::Solver::Summary summary;
   ceres::Solve(options, &problem, &summary);
@@ -917,6 +979,7 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
     return false;
   }
   PRINT_DEBUG("[init-d]: %s\n", summary.message.c_str());
+#endif
 
   //======================================================
   //======================================================
@@ -987,7 +1050,25 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
     // TODO: std::unordered_map<size_t, std::shared_ptr<ov_type::Vec>> &_cam_intrinsics
   }
 
-  // Recover the covariance here of the optimized states
+  // Recover the covariance of the optimized IMU state.
+#ifdef USE_CERES_FREE_INIT
+  // ov_init::zbft_sfm marginalizes the Schur landmarks AND all other navigation states
+  // (clones, calibration) by inverting the gauge-anchored reduced Hessian and
+  // extracting the most-recent IMU block, in OpenVINS order [theta, p, v, bg, ba].
+  order.clear();
+  order.push_back(_imu);
+  covariance = Eigen::MatrixXd::Zero(_imu->size(), _imu->size());
+  {
+    int state_index = map_states[newest_cam_time];
+    std::vector<double *> cov_blocks = {ceres_vars_ori[state_index], ceres_vars_pos[state_index], ceres_vars_vel[state_index],
+                                        ceres_vars_bias_g[state_index], ceres_vars_bias_a[state_index]};
+    if (!problem.ComputeCovariance(cov_blocks, covariance, options)) {
+      PRINT_WARNING(YELLOW "[init-d]: covariance recovery failed...\n" RESET);
+      free_state_memory();
+      return false;
+    }
+  }
+#else
   // NOTE: for now just the IMU state is recovered, but we should be able to do everything
   // NOTE: maybe having features / clones will make it more stable?
   std::vector<std::pair<const double *, const double *>> covariance_blocks;
@@ -1083,6 +1164,8 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
   CHECK(problem_cov.GetCovarianceBlockInTangentSpace(ceres_vars_bias_g[state_index], ceres_vars_bias_a[state_index], covtmp.data()));
   covariance.block(9, 12, 3, 3) = covtmp.eval();
   covariance.block(12, 9, 3, 3) = covtmp.transpose().eval();
+
+#endif // USE_CERES_FREE_INIT
 
   // inflate as needed
   covariance.block(0, 0, 3, 3) *= params.init_dyn_inflation_orientation;

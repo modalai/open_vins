@@ -35,6 +35,18 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS ON)
 
+# Ceres-free initialization backend (ov_init::zbft_sfm). When ON, the dynamic
+# initializer's MLE refinement + covariance recovery use the in-tree, lock-free,
+# RT-friendly solver instead of Ceres. Default ON: it reaches the same init minimum as
+# the Ceres MLE on the synthetic VI-init benchmark and is faster on-target (0.76x LM /
+# 0.70x dogleg, single thread; see src/ceres_free/README.md). Set -DOV_INIT_CERES_FREE=OFF
+# to fall back to the Ceres MLE.
+option(OV_INIT_CERES_FREE "Use the ceres-free ov_init::zbft_sfm solver for dynamic init" ON)
+if (OV_INIT_CERES_FREE)
+    add_definitions(-DUSE_CERES_FREE_INIT)
+    message(STATUS "ov_init: USING CERES-FREE (ov_init::zbft_sfm) DYNAMIC INITIALIZER")
+endif ()
+
 # Default build as release
 if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE "Release" CACHE STRING "Choose the type of build, options are: Debug Release RelWithDebInfo MinSizeRel." FORCE)

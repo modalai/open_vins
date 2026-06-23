@@ -22,10 +22,13 @@ include_directories(
 )
 
 # Set link libraries used by all binaries
+# Threads::Threads provides pthread for the lock-free worker pool in ceres_free.
+find_package(Threads REQUIRED)
 list(APPEND thirdparty_libraries
         ${Boost_LIBRARIES}
         ${CERES_LIBRARIES}
         ${OpenCV_LIBRARIES}
+        Threads::Threads
 )
 
 ##################################################
@@ -42,6 +45,13 @@ list(APPEND LIBRARY_SOURCES
         src/dynamic/DynamicInitializer.cpp
         src/static/StaticInitializer.cpp
         src/sim/SimulatorInit.cpp
+        # Ceres-free initialization backend (ov_init::zbft_sfm); see ceres_free/README.md.
+        src/ceres_free/Parallel.cpp
+        src/ceres_free/Problem.cpp
+        src/ceres_free/State_JPLQuatLocal.cpp
+        src/ceres_free/Factor_GenericPrior.cpp
+        src/ceres_free/Factor_ImageReprojCalib.cpp
+        src/ceres_free/Factor_ImuCPIv1.cpp
 )
 file(GLOB_RECURSE LIBRARY_HEADERS "src/*.h")
 add_library(ov_init_lib SHARED ${LIBRARY_SOURCES} ${LIBRARY_HEADERS})
