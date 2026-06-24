@@ -48,9 +48,9 @@ namespace ov_init {
 namespace zbft_sfm {
 
 struct SolverOptions {
-  int max_num_iterations = 10;           ///< max accepted steps
-  double max_solver_time_seconds = 0.04; ///< hard wall-clock budget (mirrors init_dyn_mle_max_time)
-  int num_threads = 1;                   ///< accumulation workers; 1 => fully inline/deterministic (the RT default)
+  int max_num_iterations = 30;           ///< max accepted steps
+  double max_solver_time_seconds = 0.05; ///< hard wall-clock budget (mirrors init_dyn_mle_max_time)
+  int num_threads = 4;                   ///< accumulation workers; 1 => fully inline/deterministic (the RT default)
 
   /// Optional per-worker thread setup (CPU affinity / scheduling class) so workers
   /// never preempt the IMU/camera real-time threads. Called once per spawned worker.
@@ -63,7 +63,7 @@ struct SolverOptions {
 
   // Powell dogleg trust region (default; the per-iteration win: ONE factorization per
   // linearization, rejected trials are cheap GN/Cauchy blends). use_dogleg=false -> LM.
-  bool use_dogleg = true;
+  bool use_dogleg = false;
   double initial_radius = 1e4; // matches Ceres' DoglegStrategy default
   double max_radius = 1e16;
 
@@ -75,7 +75,7 @@ struct SolverOptions {
   double parameter_tolerance = 1e-8; ///< step 2-norm
 
   bool verbose = false;
-  bool pin_eigen_single_thread = true; ///< Eigen::setNbThreads(1) during solve
+  bool pin_eigen_single_thread = false; ///< Eigen::setNbThreads(1) during solve
 };
 
 struct SolverSummary {
