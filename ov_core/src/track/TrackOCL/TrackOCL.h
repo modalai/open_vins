@@ -191,7 +191,7 @@ namespace ov_core
     // static, so both sides of the match stay on seed calib.
     // NOTE: deliberately NOT camera_calib.at(left), whose values get 
     // overwritten by the EKF when do_calib_camera_intrinsics is enabled.
-    std::shared_ptrCamBase                   stereo_static_cam_left_;
+    std::shared_ptr<CamBase>                 stereo_static_cam_left_;
 
     // Per-feature stereo-match confidence (peak_zncc, margin, lr_err) keyed by
     // feature id.
