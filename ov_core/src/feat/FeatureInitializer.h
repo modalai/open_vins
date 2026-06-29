@@ -43,6 +43,22 @@ class FeatureInitializer {
 
 public:
   /**
+   * @brief Why a feature failed triangulation/refinement, for gate-level
+   * diagnostics (stereo-vs-mono reject accounting in the updaters). NONE means
+   * the call succeeded. Passed back via an optional out-param so existing
+   * callers are unaffected.
+   */
+  enum class FailReason {
+    NONE = 0,
+    TRI_COND,     ///< linear-triangulation condition number > max_cond_number
+    TRI_DEPTH,    ///< linear-triangulation depth outside [min_dist, max_dist]
+    TRI_NAN,      ///< linear-triangulation produced NaN
+    GN_DEPTH,     ///< gauss-newton refined depth outside [min_dist, max_dist]
+    GN_BASELINE,  ///< gauss-newton depth/parallax-baseline ratio > max_baseline
+    GN_NAN        ///< gauss-newton produced NaN
+  };
+
+  /**
    * @brief Structure which stores pose estimates for use in triangulation
    *
    * - R_GtoC - rotation from global to camera
@@ -97,7 +113,8 @@ public:
    * in global frame)
    * @return Returns false if it fails to triangulate (based on the thresholds)
    */
-  bool single_triangulation(std::shared_ptr<Feature> feat, std::unordered_map<size_t, std::unordered_map<double, ClonePose>> &clonesCAM);
+  bool single_triangulation(std::shared_ptr<Feature> feat, std::unordered_map<size_t, std::unordered_map<double, ClonePose>> &clonesCAM,
+                            FailReason *reason = nullptr);
 
   /**
    * @brief Uses a linear triangulation to get initial estimate for the feature, treating the anchor observation as a true bearing.
@@ -119,7 +136,8 @@ public:
    * in global frame)
    * @return Returns false if it fails to be optimize (based on the thresholds)
    */
-  bool single_gaussnewton(std::shared_ptr<Feature> feat, std::unordered_map<size_t, std::unordered_map<double, ClonePose>> &clonesCAM);
+  bool single_gaussnewton(std::shared_ptr<Feature> feat, std::unordered_map<size_t, std::unordered_map<double, ClonePose>> &clonesCAM,
+                          FailReason *reason = nullptr);
 
   /**
    * @brief Gets the current configuration of the feature initializer

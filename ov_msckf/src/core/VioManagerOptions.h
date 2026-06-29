@@ -184,6 +184,20 @@ struct VioManagerOptions {
       msckf_options.sigma_pix_sq = std::pow(msckf_options.sigma_pix, 2);
       slam_options.sigma_pix_sq = std::pow(slam_options.sigma_pix, 2);
       aruco_options.sigma_pix_sq = std::pow(aruco_options.sigma_pix, 2);
+      // Optional STEREO (multi-cam) measurement noise. If unset (<=0) it falls
+      // back to the mono sigma_pix so behavior is unchanged. Stereo cross-camera
+      // ZNCC matches are noisier than same-camera KLT, so a feature observed in
+      // >1 camera is weighted with this larger noise (see UpdaterOptions).
+      msckf_options.sigma_pix_stereo = -1;
+      slam_options.sigma_pix_stereo = -1;
+      parser->parse_config("up_msckf_sigma_px_stereo", msckf_options.sigma_pix_stereo, false);
+      parser->parse_config("up_slam_sigma_px_stereo", slam_options.sigma_pix_stereo, false);
+      msckf_options.sigma_pix_sq_stereo =
+          (msckf_options.sigma_pix_stereo > 0) ? std::pow(msckf_options.sigma_pix_stereo, 2) : msckf_options.sigma_pix_sq;
+      slam_options.sigma_pix_sq_stereo =
+          (slam_options.sigma_pix_stereo > 0) ? std::pow(slam_options.sigma_pix_stereo, 2) : slam_options.sigma_pix_sq;
+      // aruco tags are single-cam fiducials; keep their stereo noise = mono.
+      aruco_options.sigma_pix_sq_stereo = aruco_options.sigma_pix_sq;
       parser->parse_config("zupt_chi2_multipler", zupt_options.chi2_multipler);
     }
     PRINT_DEBUG("  Updater MSCKF Feats:\n");

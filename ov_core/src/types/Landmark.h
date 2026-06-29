@@ -66,6 +66,13 @@ public:
   /// Number of times the update has failed for this feature (we should remove if it fails a couple times!)
   int update_fail_count = 0;
 
+  /// (stereo->mono graceful degrade): if true, this landmark was admitted
+  /// as MONO after its stereo (two-view) form failed the chi2 gate. The SLAM update
+  /// must then keep using ONLY its anchor camera's observations -- otherwise the
+  /// update path would re-fetch both cameras, re-impose the failing stereo
+  /// constraint, and evict it. Stays mono for the landmark's life.
+  bool demoted_to_mono = false;
+
   /// First normalized uv coordinate bearing of this measurement (used for single depth representation)
   Eigen::Vector3d uv_norm_zero;
 

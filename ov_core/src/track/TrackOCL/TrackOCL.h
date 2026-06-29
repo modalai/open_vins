@@ -182,9 +182,25 @@ namespace ov_core
     // was never enabled since both default to 0).
     size_t                                     stereo_cam_id_left_  = 0;
     size_t                                     stereo_cam_id_right_ = 0;
+
+    // Static left camera model used to undistort left features into bearings 
+    // for the ZNCC matcher. Built once in enable_zncc_stereo_matcher from the
+    // the static /etc/modalai conf + opencv_tracking_left_intrinsics.yml seed
+    // so that the stereo correspondence search never drifts with online 
+    // intrinsic calibration -- the matcher's epipolar projection is likewise 
+    // static, so both sides of the match stay on seed calib.
+    // NOTE: deliberately NOT camera_calib.at(left), whose values get 
+    // overwritten by the EKF when do_calib_camera_intrinsics is enabled.
+    std::shared_ptrCamBase                   stereo_static_cam_left_;
+
     // Per-feature stereo-match confidence (peak_zncc, margin, lr_err) keyed by
-    // feature id, used by the EKF measurement-noise weighting in Phase 5.
+    // feature id.
     std::unordered_map<size_t, StereoConfidence> stereo_confidence_;
+
+    // DIAGNOSTIC: count of mono-left -> stereo upgrades accepted in the most
+    // recent perform_detection_stereo call (ZNCC "promote" pass). Read by
+    // feed_stereo's per-frame track-stats log.
+    int last_n_promoted_ = 0;
   };
 
 } // namespace ov_core

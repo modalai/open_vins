@@ -27,15 +27,51 @@
 #include "../Grider_GRID.h"
 #include "Grider_OCL.h"
 #include "cam/CamBase.h"
+#include "cam/CamEqui.h"
 #include "feat/Feature.h"
 #include "feat/FeatureDatabase.h"
 #include "utils/opencv_lambda_body.h"
 #include <modal_flow/ocl/StereoMatcherCL.hpp>
 #include "utils/print.h"
 
+#include <cstdio>
+#include <mutex>
+#include <unistd.h>
+
 using namespace ov_core;
 
 int test_feed_all = 0;
+
+namespace {
+// DIAGNOSTIC: per-frame feature-track breakdown handed to the feature DB (what the
+// VIO sees). Lets us see stereo-vs-mono counts, when tracking thins out / goes
+// IMU-only, and how many L->R (stereo) matches actually exist. Single per-process
+// file; correlate meas_ts with the ov/data.csv published feat count.
+//   STEREO rows: cam=-1, full breakdown (n_stereo = L&R paired, mono_left/right).
+//   MONO rows:   cam=<id>, n_total = that camera's tracks (stereo fields 0).
+void note_track_stats(double meas_ts, const char *mode, int cam,
+                      int n_total, int n_stereo, int n_mono_left, int n_mono_right, int n_promoted)
+{
+    static std::mutex mtx;
+    static FILE *fp = nullptr;
+    static bool tried = false;
+    std::lock_guard<std::mutex> lk(mtx);
+    if (!tried) {
+        tried = true;
+        fp = fopen("/run/voxl-open-vins-track-stats.log", "w"); // truncate once per process
+        if (fp == nullptr) fp = fopen("/tmp/voxl-open-vins-track-stats.log", "w");
+        if (fp != nullptr) {
+            fprintf(fp, "# voxl-open-vins-server per-frame feature-track stats (pid=%d)\n", (int)getpid());
+            fprintf(fp, "# meas_ts_s, mode, cam, n_total, n_stereo, n_mono_left, n_mono_right, n_promoted\n");
+            fflush(fp);
+        }
+    }
+    if (fp == nullptr) return;
+    fprintf(fp, "%.6f, %s, %d, %d, %d, %d, %d, %d\n",
+            meas_ts, mode, cam, n_total, n_stereo, n_mono_left, n_mono_right, n_promoted);
+    fflush(fp);
+}
+} // namespace
 
 // Compile-time toggle for the per-call [STEREO ZNCC] diagnostic prints in
 // perform_detection_stereo (top-off accept summary, top-off accept=0 per-gate
@@ -46,12 +82,43 @@ int test_feed_all = 0;
 // runtime cost in the off configuration.
 static constexpr bool kEnableStereoZnccDiag = false;
 
+// Compile-time toggle for the per-frame feature-track stats log
+// (/run/voxl-open-vins-track-stats.log via note_track_stats). On by default; flip
+// to false to dead-strip the logging (and its per-frame stereo/mono breakdown
+// computation) for clean production runs.
+static constexpr bool kEnableTrackStatsDiag = false;
+
+// Stereo match uniqueness ceiling. The matcher's margin gate (best - runner >=
+// margin_min) only checks RELATIVE dominance: on repetitive texture two strong
+// periodic peaks (e.g. best 0.90, runner 0.70) pass even though the runner-up is
+// itself a perfectly good candidate -> ambiguous -> the period-aliased "ghost".
+// runner = peak - margin (exact). Reject the match when its runner-up is itself
+// >= a valid-match level, i.e. there is "another good option" on the epipolar
+// line. Rejected matches fall through to being kept as mono-left features.
+// Tunable: raise toward 0.70 if this rejects too many legit matches.
+static constexpr float kStereoRunnerMax = 0.60f;
+// Helper: does this match pass the uniqueness ceiling (runner-up not too strong)?
+static inline bool stereo_runner_ok(float peak, float margin) {
+    return (peak - margin) < kStereoRunnerMax;
+}
+
 
 void TrackOCL::enable_zncc_stereo_matcher(const modal_flow::StereoCalib &calib_in,
                                           float z_min, float z_max)
 {
     auto stm = std::make_unique<modal_flow::ocl::StereoMatcherCL>(dev_);
-    stm->set_lr_thresh(5.0f);
+    // Matcher gates. margin_min (forward peak minus runner-up) is the uniqueness /
+    // anti-aliasing gate: on repetitive texture an aliased match has a strong
+    // runner-up (the other period of the pattern) -> small margin. The default 0.10
+    // was too loose and let near-field FALSE matches through; they triangulate at
+    // large disparity and pile at the z_min floor (~0.4 m), corrupting local scale.
+    // Tightened to 0.20 to reject ambiguous matches (the central large-disparity
+    // "ghost" aliases that still survived at 0.15). lr_thresh tightened 5.0 -> 3.0
+    // (L-R round-trip px) for the same reason; zncc_min left at its 0.60 default so
+    // we don't over-reject weak-but-valid matches.
+    stm->set_zncc_min(0.60f);
+    stm->set_margin_min(0.20f);
+    stm->set_lr_thresh(3.0f);
     mgr_.set_stereo_matcher(std::move(stm));
 
     modal_flow::StereoCalib c = calib_in;
@@ -61,8 +128,33 @@ void TrackOCL::enable_zncc_stereo_matcher(const modal_flow::StereoCalib &calib_i
 
     stereo_cam_id_left_  = (size_t)c.left;
     stereo_cam_id_right_ = (size_t)c.right;
+
+    // Build the static left camera model used to undistort left features into
+    // bearings for the matcher. Seeded from the StereoCalib K_left/D_left (the
+    // static conf, NOT the online-calibrated camera_calib) so the ZNCC search is
+    // fully decoupled from EKF intrinsic calibration. The matcher kernel is
+    // equidistant-only, so a CamEqui is exact here. undistort_f only consumes
+    // K/D, but we pass the real dims from camera_calib for completeness.
+    {
+        int w = 0, h = 0;
+        auto it = camera_calib.find(stereo_cam_id_left_);
+        if (it != camera_calib.end() && it->second) {
+            w = it->second->w();
+            h = it->second->h();
+        }
+        auto cam = std::make_shared<CamEqui>(w, h);
+        Eigen::MatrixXd calib(8, 1);
+        calib << c.K_left[0], c.K_left[1], c.K_left[2], c.K_left[3],
+                 c.D_left[0], c.D_left[1], c.D_left[2], c.D_left[3];
+        cam->set_value(calib);
+        stereo_static_cam_left_ = cam;
+    }
+
     printf("[TrackOCL] ZNCC-band stereo matcher enabled (src cam %zu -> dst cam %zu, z=[%.2f,%.1f]m)\n",
            stereo_cam_id_left_, stereo_cam_id_right_, (double)z_min, (double)z_max);
+    printf("[TrackOCL]   static left bearing calib: fxy=(%.1f,%.1f) c=(%.1f,%.1f) D=(%.4f,%.4f,%.4f,%.4f)\n",
+           (double)c.K_left[0], (double)c.K_left[1], (double)c.K_left[2], (double)c.K_left[3],
+           (double)c.D_left[0], (double)c.D_left[1], (double)c.D_left[2], (double)c.D_left[3]);
 }
 
 void TrackOCL::feed_new_camera(const CameraData &message)
@@ -267,6 +359,11 @@ void TrackOCL::feed_monocular(const CameraData &message, size_t msg_id)
     int64_t t5 = _apps_time_monotonic_ns();
     rT5 = boost::posix_time::microsec_clock::local_time();
 
+    // DIAGNOSTIC: per-frame mono track count for this camera (stereo fields 0).
+    if (kEnableTrackStatsDiag) {
+        note_track_stats(message.timestamp, "MONO", (int)cam_id, (int)good_left.size(), 0, 0, 0, 0);
+    }
+
     // Timing prints in milliseconds
     auto dt = [](int64_t a, int64_t b){ return double(b - a) / 1e6; };
 
@@ -450,6 +547,21 @@ void TrackOCL::feed_stereo(const CameraData &message, size_t msg_id_left, size_t
     }
     rT6 = boost::posix_time::microsec_clock::local_time();
 
+    // DIAGNOSTIC: per-frame track breakdown. n_stereo = features observed in BOTH
+    // cams (shared id between good_ids_left/right); the rest are mono on one side.
+    // last_n_promoted_ = this frame's mono-left -> stereo upgrades (promote pass).
+    if (kEnableTrackStatsDiag) {
+        std::unordered_set<size_t> right_set(good_ids_right.begin(), good_ids_right.end());
+        int n_stereo = 0;
+        for (size_t id : good_ids_left)
+            if (right_set.count(id)) n_stereo++;
+        int n_mono_left  = (int)good_ids_left.size()  - n_stereo;
+        int n_mono_right = (int)good_ids_right.size() - n_stereo;
+        note_track_stats(message.timestamp, "STEREO", -1,
+                         n_stereo + n_mono_left + n_mono_right,
+                         n_stereo, n_mono_left, n_mono_right, last_n_promoted_);
+    }
+
     //  // Timing information
     PRINT_ALL("[TIME-KLT]: %.4f seconds for pyramid\n", (rT2 - rT1).total_microseconds() * 1e-6);
     PRINT_ALL("[TIME-KLT]: %.4f seconds for detection (%d detected)\n", (rT3 - rT2).total_microseconds() * 1e-6,
@@ -626,6 +738,7 @@ void TrackOCL::perform_detection_stereo(modal_flow::BufferId buf_id_left, modal_
                                         std::vector<cv::KeyPoint> &pts0, std::vector<cv::KeyPoint> &pts1,
                                         std::vector<size_t> &ids0, std::vector<size_t> &ids1)
 {
+    last_n_promoted_ = 0; // reset per-call promote counter (diagnostic)
     int img_width0  = mask0.cols;
     int img_height0 = mask0.rows;
     int img_width1  = mask1.cols;
@@ -778,7 +891,10 @@ void TrackOCL::perform_detection_stereo(modal_flow::BufferId buf_id_left, modal_
             in.left_points  .reserve(pts0_new.size());
             in.left_bearings.reserve(pts0_new.size());
             for (const auto &p : pts0_new) {
-                Eigen::Vector2f n = camera_calib.at(cam_id_left)->undistort_f(Eigen::Vector2f(p.x, p.y));
+                // Static seed calib (see stereo_static_cam_left_), NOT the
+                // online-calibrated camera_calib, so the ZNCC search stays on the
+                // same fixed calibration as the matcher's epipolar projection.
+                Eigen::Vector2f n = stereo_static_cam_left_->undistort_f(Eigen::Vector2f(p.x, p.y));
                 in.left_points  .push_back({p.x, p.y, 0.f});
                 in.left_bearings.push_back({n(0), n(1), 0.f});
             }
@@ -812,8 +928,8 @@ void TrackOCL::perform_detection_stereo(modal_flow::BufferId buf_id_left, modal_
                     // peak∧margin∧lr) -- marginals add to N even when joint is 0
                     // because the three gates can have disjoint pass populations.
                     const float zncc_min   = 0.60f;
-                    const float margin_min = 0.10f;
-                    const float lr_thresh  = 5.0f;
+                    const float margin_min = 0.20f;
+                    const float lr_thresh  = 3.0f;
                     int    n_oob = 0, n_peak_ok = 0, n_marg_ok = 0, n_lr_ok = 0;
                     int    n_joint_pm = 0, n_full = 0;
                     int    n_valid = 0;
@@ -860,7 +976,7 @@ void TrackOCL::perform_detection_stereo(modal_flow::BufferId buf_id_left, modal_
                                  (int)pts0_new.at(i).y < 0 || (int)pts0_new.at(i).y >= img_height0);
                 if (oob_left) continue;
 
-                if (res.status[i]) {
+                if (res.status[i] && stereo_runner_ok(res.peak_zncc[i], res.margin[i])) {
                     cv::Point2f rpt(res.right_points[i].x, res.right_points[i].y);
                     bool oob_right = ((int)rpt.x < 0 || (int)rpt.x >= img_width1 ||
                                       (int)rpt.y < 0 || (int)rpt.y >= img_height1);
@@ -934,7 +1050,8 @@ void TrackOCL::perform_detection_stereo(modal_flow::BufferId buf_id_left, modal_
             // them up-front saves a kernel slot and keeps the accept-rate print honest.
             if (p.x < 15 || p.x >= img_width0 - 15 ||
                 p.y < 15 || p.y >= img_height0 - 15) continue;
-            Eigen::Vector2f n = camera_calib.at(cam_id_left)->undistort_f(Eigen::Vector2f(p.x, p.y));
+            // Static seed calib (see stereo_static_cam_left_), NOT camera_calib.
+            Eigen::Vector2f n = stereo_static_cam_left_->undistort_f(Eigen::Vector2f(p.x, p.y));
             in.left_points  .push_back({p.x, p.y, 0.f});
             in.left_bearings.push_back({n(0), n(1), 0.f});
             src_idx.push_back(i);
@@ -947,7 +1064,7 @@ void TrackOCL::perform_detection_stereo(modal_flow::BufferId buf_id_left, modal_
             [[maybe_unused]] int    n_promote = 0;
             [[maybe_unused]] double sum_disp = 0, sum_peak = 0, sum_lr = 0;
             for (size_t k = 0; k < in.left_points.size(); k++) {
-                if (!res.status[k]) continue;
+                if (!res.status[k] || !stereo_runner_ok(res.peak_zncc[k], res.margin[k])) continue;
                 cv::Point2f rpt(res.right_points[k].x, res.right_points[k].y);
                 if ((int)rpt.x < 0 || (int)rpt.x >= img_width1 ||
                     (int)rpt.y < 0 || (int)rpt.y >= img_height1) continue;
@@ -956,6 +1073,7 @@ void TrackOCL::perform_detection_stereo(modal_flow::BufferId buf_id_left, modal_
                 rkpt.pt = rpt;
                 pts1.push_back(rkpt);
                 ids1.push_back(ids0[i]);     // SAME id == becomes a stereo pair
+                last_n_promoted_++;          // diagnostic: count mono->stereo upgrades
                 stereo_confidence_[ids0[i]] = StereoConfidence{
                     res.peak_zncc[k], res.margin[k], res.lr_err[k]};
                 float dx = rpt.x - pts0[i].pt.x;
@@ -977,8 +1095,8 @@ void TrackOCL::perform_detection_stereo(modal_flow::BufferId buf_id_left, modal_
                     // Mirrors the per-gate breakdown on the new-features path; see the
                     // comment there for why we report joint counts alongside marginals.
                     const float zncc_min   = 0.60f;
-                    const float margin_min = 0.10f;
-                    const float lr_thresh  = 5.0f;
+                    const float margin_min = 0.20f;
+                    const float lr_thresh  = 3.0f;
                     int    n_oob = 0, n_peak_ok = 0, n_marg_ok = 0, n_lr_ok = 0;
                     int    n_joint_pm = 0, n_full = 0;
                     int    n_valid = 0;
