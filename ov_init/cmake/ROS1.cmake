@@ -118,40 +118,66 @@ install(DIRECTORY src/
 #         RUNTIME DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 # )
 
-# test_dynamic_init using TrackSIM (no modal_flow needed for simulation)
-add_executable(test_dynamic_init src/test_dynamic_init.cpp)
-target_link_libraries(test_dynamic_init ov_init_lib ${thirdparty_libraries})
+# ---------------------------------------------------------------------------------------------------
+# Test & benchmark executables.
+# OFF by default so PRODUCTION / Debian package builds do NOT compile any of them. bench_init in
+# particular links Ceres, so gating it is also a prerequisite for eventually dropping the
+# voxl-ceres-solver dependency. Enable for dev/CI with -DOV_INIT_BUILD_TESTS=ON; the Eigen-only
+# self-tests are registered with CTest (run: ctest --test-dir <build> --output-on-failure).
+# OV_INIT_BUILD_MINI_TESTS is kept as a narrower switch that builds ONLY the Eigen-only self-tests.
+# (test_init_ab_compare.cpp and bench_zbft_s2.cpp remain manual-build; see their file-header recipes.)
+# ---------------------------------------------------------------------------------------------------
+option(OV_INIT_BUILD_TESTS "Build ov_init test & benchmark executables (dev/CI only)" OFF)
+option(OV_INIT_BUILD_MINI_TESTS "Build only the ceres-free Eigen-only solver self-tests" OFF)
 
-# Ceres-free solver core self-test (Eigen-only; see ceres_free/README.md).
-# Enable to build, or compile standalone with g++ (no ov_core/Ceres needed):
-#   g++ -O2 -std=c++17 -pthread -I/usr/include/eigen3 \
-#       src/ceres_free/test_mini_solver.cpp src/ceres_free/Problem.cpp \
-#       src/ceres_free/Parallel.cpp -o /tmp/test_mini && /tmp/test_mini
-option(OV_INIT_BUILD_MINI_TESTS "Build the ceres-free solver core self-test" OFF)
-if (OV_INIT_BUILD_MINI_TESTS)
+find_package(Threads REQUIRED)
+
+# Eigen-only ceres-free solver self-tests -- no ov_core / Ceres / OpenCV. Fast; registered with CTest.
+if (OV_INIT_BUILD_TESTS OR OV_INIT_BUILD_MINI_TESTS)
+    enable_testing()
     add_executable(test_mini_solver src/ceres_free/test_mini_solver.cpp src/ceres_free/Problem.cpp src/ceres_free/Parallel.cpp)
     target_include_directories(test_mini_solver PRIVATE src/ceres_free ${EIGEN3_INCLUDE_DIR})
     target_link_libraries(test_mini_solver Threads::Threads)
+    add_test(NAME test_mini_solver COMMAND test_mini_solver)
+
+    add_executable(test_warmstart_cov src/ceres_free/test_warmstart_cov.cpp src/ceres_free/Problem.cpp src/ceres_free/Parallel.cpp)
+    target_include_directories(test_warmstart_cov PRIVATE src/ceres_free ${EIGEN3_INCLUDE_DIR})
+    target_link_libraries(test_warmstart_cov Threads::Threads)
+    add_test(NAME test_warmstart_cov COMMAND test_warmstart_cov)
 endif ()
 
-# Ceres vs ov_init::zbft_sfm parity/performance benchmark. Self-contained (compiles
-# the needed factor sources in) so the on-target binary needs only Ceres + LAPACK/BLAS
-# from the board rootfs, not a matching libov_init_lib.so. Built with the toolchain so
-# its ABI matches the target. Run on device: adb push + run.
-add_executable(bench_init
-        src/bench_init.cpp
-        src/ceres/Factor_ImuCPIv1.cpp
-        src/ceres/Factor_GenericPrior.cpp
-        src/ceres/State_JPLQuatLocal.cpp
-        src/ceres_free/Factor_ImuCPIv1.cpp
-        src/ceres_free/Factor_GenericPrior.cpp
-        src/ceres_free/State_JPLQuatLocal.cpp
-        src/ceres_free/Problem.cpp
-        src/ceres_free/Parallel.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/../ov_core/src/cpi/CpiV1.cpp
-)
-find_package(Threads REQUIRED)
-target_include_directories(bench_init PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../ov_core/src ${EIGEN3_INCLUDE_DIR} ${CERES_INCLUDE_DIRS})
-target_link_libraries(bench_init ${thirdparty_libraries} Threads::Threads)
+# Tests/benches that need ov_core (and, for bench_init, Ceres). Dev/CI only.
+if (OV_INIT_BUILD_TESTS)
+    # test_dynamic_init using TrackSIM (no modal_flow needed for simulation)
+    add_executable(test_dynamic_init src/test_dynamic_init.cpp)
+    target_link_libraries(test_dynamic_init ov_init_lib ${thirdparty_libraries})
+
+    # NEES consistency gold standard for the ceres-free S2 dynamic init (no OpenCV/Ceres).
+    add_executable(test_init_consistency src/test_init_consistency.cpp
+            src/ceres_free/Problem.cpp src/ceres_free/Parallel.cpp src/ceres_free/State_JPLQuatLocal.cpp
+            src/ceres_free/Factor_ImuCPIv1.cpp src/ceres_free/Factor_GenericPrior.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/../ov_core/src/cpi/CpiV1.cpp)
+    target_include_directories(test_init_consistency PRIVATE src ${CMAKE_CURRENT_SOURCE_DIR}/../ov_core/src ${EIGEN3_INCLUDE_DIR})
+    target_link_libraries(test_init_consistency Threads::Threads)
+    add_test(NAME test_init_consistency COMMAND test_init_consistency)
+
+    # Ceres vs ov_init::zbft_sfm parity/performance benchmark. Self-contained (compiles the needed
+    # factor sources in) so the on-target binary needs only Ceres + LAPACK/BLAS from the board rootfs,
+    # not a matching libov_init_lib.so. Built with the toolchain so its ABI matches the target.
+    add_executable(bench_init
+            src/bench_init.cpp
+            src/ceres/Factor_ImuCPIv1.cpp
+            src/ceres/Factor_GenericPrior.cpp
+            src/ceres/State_JPLQuatLocal.cpp
+            src/ceres_free/Factor_ImuCPIv1.cpp
+            src/ceres_free/Factor_GenericPrior.cpp
+            src/ceres_free/State_JPLQuatLocal.cpp
+            src/ceres_free/Problem.cpp
+            src/ceres_free/Parallel.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/../ov_core/src/cpi/CpiV1.cpp
+    )
+    target_include_directories(bench_init PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../ov_core/src ${EIGEN3_INCLUDE_DIR} ${CERES_INCLUDE_DIRS})
+    target_link_libraries(bench_init ${thirdparty_libraries} Threads::Threads)
+endif ()
 
 

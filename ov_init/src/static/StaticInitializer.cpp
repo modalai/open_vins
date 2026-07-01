@@ -122,11 +122,18 @@ bool StaticInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarianc
   // Check if gravity is pointing in an acceptable direction (prevents upside-down initialization)
   // The accelerometer measures -gravity when stationary, so a_avg_2to1 should be approximately [0,0,+g] for upright
   // This means the IMU's Z-axis points up (opposite to gravity direction)
+  // Static-specific gravity gate. The static initializer assumes a near-level, stationary platform, so
+  // it must stay tight even when the dynamic S2 path is allowed to (re)init at any attitude. Use the
+  // dedicated init_static_gravity_max_angle when set (>=0), else fall back to init_gravity_max_angle
+  // (legacy coupled behavior). See InertialInitializerOptions.h.
+  double static_grav_max_angle =
+      (params.init_static_gravity_max_angle >= 0.0) ? params.init_static_gravity_max_angle : params.init_gravity_max_angle;
   Eigen::Vector3d expected_gravity_dir(0, 0, -1); // Expected: gravity points in -Z direction in IMU frame
-  if (!InitializerHelper::check_gravity_direction(a_avg_2to1, expected_gravity_dir, params.init_gravity_max_angle)) {
+  if (!InitializerHelper::check_gravity_direction(a_avg_2to1, expected_gravity_dir, static_grav_max_angle)) {
     double angle_deg = std::acos(std::max(-1.0, std::min(1.0, (a_avg_2to1.normalized()).dot(expected_gravity_dir.normalized())))) * 180.0 / M_PI;
-    PRINT_WARNING(YELLOW "[init-s]: gravity direction check failed! Angle from expected: %.1f deg (max: %.1f deg)\n" RESET,
-                  angle_deg, params.init_gravity_max_angle);
+    PRINT_WARNING(YELLOW "[init-s]: gravity direction check failed! tilt %.1f deg > static max %.1f deg -- static init "
+                         "denied; awaiting near-level attitude or enough motion for dynamic init\n" RESET,
+                  angle_deg, static_grav_max_angle);
     PRINT_WARNING(YELLOW "[init-s]: measured gravity direction: [%.3f, %.3f, %.3f]\n" RESET,
                   a_avg_2to1(0) / a_avg_2to1.norm(), a_avg_2to1(1) / a_avg_2to1.norm(), a_avg_2to1(2) / a_avg_2to1.norm());
     return false;

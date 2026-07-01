@@ -132,6 +132,15 @@ struct InertialInitializerOptions {
   /// This prevents initialization when the platform is upside down or severely tilted
   double init_gravity_max_angle = 45.0;
 
+  /// Maximum allowed gravity-direction angle (degrees) for the STATIC initializer specifically.
+  /// The static initializer assumes a near-level, stationary platform (it injects v~0 with a tight
+  /// covariance); a large tilt usually means the platform is NOT in that regime (hand-launch, ramp,
+  /// aggressive hold), so a confident static seed there would corrupt the filter. Kept SEPARATE from
+  /// init_gravity_max_angle so the dynamic S2 path can stay wide (reset at any attitude) while the
+  /// static path stays tight. Default 5 deg (historically the static value). Set < 0 to instead reuse
+  /// init_gravity_max_angle (legacy coupled behavior).
+  double init_static_gravity_max_angle = 5.0;
+
   /**
    * @brief This function will load print out all initializer settings loaded.
    * This allows for visual checking that everything was loaded properly from ROS/CMD parsers.
@@ -166,6 +175,7 @@ struct InertialInitializerOptions {
       init_dyn_bias_g << bias_g.at(0), bias_g.at(1), bias_g.at(2);
       init_dyn_bias_a << bias_a.at(0), bias_a.at(1), bias_a.at(2);
       parser->parse_config("init_gravity_max_angle", init_gravity_max_angle);
+      parser->parse_config("init_static_gravity_max_angle", init_static_gravity_max_angle, false); // optional; <0 => use init_gravity_max_angle
     }
     PRINT_DEBUG("  - init_window_time: %.2f\n", init_window_time);
     PRINT_DEBUG("  - init_imu_thresh: %.2f\n", init_imu_thresh);
@@ -210,6 +220,8 @@ struct InertialInitializerOptions {
     PRINT_DEBUG("  - init_dyn_bias_g: %.2f, %.2f, %.2f\n", init_dyn_bias_g(0), init_dyn_bias_g(1), init_dyn_bias_g(2));
     PRINT_DEBUG("  - init_dyn_bias_a: %.2f, %.2f, %.2f\n", init_dyn_bias_a(0), init_dyn_bias_a(1), init_dyn_bias_a(2));
     PRINT_DEBUG("  - init_gravity_max_angle: %.2f\n", init_gravity_max_angle);
+    PRINT_DEBUG("  - init_static_gravity_max_angle: %.2f%s\n", init_static_gravity_max_angle,
+                (init_static_gravity_max_angle < 0.0) ? " (<0: uses init_gravity_max_angle)" : "");
   }
 
   // NOISE / CHI2 ============================
