@@ -141,6 +141,16 @@ struct InertialInitializerOptions {
   /// init_gravity_max_angle (legacy coupled behavior).
   double init_static_gravity_max_angle = 5.0;
 
+  /// Weak prior sigma (m/s^2) pulling the ceres-free dynamic-init S2 gravity toward its +Z seed. Fights
+  /// the gravity<->accel-bias ambiguity and, critically, the flipped-gravity basin: at sigma~0.5 (~3 deg)
+  /// the post-solve flip gate goes 42/50 -> 49/50 in the NEES gold standard with negligible accuracy
+  /// cost (grav err 2.62 vs 2.64 deg). <= 0 disables it. Only used on the ceres-free (S2) dynamic path.
+  double init_dyn_grav_prior_sigma = 0.5;
+
+  /// Post-solve gravity reject gate (deg) for the ceres-free dynamic init: reject if the optimized
+  /// gravity ends up more than this from the expected +Z pole (flip/corruption guard before injection).
+  double init_dyn_grav_gate_deg = 30.0;
+
   /**
    * @brief This function will load print out all initializer settings loaded.
    * This allows for visual checking that everything was loaded properly from ROS/CMD parsers.
@@ -176,6 +186,8 @@ struct InertialInitializerOptions {
       init_dyn_bias_a << bias_a.at(0), bias_a.at(1), bias_a.at(2);
       parser->parse_config("init_gravity_max_angle", init_gravity_max_angle);
       parser->parse_config("init_static_gravity_max_angle", init_static_gravity_max_angle, false); // optional; <0 => use init_gravity_max_angle
+      parser->parse_config("init_dyn_grav_prior_sigma", init_dyn_grav_prior_sigma, false);          // optional; <=0 disables the gravity prior
+      parser->parse_config("init_dyn_grav_gate_deg", init_dyn_grav_gate_deg, false);                // optional; post-solve flip-reject gate
     }
     PRINT_DEBUG("  - init_window_time: %.2f\n", init_window_time);
     PRINT_DEBUG("  - init_imu_thresh: %.2f\n", init_imu_thresh);
@@ -222,6 +234,8 @@ struct InertialInitializerOptions {
     PRINT_DEBUG("  - init_gravity_max_angle: %.2f\n", init_gravity_max_angle);
     PRINT_DEBUG("  - init_static_gravity_max_angle: %.2f%s\n", init_static_gravity_max_angle,
                 (init_static_gravity_max_angle < 0.0) ? " (<0: uses init_gravity_max_angle)" : "");
+    PRINT_DEBUG("  - init_dyn_grav_prior_sigma: %.3f\n", init_dyn_grav_prior_sigma);
+    PRINT_DEBUG("  - init_dyn_grav_gate_deg: %.2f\n", init_dyn_grav_gate_deg);
   }
 
   // NOISE / CHI2 ============================

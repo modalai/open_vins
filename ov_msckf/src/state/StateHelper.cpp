@@ -248,6 +248,24 @@ bool StateHelper::set_initial_state_warmstart(std::shared_ptr<State> state, cons
     }
   }
 
+  // Value guard: a NON-FINITE or non-PSD joint covariance is worse than a cold start -- it would inject
+  // NaN/Inf or negative variance into the filter (e.g. a marginal/near-degenerate init, or a divergence-
+  // triggered soft reset whose recovered covariance is garbage). Reject BEFORE mutating any state so the
+  // caller cleanly falls back to the legacy IMU-only seed. Check all entries finite and every diagonal
+  // strictly positive (a necessary PD condition; cheap proxy vs. a full eigen-decomposition on the hot
+  // reset path).
+  if (!covariance.allFinite()) {
+    PRINT_ERROR(RED "StateHelper::set_initial_state_warmstart() - non-finite joint covariance; cold-starting\n" RESET);
+    return false;
+  }
+  for (int d = 0; d < covariance.rows(); ++d) {
+    if (covariance(d, d) <= 0.0) {
+      PRINT_ERROR(RED "StateHelper::set_initial_state_warmstart() - non-positive covariance diagonal at %d (%.3e); cold-starting\n" RESET,
+                  d, covariance(d, d));
+      return false;
+    }
+  }
+
   // Grow the covariance ONCE for all K clones (single reallocation; the new rows/cols are zero-filled,
   // i.e. clones start uncorrelated with the existing calibration blocks -- the same block-diagonal
   // assumption set_initial_covariance() makes for the IMU). Register each clone (id / _variables /

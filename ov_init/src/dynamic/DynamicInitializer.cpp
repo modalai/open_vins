@@ -654,6 +654,19 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
   var_gravity[2] = params.gravity_mag;
   auto *gravity_s2_param = new MleGravityS2(params.gravity_mag);
   problem.AddParameterBlock(var_gravity, 3, gravity_s2_param);
+
+  // Weak prior pulling gravity toward its +Z seed (0,0,G). Fights the gravity<->accel-bias ambiguity
+  // and the flipped-gravity basin so the post-solve flip gate is robust (NEES gold standard,
+  // test_init_consistency: flip rejection 42/50 -> 49/50 at sigma=0.5, grav err unchanged). It does NOT
+  // fix the free-S2 NEES overconfidence (that is weak gravity/bias observability over the init window,
+  // mitigated by the init_dyn_inflation_* congruence). Disabled if init_dyn_grav_prior_sigma <= 0.
+  if (params.init_dyn_grav_prior_sigma > 0.0) {
+    Eigen::MatrixXd g_lin(3, 1);
+    g_lin << var_gravity[0], var_gravity[1], var_gravity[2];
+    Eigen::MatrixXd g_info = Eigen::MatrixXd::Identity(3, 3) / std::pow(params.init_dyn_grav_prior_sigma, 2);
+    std::vector<std::string> g_types = {"vec3"};
+    problem.AddResidualBlock(new MlePrior(g_lin, g_types, g_info, Eigen::MatrixXd::Zero(3, 1)), nullptr, {var_gravity});
+  }
 #else
   double *var_gravity = nullptr; // unused in Ceres path
 #endif
@@ -1071,8 +1084,8 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
     double angle_rad = std::acos(std::min(1.0, std::max(-1.0, cos_angle)));
     double angle_deg = angle_rad * 180.0 / M_PI;
 
-    // Hard reject if gravity is more than 30° off — this catches flipped/corrupted gravity
-    const double kMaxGravityTiltDeg = 30.0;
+    // Hard reject if gravity is more than the configured gate off — catches flipped/corrupted gravity
+    const double kMaxGravityTiltDeg = params.init_dyn_grav_gate_deg;
     if (angle_deg > kMaxGravityTiltDeg) {
       PRINT_ERROR(RED "[init-d]: GRAVITY DIRECTION INVALID! Optimized g=(%.3f,%.3f,%.3f) is %.1f° from expected +Z. "
                       "Rejecting init to prevent NED corruption.\n" RESET,
