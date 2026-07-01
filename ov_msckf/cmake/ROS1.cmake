@@ -28,7 +28,6 @@ include_directories(
         ${EIGEN3_INCLUDE_DIR}
         ${Boost_INCLUDE_DIRS}
         ${OpenCV_INCLUDE_DIRS}
-        ${CERES_INCLUDE_DIRS}
         ${catkin_INCLUDE_DIRS}
 )
 
@@ -36,7 +35,6 @@ include_directories(
 list(APPEND thirdparty_libraries
         ${Boost_LIBRARIES}
         ${OpenCV_LIBRARIES}
-        ${CERES_LIBRARIES}
         ${catkin_LIBRARIES}
 )
 

@@ -161,23 +161,28 @@ if (OV_INIT_BUILD_TESTS)
     target_link_libraries(test_init_consistency Threads::Threads)
     add_test(NAME test_init_consistency COMMAND test_init_consistency)
 
-    # Ceres vs ov_init::zbft_sfm parity/performance benchmark. Self-contained (compiles the needed
-    # factor sources in) so the on-target binary needs only Ceres + LAPACK/BLAS from the board rootfs,
-    # not a matching libov_init_lib.so. Built with the toolchain so its ABI matches the target.
-    add_executable(bench_init
-            src/bench_init.cpp
-            src/ceres/Factor_ImuCPIv1.cpp
-            src/ceres/Factor_GenericPrior.cpp
-            src/ceres/State_JPLQuatLocal.cpp
-            src/ceres_free/Factor_ImuCPIv1.cpp
-            src/ceres_free/Factor_GenericPrior.cpp
-            src/ceres_free/State_JPLQuatLocal.cpp
-            src/ceres_free/Problem.cpp
-            src/ceres_free/Parallel.cpp
-            ${CMAKE_CURRENT_SOURCE_DIR}/../ov_core/src/cpi/CpiV1.cpp
-    )
-    target_include_directories(bench_init PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../ov_core/src ${EIGEN3_INCLUDE_DIR} ${CERES_INCLUDE_DIRS})
-    target_link_libraries(bench_init ${thirdparty_libraries} Threads::Threads)
+    # Ceres vs ov_init::zbft_sfm parity/performance benchmark. Compiles the src/ceres/* factors, so it
+    # needs Ceres regardless of OV_INIT_CERES_FREE. Look it up locally (QUIET) and skip if unavailable --
+    # so enabling tests on a ceres-free image (no voxl-ceres-solver) does not break the build.
+    find_package(Ceres QUIET)
+    if (Ceres_FOUND)
+        add_executable(bench_init
+                src/bench_init.cpp
+                src/ceres/Factor_ImuCPIv1.cpp
+                src/ceres/Factor_GenericPrior.cpp
+                src/ceres/State_JPLQuatLocal.cpp
+                src/ceres_free/Factor_ImuCPIv1.cpp
+                src/ceres_free/Factor_GenericPrior.cpp
+                src/ceres_free/State_JPLQuatLocal.cpp
+                src/ceres_free/Problem.cpp
+                src/ceres_free/Parallel.cpp
+                ${CMAKE_CURRENT_SOURCE_DIR}/../ov_core/src/cpi/CpiV1.cpp
+        )
+        target_include_directories(bench_init PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../ov_core/src ${EIGEN3_INCLUDE_DIR} ${CERES_INCLUDE_DIRS})
+        target_link_libraries(bench_init ${thirdparty_libraries} ${CERES_LIBRARIES} Threads::Threads)
+    else ()
+        message(STATUS "ov_init: bench_init skipped (Ceres not found; it is the Ceres-vs-free benchmark)")
+    endif ()
 endif ()
 
 

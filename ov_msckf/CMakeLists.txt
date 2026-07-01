@@ -12,8 +12,8 @@ if (NOT OpenCV_FOUND)
     endif ()
 endif ()
 find_package(Boost REQUIRED COMPONENTS system filesystem thread date_time)
-find_package(Ceres REQUIRED)
-message(STATUS "OPENCV: " ${OpenCV_VERSION} " | BOOST: " ${Boost_VERSION} " | CERES: " ${Ceres_VERSION})
+# ov_msckf has ZERO ceres:: usage -- Ceres intentionally not required or linked (ceres-free init).
+message(STATUS "OPENCV: " ${OpenCV_VERSION} " | BOOST: " ${Boost_VERSION})
 
 # If we will compile with aruco support
 option(ENABLE_ARUCO_TAGS "Enable or disable aruco tag (disable if no contrib modules)" ON)
