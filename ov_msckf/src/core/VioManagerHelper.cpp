@@ -21,6 +21,9 @@
 
 #include "VioManager.h"
 
+#include <cmath>
+#include <limits>
+
 #include "feat/Feature.h"
 #include "feat/FeatureDatabase.h"
 #include "feat/FeatureInitializer.h"
@@ -98,32 +101,57 @@ bool VioManager::try_to_initialize(const ov_core::CameraData &message) {
     double timestamp;
     Eigen::MatrixXd covariance;
     std::vector<std::shared_ptr<ov_type::Type>> order;
+    std::map<double, std::shared_ptr<ov_type::PoseJPL>> clones_IMU;
+    std::unordered_map<size_t, std::shared_ptr<ov_type::Landmark>> features_SLAM;
     auto init_rT1 = boost::posix_time::microsec_clock::local_time();
 
     // Try to initialize the system
     // We will wait for a jerk if we do not have the zero velocity update enabled
     // Otherwise we can initialize right away as the zero velocity will handle the stationary case
     bool wait_for_jerk = (updaterZUPT == nullptr);
-    bool success = initializer->initialize(timestamp, covariance, order, state->_imu, wait_for_jerk);
+    bool success = initializer->initialize(timestamp, covariance, order, state->_imu, clones_IMU, features_SLAM, wait_for_jerk);
 
     // If we have initialized successfully we will set the covariance and state elements as needed
-    // TODO: set the clones and SLAM features here so we can start updating right away...
     if (success) {
 
-      // Set our covariance (state should already be set in the initializer)
-      StateHelper::set_initial_covariance(state, covariance, order);
+      // Seed the EKF. Warm-start is ONLY for a soft reset (mid-ops re-init with a warm front-end):
+      // warmstart_next_init is set by VioManager::soft_reset() and is false on first boot / hard reset,
+      // which therefore always cold-start. When it is set AND the config enables it AND the dynamic
+      // initializer returned the joint [IMU, clones...] covariance (rows == 15 + 6*num_clones), inject
+      // the window clones so the filter updates immediately instead of re-collecting a fresh window.
+      // The size guard keeps this robust to the static-init / Ceres backends (which return no joint
+      // cov), and set_initial_state_warmstart re-checks the contract -> on any violation we cold-start.
+      const int njoint = state->_imu->size() + 6 * (int)clones_IMU.size();
+      bool warm = warmstart_next_init.load() && params.init_options.init_warmstart_inject && !clones_IMU.empty() &&
+                  covariance.rows() == njoint && (int)clones_IMU.size() <= params.state_options.max_clone_size;
+      if (warm)
+        warm = StateHelper::set_initial_state_warmstart(state, covariance, clones_IMU);
+      if (!warm) {
+        // Cold seed: inject only the IMU 15x15 (the top-left of covariance, whether it is 15x15 or the
+        // larger joint form), matching the legacy single-state behaviour exactly.
+        std::vector<std::shared_ptr<ov_type::Type>> imu_order = {state->_imu};
+        StateHelper::set_initial_covariance(state, covariance.topLeftCorner(state->_imu->size(), state->_imu->size()), imu_order);
+      }
 
       // Set the state time
       state->_timestamp = timestamp;
       startup_time = timestamp;
 
-      // Cleanup any features older than the initialization time
-      // Also increase the number of features to the desired amount during estimation
-      // NOTE: we will split the total number of features over all cameras uniformly
-      trackFEATS->get_feature_database()->cleanup_measurements(state->_timestamp);
+      // Cleanup old feature measurements, and grow the tracker to the estimation feature count.
+      // Cold-start drops everything before the init time. Warm-start instead KEEPS the whole init window
+      // (clean just below the oldest injected clone time -- clean_older_measurements removes obs <= t) so
+      // the injected clones retain observations to update against; otherwise they would be feature-less
+      // and the warm-start benefit (immediate triangulation/update) would be lost.
+      double clean_time = warm ? std::nextafter(clones_IMU.begin()->first, -std::numeric_limits<double>::infinity())
+                               : state->_timestamp;
+      trackFEATS->get_feature_database()->cleanup_measurements(clean_time);
       trackFEATS->set_num_features(std::floor((double)params.num_pts));
       if (trackARUCO != nullptr) {
-        trackARUCO->get_feature_database()->cleanup_measurements(state->_timestamp);
+        trackARUCO->get_feature_database()->cleanup_measurements(clean_time);
+      }
+      if (warm) {
+        PRINT_INFO(GREEN "[init]: WARM-START injected %d clones, joint cov %dx%d (kept window features >= %.6f)\n" RESET,
+                   (int)clones_IMU.size(), (int)covariance.rows(), (int)covariance.cols(), clones_IMU.begin()->first);
       }
 
       // If we are moving then don't do zero velocity update4
@@ -162,6 +190,8 @@ bool VioManager::try_to_initialize(const ov_core::CameraData &message) {
         StateHelper::marginalize_old_clone(state);
       }
       PRINT_DEBUG(YELLOW "[init]: moved the state forward %.2f seconds\n" RESET, state->_timestamp - timestamp);
+      // Soft-reset re-init episode is over; the next init cold-starts unless another soft_reset() arms it.
+      warmstart_next_init.store(false);
       thread_init_success = true;
       camera_queue_init.clear();
 

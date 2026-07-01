@@ -4,6 +4,7 @@
  * Copyright (C) 2018-2023 Guoquan Huang
  * Copyright (C) 2018-2023 OpenVINS Contributors
  * Copyright (C) 2018-2019 Kevin Eckenhoff
+ * Contributor: Joao Leonardo Silva Cotta (@zauberflote1)
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -21,10 +22,12 @@
 
 #include "DynamicInitializer.h"
 
+#ifndef USE_CERES_FREE_INIT
 #include "ceres/Factor_GenericPrior.h"
 #include "ceres/Factor_ImageReprojCalib.h"
 #include "ceres/Factor_ImuCPIv1.h"
 #include "ceres/State_JPLQuatLocal.h"
+#endif
 #include "utils/helper.h"
 
 #include "cpi/CpiV1.h"
@@ -52,6 +55,7 @@ using namespace ov_init;
 #include "ceres_free/Factor_GenericPrior.h"
 #include "ceres_free/Factor_ImageReprojCalib.h"
 #include "ceres_free/Factor_ImuCPIv1.h"
+#include "ceres_free/LocalParameterization.h"
 #include "ceres_free/LossFunction.h"
 #include "ceres_free/Problem.h"
 #include "ceres_free/State_JPLQuatLocal.h"
@@ -62,6 +66,7 @@ using MleImuFactor = ov_init::zbft_sfm::Factor_ImuCPIv1;
 using MleReprojFactor = ov_init::zbft_sfm::Factor_ImageReprojCalib;
 using MleLoss = ov_init::zbft_sfm::LossFunction;
 using MleCauchy = ov_init::zbft_sfm::CauchyLoss;
+using MleGravityS2 = ov_init::zbft_sfm::GravityS2Parameterization;
 #else
 using MleProblem = ceres::Problem;
 using MleJplQuat = ov_init::State_JPLQuatLocal;
@@ -640,6 +645,19 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
   std::map<size_t, int> map_calib_cam;
   std::vector<double *> ceres_vars_calib_cam_intrinsics;
 
+#ifdef USE_CERES_FREE_INIT
+  // S² gravity parameter: world is already aligned to gravity (gram_schmidt above),
+  // so the seed is the pole (0,0,+G). This block is shared by all IMU factors.
+  double *var_gravity = new double[3];
+  var_gravity[0] = 0.0;
+  var_gravity[1] = 0.0;
+  var_gravity[2] = params.gravity_mag;
+  auto *gravity_s2_param = new MleGravityS2(params.gravity_mag);
+  problem.AddParameterBlock(var_gravity, 3, gravity_s2_param);
+#else
+  double *var_gravity = nullptr; // unused in Ceres path
+#endif
+
   // Helper lambda that will free any memory we have allocated
   auto free_state_memory = [&]() {
     for (auto const &ptr : ceres_vars_ori)
@@ -660,6 +678,9 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
       delete[] ptr;
     for (auto const &ptr : ceres_vars_calib_cam_intrinsics)
       delete[] ptr;
+#ifdef USE_CERES_FREE_INIT
+    delete[] var_gravity;
+#endif
   };
 
   // Set the optimization settings
@@ -668,9 +689,9 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
 #ifdef USE_CERES_FREE_INIT
   ov_init::zbft_sfm::SolverOptions options;
   // Feature blocks are eliminated via the Schur complement by tagging them with
-  // SetSchurLandmark() below (there is no separate enable flag). Dogleg is the default
-  // trust-region strategy, matching the Ceres path.
-  options.num_threads = params.init_dyn_mle_max_threads;
+  // SetSchurLandmark() below (there is no separate enable flag).
+  // LM is used (use_dogleg defaults to false) - better results on actual hardware.
+  options.num_threads = params.init_dyn_mle_max_threads; // worker count comes straight from the YAML
   options.max_solver_time_seconds = params.init_dyn_mle_max_time;
   options.max_num_iterations = params.init_dyn_mle_max_iter;
   options.function_tolerance = 1e-5;
@@ -739,8 +760,45 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
     // NOTE: Since init is over a small window, we are likely to be degenerate
     // NOTE: Thus we need to fix these parameters
     if (map_states.empty()) {
+#ifdef USE_CERES_FREE_INIT
+      // S² gravity path: the 2 observable tilt DOF now live in gravity on S².
+      // Use a TIGHT SOFT PRIOR on first-pose orientation and position (not hard-fixed)
+      // to anchor the gauge while allowing small corrections on aggressive reset windows.
+      // Prior: full 3-DOF orientation (over-constrains yaw by 1, harmless since yaw unobservable),
+      //        full 3-DOF position, and biases.
+      Eigen::MatrixXd x_lin = Eigen::MatrixXd::Zero(13, 1);
+      for (int j = 0; j < 4; j++) {
+        x_lin(0 + j) = var_ori[j];
+      }
+      for (int j = 0; j < 3; j++) {
+        x_lin(4 + j) = var_pos[j];
+        x_lin(7 + j) = var_bias_g[j];
+        x_lin(10 + j) = var_bias_a[j];
+      }
+      Eigen::MatrixXd prior_grad = Eigen::MatrixXd::Zero(12, 1);
+      Eigen::MatrixXd prior_Info = Eigen::MatrixXd::Identity(12, 12);
+      prior_Info.block(0, 0, 3, 3) *= 1.0 / std::pow(0.001, 2);  // orientation: tight (~0.057 deg)
+      prior_Info.block(3, 3, 3, 3) *= 1.0 / std::pow(0.001, 2);  // position: tight (~1 mm)
+      prior_Info.block(6, 6, 3, 3) *= 1.0 / std::pow(0.05, 2);   // bias_g prior
+      prior_Info.block(9, 9, 3, 3) *= 1.0 / std::pow(0.10, 2);   // bias_a prior
 
-      // Construct state and prior
+      // Construct state type and ceres parameter pointers
+      std::vector<std::string> x_types;
+      std::vector<double *> factor_params;
+      factor_params.push_back(var_ori);
+      x_types.emplace_back("quat"); // full 3-DOF orientation (not quat_yaw)
+      factor_params.push_back(var_pos);
+      x_types.emplace_back("vec3");
+      factor_params.push_back(var_bias_g);
+      x_types.emplace_back("vec3");
+      factor_params.push_back(var_bias_a);
+      x_types.emplace_back("vec3");
+
+      // Append it to the problem
+      auto *factor_prior = new MlePrior(x_lin, x_types, prior_Info, prior_grad);
+      problem.AddResidualBlock(factor_prior, nullptr, factor_params);
+#else
+      // Ceres path: original gauge anchoring (quat_yaw + position fixed)
       Eigen::MatrixXd x_lin = Eigen::MatrixXd::Zero(13, 1);
       for (int j = 0; j < 4; j++) {
         x_lin(0 + j) = var_ori[j];
@@ -771,6 +829,7 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
       // Append it to the problem
       auto *factor_prior = new MlePrior(x_lin, x_types, prior_Info, prior_grad);
       problem.AddResidualBlock(factor_prior, nullptr, factor_params);
+#endif
     }
 
     // Append to our historical vector of states
@@ -799,6 +858,10 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
       factor_params.push_back(ceres_vars_vel.at(map_states.at(timestamp_k1)));
       factor_params.push_back(ceres_vars_bias_a.at(map_states.at(timestamp_k1)));
       factor_params.push_back(ceres_vars_pos.at(map_states.at(timestamp_k1)));
+#ifdef USE_CERES_FREE_INIT
+      // 11th block: shared S² gravity parameter (the solver applies the manifold Jacobian)
+      factor_params.push_back(var_gravity);
+#endif
       auto *factor_imu = new MleImuFactor(cpi->DT, gravity, cpi->alpha_tau, cpi->beta_tau, cpi->q_k2tau, cpi->b_a_lin, cpi->b_w_lin,
                                           cpi->J_q, cpi->J_b, cpi->J_a, cpi->H_b, cpi->H_a, cpi->P_meas);
       problem.AddResidualBlock(factor_imu, nullptr, factor_params);
@@ -962,6 +1025,149 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
     return false;
   }
   PRINT_DEBUG("[init-d]: %s\n", summary.message.c_str());
+
+  // Recover the marginal covariance AT THE OPTIMUM, BEFORE any re-align rotates the states.
+  // Re-aligning and then recomputing would re-linearize the IMU factors against rotated states with
+  // an un-rotated gravity block -> an off-optimum, internally inconsistent covariance (exactly in the
+  // 0.1-30 deg tilt band where it matters). We recover it here and carry it through the re-align via a
+  // closed-form similarity transform (below). [theta, p, v, bg, ba], local error coordinates.
+  // When warm-starting we recover the FULL joint covariance over [IMU(15), clones(6 each, ascending
+  // time)] in a single shot. ComputeCovariance already inverts the entire landmark-marginalized
+  // reduced navigation Hessian and merely slices the requested blocks, so asking for every clone costs
+  // no extra factorization -- only a larger slice. The IMU 15x15 stays the top-left block, identical
+  // to the legacy seed, so the cold path is bit-for-bit unchanged. [theta,p,v,bg,ba | theta_i,p_i ...]
+  const bool warmstart = params.init_warmstart_inject;
+  const int n_clones = (int)map_states.size();
+  Eigen::MatrixXd cov_inject; // 15x15 (legacy) or (15 + 6*n_clones) (warm). ComputeCovariance sizes it.
+  bool cov_ok = false;
+  {
+    int sidx = map_states[newest_cam_time];
+    std::vector<double *> cb = {ceres_vars_ori[sidx], ceres_vars_pos[sidx], ceres_vars_vel[sidx], ceres_vars_bias_g[sidx],
+                                ceres_vars_bias_a[sidx]};
+    if (warmstart) {
+      // Clones in ascending-time order -> matches _clones_IMU (std::map) iteration, the inflation/
+      // T-transform block layout, and the injection contract in StateHelper::set_initial_state_warmstart.
+      for (auto const &sp : map_states) {
+        cb.push_back(ceres_vars_ori[sp.second]);
+        cb.push_back(ceres_vars_pos[sp.second]);
+      }
+    }
+    cov_ok = problem.ComputeCovariance(cb, cov_inject, options);
+    if (!cov_ok) {
+      PRINT_WARNING(YELLOW "[init-d]: covariance recovery failed...\n" RESET);
+      free_state_memory();
+      return false;
+    }
+  }
+
+  // GRAVITY DIRECTION GATE + CONDITIONAL RE-ALIGN
+  // Reject if the optimized gravity is too far from +Z (the expected pole).
+  // A flipped or badly tilted gravity will corrupt downstream attitude (especially PX4 NED).
+  // If tilt is moderate, re-align all states so gravity returns to +Z before injection.
+  {
+    Eigen::Vector3d g_opt(var_gravity[0], var_gravity[1], var_gravity[2]);
+    Eigen::Vector3d g_expected(0.0, 0.0, params.gravity_mag);
+    double cos_angle = g_opt.dot(g_expected) / (g_opt.norm() * g_expected.norm());
+    double angle_rad = std::acos(std::min(1.0, std::max(-1.0, cos_angle)));
+    double angle_deg = angle_rad * 180.0 / M_PI;
+
+    // Hard reject if gravity is more than 30° off — this catches flipped/corrupted gravity
+    const double kMaxGravityTiltDeg = 30.0;
+    if (angle_deg > kMaxGravityTiltDeg) {
+      PRINT_ERROR(RED "[init-d]: GRAVITY DIRECTION INVALID! Optimized g=(%.3f,%.3f,%.3f) is %.1f° from expected +Z. "
+                      "Rejecting init to prevent NED corruption.\n" RESET,
+                  g_opt(0), g_opt(1), g_opt(2), angle_deg);
+      free_state_memory();
+      return false;
+    }
+
+    // Conditional re-align: if tilt > 0.1°, rotate all states so gravity returns to +Z.
+    // This ensures downstream (propagator, PX4) sees a gravity-aligned world frame.
+    const double kRealignThresholdDeg = 0.1;
+    if (angle_deg > kRealignThresholdDeg) {
+      // Compute rotation from g_opt to g_expected using Rodrigues
+      Eigen::Vector3d g_opt_norm = g_opt.normalized();
+      Eigen::Vector3d g_exp_norm = g_expected.normalized();
+      Eigen::Vector3d axis = g_opt_norm.cross(g_exp_norm);
+      double axis_norm = axis.norm();
+      if (axis_norm > 1e-9) {
+        axis /= axis_norm;
+        // R_realign rotates g_opt to g_expected
+        Eigen::Matrix3d R_realign = Eigen::AngleAxisd(angle_rad, axis).toRotationMatrix();
+
+        // Carry the recovered-at-optimum covariance through this world-frame re-align via the
+        // closed-form similarity T = blkdiag(I, R_realign, R_realign, I, I): delta-theta is the
+        // body-frame (left-JPL) error, invariant under the right-multiply world rotation
+        // (R_new = R_old * R_realign^T); delta-p and delta-v are world vectors (-> R_realign); the
+        // biases are body-frame (-> I). O(1) and provably consistent with the rotated state.
+        if (cov_ok) {
+          // Closed-form similarity over [IMU(15) | clones(6 each)]. IMU: blkdiag(I,R,R,I,I) over
+          // [theta,p,v,bg,ba]. Each clone: blkdiag(I,R) over [theta,p] -- the orientation error is the
+          // body-frame (left-JPL) error, invariant under the right-multiply world rotation
+          // (R_new = R_old * R_realign^T); the clone position is a world vector -> R_realign. T_theta=I
+          // is validated by the realign-consistency NEES case. O(1) and consistent with the rotated state.
+          Eigen::MatrixXd Tre = Eigen::MatrixXd::Identity(cov_inject.rows(), cov_inject.cols());
+          Tre.block(3, 3, 3, 3) = R_realign; // IMU p
+          Tre.block(6, 6, 3, 3) = R_realign; // IMU v
+          if (warmstart) {
+            for (int c = 0; c < n_clones; ++c)
+              Tre.block(15 + 6 * c + 3, 15 + 6 * c + 3, 3, 3) = R_realign; // clone p
+          }
+          cov_inject = (Tre * cov_inject * Tre.transpose()).eval();
+        }
+
+        // Rotate all clone poses and velocities
+        for (auto &var_q : ceres_vars_ori) {
+          Eigen::Matrix3d R_old = ov_core::quat_2_Rot(Eigen::Map<Eigen::Vector4d>(var_q));
+          Eigen::Matrix3d R_new = R_old * R_realign.transpose(); // world frame rotation
+          Eigen::Vector4d q_new = ov_core::rot_2_quat(R_new);
+          for (int j = 0; j < 4; j++) var_q[j] = q_new(j);
+        }
+        for (auto &var_p : ceres_vars_pos) {
+          Eigen::Vector3d p_old = Eigen::Map<Eigen::Vector3d>(var_p);
+          Eigen::Vector3d p_new = R_realign * p_old;
+          for (int j = 0; j < 3; j++) var_p[j] = p_new(j);
+        }
+        for (auto &var_v : ceres_vars_vel) {
+          Eigen::Vector3d v_old = Eigen::Map<Eigen::Vector3d>(var_v);
+          Eigen::Vector3d v_new = R_realign * v_old;
+          for (int j = 0; j < 3; j++) var_v[j] = v_new(j);
+        }
+        for (auto &var_f : ceres_vars_feat) {
+          Eigen::Vector3d f_old = Eigen::Map<Eigen::Vector3d>(var_f);
+          Eigen::Vector3d f_new = R_realign * f_old;
+          for (int j = 0; j < 3; j++) var_f[j] = f_new(j);
+        }
+
+        PRINT_INFO("[init-d]: Re-aligned states by %.2f° to restore gravity to +Z\n", angle_deg);
+      }
+    }
+
+    if (angle_deg > 5.0) {
+      PRINT_WARNING(YELLOW "[init-d]: Gravity tilt was %.2f° from expected +Z (g=%.3f,%.3f,%.3f). "
+                           "Linear init may have been marginal.\n" RESET,
+                    angle_deg, g_opt(0), g_opt(1), g_opt(2));
+    } else {
+      PRINT_DEBUG("[init-d]: Gravity tilt %.3f° from +Z (nominal)\n", angle_deg);
+    }
+  }
+
+  // WARM-START WORLD GAUGE: translate the world so the newest IMU sits at the origin (matching the
+  // legacy single-state seed, which zeroes the injected position below). Applied here -- after the
+  // gravity re-align rotated the raw solver arrays, before the clone/feature objects are built -- as
+  // ONE rigid world translation over every clone position and feature, so the injected geometry stays
+  // self-consistent (the newest clone keeps coinciding with the zeroed IMU pose). Covariance is
+  // translation-invariant (it is the first-pose-anchored relative error), so cov_inject is untouched.
+  if (warmstart) {
+    const int sN = map_states.at(newest_cam_time);
+    const Eigen::Vector3d p_newest(ceres_vars_pos[sN][0], ceres_vars_pos[sN][1], ceres_vars_pos[sN][2]);
+    for (auto const &sp : map_states)
+      for (int j = 0; j < 3; j++)
+        ceres_vars_pos[sp.second][j] -= p_newest(j);
+    for (auto &var_f : ceres_vars_feat)
+      for (int j = 0; j < 3; j++)
+        var_f[j] -= p_newest(j);
+  }
 #else
   // Optimize the ceres graph
   ceres::Solver::Summary summary;
@@ -1052,22 +1258,20 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
 
   // Recover the covariance of the optimized IMU state.
 #ifdef USE_CERES_FREE_INIT
-  // ov_init::zbft_sfm marginalizes the Schur landmarks AND all other navigation states
-  // (clones, calibration) by inverting the gauge-anchored reduced Hessian and
-  // extracting the most-recent IMU block, in OpenVINS order [theta, p, v, bg, ba].
+  // The marginal covariance was recovered AT THE OPTIMUM above (before the gravity re-align, by
+  // inverting the gauge-anchored landmark-marginalized reduced Hessian) and carried through the
+  // re-align by a closed-form similarity transform, so it is consistent with the injected (possibly
+  // re-aligned) state. OpenVINS order [theta, p, v, bg, ba].
   order.clear();
   order.push_back(_imu);
-  covariance = Eigen::MatrixXd::Zero(_imu->size(), _imu->size());
-  {
-    int state_index = map_states[newest_cam_time];
-    std::vector<double *> cov_blocks = {ceres_vars_ori[state_index], ceres_vars_pos[state_index], ceres_vars_vel[state_index],
-                                        ceres_vars_bias_g[state_index], ceres_vars_bias_a[state_index]};
-    if (!problem.ComputeCovariance(cov_blocks, covariance, options)) {
-      PRINT_WARNING(YELLOW "[init-d]: covariance recovery failed...\n" RESET);
-      free_state_memory();
-      return false;
-    }
+  if (warmstart) {
+    // Append clones in ascending-time order so `order` matches cov_inject's clone-block layout
+    // exactly (both derived from map_states / _clones_IMU, which are ascending std::maps). Keeps the
+    // returned (covariance, order) pair dimensionally consistent for downstream injection.
+    for (auto const &cp : _clones_IMU)
+      order.push_back(cp.second);
   }
+  covariance = cov_inject;
 #else
   // NOTE: for now just the IMU state is recovered, but we should be able to do everything
   // NOTE: maybe having features / clones will make it more stable?
@@ -1167,11 +1371,28 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
 
 #endif // USE_CERES_FREE_INIT
 
-  // inflate as needed
-  covariance.block(0, 0, 3, 3) *= params.init_dyn_inflation_orientation;
-  covariance.block(6, 6, 3, 3) *= params.init_dyn_inflation_velocity;
-  covariance.block(9, 9, 3, 3) *= params.init_dyn_inflation_bias_gyro;
-  covariance.block(12, 12, 3, 3) *= params.init_dyn_inflation_bias_accel;
+  // Inflate as a proper congruence S*Cov*S^T (scales cross-covariances consistently, not just the
+  // diagonal blocks -- required once the full joint covariance over clones is injected). S scales
+  // each error sub-block's sigma by sqrt(variance-inflation). NEES gold-standard guidance
+  // (test_init_consistency, free-S2 path): velocity/accel-bias dominate the raw Laplace overconfidence
+  // (ba ~ x100 variance); orientation/gyro-bias need far less; position is unscaled today but is
+  // itself mildly overconfident (a future knob). [theta, p, v, bg, ba]
+  {
+    Eigen::VectorXd sd = Eigen::VectorXd::Ones(covariance.rows());
+    sd.segment<3>(0).setConstant(std::sqrt(params.init_dyn_inflation_orientation));
+    sd.segment<3>(3).setConstant(std::sqrt(params.init_dyn_inflation_position));
+    sd.segment<3>(6).setConstant(std::sqrt(params.init_dyn_inflation_velocity));
+    sd.segment<3>(9).setConstant(std::sqrt(params.init_dyn_inflation_bias_gyro));
+    sd.segment<3>(12).setConstant(std::sqrt(params.init_dyn_inflation_bias_accel));
+    // Warm-start clone poses inflate with the SAME orientation/position factors as the IMU pose block,
+    // so the newest clone (which shares the IMU pose) stays bit-identical to the IMU's (theta,p)
+    // sub-block and every cross-covariance scales as a proper congruence. Loop is a no-op when 15x15.
+    for (int o = 15; o + 6 <= (int)covariance.rows(); o += 6) {
+      sd.segment<3>(o).setConstant(std::sqrt(params.init_dyn_inflation_orientation));
+      sd.segment<3>(o + 3).setConstant(std::sqrt(params.init_dyn_inflation_position));
+    }
+    covariance = (sd.asDiagonal() * covariance * sd.asDiagonal()).eval();
+  }
 
   // we are done >:D
   covariance = 0.5 * (covariance + covariance.transpose());

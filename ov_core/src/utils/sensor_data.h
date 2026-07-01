@@ -25,8 +25,10 @@
 #include <Eigen/Eigen>
 #include <opencv2/opencv.hpp>
 #include <vector>
+#if HAVE_OPENCL
 #include <CL/cl.h>
 #include <modal_flow/Types.hpp>
+#endif
 
 namespace ov_core {
 
@@ -65,10 +67,11 @@ struct CameraData {
   /// Raw image we have collected for each camera
   std::vector<cv::Mat> images;
 
+#if HAVE_OPENCL
   // Device memory references for each camera
   std::vector<cl_mem> cl_images;
-  
   std::vector<modal_flow::Frame> img_frames;
+#endif
 
   /// Tracking masks for each camera we have
   std::vector<cv::Mat> masks;

@@ -4,6 +4,7 @@
  * Copyright (C) 2018-2023 Guoquan Huang
  * Copyright (C) 2018-2023 OpenVINS Contributors
  * Copyright (C) 2018-2019 Kevin Eckenhoff
+ * Contributor: Joao Leonardo Silva Cotta (@zauberflote1)
  *
  * Lifted from ov_init/src/ceres/Factor_ImuCPIv1.cpp (residual + Jacobians verbatim).
  *
@@ -69,12 +70,14 @@ Factor_ImuCPIv1::Factor_ImuCPIv1(double deltatime, Eigen::Vector3d &grav, Eigen:
   mutable_parameter_block_sizes()->push_back(3); // v_I2inG
   mutable_parameter_block_sizes()->push_back(3); // ba_2
   mutable_parameter_block_sizes()->push_back(3); // p_I2inG
+  mutable_parameter_block_sizes()->push_back(3); // gravity (S² with lsize=2, gsize=3)
 }
 
 bool Factor_ImuCPIv1::Evaluate(double const *const *parameters, double *residuals, double **jacobians) const {
 
   // Get the local variables (these would be different if we relinearized)
-  Eigen::Vector3d gravity = grav_save;
+  // Gravity comes from parameters[10] (S² on the sphere, explicit optimization)
+  Eigen::Vector3d gravity = Eigen::Map<const Eigen::Vector3d>(parameters[10]);
   Eigen::Matrix<double, 15, 15> sqrtI = sqrtI_save;
   Eigen::Vector3d b_w_lin = b_w_lin_save;
   Eigen::Vector3d b_a_lin = b_a_lin_save;
@@ -246,6 +249,17 @@ bool Factor_ImuCPIv1::Evaluate(double const *const *parameters, double *residual
     if (jacobians[9]) {
       Eigen::Map<Eigen::Matrix<double, 15, 3, Eigen::RowMajor>> J_p2(jacobians[9], 15, 3);
       J_p2.block(0, 0, 15, 3) = Jacobian.block(0, 27, 15, 3);
+    }
+    // gravity (S² parameter, 3-global; solver applies tangent basis to get 2-local)
+    // dr_v/dg = R_1 * dt (rows 6-8), dr_p/dg = 0.5 * R_1 * dt^2 (rows 12-14)
+    if (jacobians[10]) {
+      Eigen::Matrix<double, 15, 3> J_g_raw = Eigen::Matrix<double, 15, 3>::Zero();
+      J_g_raw.block(6, 0, 3, 3) = R_1 * dt;
+      J_g_raw.block(12, 0, 3, 3) = 0.5 * R_1 * std::pow(dt, 2);
+      // Apply full dense sqrtI (mixes all 15 rows)
+      Eigen::Matrix<double, 15, 3> J_g_weighted = sqrtI * J_g_raw;
+      Eigen::Map<Eigen::Matrix<double, 15, 3, Eigen::RowMajor>> J_grav(jacobians[10], 15, 3);
+      J_grav = J_g_weighted;
     }
   }
   return true;

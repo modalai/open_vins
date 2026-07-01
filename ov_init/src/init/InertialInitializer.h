@@ -4,6 +4,7 @@
  * Copyright (C) 2018-2023 Guoquan Huang
  * Copyright (C) 2018-2023 OpenVINS Contributors
  * Copyright (C) 2018-2019 Kevin Eckenhoff
+ * Contributor: Joao Leonardo Silva Cotta (@zauberflote1)
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -22,6 +23,9 @@
 #ifndef OV_INIT_INERTIALINITIALIZER_H
 #define OV_INIT_INERTIALINITIALIZER_H
 
+#include <map>
+#include <unordered_map>
+
 #include "init/InertialInitializerOptions.h"
 
 namespace ov_core {
@@ -31,6 +35,8 @@ struct ImuData;
 namespace ov_type {
 class Type;
 class IMU;
+class PoseJPL;
+class Landmark;
 } // namespace ov_type
 
 namespace ov_init {
@@ -98,11 +104,17 @@ public:
    * @param[out] covariance Calculated covariance of the returned state
    * @param[out] order Order of the covariance matrix
    * @param[out] t_imu Our imu type (need to have correct ids)
+   * @param[out] clones_IMU Window clone poses recovered by the dynamic init (empty for static init). When
+   *             warm-start injection is enabled these are seeded into the EKF; @p covariance / @p order
+   *             then span the full joint [IMU, clones...] state. Empty otherwise (legacy IMU-only seed).
+   * @param[out] features_SLAM SLAM features recovered by the dynamic init (currently informational; landmark
+   *             warm-start is deferred -- the filter re-brings them via delayed SLAM init).
    * @param wait_for_jerk If true we will wait for a "jerk"
    * @return True if we have successfully initialized our system
    */
   bool initialize(double &timestamp, Eigen::MatrixXd &covariance, std::vector<std::shared_ptr<ov_type::Type>> &order,
-                  std::shared_ptr<ov_type::IMU> t_imu, bool wait_for_jerk = true);
+                  std::shared_ptr<ov_type::IMU> t_imu, std::map<double, std::shared_ptr<ov_type::PoseJPL>> &clones_IMU,
+                  std::unordered_map<size_t, std::shared_ptr<ov_type::Landmark>> &features_SLAM, bool wait_for_jerk = true);
 
 protected:
   /// Initialization parameters

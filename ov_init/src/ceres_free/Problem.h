@@ -3,6 +3,7 @@
  * Copyright (C) 2018-2023 Patrick Geneva
  * Copyright (C) 2018-2023 Guoquan Huang
  * Copyright (C) 2018-2023 OpenVINS Contributors
+ * Contributor: Joao Leonardo Silva Cotta (@zauberflote1)
  *
  * Ceres-free initialization backend (ov_init::zbft_sfm)
  * ------------------------------------------------
@@ -145,6 +146,7 @@ private:
     const LocalParameterization *param = nullptr;
     bool constant = false;
     bool landmark = false;
+    bool tangent_leading_identity = true; // true iff V=[I;0], so J_local = J_ambient.leftCols(lsize)
     int offset = -1; // local offset in the assembled error-state vector (variable blocks only)
   };
 

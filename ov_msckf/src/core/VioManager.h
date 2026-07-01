@@ -31,6 +31,10 @@
 #include <mutex>
 #include <string>
 
+#if HAVE_OPENCL
+#include <CL/cl.h> // cl_context used by the HAVE_OPENCL-guarded get_ocl_context() below (matches TrackBase.h)
+#endif
+
 #include "VioManagerOptions.h"
 
 namespace ov_core {
@@ -114,6 +118,20 @@ public:
   /// Accessor to get the current state
   std::shared_ptr<State> get_state() { return state; }
 
+  /**
+   * @brief Front-end-preserving SOFT reset (toward the reset-at-any-moment method).
+   *
+   * Resets ONLY the navigation EKF (a fresh State with the configured calibration) and the
+   * initialization flags/queue, while KEEPING the feature-tracker database, the inertial
+   * initializer's IMU history, and the propagator. Those hold raw measurements that stay valid
+   * across a reset, so the improved (any-attitude, S2-gravity) dynamic initializer can re-fire
+   * within a frame or two instead of re-collecting a full ~init_window_time window -- the dominant
+   * reset latency. Contrast the hard reset, which destroys + recreates the whole VioManager.
+   *
+   * The caller MUST have quiesced sensor callbacks (no concurrent feed_*) before calling this.
+   */
+  void soft_reset();
+
   /// Accessor to get the current propagator
   std::shared_ptr<Propagator> get_propagator() { return propagator; }
 
@@ -143,8 +161,10 @@ public:
     feat_tracks_uvd = active_tracks_uvd;
   }
 
-  // Returns the OpenCL context if we are using the GPU for feature tracking 
+  // Returns the OpenCL context if we are using the GPU for feature tracking
+#if HAVE_OPENCL
   cl_context get_ocl_context() const { return trackFEATS->get_ocl_context(); }
+#endif
 
   std::shared_ptr<ov_core::TrackBase> get_track_feats() { return trackFEATS; }
 
@@ -285,6 +305,12 @@ protected:
 
   // Threads and their atomics
   std::atomic<bool> thread_init_running, thread_init_success;
+
+  // Set by soft_reset() (mid-ops re-init): the NEXT successful initialization is allowed to warm-start
+  // (inject the window clones + joint covariance) instead of cold-starting. Cleared once we re-init.
+  // First boot and hard reset leave this false -> they always cold-start. Lock-free hand-off between
+  // the (health/main) thread that calls soft_reset() and the async init thread that consumes it.
+  std::atomic<bool> warmstart_next_init{false};
 
   // If we did a zero velocity update
   bool did_zupt_update = false;

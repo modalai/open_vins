@@ -4,6 +4,7 @@
  * Copyright (C) 2018-2023 Guoquan Huang
  * Copyright (C) 2018-2023 OpenVINS Contributors
  * Copyright (C) 2018-2019 Kevin Eckenhoff
+ * Contributor: Joao Leonardo Silva Cotta (@zauberflote1)
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -96,6 +97,11 @@ struct InertialInitializerOptions {
   /// Magnitude we will inflate initial covariance of orientation
   double init_dyn_inflation_orientation = 10.0;
 
+  /// Magnitude we will inflate initial covariance of position. 1.0 = none (default, no behavior
+  /// change); the NEES gold standard shows the free-S2 init's position is mildly overconfident, so
+  /// a value >1 may be warranted -- tune on real reset data rather than baking in a sim-derived one.
+  double init_dyn_inflation_position = 1.0;
+
   /// Magnitude we will inflate initial covariance of velocity
   double init_dyn_inflation_velocity = 10.0;
 
@@ -104,6 +110,13 @@ struct InertialInitializerOptions {
 
   /// Magnitude we will inflate initial covariance of accelerometer bias
   double init_dyn_inflation_bias_accel = 100.0;
+
+  /// Warm-start injection: if true, the dynamic initializer returns the FULL joint covariance over the
+  /// IMU state + all window clones (landmark-marginalized) and the EKF is seeded with those clones, so
+  /// the filter can update immediately instead of cold-starting and re-collecting a fresh window. The
+  /// joint covariance, the gravity re-align similarity transform, and the congruence inflation are all
+  /// extended consistently to the clone blocks. Off => legacy IMU-only (15x15) seed, bit-for-bit.
+  bool init_warmstart_inject = false;
 
   /// Minimum reciprocal condition number acceptable for our covariance recovery (min_sigma / max_sigma <
   /// sqrt(min_reciprocal_condition_number))
@@ -140,9 +153,11 @@ struct InertialInitializerOptions {
       parser->parse_config("init_dyn_num_pose", init_dyn_num_pose);
       parser->parse_config("init_dyn_min_deg", init_dyn_min_deg);
       parser->parse_config("init_dyn_inflation_ori", init_dyn_inflation_orientation);
+      parser->parse_config("init_dyn_inflation_pos", init_dyn_inflation_position, false); // optional; keeps default if absent
       parser->parse_config("init_dyn_inflation_vel", init_dyn_inflation_velocity);
       parser->parse_config("init_dyn_inflation_bg", init_dyn_inflation_bias_gyro);
       parser->parse_config("init_dyn_inflation_ba", init_dyn_inflation_bias_accel);
+      parser->parse_config("init_warmstart_inject", init_warmstart_inject, false); // optional; keeps default if absent
       parser->parse_config("init_dyn_min_rec_cond", init_dyn_min_rec_cond);
       std::vector<double> bias_g = {0, 0, 0};
       std::vector<double> bias_a = {0, 0, 0};
@@ -181,9 +196,11 @@ struct InertialInitializerOptions {
     PRINT_DEBUG("  - init_dyn_num_pose: %d\n", init_dyn_num_pose);
     PRINT_DEBUG("  - init_dyn_min_deg: %.2f\n", init_dyn_min_deg);
     PRINT_DEBUG("  - init_dyn_inflation_ori: %.2e\n", init_dyn_inflation_orientation);
+    PRINT_DEBUG("  - init_dyn_inflation_pos: %.2e\n", init_dyn_inflation_position);
     PRINT_DEBUG("  - init_dyn_inflation_vel: %.2e\n", init_dyn_inflation_velocity);
     PRINT_DEBUG("  - init_dyn_inflation_bg: %.2e\n", init_dyn_inflation_bias_gyro);
     PRINT_DEBUG("  - init_dyn_inflation_ba: %.2e\n", init_dyn_inflation_bias_accel);
+    PRINT_DEBUG("  - init_warmstart_inject: %d\n", init_warmstart_inject);
     PRINT_DEBUG("  - init_dyn_min_rec_cond: %.2e\n", init_dyn_min_rec_cond);
     if (init_dyn_num_pose < 4) {
       PRINT_ERROR(RED "number of requested frames to init not enough!!\n" RESET);

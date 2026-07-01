@@ -33,7 +33,9 @@
 #include <opencv2/highgui/highgui.hpp>
 #include <opencv2/opencv.hpp>
 
+#if HAVE_OPENCL
 #include <CL/cl.h>
+#endif
 
 #include "utils/colors.h"
 #include "utils/print.h"
@@ -153,7 +155,9 @@ public:
   /// Setter method for number of active features
   void set_num_features(int _num_features) { num_features = _num_features; }
 
+#if HAVE_OPENCL
   virtual cl_context get_ocl_context() const { return nullptr; }
+#endif
 
 protected:
   /// Camera object which has all calibration in it

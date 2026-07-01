@@ -3,6 +3,7 @@
  * Copyright (C) 2018-2023 Patrick Geneva
  * Copyright (C) 2018-2023 Guoquan Huang
  * Copyright (C) 2018-2023 OpenVINS Contributors
+ * Contributor: Joao Leonardo Silva Cotta (@zauberflote1)
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -34,6 +35,10 @@ ParallelExecutor::ParallelExecutor(int num_threads, std::function<void(int)> wor
   int hw = (int)std::thread::hardware_concurrency();
   if (hw < 1)
     hw = 1;
+  // Honor the requested worker count (it comes from the YAML init_dyn_mle_max_threads), bounded only
+  // by the physical core count. RT-safety (keeping cores free for the 1 kHz IMU / camera threads) is a
+  // DEPLOYMENT choice made in the config -- set init_dyn_mle_max_threads <= cores-2 there; the library
+  // does not force it.
   num_workers_ = std::max(1, std::min(num_threads, hw));
   if (num_workers_ <= 1) {
     num_workers_ = 1;

@@ -4,6 +4,7 @@
  * Copyright (C) 2018-2023 Guoquan Huang
  * Copyright (C) 2018-2023 OpenVINS Contributors
  * Copyright (C) 2018-2019 Kevin Eckenhoff
+ * Contributor: Joao Leonardo Silva Cotta (@zauberflote1)
  *
  * Ceres-free initialization backend (ov_init::zbft_sfm)
  * ------------------------------------------------
@@ -33,6 +34,8 @@ namespace zbft_sfm {
  * Parameter blocks (canonical VINS clone order), 15 residuals:
  *   [0] q_GtoI1 (4)  [1] bg_1 (3)  [2] v_I1inG (3)  [3] ba_1 (3)  [4] p_I1inG (3)
  *   [5] q_GtoI2 (4)  [6] bg_2 (3)  [7] v_I2inG (3)  [8] ba_2 (3)  [9] p_I2inG (3)
+ *   [10] gravity (3, optional) — when present, gravity is a free parameter on S²(G)
+ *        rather than the fixed grav_save. The solver applies the S² manifold Jacobian.
  */
 class Factor_ImuCPIv1 : public CostFunction {
 public:

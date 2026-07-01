@@ -223,6 +223,66 @@ void StateHelper::set_initial_covariance(std::shared_ptr<State> state, const Eig
   state->_Cov = state->_Cov.selfadjointView<Eigen::Upper>();
 }
 
+bool StateHelper::set_initial_state_warmstart(std::shared_ptr<State> state, const Eigen::MatrixXd &covariance,
+                                              const std::map<double, std::shared_ptr<ov_type::PoseJPL>> &clones_IMU) {
+
+  // Contract: `covariance` is the joint, landmark-marginalized navigation covariance in LOCAL error
+  // coordinates, ordered [IMU(15) | clone_0(6) | clone_1(6) | ...] with clones ASCENDING in time, which
+  // is exactly clones_IMU's (std::map) iteration order. The IMU block is the active state->_imu, already
+  // valued by the initializer; the clones are fresh, valued PoseJPL objects not yet in the covariance.
+  const int K = (int)clones_IMU.size();
+  const int imu_sz = state->_imu->size(); // 15
+  const int expected = imu_sz + 6 * K;
+
+  // Defensive gate -- a wrong joint covariance is worse than a cold start, so verify the contract and
+  // let the caller fall back to the legacy IMU-only seed on any violation.
+  if (K == 0 || state->_imu->id() != 0 || covariance.rows() != expected || covariance.cols() != expected) {
+    PRINT_ERROR(RED "StateHelper::set_initial_state_warmstart() - contract violated (imu_id=%d, cov=%ldx%ld, expected %d, K=%d)\n" RESET,
+                state->_imu->id(), (long)covariance.rows(), (long)covariance.cols(), expected, K);
+    return false;
+  }
+  for (auto const &cp : clones_IMU) {
+    if (cp.second == nullptr || state->_clones_IMU.find(cp.first) != state->_clones_IMU.end()) {
+      PRINT_ERROR(RED "StateHelper::set_initial_state_warmstart() - clone @ %.6f null or already in state\n" RESET, cp.first);
+      return false;
+    }
+  }
+
+  // Grow the covariance ONCE for all K clones (single reallocation; the new rows/cols are zero-filled,
+  // i.e. clones start uncorrelated with the existing calibration blocks -- the same block-diagonal
+  // assumption set_initial_covariance() makes for the IMU). Register each clone (id / _variables /
+  // _clones_IMU) and build the [imu, clones-ascending] ordering used to place the joint covariance.
+  std::vector<std::shared_ptr<Type>> order;
+  order.reserve(1 + K);
+  order.push_back(state->_imu);
+  const int old_size = (int)state->_Cov.rows();
+  state->_Cov.conservativeResizeLike(Eigen::MatrixXd::Zero(old_size + 6 * K, old_size + 6 * K));
+  int loc = old_size;
+  for (auto const &cp : clones_IMU) { // ascending time -> matches the clone-block order in `covariance`
+    std::shared_ptr<PoseJPL> pose = cp.second;
+    pose->set_local_id(loc);
+    state->_variables.push_back(pose);
+    state->_clones_IMU[cp.first] = pose;
+    order.push_back(pose);
+    loc += pose->size(); // 6
+  }
+
+  // Copy the joint covariance (diagonal blocks AND all cross-terms) into the state covariance, mapping
+  // contiguous source offsets to each variable's id. Identical block-copy to set_initial_covariance.
+  int i_index = 0;
+  for (size_t i = 0; i < order.size(); i++) {
+    int k_index = 0;
+    for (size_t k = 0; k < order.size(); k++) {
+      state->_Cov.block(order[i]->id(), order[k]->id(), order[i]->size(), order[k]->size()) =
+          covariance.block(i_index, k_index, order[i]->size(), order[k]->size());
+      k_index += order[k]->size();
+    }
+    i_index += order[i]->size();
+  }
+  state->_Cov = state->_Cov.selfadjointView<Eigen::Upper>();
+  return true;
+}
+
 Eigen::MatrixXd StateHelper::get_marginal_covariance(std::shared_ptr<State> state,
                                                      const std::vector<std::shared_ptr<Type>> &small_variables) {
 

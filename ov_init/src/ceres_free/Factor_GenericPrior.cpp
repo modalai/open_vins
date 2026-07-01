@@ -3,6 +3,7 @@
  * Copyright (C) 2018-2023 Patrick Geneva
  * Copyright (C) 2018-2023 Guoquan Huang
  * Copyright (C) 2018-2023 OpenVINS Contributors
+ * Contributor: Joao Leonardo Silva Cotta (@zauberflote1)
  *
  * Lifted from ov_init/src/ceres/Factor_GenericPrior.cpp (residual + Jacobians verbatim).
  *

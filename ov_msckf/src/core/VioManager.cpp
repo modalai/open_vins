@@ -192,6 +192,52 @@ VioManager::VioManager(VioManagerOptions &params_) : thread_init_running(false),
   }
 }
 
+void VioManager::soft_reset() {
+
+  // Stop/clear the async initialization machinery (the caller has already quiesced sensor callbacks).
+  {
+    std::lock_guard<std::mutex> lck(camera_queue_init_mtx);
+    camera_queue_init.clear();
+  }
+  thread_init_running.store(false);
+  thread_init_success.store(false);
+  is_initialized_vio = false;
+  timelastupdate = -1;
+  startup_time = -1;
+
+  // This is a mid-ops re-init with a warm front-end (feature DB + IMU history preserved below), so the
+  // next successful initialization may warm-start. First boot / hard reset never set this -> cold-start.
+  warmstart_next_init.store(true);
+
+  // Fresh navigation EKF with the configured calibration (mirrors the constructor). The feature
+  // tracker, inertial initializer (IMU history) and propagator are VioManager members and are
+  // intentionally PRESERVED, so re-initialization reuses the already-buffered recent measurements.
+  state = std::make_shared<State>(params.state_options);
+  state->_calib_imu_dw->set_value(params.vec_dw);
+  state->_calib_imu_dw->set_fej(params.vec_dw);
+  state->_calib_imu_da->set_value(params.vec_da);
+  state->_calib_imu_da->set_fej(params.vec_da);
+  state->_calib_imu_tg->set_value(params.vec_tg);
+  state->_calib_imu_tg->set_fej(params.vec_tg);
+  state->_calib_imu_GYROtoIMU->set_value(params.q_GYROtoIMU);
+  state->_calib_imu_GYROtoIMU->set_fej(params.q_GYROtoIMU);
+  state->_calib_imu_ACCtoIMU->set_value(params.q_ACCtoIMU);
+  state->_calib_imu_ACCtoIMU->set_fej(params.q_ACCtoIMU);
+  Eigen::VectorXd temp_camimu_dt(1);
+  temp_camimu_dt(0) = params.calib_camimu_dt;
+  state->_calib_dt_CAMtoIMU->set_value(temp_camimu_dt);
+  state->_calib_dt_CAMtoIMU->set_fej(temp_camimu_dt);
+  state->_cam_intrinsics_cameras = params.camera_intrinsics;
+  for (int i = 0; i < state->_options.num_cameras; i++) {
+    state->_cam_intrinsics.at(i)->set_value(params.camera_intrinsics.at(i)->get_value());
+    state->_cam_intrinsics.at(i)->set_fej(params.camera_intrinsics.at(i)->get_value());
+    state->_calib_IMUtoCAM.at(i)->set_value(params.camera_extrinsics.at(i));
+    state->_calib_IMUtoCAM.at(i)->set_fej(params.camera_extrinsics.at(i));
+  }
+
+  PRINT_INFO("[soft-reset]: EKF reset; feature DB + IMU history preserved for fast re-init\n");
+}
+
 void VioManager::feed_measurement_batch_imu(const std::vector<ov_core::ImuData>& messages, double target_freq_hz) {
     if (messages.empty()) return;
 

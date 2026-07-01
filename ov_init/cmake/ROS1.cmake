@@ -42,30 +42,45 @@ list(APPEND thirdparty_libraries
         Threads::Threads
 )
 
+# For native builds without ROS, add ov_core library path early
+if (NOT catkin_FOUND OR NOT ENABLE_ROS)
+    if (EXISTS "${CMAKE_SOURCE_DIR}/../ov_core/build_native/libov_core_lib.so")
+        link_directories(${CMAKE_SOURCE_DIR}/../ov_core/build_native)
+    endif()
+endif()
+
 ##################################################
 # Make the shared library
 ##################################################
 
 list(APPEND LIBRARY_SOURCES
         src/dummy.cpp
-        src/ceres/Factor_GenericPrior.cpp
-        src/ceres/Factor_ImageReprojCalib.cpp
-        src/ceres/Factor_ImuCPIv1.cpp
-        src/ceres/State_JPLQuatLocal.cpp
         src/init/InertialInitializer.cpp
         src/dynamic/DynamicInitializer.cpp
         src/static/StaticInitializer.cpp
         src/sim/SimulatorInit.cpp
-        # Ceres-free initialization backend (ov_init::zbft_sfm). Depends only on
-        # Eigen + ov_core + pthread; compiles alongside the Ceres path until the
-        # A/B parity gate flips the default (then src/ceres/* + Ceres are removed).
+)
+
+# Ceres-free initialization backend (ov_init::zbft_sfm). Depends only on
+# Eigen + ov_core + pthread.
+if (OV_INIT_CERES_FREE)
+    list(APPEND LIBRARY_SOURCES
         src/ceres_free/Parallel.cpp
         src/ceres_free/Problem.cpp
         src/ceres_free/State_JPLQuatLocal.cpp
         src/ceres_free/Factor_GenericPrior.cpp
         src/ceres_free/Factor_ImageReprojCalib.cpp
         src/ceres_free/Factor_ImuCPIv1.cpp
-)
+    )
+else()
+    # Original Ceres-based factors (require Ceres with LocalParameterization API)
+    list(APPEND LIBRARY_SOURCES
+        src/ceres/Factor_GenericPrior.cpp
+        src/ceres/Factor_ImageReprojCalib.cpp
+        src/ceres/Factor_ImuCPIv1.cpp
+        src/ceres/State_JPLQuatLocal.cpp
+    )
+endif()
 file(GLOB_RECURSE LIBRARY_HEADERS "src/*.h")
 add_library(ov_init_lib SHARED ${LIBRARY_SOURCES} ${LIBRARY_HEADERS})
 
@@ -73,7 +88,6 @@ add_library(ov_init_lib SHARED ${LIBRARY_SOURCES} ${LIBRARY_HEADERS})
 # This isn't that elegant of a way, but this at least allows for building without ROS
 # See this stackoverflow answer: https://stackoverflow.com/a/11217008/7718197
 if (NOT catkin_FOUND OR NOT ENABLE_ROS)
-
     message(STATUS "MANUALLY LINKING TO OV_CORE LIBRARY....")
     include_directories(${CMAKE_SOURCE_DIR}/../ov_core/src/)
     target_link_libraries(ov_init_lib ov_core_lib)
@@ -104,21 +118,9 @@ install(DIRECTORY src/
 #         RUNTIME DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 # )
 
-# add_executable(test_dynamic_mle src/test_dynamic_mle.cpp)
-# target_link_libraries(test_dynamic_mle ov_init_lib ${thirdparty_libraries})
-# install(TARGETS test_dynamic_mle
-#         ARCHIVE DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}
-#         LIBRARY DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}
-#         RUNTIME DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
-# )
-
-# add_executable(test_dynamic_init src/test_dynamic_init.cpp)
-# target_link_libraries(test_dynamic_init ov_init_lib ${thirdparty_libraries})
-# install(TARGETS test_dynamic_init
-#         ARCHIVE DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}
-#         LIBRARY DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}
-#         RUNTIME DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
-# )
+# test_dynamic_init using TrackSIM (no modal_flow needed for simulation)
+add_executable(test_dynamic_init src/test_dynamic_init.cpp)
+target_link_libraries(test_dynamic_init ov_init_lib ${thirdparty_libraries})
 
 # Ceres-free solver core self-test (Eigen-only; see ceres_free/README.md).
 # Enable to build, or compile standalone with g++ (no ov_core/Ceres needed):

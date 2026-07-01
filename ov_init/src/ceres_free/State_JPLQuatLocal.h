@@ -4,6 +4,7 @@
  * Copyright (C) 2018-2023 Guoquan Huang
  * Copyright (C) 2018-2023 OpenVINS Contributors
  * Copyright (C) 2018-2019 Kevin Eckenhoff
+ * Contributor: Joao Leonardo Silva Cotta (@zauberflote1)
  *
  * Ceres-free initialization backend (ov_init::zbft_sfm)
  * ------------------------------------------------
@@ -38,6 +39,7 @@ public:
   bool ComputeJacobian(const double *x, double *jacobian) const override;
   int GlobalSize() const override { return 4; }
   int LocalSize() const override { return 3; }
+  bool tangent_is_leading_identity() const override { return true; } // V = [I₃; 0]
 };
 
 } // namespace zbft_sfm

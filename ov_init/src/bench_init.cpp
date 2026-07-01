@@ -29,6 +29,7 @@
 
 #include "ceres_free/Factor_GenericPrior.h"
 #include "ceres_free/Factor_ImuCPIv1.h"
+#include "ceres_free/LocalParameterization.h"
 #include "ceres_free/LossFunction.h"
 #include "ceres_free/Problem.h"
 #include "ceres_free/State_JPLQuatLocal.h"
@@ -355,6 +356,12 @@ static Result run_zbft(const Sim &s, const InitGuess &g, int num_threads, bool u
 
   Problem problem;
   problem.EnableOwnership();
+
+  // Gravity as a CONSTANT S² block (bench exercises the 11-block signature without optimizing g)
+  auto *gravity_s2_param = new GravityS2Parameterization(grav.norm());
+  problem.AddParameterBlock(grav.data(), 3, gravity_s2_param);
+  problem.SetParameterBlockConstant(grav.data());
+
   for (int i = 0; i < s.N; ++i) {
     auto *qparam = new State_JPLQuatLocal();
     qp.push_back(qparam);
@@ -370,9 +377,10 @@ static Result run_zbft(const Sim &s, const InitGuess &g, int num_threads, bool u
       auto c = s.cpi[i - 1];
       auto *f = new Factor_ImuCPIv1(c->DT, grav, c->alpha_tau, c->beta_tau, c->q_k2tau, c->b_a_lin, c->b_w_lin, c->J_q, c->J_b, c->J_a,
                                     c->H_b, c->H_a, c->P_meas);
+      // 11th block: gravity (constant here for bench parity)
       problem.AddResidualBlock(f, nullptr,
                                {q[i - 1].data(), bg[i - 1].data(), v[i - 1].data(), ba[i - 1].data(), p[i - 1].data(), q[i].data(),
-                                bg[i].data(), v[i].data(), ba[i].data(), p[i].data()});
+                                bg[i].data(), v[i].data(), ba[i].data(), p[i].data(), grav.data()});
     }
   }
   for (int j = 0; j < s.M; ++j) {

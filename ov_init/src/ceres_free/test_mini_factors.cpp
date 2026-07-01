@@ -3,6 +3,7 @@
  * Copyright (C) 2018-2023 Patrick Geneva
  * Copyright (C) 2018-2023 Guoquan Huang
  * Copyright (C) 2018-2023 OpenVINS Contributors
+ * Contributor: Joao Leonardo Silva Cotta (@zauberflote1)
  *
  * Finite-difference validation of the LIFTED analytic factors (ov_init::zbft_sfm)
  * against ov_core. Confirms the residual/Jacobian transcription is correct.
@@ -24,6 +25,7 @@
  * (at your option) any later version.
  */
 
+#include <cmath>
 #include <cstdio>
 #include <random>
 #include <vector>
@@ -32,6 +34,7 @@
 
 #include "Factor_GenericPrior.h"
 #include "Factor_ImuCPIv1.h"
+#include "LocalParameterization.h"
 #include "State_JPLQuatLocal.h"
 
 #include "cpi/CpiV1.h"
@@ -135,9 +138,11 @@ static void test_imu_cpi(std::mt19937 &rng) {
 
   // States set near the preintegrated prediction so the residual is ~0 -- the regime
   // the factor actually operates in during initialization. (Block order per clone:
-  // q, bg, v, ba, p.) The analytic CPI Jacobian is a linearization, so the FD check is
-  // performed at a representative operating point, not at random ~180-deg-apart states.
+  // q, bg, v, ba, p; 11th block: gravity on S².)
+  // The analytic CPI Jacobian is a linearization, so the FD check is performed at a
+  // representative operating point, not at random ~180-deg-apart states.
   State_JPLQuatLocal quat;
+  GravityS2Parameterization grav_s2(grav.norm());
   Eigen::Vector4d q1 = rand_quat(rng);
   Eigen::Matrix3d R1 = ov_core::quat_2_Rot(q1);
   Eigen::Vector4d q2 = ov_core::quatnorm(ov_core::quat_multiply(cpi.q_k2tau, q1)); // zero orientation residual
@@ -145,12 +150,14 @@ static void test_imu_cpi(std::mt19937 &rng) {
   Eigen::Vector3d v2 = v1 - grav * cpi.DT + R1.transpose() * cpi.beta_tau;
   Eigen::Vector3d p1(0.1, 0.2, -0.15);
   Eigen::Vector3d p2 = p1 + v1 * cpi.DT - 0.5 * grav * cpi.DT * cpi.DT + R1.transpose() * cpi.alpha_tau;
-  std::vector<Eigen::VectorXd> xs(10);
+  std::vector<Eigen::VectorXd> xs(11);
   xs[0] = q1; xs[1] = bg_lin; xs[2] = v1; xs[3] = ba_lin; xs[4] = p1;
   xs[5] = q2; xs[6] = bg_lin; xs[7] = v2; xs[8] = ba_lin; xs[9] = p2;
+  xs[10] = grav; // gravity (S² param, 3-global, 2-local)
   std::vector<const LocalParameterization *> lps = {&quat, nullptr, nullptr, nullptr, nullptr,
-                                                    &quat, nullptr, nullptr, nullptr, nullptr};
-  check_lt(fd_error(f, xs, lps), 1e-5, "Factor_ImuCPIv1");
+                                                    &quat, nullptr, nullptr, nullptr, nullptr,
+                                                    &grav_s2};
+  check_lt(fd_error(f, xs, lps), 1e-5, "Factor_ImuCPIv1 (incl. S2 gravity)");
 }
 
 static void test_generic_prior(std::mt19937 &rng) {
@@ -193,11 +200,71 @@ static void test_generic_prior(std::mt19937 &rng) {
   }
 }
 
+// Standalone validation of the S² gravity retraction + tangent basis (independent of any
+// factor): (a) B(g) is orthonormal and ⊥ g, (b) the retraction stays on the sphere of radius
+// G for any step size, (c) ComputeJacobian == d Plus/d delta at delta=0 (central difference).
+static void check_gravity_s2_at(const Eigen::Vector3d &g_dir, double G, const char *label) {
+  Eigen::Vector3d g = G * g_dir.normalized(); // put it on the sphere
+  GravityS2Parameterization param(G);
+  const LocalParameterization &lp = param; // 2-arg Eigen Plus() wrapper lives on the base (hidden by the override)
+  Eigen::Vector3d ghat = g.normalized();
+  char name[96];
+
+  // (a) tangent basis: orthonormal columns, both ⊥ g
+  Eigen::MatrixXd B = param.PlusJacobian(g.data()); // 3x2, == ComputeJacobian at delta=0
+  std::snprintf(name, sizeof(name), "S2 %-14s BtB == I2", label);
+  check_lt((B.transpose() * B - Eigen::Matrix2d::Identity()).cwiseAbs().maxCoeff(), 1e-9, name);
+  std::snprintf(name, sizeof(name), "S2 %-14s B cols perp g", label);
+  check_lt((B.transpose() * ghat).cwiseAbs().maxCoeff(), 1e-9, name);
+
+  // (b) retraction stays on the sphere across a wide range of step magnitudes
+  std::mt19937 rng(12345);
+  std::normal_distribution<double> N(0, 1);
+  double max_sphere_err = 0.0;
+  for (double scale : {1e-3, 1e-1, 1.0, 3.0})
+    for (int t = 0; t < 8; ++t) {
+      Eigen::Vector2d d(scale * N(rng), scale * N(rng));
+      max_sphere_err = std::max(max_sphere_err, std::abs(lp.Plus(g,d).norm() - G));
+    }
+  std::snprintf(name, sizeof(name), "S2 %-14s |Plus| == G", label);
+  check_lt(max_sphere_err, 1e-9, name);
+
+  // (c) analytic Jacobian == central difference of Plus wrt delta at delta=0
+  const double eps = 1e-6;
+  double max_jac_err = 0.0;
+  for (int j = 0; j < 2; ++j) {
+    Eigen::Vector2d dp = Eigen::Vector2d::Zero(), dm = Eigen::Vector2d::Zero();
+    dp(j) = eps;
+    dm(j) = -eps;
+    Eigen::Vector3d col = (lp.Plus(g,dp) - lp.Plus(g,dm)) / (2.0 * eps);
+    max_jac_err = std::max(max_jac_err, (col - B.col(j)).cwiseAbs().maxCoeff());
+  }
+  std::snprintf(name, sizeof(name), "S2 %-14s J == dPlus/ddelta", label);
+  check_lt(max_jac_err, 1e-6, name);
+}
+
+static void test_gravity_s2() {
+  std::printf("[test] GravityS2Parameterization manifold (retraction + tangent basis)\n");
+  const double G = 9.81;
+  auto deg = [](double d) { return d * M_PI / 180.0; };
+  check_gravity_s2_at(Eigen::Vector3d(0, 0, 1), G, "pole +Z");
+  check_gravity_s2_at(Eigen::Vector3d(0, std::sin(deg(5)), std::cos(deg(5))), G, "tilt 5deg");
+  check_gravity_s2_at(Eigen::Vector3d(0, std::sin(deg(30)), std::cos(deg(30))), G, "tilt 30deg");
+  check_gravity_s2_at(Eigen::Vector3d(0, std::sin(deg(89)), std::cos(deg(89))), G, "tilt 89deg");
+  check_gravity_s2_at(Eigen::Vector3d(0, 0, -1), G, "flipped -Z");
+  // exercise each argmin-axis branch of the tangent-basis seed selection
+  check_gravity_s2_at(Eigen::Vector3d(0.99, 0.10, 0.10), G, "mostly X");
+  check_gravity_s2_at(Eigen::Vector3d(0.10, 0.99, 0.10), G, "mostly Y");
+  check_gravity_s2_at(Eigen::Vector3d(0.10, 0.10, 0.99), G, "mostly Z");
+  check_gravity_s2_at(Eigen::Vector3d(0.5001, 0.5, 0.707), G, "argmin edge");
+}
+
 int main() {
   std::printf("==== ov_init::zbft_sfm lifted-factor FD tests (vs ov_core) ====\n");
   std::mt19937 rng(7);
   test_imu_cpi(rng);
   test_generic_prior(rng);
+  test_gravity_s2();
   std::printf("==== %d failures ====\n", g_failures);
   return g_failures == 0 ? 0 : 1;
 }
