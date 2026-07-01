@@ -8,17 +8,17 @@ anchoring, gravity gate/re-align, covariance recovery, and warm-start injection 
 top of it. It is purpose-built for the visual-inertial (re)initialization / reset problem
 on resource-constrained hardware (QRB5165), not a general graph optimizer.
 
-Ceres has exactly one real consumer in this tree (the `ov_init` dynamic MLE — `ov_core`,
-`ov_msckf`, `ov_eval` contain **zero** `ceres::` usage). Replacing it here lets the
-`voxl-ceres-solver` dependency be dropped from the flight image once the removal step
-(below) is taken.
+Ceres had exactly one real consumer in this tree (the `ov_init` dynamic MLE — `ov_core`,
+`ov_msckf`, `ov_eval` contain **zero** `ceres::` usage). With the ceres-free path now the
+default, **a normal build no longer finds or links Ceres**, and the `voxl-ceres-solver` /
+`libceres-dev` dependencies have been dropped (see **Build wiring**). Ceres survives only as an
+opt-in A/B fallback under `-DOV_INIT_CERES_FREE=OFF`.
 
 > **Status in one line:** the ceres-free path is **implemented, wired into
-> `DynamicInitializer`, and ON BY DEFAULT** (`OV_INIT_CERES_FREE=ON`). It is what a normal
-> build compiles and what the shipped `fpv` config runs. Ceres is retained only as a
-> compile-time A/B fallback and has **not** been removed yet. See **Current status** at the
-> bottom for what is verified vs. what is still open — do not assume "done" means
-> "consistency-validated on hardware."
+> `DynamicInitializer`, ON BY DEFAULT** (`OV_INIT_CERES_FREE=ON`), and **the default build no
+> longer finds or links Ceres**. It is what a normal build compiles and what the shipped `fpv`
+> config runs. See **Current status** at the bottom for what is verified vs. what is still open —
+> do not assume "done" means "consistency-validated on hardware."
 
 ## Why Ceres-free (the RT argument)
 
@@ -76,13 +76,25 @@ gravity_mag`, 3 global coords, **2 local** tilt DOF) via `GravityS2Parameterizat
   `quat_yaw` gauge, so the first-pose gauge can use a **full 3-DOF orientation soft prior**
   (tight, ~0.057°) + position + bias priors rather than hard-fixing states — which is what lets
   init/reset succeed at aggressive/arbitrary attitudes.
-- **Post-solve gravity gate + conditional re-align:** if optimized `g` is >30° from +Z the
-  init is **rejected** (flip/corruption guard, protects downstream PX4 NED); if >0.1° all
-  states are rotated (Rodrigues) so `g → +Z` before injection.
+- **Weak +Z gravity prior** (`init_dyn_grav_prior_sigma`, default `0.5` m/s² ≈ 3°): a soft prior
+  pulling `g` toward its +Z seed. It fights the gravity↔accel-bias ambiguity and the flipped-gravity
+  basin — in the NEES gold standard it takes flip rejection **42/50 → 49/50** with negligible accuracy
+  cost (grav err 2.62 vs 2.64°). Set `≤ 0` to disable.
+- **Post-solve gravity gate + conditional re-align:** if optimized `g` is more than
+  `init_dyn_grav_gate_deg` (default `30°`) from +Z the init is **rejected** (flip/corruption guard,
+  protects downstream PX4 NED); if >0.1° all states are rotated (Rodrigues) so `g → +Z` before injection.
 - **Covariance is recovered AT the optimum, before re-align**, then carried through the
   re-align by a closed-form similarity `T = blkdiag(I, R, R, I, I)` (per clone `blkdiag(I,R)`)
   — so the injected covariance stays consistent with the (possibly rotated) injected state
   instead of being re-linearized off-optimum.
+
+**Gate decoupling (any-attitude reset).** The wide-attitude claim above relies on three *separate*
+gravity gates that used to be one coupled knob: the **static** initializer keeps a tight
+`init_static_gravity_max_angle` (default 5°, so a pitched/held platform is not given a bogus confident
+static seed), the **dynamic** S² path uses a wide `init_gravity_max_angle` (85° in `fpv`), and the
+**server** `FrameTransform` no longer gates the sensor feed on tilt (`imu_init_max_gravity_angle_deg`,
+default any-attitude) — otherwise a pitched boot never fed the estimator. That gate code lives in the
+init pipeline / server, not in this solver.
 
 ## Warm-start injection
 
@@ -97,6 +109,11 @@ inflation is applied as a proper **congruence** `S·Σ·Sᵀ` extended over the 
 (not a diagonal-only scale), and a new `init_dyn_inflation_pos` knob exists (default `1.0` =
 no change).
 
+`set_initial_state_warmstart` additionally **rejects a non-finite or non-PSD (non-positive-diagonal)
+joint covariance before mutating any state** and falls back to the cold-start seed — a wrong joint
+covariance is worse than a cold start (e.g. a divergence-triggered soft reset whose recovered
+covariance is garbage).
+
 ## Threading model (lock-free)
 
 `Parallel.{h,cpp}` is a pre-spawned worker pool using **only release/acquire atomics**,
@@ -110,15 +127,21 @@ fixed `num_threads`** (verified); across thread counts, identical up to FP summa
 ## Build wiring
 
 - CMake option **`OV_INIT_CERES_FREE` (default `ON`)** → `add_definitions(-DUSE_CERES_FREE_INIT)`
-  (`ov_init/CMakeLists.txt`). This macro selects the ceres-free path in
-  `DynamicInitializer.cpp`; the Ceres path is the `#else` fallback. Build with
-  `-DOV_INIT_CERES_FREE=OFF` to A/B against Ceres.
-- `ceres_free/*.cpp` are compiled into `ov_init_lib` (`ov_init/cmake/ROS1.cmake`).
-- **Ceres is still a hard dependency and has NOT been removed:** `find_package(Ceres REQUIRED)`,
-  `${CERES_LIBRARIES}` on the link line, `voxl-ceres-solver` in `install_build_deps.sh`, and the
-  `src/ceres/*` factors still dual-compiled as the fallback. (Note: because the active build
-  `#ifdef`s the Ceres path out, the shipped `libov_init_lib.so` contains no `ceres::` symbols
-  even though it links libceres.)
+  (`ov_init/CMakeLists.txt`, declared *before* the Ceres lookup). This macro selects the ceres-free
+  path in `DynamicInitializer.cpp`; the Ceres path is the `#else` fallback (`-DOV_INIT_CERES_FREE=OFF`).
+- **The default build does NOT find or link Ceres.** `find_package(Ceres REQUIRED)` runs *only* on the
+  OFF fallback; `ov_msckf` and `server` (zero `ceres::` usage) dropped their vestigial
+  `find_package(Ceres)` + `${CERES_*}` entirely. `voxl-ceres-solver` (`install_build_deps.sh`) and
+  `libceres-dev` (`ov_init`/`ov_msckf` `package.xml`) were removed. *Verified:* a fresh default
+  configure prints `USING CERES-FREE ... (Ceres not required)`, and the built `libov_init_lib.so` has
+  **0 `ceres::` symbols and no `libceres` in `ldd`**.
+- `ceres_free/*.cpp` compile into `ov_init_lib`; `src/ceres/*` compile *only* on the OFF fallback
+  (which then needs `voxl-ceres-solver` / `libceres-dev` re-provisioned).
+- Test/benchmark executables are behind **`OV_INIT_BUILD_TESTS` (default `OFF`)** so production/Debian
+  builds compile none of them; the Eigen-only self-tests register with CTest. `bench_init` (which
+  compiles the `ceres/` factors) is additionally guarded by `find_package(Ceres QUIET)`.
+- Build type is **Release, `-O3 -ffast-math -ftree-vectorize`** (ARMv8.2-A); `build.sh` passes
+  `-DCMAKE_BUILD_TYPE=Release`.
 
 ## Verification (reproduced natively — x86-64 g++ 13.3, this pass)
 
@@ -151,45 +174,48 @@ g++ -O2 -std=c++17 -pthread -I/usr/include/eigen3 -Iceres_free \
 rel. diff 1.2e-5). LM **55.7 ms vs 73.5 ms (0.76×)**, dogleg **50.6 ms vs 72.0 ms (0.70×)**.
 Reproduce: `adb push` the cross-built `bench_init` and run `./bench_init 30 1 0 0`.
 
-## Standalone validation binaries (manual build — NOT wired into CMake)
+## Validation binaries (wired into CMake under `OV_INIT_BUILD_TESTS`, default OFF)
 
-These live in `ov_init/src/` (+ `ceres_free/`) and are compiled by hand (recipes in each
-file header), not by the CMake build:
+Enable with `-DOV_INIT_BUILD_TESTS=ON`; the Eigen-only ones run under CTest
+(`ctest --test-dir <build> --output-on-failure`). They compile *only* when tests are enabled, so
+production builds skip them. Standalone `g++` recipes are still in each file header.
 
-| File | Purpose | Re-run this pass |
-|------|---------|------------------|
-| `ceres_free/test_mini_solver.cpp` | Eigen-only solver-core self-test | ✅ 13/13 |
-| `ceres_free/test_warmstart_cov.cpp` | Warm-start joint-covariance / realign / inflation | ✅ 20/20 |
-| `ceres_free/test_mini_factors.cpp` | FD checks of lifted factors vs `ov_core` | not run |
-| `test_init_consistency.cpp` | Monte-Carlo **NEES** consistency gold standard (S² gravity) | ⚠️ ran — see below |
-| `test_init_ab_compare.cpp` | Ceres vs ceres-free A/B on identical synthetic window | not run |
-| `bench_zbft_s2.cpp` | S²-gravity MLE micro-benchmark | not run |
+| File | Purpose | CTest | Status |
+|------|---------|-------|--------|
+| `ceres_free/test_mini_solver.cpp` | Eigen-only solver-core self-test | ✅ | 13/13 |
+| `ceres_free/test_warmstart_cov.cpp` | Warm-start joint-cov / realign / inflation congruence | ✅ | 20/20 |
+| `test_init_consistency.cpp` | Monte-Carlo **NEES** consistency + flip-rejection gold standard | ✅ | red gate (see status) |
+| `ceres_free/test_mini_factors.cpp` | FD checks of lifted factors vs `ov_core` | — | manual |
+| `test_init_ab_compare.cpp` | Ceres vs ceres-free A/B (needs Ceres) | — | manual |
+| `bench_zbft_s2.cpp` | S²-gravity MLE micro-benchmark | — | manual |
 
 ## Current status (code-accurate, honest)
 
 **Done and default:**
-- Ceres-free LM/Schur solver core, lock-free pool, covariance — verified (13/13, 20/20 this pass).
-- S²-gravity MLE, full-orientation gauge prior, gravity gate + conditional re-align,
-  covariance-at-optimum + similarity carry-through — implemented and `ON` by default.
-- Warm-start joint-covariance injection (`DynamicInitializer` ↔ `StateHelper::set_initial_state_warmstart`
-  ↔ `VioManagerHelper`) — implemented; enabled in the shipped `fpv` config.
+- Ceres-free LM/Schur solver core, lock-free pool, covariance — verified (13/13, 20/20).
+- S²-gravity MLE, full-orientation gauge prior, **weak +Z gravity prior** (`init_dyn_grav_prior_sigma`),
+  config-driven gravity gate (`init_dyn_grav_gate_deg`) + conditional re-align, covariance-at-optimum +
+  similarity carry-through — implemented and `ON` by default.
+- Warm-start joint-covariance injection with a **non-finite / non-PSD value guard**; enabled in `fpv`.
+- **Static / dynamic / server gravity gates decoupled** for any-attitude reset (static 5°, dynamic 85°,
+  server any-attitude) + tilt-init heading re-origin fixed on the server (yaw-only, world-frame).
+- **Ceres unlinked from the default build**; test/bench exes gated behind `OV_INIT_BUILD_TESTS` and the
+  Eigen-only self-tests wired into CTest.
 
 **Open / not-yet-true (do not read the "Done" list as production-signed-off):**
-- **Statistical consistency is NOT yet in band.** `test_init_consistency` (500 trials, inflation
-  OFF, free-S²) reports **ANEES/15 ≈ 26** (ideal 1.0): the raw Laplace covariance is
-  overconfident, dominated by accel-bias (per-block NEES ba ≈ 285), velocity (≈ 59) and
-  position (≈ 16). The shipped config compensates with aggressive inflation
-  (`init_dyn_inflation_vel: 150`, `ba: 150`, `ori: 30`) — but **position is still uninflated**
-  (`init_dyn_inflation_pos` default 1.0) despite being ~5× overconfident. This inflation is a
-  band-aid, not a consistency fix; it should be tuned on real reset logs.
-- **Gravity flip-rejection gate is leaky.** Same test: **42/50** upside-down seeds rejected (want
-  50/50). Eight flipped seeds passed the 30° gate in synthetic data.
-- **Ceres not removed.** Still `find_package(Ceres REQUIRED)` + `voxl-ceres-solver` + dual-built
-  fallback. Removal (delete `src/ceres/*`, drop `find_package`/`${CERES_LIBRARIES}`/`voxl-ceres-solver`/
-  `libceres-dev`) is deliberately deferred until on-hardware A/B + consistency pass.
-- Validation binaries are manual-build only (not in CI); `init_dyn_mle_opt_calib` calib
-  injection is still a TODO in the injection block.
+- **Statistical consistency is NOT in band.** `test_init_consistency` (500 trials, inflation OFF,
+  free-S²) reports **ANEES/15 ≈ 25** (ideal 1.0), dominated by accel-bias (per-block NEES ≈ 278),
+  velocity (≈ 56), position (≈ 16). This is intrinsic to *free* gravity over the short init window: with
+  gravity **fixed** the same test is conservative (ANEES/15 ≈ 0.46), and the gravity prior does **not**
+  change it (≈ 26.5). Mitigated by the `init_dyn_inflation_*` congruence; **position is still uninflated**
+  (`init_dyn_inflation_pos` = 1.0, ~5× overconfident) — deliberately left to real-reset-log tuning per
+  the in-code note, not a sim-derived value.
+- **Flip rejection is 49/50** (was 42/50 before the gravity prior). One synthetic flipped seed still
+  slips the gate.
+- On-hardware A/B + consistency validation of the dynamic init is still pending — the CTest NEES gate is
+  intentionally **red** until then.
+- `init_dyn_mle_opt_calib` calibration injection is still a TODO in the injection block.
 
-**Removal step (once consistency + on-hardware A/B pass):** flip nothing (already default), then
-delete `src/ceres/*`, `find_package(Ceres)`, `${CERES_LIBRARIES}`, `voxl-ceres-solver` in
-`install_build_deps.sh`, and `libceres-dev` in `ov_msckf/package.xml`.
+**Fully dropping Ceres (optional):** the default build already skips it. To remove the A/B fallback
+entirely, delete `src/ceres/*`, the guarded `find_package(Ceres)` / `${CERES_*}` in `ov_init`, and the
+leftover `${CERES_*}` in the `ROS2.cmake` files (unused in this ROS1 build).
