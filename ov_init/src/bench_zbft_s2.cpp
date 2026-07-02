@@ -101,8 +101,20 @@ static Eigen::Vector4d perturb_q(const Eigen::Vector4d &q, const Eigen::Vector3d
   return quatnorm(quat_multiply(quatnorm(dq), q));
 }
 
+// Optional problem-shape overrides (argv; <=0 keeps the 40kf/120lm stress shape).
+// fpv-sized: N=8 poses over a 2.0s window (dt=0.285), M=50 features -- matches
+// init_dyn_num_pose / init_max_features / init_window_time in the fpv estimator_config.yaml.
+static int g_N = -1, g_M = -1;
+static double g_dt = -1.0;
+
 static Sim make_sim(std::mt19937 &rng) {
   Sim s;
+  if (g_N > 0)
+    s.N = g_N;
+  if (g_M > 0)
+    s.M = g_M;
+  if (g_dt > 0)
+    s.dt = g_dt;
   s.bg_gt = randn3(rng, 0.01);
   s.ba_gt = randn3(rng, 0.05);
 
@@ -216,11 +228,37 @@ struct Result {
   bool ok = false;
   int iters = 0;
   double time_ms = 0, cost0 = 0, cost1 = 0;
+  int rejected = 0, jac_evals = 0, res_evals = 0;
+  double t_lin_ms = 0, t_sol_ms = 0, t_res_ms = 0; // solver wall-clock split (P0.4)
   std::vector<Eigen::Vector4d> q;
   std::vector<Eigen::Vector3d> p, v;
   Eigen::Vector3d bg, ba;  // Shared biases
   Eigen::Vector3d grav_final;
   double grav_err_deg = 0;
+};
+
+// Per-test aggregation of solver counters/timing (mean over trials).
+struct Agg {
+  double t = 0, it = 0, rej = 0, jev = 0, rev = 0, tlin = 0, tsol = 0, tres = 0;
+  int n = 0, ok = 0;
+  void add(const Result &r) {
+    n++;
+    ok += r.ok ? 1 : 0;
+    t += r.time_ms;
+    it += r.iters;
+    rej += r.rejected;
+    jev += r.jac_evals;
+    rev += r.res_evals;
+    tlin += r.t_lin_ms;
+    tsol += r.t_sol_ms;
+    tres += r.t_res_ms;
+  }
+  void print() const {
+    const double i = (n > 0) ? 1.0 / n : 0.0;
+    std::printf("  Converged: %d/%d\n", ok, n);
+    std::printf("  Time (mean): %.2f ms  [linearize %.2f | linsolve %.2f | residual %.2f]\n", t * i, tlin * i, tsol * i, tres * i);
+    std::printf("  Evals (mean): %.1f accepted, %.1f rejected | %.1f jac, %.1f res\n", it * i, rej * i, jev * i, rev * i);
+  }
 };
 
 template <class PriorT>
@@ -248,6 +286,11 @@ static PriorT *make_prior(const double *q0, const double *p0, const double *bg0,
   std::vector<std::string> types = {"quat", "vec3", "vec3", "vec3"};
   return new PriorT(x_lin, types, info, grad);
 }
+
+// Optional LM-schedule overrides (argv; <=0 keeps the Ceres-parity defaults)
+static double g_min_lambda = -1.0;
+static double g_nu_growth = -1.0;
+static double g_ftol = -1.0; // diagnostic function_tolerance override (<=0: 1e-5)
 
 static Result run_zbft(const Sim &s, const InitGuess &g, int num_threads, bool use_dogleg,
                        bool optimize_gravity, bool verbose = false) {
@@ -321,6 +364,12 @@ static Result run_zbft(const Sim &s, const InitGuess &g, int num_threads, bool u
   o.function_tolerance = 1e-5;
   o.gradient_tolerance = 1e-9;
   o.verbose = verbose;
+  if (g_min_lambda > 0)
+    o.min_lambda = g_min_lambda;
+  if (g_nu_growth > 0)
+    o.lm_nu_growth = g_nu_growth;
+  if (g_ftol > 0)
+    o.function_tolerance = g_ftol; // diagnostic: tighten to separate early-exit vs landscape effects
 
   Eigen::Vector3d grav_init = grav;
   auto t0 = std::chrono::steady_clock::now();
@@ -337,6 +386,12 @@ static Result run_zbft(const Sim &s, const InitGuess &g, int num_threads, bool u
   r.iters = sum.iterations;
   r.cost0 = sum.initial_cost;
   r.cost1 = sum.final_cost;
+  r.rejected = sum.rejected_steps;
+  r.jac_evals = sum.jacobian_evals;
+  r.res_evals = sum.residual_evals;
+  r.t_lin_ms = 1e3 * sum.time_linearize_seconds;
+  r.t_sol_ms = 1e3 * sum.time_linear_solve_seconds;
+  r.t_res_ms = 1e3 * sum.time_residual_seconds;
   r.q = q;
   r.p = p;
   r.v = v;
@@ -378,28 +433,34 @@ int main(int argc, char **argv) {
   int K = (argc > 1) ? atoi(argv[1]) : 30;
   int threads = (argc > 2) ? atoi(argv[2]) : 1;
   bool dl = (argc > 3) ? (atoi(argv[3]) != 0) : false;
+  g_min_lambda = (argc > 4) ? atof(argv[4]) : -1.0; // <=0: Ceres-parity default (1e-12)
+  g_nu_growth = (argc > 5) ? atof(argv[5]) : -1.0;  // <=0: Ceres-parity default (2.0)
+  g_N = (argc > 6) ? atoi(argv[6]) : -1;            // poses  (<=0: 40 stress default; fpv: 8)
+  g_M = (argc > 7) ? atoi(argv[7]) : -1;            // feats  (<=0: 120 stress default; fpv: 50)
+  g_dt = (argc > 8) ? atof(argv[8]) : -1.0;         // inter-pose dt (<=0: 1/30; fpv: 2.0s/7 = 0.285)
+  g_ftol = (argc > 9) ? atof(argv[9]) : -1.0;       // function tolerance (<=0: 1e-5)
 
   std::printf("====== S² Gravity MLE Benchmark (zbft_sfm) ======\n");
-  std::printf("Trials: %d | Threads: %d | Method: %s\n\n", K, threads, dl ? "DOGLEG" : "LM");
+  std::printf("Trials: %d | Threads: %d | Method: %s | min_lambda=%s nu_growth=%s | N=%d M=%d dt=%.3f\n\n", K, threads,
+              dl ? "DOGLEG" : "LM", (g_min_lambda > 0) ? argv[4] : "default", (g_nu_growth > 0) ? argv[5] : "default",
+              (g_N > 0) ? g_N : 40, (g_M > 0) ? g_M : 120, (g_dt > 0) ? g_dt : 1.0 / 30.0);
 
   // Test 1: Gravity fixed (baseline)
   std::printf("--- Test 1: Gravity FIXED at GT (baseline) ---\n");
   {
-    double sum_time = 0, sum_rot = 0, sum_pos = 0, sum_vel = 0, sum_bg = 0, sum_ba = 0;
-    int ok = 0;
+    double sum_rot = 0, sum_pos = 0, sum_vel = 0, sum_bg = 0, sum_ba = 0;
+    Agg agg;
     for (int t = 0; t < K; ++t) {
       std::mt19937 rng(1000 + t);
       Sim s = make_sim(rng);
       InitGuess g = make_init(s, rng, false);
       Result r = run_zbft(s, g, threads, dl, false, t == 0);
-      if (r.ok) ok++;
-      sum_time += r.time_ms;
+      agg.add(r);
       Rmse m = rmse_vs_gt(r, s);
       sum_rot += m.rot_deg; sum_pos += m.pos; sum_vel += m.vel; sum_bg += m.bg; sum_ba += m.ba;
     }
     double iK = 1.0 / K;
-    std::printf("  Converged: %d/%d\n", ok, K);
-    std::printf("  Time (mean): %.2f ms\n", sum_time * iK);
+    agg.print();
     std::printf("  RMSE vs GT:  rot=%.4f deg  pos=%.4f m  vel=%.4f m/s  bg=%.5f  ba=%.5f\n",
                 sum_rot * iK, sum_pos * iK, sum_vel * iK, sum_bg * iK, sum_ba * iK);
   }
@@ -407,22 +468,20 @@ int main(int argc, char **argv) {
   // Test 2: Gravity optimized on S² (starting from GT)
   std::printf("\n--- Test 2: Gravity OPTIMIZED on S² (init from GT) ---\n");
   {
-    double sum_time = 0, sum_rot = 0, sum_pos = 0, sum_vel = 0, sum_bg = 0, sum_ba = 0, sum_grav_err = 0;
-    int ok = 0;
+    double sum_rot = 0, sum_pos = 0, sum_vel = 0, sum_bg = 0, sum_ba = 0, sum_grav_err = 0;
+    Agg agg;
     for (int t = 0; t < K; ++t) {
       std::mt19937 rng(1000 + t);
       Sim s = make_sim(rng);
       InitGuess g = make_init(s, rng, false);
       Result r = run_zbft(s, g, threads, dl, true, t == 0);
-      if (r.ok) ok++;
-      sum_time += r.time_ms;
+      agg.add(r);
       sum_grav_err += r.grav_err_deg;
       Rmse m = rmse_vs_gt(r, s);
       sum_rot += m.rot_deg; sum_pos += m.pos; sum_vel += m.vel; sum_bg += m.bg; sum_ba += m.ba;
     }
     double iK = 1.0 / K;
-    std::printf("  Converged: %d/%d\n", ok, K);
-    std::printf("  Time (mean): %.2f ms\n", sum_time * iK);
+    agg.print();
     std::printf("  Gravity error (mean): %.4f deg\n", sum_grav_err * iK);
     std::printf("  RMSE vs GT:  rot=%.4f deg  pos=%.4f m  vel=%.4f m/s  bg=%.5f  ba=%.5f\n",
                 sum_rot * iK, sum_pos * iK, sum_vel * iK, sum_bg * iK, sum_ba * iK);
@@ -431,9 +490,9 @@ int main(int argc, char **argv) {
   // Test 3: Gravity optimized on S² (starting from perturbed)
   std::printf("\n--- Test 3: Gravity OPTIMIZED on S² (init perturbed 3-15°) ---\n");
   {
-    double sum_time = 0, sum_rot = 0, sum_pos = 0, sum_vel = 0, sum_bg = 0, sum_ba = 0;
+    double sum_rot = 0, sum_pos = 0, sum_vel = 0, sum_bg = 0, sum_ba = 0;
     double sum_grav_err_init = 0, sum_grav_err_final = 0;
-    int ok = 0;
+    Agg agg;
     for (int t = 0; t < K; ++t) {
       std::mt19937 rng(1000 + t);
       Sim s = make_sim(rng);
@@ -444,8 +503,7 @@ int main(int argc, char **argv) {
       sum_grav_err_init += init_err;
 
       Result r = run_zbft(s, g, threads, dl, true, t == 0);
-      if (r.ok) ok++;
-      sum_time += r.time_ms;
+      agg.add(r);
       sum_grav_err_final += r.grav_err_deg;
       Rmse m = rmse_vs_gt(r, s);
       sum_rot += m.rot_deg; sum_pos += m.pos; sum_vel += m.vel; sum_bg += m.bg; sum_ba += m.ba;
@@ -456,8 +514,7 @@ int main(int argc, char **argv) {
       }
     }
     double iK = 1.0 / K;
-    std::printf("  Converged: %d/%d\n", ok, K);
-    std::printf("  Time (mean): %.2f ms\n", sum_time * iK);
+    agg.print();
     std::printf("  Gravity error: init=%.2f° -> final=%.4f° (%.1fx improvement)\n",
                 sum_grav_err_init * iK, sum_grav_err_final * iK, sum_grav_err_init / std::max(1e-6, sum_grav_err_final));
     std::printf("  RMSE vs GT:  rot=%.4f deg  pos=%.4f m  vel=%.4f m/s  bg=%.5f  ba=%.5f\n",

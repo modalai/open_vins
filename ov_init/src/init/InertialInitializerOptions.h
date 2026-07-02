@@ -151,6 +151,25 @@ struct InertialInitializerOptions {
   /// gravity ends up more than this from the expected +Z pole (flip/corruption guard before injection).
   double init_dyn_grav_gate_deg = 30.0;
 
+  /// Ceres-free (zbft) LM lambda floor (SolverOptions::min_lambda). With the Ceres-parity default
+  /// (1e-12), the free-S2 solve first lets lambda crash ~5 decades below the useful range during its
+  /// easy phase, then pays ~9-12 REJECTED trials (each a full Schur solve + residual pass) climbing
+  /// back when it reaches the gravity<->accel-bias valley. Raising the floor (e.g. 1e-7) trims that
+  /// climb but can cost convergence-flag rate (bench_zbft_s2 fpv shape: 100/100 -> 84-97/100) -- A/B
+  /// on target before changing. Only used on the ceres-free dynamic path.
+  double init_dyn_mle_lm_min_lambda = 1e-12;
+
+  /// Ceres-free (zbft) LM rejected-trial escalation growth (SolverOptions::lm_nu_growth).
+  /// 2.0 is Ceres-exact (lambda *= nu; nu *= 2); larger climbs the valley wall in fewer rejected
+  /// trials, with the same convergence-flag caveat as init_dyn_mle_lm_min_lambda.
+  double init_dyn_mle_lm_nu_growth = 2.0;
+
+  /// Ceres-free (zbft) LM initial lambda (SolverOptions::initial_lambda). 1e-4 mirrors Ceres'
+  /// initial_trust_region_radius=1e4. ORB-SLAM3's inertial-only MAP instead starts HEAVILY damped
+  /// (g2o setUserLambdaInit(1e3)) so the early steps stay short and gradient-like in the
+  /// gravity/accel-bias valley -- an alternative worth A/B-ing on target for reset-heavy profiles.
+  double init_dyn_mle_lm_initial_lambda = 1e-4;
+
   /**
    * @brief This function will load print out all initializer settings loaded.
    * This allows for visual checking that everything was loaded properly from ROS/CMD parsers.
@@ -188,6 +207,9 @@ struct InertialInitializerOptions {
       parser->parse_config("init_static_gravity_max_angle", init_static_gravity_max_angle, false); // optional; <0 => use init_gravity_max_angle
       parser->parse_config("init_dyn_grav_prior_sigma", init_dyn_grav_prior_sigma, false);          // optional; <=0 disables the gravity prior
       parser->parse_config("init_dyn_grav_gate_deg", init_dyn_grav_gate_deg, false);                // optional; post-solve flip-reject gate
+      parser->parse_config("init_dyn_mle_lm_min_lambda", init_dyn_mle_lm_min_lambda, false);        // optional; zbft LM lambda floor
+      parser->parse_config("init_dyn_mle_lm_nu_growth", init_dyn_mle_lm_nu_growth, false);          // optional; zbft LM reject escalation growth
+      parser->parse_config("init_dyn_mle_lm_initial_lambda", init_dyn_mle_lm_initial_lambda, false); // optional; zbft LM initial damping
     }
     PRINT_DEBUG("  - init_window_time: %.2f\n", init_window_time);
     PRINT_DEBUG("  - init_imu_thresh: %.2f\n", init_imu_thresh);
@@ -235,6 +257,9 @@ struct InertialInitializerOptions {
     PRINT_DEBUG("  - init_static_gravity_max_angle: %.2f%s\n", init_static_gravity_max_angle,
                 (init_static_gravity_max_angle < 0.0) ? " (<0: uses init_gravity_max_angle)" : "");
     PRINT_DEBUG("  - init_dyn_grav_prior_sigma: %.3f\n", init_dyn_grav_prior_sigma);
+    PRINT_DEBUG("  - init_dyn_mle_lm_min_lambda: %.3e\n", init_dyn_mle_lm_min_lambda);
+    PRINT_DEBUG("  - init_dyn_mle_lm_nu_growth: %.2f\n", init_dyn_mle_lm_nu_growth);
+    PRINT_DEBUG("  - init_dyn_mle_lm_initial_lambda: %.3e\n", init_dyn_mle_lm_initial_lambda);
     PRINT_DEBUG("  - init_dyn_grav_gate_deg: %.2f\n", init_dyn_grav_gate_deg);
   }
 

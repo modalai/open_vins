@@ -58,6 +58,12 @@ Factor_ImuCPIv1::Factor_ImuCPIv1(double deltatime, Eigen::Vector3d &grav, Eigen:
   Eigen::LLT<Eigen::MatrixXd> lltOfI(information);
   sqrtI_save = lltOfI.matrixL().transpose();
 
+  // Gravity enters the raw Jacobian only through rows 6-8 (R_1*dt) and 12-14 (0.5*R_1*dt^2),
+  // so fold the corresponding sqrtI columns ONCE here: J_grav = sqrtI_grav_fold * R_1 in
+  // Evaluate() -- replaces a dense 15x15 * 15x3 product per IMU factor per linearization.
+  sqrtI_grav_fold = deltatime * sqrtI_save.block<15, 3>(0, 6) +
+                    (0.5 * deltatime * deltatime) * sqrtI_save.block<15, 3>(0, 12);
+
   // Set the number of measurements, and the block sized
   set_num_residuals(15);
   mutable_parameter_block_sizes()->push_back(4); // q_GtoI1
@@ -251,15 +257,11 @@ bool Factor_ImuCPIv1::Evaluate(double const *const *parameters, double *residual
       J_p2.block(0, 0, 15, 3) = Jacobian.block(0, 27, 15, 3);
     }
     // gravity (S² parameter, 3-global; solver applies tangent basis to get 2-local)
-    // dr_v/dg = R_1 * dt (rows 6-8), dr_p/dg = 0.5 * R_1 * dt^2 (rows 12-14)
+    // dr_v/dg = R_1 * dt (rows 6-8), dr_p/dg = 0.5 * R_1 * dt^2 (rows 12-14), with sqrtI
+    // pre-folded into sqrtI_grav_fold at construction (see constructor).
     if (jacobians[10]) {
-      Eigen::Matrix<double, 15, 3> J_g_raw = Eigen::Matrix<double, 15, 3>::Zero();
-      J_g_raw.block(6, 0, 3, 3) = R_1 * dt;
-      J_g_raw.block(12, 0, 3, 3) = 0.5 * R_1 * std::pow(dt, 2);
-      // Apply full dense sqrtI (mixes all 15 rows)
-      Eigen::Matrix<double, 15, 3> J_g_weighted = sqrtI * J_g_raw;
       Eigen::Map<Eigen::Matrix<double, 15, 3, Eigen::RowMajor>> J_grav(jacobians[10], 15, 3);
-      J_grav = J_g_weighted;
+      J_grav.noalias() = sqrtI_grav_fold * R_1;
     }
   }
   return true;

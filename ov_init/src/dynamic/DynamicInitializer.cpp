@@ -709,6 +709,10 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
   options.max_num_iterations = params.init_dyn_mle_max_iter;
   options.function_tolerance = 1e-5;
   options.gradient_tolerance = 1e-9;
+  // LM lambda schedule (YAML; defaults are Ceres-exact -- see InertialInitializerOptions)
+  options.min_lambda = params.init_dyn_mle_lm_min_lambda;
+  options.lm_nu_growth = params.init_dyn_mle_lm_nu_growth;
+  options.initial_lambda = params.init_dyn_mle_lm_initial_lambda;
 #else
   ceres::Solver::Options options;
   options.linear_solver_type = ceres::DENSE_SCHUR;
@@ -1427,9 +1431,9 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
   PRINT_DEBUG("[TIME]: %.4f sec for prelim tests\n", (rT2 - rT1).total_microseconds() * 1e-6);
   PRINT_DEBUG("[TIME]: %.4f sec for linsys setup\n", (rT3 - rT2).total_microseconds() * 1e-6);
   PRINT_DEBUG("[TIME]: %.4f sec for linsys\n", (rT4 - rT3).total_microseconds() * 1e-6);
-  PRINT_DEBUG("[TIME]: %.4f sec for ceres opt setup\n", (rT5 - rT4).total_microseconds() * 1e-6);
-  PRINT_DEBUG("[TIME]: %.4f sec for ceres opt\n", (rT6 - rT5).total_microseconds() * 1e-6);
-  PRINT_DEBUG("[TIME]: %.4f sec for ceres covariance\n", (rT7 - rT6).total_microseconds() * 1e-6);
+  PRINT_DEBUG("[TIME]: %.4f sec for ceres-free opt setup\n", (rT5 - rT4).total_microseconds() * 1e-6);
+  PRINT_DEBUG("[TIME]: %.4f sec for ceres-free opt\n", (rT6 - rT5).total_microseconds() * 1e-6);
+  PRINT_DEBUG("[TIME]: %.4f sec for ceres-free covariance\n", (rT7 - rT6).total_microseconds() * 1e-6);
   PRINT_DEBUG("[TIME]: %.4f sec total for initialization\n", (rT7 - rT1).total_microseconds() * 1e-6);
   free_state_memory();
   return true;

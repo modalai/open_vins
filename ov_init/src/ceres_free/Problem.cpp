@@ -131,6 +131,21 @@ void Problem::assign_ordering() {
   }
   n_total_ = n_nav_ + n_land_;
 
+  // Size the apply_delta Plus() scratch once (largest ambient block) -- no alloc per trial.
+  int max_gsize = 0;
+  for (const auto &b : blocks_)
+    max_gsize = std::max(max_gsize, b.gsize);
+  plus_tmp_.resize(max_gsize);
+
+  // Used-lower-triangle column tails (see Problem.h): nav columns run to n_total_
+  // (nav-nav lower + landmark W^T strip); a landmark column ends at its own diagonal block.
+  col_tail_end_.assign(n_total_, n_total_);
+  for (const auto &od : land_diag_) {
+    const int b0 = n_nav_ + od.first;
+    for (int c = 0; c < od.second; ++c)
+      col_tail_end_[b0 + c] = b0 + od.second;
+  }
+
   // Visibility structure: for each landmark, the navigation (pose) blocks that co-occur
   // with it in a residual. Landmarks couple ONLY to these blocks (not v/bg/ba), so the
   // Schur reduction touches only them -- a handful of small updates instead of a dense gemm.
@@ -155,29 +170,44 @@ void Problem::assign_ordering() {
   }
 }
 
-double Problem::evaluate_cost() const {
+double Problem::evaluate_cost(ParallelExecutor &exec) const {
+  // Residual-only trial scoring. This runs once per LM/dogleg TRIAL (accepted or rejected),
+  // so it is parallelized on the same fixed-range executor as linearize(), with the same
+  // worker-ordered reduction: bit-identical run-to-run for a given worker count, and the
+  // W==1 inline path is arithmetically identical to the old serial loop.
   ++n_res_evals_;
-  double cost = 0.0;
-  std::vector<const double *> params;
-  Eigen::VectorXd rbuf; // residual scratch, grown once to the max residual count (no per-residual heap alloc)
-  for (const auto &res : residuals_) {
-    const int nres = res.cost->num_residuals();
-    params.clear();
-    params.reserve(res.blocks.size());
-    for (int bidx : res.blocks)
-      params.push_back(blocks_[bidx].data);
-    if (rbuf.size() < nres)
-      rbuf.resize(nres);
-    res.cost->Evaluate(params.data(), rbuf.data(), nullptr);
-    const double s = rbuf.head(nres).squaredNorm();
-    if (res.loss) {
-      double rho[2];
-      res.loss->Evaluate(s, rho);
-      cost += 0.5 * rho[0];
-    } else {
-      cost += 0.5 * s;
+  const int W = exec.num_workers();
+  if ((int)cw_.size() != W)
+    cw_.assign(W, 0.0);
+  const auto body = [&](int worker, int begin, int end) {
+    double cl = 0.0;
+    std::vector<const double *> params;
+    Eigen::VectorXd rbuf; // residual scratch, grown once to the max residual count (no per-residual heap alloc)
+    for (int ri = begin; ri < end; ++ri) {
+      const Residual &res = residuals_[ri];
+      const int nres = res.cost->num_residuals();
+      params.clear();
+      params.reserve(res.blocks.size());
+      for (int bidx : res.blocks)
+        params.push_back(blocks_[bidx].data);
+      if (rbuf.size() < nres)
+        rbuf.resize(nres);
+      res.cost->Evaluate(params.data(), rbuf.data(), nullptr);
+      const double s = rbuf.head(nres).squaredNorm();
+      if (res.loss) {
+        double rho[2];
+        res.loss->Evaluate(s, rho);
+        cl += 0.5 * rho[0];
+      } else {
+        cl += 0.5 * s;
+      }
     }
-  }
+    cw_[worker] = cl;
+  };
+  exec.parallel_ranges((int)residuals_.size(), body);
+  double cost = cw_[0];
+  for (int w = 1; w < W; ++w)
+    cost += cw_[w];
   return cost;
 }
 
@@ -193,25 +223,45 @@ void Problem::linearize(Eigen::MatrixXd &H, Eigen::VectorXd &grad, double &cost,
 
   // Per-worker private accumulators (no shared writes -> race-free), PREALLOCATED and
   // reused across iterations -- only zeroed each call (no heap traffic in the hot loop).
+  // Worker 0 accumulates DIRECTLY into the caller's H/grad (they persist across iterations),
+  // so slots [1..W) are the only extra buffers and the old H = Hw_[0] full-matrix copy is gone.
   if ((int)Hw_.size() != W) {
-    Hw_.assign(W, Eigen::MatrixXd(N, N));
-    gw_.assign(W, Eigen::VectorXd(N));
+    Hw_.assign(W, Eigen::MatrixXd());
+    gw_.assign(W, Eigen::VectorXd());
     cw_.assign(W, 0.0);
   }
-  for (int w = 0; w < W; ++w) {
-    if (Hw_[w].rows() != N)
+  // Zero ONLY the used lower-triangle column tails (see col_tail_end_): the upper triangle
+  // and the landmark-landmark off-diagonal region are never written nor read.
+  const auto zero_used = [&](Eigen::MatrixXd &M) {
+    for (int j = 0; j < N; ++j)
+      M.col(j).segment(j, col_tail_end_[j] - j).setZero();
+  };
+  // On (re)allocation, zero the WHOLE matrix once: the structurally-zero region outside the
+  // used tails is never written again, so selfadjoint<Lower> consumers (dogleg matvec) can
+  // safely read the full lower triangle. Steady state pays only the used-tail zeroing.
+  if (H.rows() != N || H.cols() != N) {
+    H.resize(N, N);
+    H.setZero();
+  }
+  if (grad.size() != N)
+    grad.resize(N);
+  zero_used(H);
+  grad.setZero();
+  for (int w = 1; w < W; ++w) {
+    if (Hw_[w].rows() != N) {
       Hw_[w].resize(N, N);
+      Hw_[w].setZero();
+    }
     if (gw_[w].size() != N)
       gw_[w].resize(N);
-    Hw_[w].setZero();
+    zero_used(Hw_[w]);
     gw_[w].setZero();
-    cw_[w] = 0.0;
   }
 
   const auto body = [&](int worker, int begin, int end) {
-    Eigen::MatrixXd &Hloc = Hw_[worker];
-    Eigen::VectorXd &gloc = gw_[worker];
-    double &cl = cw_[worker];
+    Eigen::MatrixXd &Hloc = (worker == 0) ? H : Hw_[worker];
+    Eigen::VectorXd &gloc = (worker == 0) ? grad : gw_[worker];
+    double cl = 0.0; // local accumulator (a shared cw_[worker] target would false-share the cache line)
     std::vector<const double *> params;
     std::vector<double *> jacptrs;
     std::vector<Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>> Jstore;
@@ -285,71 +335,77 @@ void Problem::linearize(Eigen::MatrixXd &H, Eigen::VectorXd &grad, double &cost,
         }
       }
 
-      // Accumulate gradient/Hessian. For tangent_leading_identity=true, use the zero-copy
-      // leftCols view (no extra copy). For false (gravity), use the pre-computed Jeff.
-      // H is symmetric, so each off-diagonal product J_a^T J_b is formed ONCE and scattered
-      // to both (a,b) and its transpose (b,a) -- ~halving the per-factor Hessian products --
-      // while still storing the full H (the Schur reduction reads its nav<->landmark coupling).
+      // Accumulate gradient/Hessian into the LOWER triangle only (see col_tail_end_ in
+      // Problem.h). For tangent_leading_identity=true, use the zero-copy leftCols view; for
+      // false (gravity), use the pre-computed Jeff. Each off-diagonal product J_a^T J_b is
+      // formed ONCE and stored in its lower-triangle slot; diagonal blocks accumulate their
+      // lower part via a rank update (syrk: half the flops and half the writes of a gemm).
       for (size_t a = 0; a < vidx.size(); ++a) {
         const Block &ba = blocks_[vidx[a]];
         // Effective local Jacobian: leftCols for identity, Jeff for non-identity
         const auto &Ja_ref = ba.tangent_leading_identity ? Jstore[vk[a]].leftCols(ba.lsize)
                                                           : Jeff[vk[a]].leftCols(ba.lsize);
         gloc.segment(ba.offset, ba.lsize).noalias() += w * (Ja_ref.transpose() * r);
-        Hloc.block(ba.offset, ba.offset, ba.lsize, ba.lsize).noalias() += w * (Ja_ref.transpose() * Ja_ref);
+        Hloc.block(ba.offset, ba.offset, ba.lsize, ba.lsize).selfadjointView<Eigen::Lower>().rankUpdate(Ja_ref.transpose(), w);
         for (size_t b = a + 1; b < vidx.size(); ++b) {
           const Block &bb = blocks_[vidx[b]];
           const auto &Jb_ref = bb.tangent_leading_identity ? Jstore[vk[b]].leftCols(bb.lsize)
                                                             : Jeff[vk[b]].leftCols(bb.lsize);
           Mab.noalias() = w * (Ja_ref.transpose() * Jb_ref); // lsize_a x lsize_b
-          Hloc.block(ba.offset, bb.offset, ba.lsize, bb.lsize).noalias() += Mab;
-          Hloc.block(bb.offset, ba.offset, bb.lsize, ba.lsize).noalias() += Mab.transpose();
+          if (ba.offset > bb.offset) {
+            Hloc.block(ba.offset, bb.offset, ba.lsize, bb.lsize).noalias() += Mab; // H(a,b) is the lower slot
+          } else if (ba.offset < bb.offset) {
+            Hloc.block(bb.offset, ba.offset, bb.lsize, ba.lsize).noalias() += Mab.transpose(); // lower slot holds Jb^T Ja
+          } else {
+            // Duplicate parameter block within one residual (e.g. a shared bias passed as both
+            // bg1 and bg2 of an IMU factor): both cross terms land on the SAME diagonal block;
+            // add the lower part of (Mab + Mab^T) column by column.
+            for (int c = 0; c < ba.lsize; ++c)
+              Hloc.col(ba.offset + c).segment(ba.offset + c, ba.lsize - c) +=
+                  Mab.col(c).tail(ba.lsize - c) + Mab.row(c).tail(ba.lsize - c).transpose();
+          }
         }
       }
     }
+    cw_[worker] = cl;
   };
 
   exec.parallel_ranges((int)residuals_.size(), body);
 
-  // Deterministic reduction in fixed worker order (bit-identical regardless of W).
-  H = Hw_[0];
-  grad = gw_[0];
+  // Deterministic reduction in fixed worker order (bit-identical regardless of W;
+  // worker 0 already lives in H/grad). Adds ONLY the used lower-triangle column tails.
   cost = cw_[0];
   for (int w = 1; w < W; ++w) {
-    H += Hw_[w];
+    for (int j = 0; j < N; ++j)
+      H.col(j).segment(j, col_tail_end_[j] - j) += Hw_[w].col(j).segment(j, col_tail_end_[j] - j);
     grad += gw_[w];
     cost += cw_[w];
   }
 }
 
-static Eigen::MatrixXd Problem_build_Dinv(const Eigen::MatrixXd &Hsrc, int n_nav, int n_land,
-                                          const std::vector<std::pair<int, int>> &land_diag, double ridge) {
-  Eigen::MatrixXd Dinv = Eigen::MatrixXd::Zero(n_land, n_land);
-  for (const auto &od : land_diag) {
-    const int off = od.first;
-    const int ls = od.second;
-    Eigen::MatrixXd Dblk = Hsrc.block(n_nav + off, n_nav + off, ls, ls);
-    if (ridge > 0.0)
-      Dblk.diagonal().array() += ridge;
-    Dinv.block(off, off, ls, ls) = Dblk.inverse();
-  }
-  return Dinv;
-}
-
 bool Problem::solve_step(const Eigen::MatrixXd &H, const Eigen::VectorXd &grad, double lambda, Eigen::VectorXd &delta) const {
   delta.resize(n_total_);
 
-  // Landmark-free (inertial-only) path: damped dense LDLT (preallocated buffers).
+  // Landmark-free (inertial-only) path: damped dense Cholesky (preallocated buffers).
+  // H holds only the used lower triangle (see col_tail_end_), which is exactly what LLT reads.
   if (n_land_ == 0 || n_nav_ == 0) {
     if (Hd_.rows() != n_total_)
       Hd_.resize(n_total_, n_total_);
-    Hd_ = H;
+    if (n_nav_ == 0)
+      Hd_.setZero(); // degenerate all-landmark problem: LLT reads the whole lower triangle, so the
+                     // structurally-zero landmark-landmark region must be explicit here
+    for (int j = 0; j < n_total_; ++j)
+      Hd_.col(j).segment(j, col_tail_end_[j] - j) = H.col(j).segment(j, col_tail_end_[j] - j);
     for (int i = 0; i < n_total_; ++i)
       Hd_(i, i) += lambda * std::min(std::max(H(i, i), 1e-6), 1e32); // Ceres min/max_lm_diagonal clamp
-    lltRed_.compute(Hd_);
-    if (lltRed_.info() != Eigen::Success)
+    // In-place Cholesky: factors Hd_'s own storage (Hd_ is rebuilt every call), so no
+    // n^2 factor-storage copy per trial; the triangular solves run in-place on delta.
+    Eigen::LLT<Eigen::Ref<Eigen::MatrixXd>> llt(Hd_);
+    if (llt.info() != Eigen::Success)
       return false;
-    delta.noalias() = lltRed_.solve(-grad);
+    delta = -grad;
+    llt.matrixL().solveInPlace(delta);
+    llt.matrixU().solveInPlace(delta);
     return delta.allFinite();
   }
 
@@ -362,14 +418,16 @@ bool Problem::solve_step(const Eigen::MatrixXd &H, const Eigen::VectorXd &grad, 
     rhs_.resize(n_nav_);
     da_.resize(n_nav_);
   }
-  Hred_ = H.topLeftCorner(n_nav_, n_nav_);
+  // H holds only the used lower triangle; copy the nav-nav lower column tails (all the LLT reads).
+  for (int j = 0; j < n_nav_; ++j)
+    Hred_.col(j).segment(j, n_nav_ - j) = H.col(j).segment(j, n_nav_ - j);
   for (int i = 0; i < n_nav_; ++i)
     Hred_(i, i) += lambda * std::min(std::max(H(i, i), 1e-6), 1e32);
   rhs_.noalias() = -grad.head(n_nav_);
 
   for (size_t li = 0; li < land_diag_.size(); ++li) {
     const int g0 = n_nav_ + land_diag_[li].first;
-    Eigen::Matrix3d V = H.block(g0, g0, 3, 3);
+    Eigen::Matrix3d V = Eigen::Matrix3d(H.block(g0, g0, 3, 3).selfadjointView<Eigen::Lower>());
     for (int d = 0; d < 3; ++d)
       V(d, d) += lambda * std::min(std::max(H(g0 + d, g0 + d), 1e-6), 1e32);
     const Eigen::Matrix3d Vinv = V.inverse();
@@ -381,12 +439,13 @@ bool Problem::solve_step(const Eigen::MatrixXd &H, const Eigen::VectorXd &grad, 
       schur_W_.resize(P);
       schur_Ma_.resize(P);
     }
-    // Precompute, per observing pose block: its nav offset, W_a = H[off_a, landmark],
-    // and M_a = W_a * V^-1. Also fold the rhs update -ga += M_a * g_l here (one pass over P).
+    // Precompute, per observing pose block: its nav offset, W_a = H[off_a, landmark] (stored
+    // transposed in the landmark row-strip of the lower triangle), and M_a = W_a * V^-1.
+    // Also fold the rhs update -ga += M_a * g_l here (one pass over P).
     for (int ia = 0; ia < P; ++ia) {
       const int off = blocks_[adj[ia]].offset;
       schur_off_[ia] = off;
-      schur_W_[ia] = H.block(off, g0, 3, 3);
+      schur_W_[ia] = H.block(g0, off, 3, 3).transpose();
       schur_Ma_[ia].noalias() = schur_W_[ia] * Vinv;
       rhs_.segment(off, 3).noalias() += schur_Ma_[ia] * gl;
     }
@@ -405,38 +464,48 @@ bool Problem::solve_step(const Eigen::MatrixXd &H, const Eigen::VectorXd &grad, 
     }
   }
 
-  lltRed_.compute(Hred_);
-  if (lltRed_.info() != Eigen::Success)
+  // In-place Cholesky on Hred_ (rebuilt every call) -- no factor-storage copy per trial.
+  Eigen::LLT<Eigen::Ref<Eigen::MatrixXd>> llt(Hred_);
+  if (llt.info() != Eigen::Success)
     return false;
-  da_.noalias() = lltRed_.solve(rhs_);
+  da_ = rhs_;
+  llt.matrixL().solveInPlace(da_);
+  llt.matrixU().solveInPlace(da_);
   if (!da_.allFinite())
     return false;
   delta.head(n_nav_) = da_;
 
-  // Back-substitute landmarks: d_l = -V^-1 (g_l + sum_a W_a^T d_a).
+  // Back-substitute landmarks: d_l = -V^-1 (g_l + sum_a W_a^T d_a), with W_a^T read directly
+  // from the landmark row-strip of the lower triangle.
   for (size_t li = 0; li < land_diag_.size(); ++li) {
     const int g0 = n_nav_ + land_diag_[li].first;
-    Eigen::Matrix3d V = H.block(g0, g0, 3, 3);
+    Eigen::Matrix3d V = Eigen::Matrix3d(H.block(g0, g0, 3, 3).selfadjointView<Eigen::Lower>());
     for (int d = 0; d < 3; ++d)
       V(d, d) += lambda * std::min(std::max(H(g0 + d, g0 + d), 1e-6), 1e32);
     Eigen::Vector3d acc = grad.segment(g0, 3);
     for (int nb : land_adj_[li]) {
       const Block &b = blocks_[nb];
-      acc.noalias() += H.block(b.offset, g0, 3, 3).transpose() * delta.segment(b.offset, 3);
+      acc.noalias() += H.block(g0, b.offset, 3, 3) * delta.segment(b.offset, 3);
     }
     delta.segment(g0, 3).noalias() = V.inverse() * (-acc);
   }
   return delta.allFinite();
 }
 
-void Problem::snapshot(std::vector<double> &backup) const {
+double Problem::snapshot(std::vector<double> &backup) const {
+  // Saves the variable-block ambient values AND returns their 2-norm: Ceres' x_norm_,
+  // needed by the candidate-step parameter-tolerance check (relative, not absolute).
   backup.clear();
+  double sq = 0.0;
   for (const auto &b : blocks_) {
     if (b.constant)
       continue;
-    for (int i = 0; i < b.gsize; ++i)
+    for (int i = 0; i < b.gsize; ++i) {
       backup.push_back(b.data[i]);
+      sq += b.data[i] * b.data[i];
+    }
   }
+  return std::sqrt(sq);
 }
 
 void Problem::restore(const std::vector<double> &backup) {
@@ -450,14 +519,13 @@ void Problem::restore(const std::vector<double> &backup) {
 }
 
 void Problem::apply_delta(const Eigen::VectorXd &delta) {
-  std::vector<double> tmp;
+  double *tmp = plus_tmp_.data(); // preallocated in assign_ordering; no heap in the trial loop
   for (auto &b : blocks_) {
     if (b.constant)
       continue;
     const double *d = delta.data() + b.offset;
-    tmp.assign(b.gsize, 0.0);
     if (b.param != nullptr) {
-      b.param->Plus(b.data, d, tmp.data());
+      b.param->Plus(b.data, d, tmp);
     } else {
       for (int i = 0; i < b.gsize; ++i)
         tmp[i] = b.data[i] + d[i];
@@ -485,10 +553,17 @@ SolverSummary Problem::Solve(const SolverOptions &options) {
 
   ParallelExecutor exec(options.num_threads, options.worker_init_fn);
 
+  // P0.4 wall-clock split (a handful of steady_clock reads per iteration; not in inner loops).
+  double t_linearize = 0.0, t_linsolve = 0.0, t_residual = 0.0;
+
   Eigen::MatrixXd H;
   Eigen::VectorXd grad;
   double cost = 0.0;
-  linearize(H, grad, cost, exec); // residual + Jacobian + cost in one pass
+  {
+    const auto tt = std::chrono::steady_clock::now();
+    linearize(H, grad, cost, exec); // residual + Jacobian + cost in one pass
+    t_linearize += seconds_since(tt);
+  }
   summary.initial_cost = cost;
 
   std::vector<double> backup;
@@ -518,6 +593,7 @@ SolverSummary Problem::Solve(const SolverOptions &options) {
       // Gauss-Newton step, mu-regularized, retried with larger mu on a failed solve.
       bool gn_ok = false;
       {
+        const auto ts = std::chrono::steady_clock::now();
         double m = mu;
         for (int t = 0; t < 24; ++t) {
           if (solve_step(H, grad, m, dgn_)) {
@@ -528,6 +604,7 @@ SolverSummary Problem::Solve(const SolverOptions &options) {
           if (m > kMaxMu)
             break;
         }
+        t_linsolve += seconds_since(ts);
         if (!gn_ok) {
           summary.message = "GN solve failed";
           break;
@@ -535,8 +612,8 @@ SolverSummary Problem::Solve(const SolverOptions &options) {
         mu = std::max(kMinMu, 2.0 * mu / kMuFactor); // relax on success
       }
 
-      // Cauchy point: alpha = ||g||^2 / (g^T H g).
-      Hg_.noalias() = H * grad;
+      // Cauchy point: alpha = ||g||^2 / (g^T H g). (H holds the used lower triangle only.)
+      Hg_.noalias() = H.selfadjointView<Eigen::Lower>() * grad;
       const double gg = grad.squaredNorm();
       const double gHg = grad.dot(Hg_);
       const double alpha = (gHg > 0.0) ? (gg / gHg) : 1.0;
@@ -575,12 +652,42 @@ SolverSummary Problem::Solve(const SolverOptions &options) {
         Hdl_.noalias() = c1 * grad + c2 * dgn_;
         const double pred = -(grad.dot(Hdl_) + 0.5 * Hdl_.dot(c1 * Hg_ - c2 * grad));
 
-        snapshot(backup);
+        const double x_norm = snapshot(backup);
         apply_delta(Hdl_);
-        const double cost_new = evaluate_cost();
+        double cost_new;
+        {
+          const auto tr = std::chrono::steady_clock::now();
+          cost_new = evaluate_cost(exec);
+          t_residual += seconds_since(tr);
+        }
         const double actual = cost - cost_new;
         const double rho = (pred > 0.0) ? (actual / pred) : (actual > 0.0 ? 1.0 : -1.0);
         const double step_norm = Hdl_.norm();
+
+        // CERES-ORDER TERMINATION (TrustRegionMinimizer::Minimize, verified against tag 2.2.0):
+        // parameter- and function-tolerance are checked on the CANDIDATE step BEFORE the
+        // accept/reject decision (ptol additionally requires one prior successful step, per
+        // Ceres 2.2.0's atleast_one_successful_step guard). A stall in a flat valley (the
+        // free-S2 gravity <-> accel-bias ambiguity) therefore exits after ONE negligible trial
+        // instead of shrinking the radius to collapse through repeated rejected trials. One
+        // deviation from Ceres (which always discards the terminal candidate): we KEEP it iff
+        // it decreased the cost -- never worse than Ceres' iterate, identical trial counts,
+        // and identical to the pre-candidate-check terminal behavior.
+        if ((summary.successful_steps > 0 &&
+             step_norm <= options.parameter_tolerance * (x_norm + options.parameter_tolerance)) ||
+            std::abs(actual) <= options.function_tolerance * std::abs(cost)) {
+          if (actual > 0.0) {
+            cost = cost_new;
+            summary.successful_steps++;
+          } else {
+            restore(backup);
+          }
+          converged = true;
+          summary.message = (step_norm <= options.parameter_tolerance * (x_norm + options.parameter_tolerance))
+                                ? "parameter tolerance"
+                                : "function tolerance";
+          break;
+        }
 
         if (rho > options.min_relative_decrease) {
           const double rel = actual / std::max(1e-12, cost);
@@ -591,22 +698,16 @@ SolverSummary Problem::Solve(const SolverOptions &options) {
             radius = std::min(options.max_radius, std::max(radius, 3.0 * step_norm));
           summary.successful_steps++;
           step_taken = true;
-          if (rel >= 0.0 && rel < options.function_tolerance) {
-            converged = true;
-            summary.message = "function tolerance";
-          }
-          if (step_norm < options.parameter_tolerance) {
-            converged = true;
-            summary.message = "parameter tolerance";
-          }
           if (options.verbose)
             std::fprintf(stderr, "[zbft/dl] it=%2d cost=%.8e rel=%.3e gnorm=%.3e radius=%.2e rho=%.3f\n", iter, cost, rel,
                          grad.lpNorm<Eigen::Infinity>(), radius, rho);
-          // Re-linearize at the accepted iterate ONLY if continuing (the Jacobian is needed
-          // solely by the next iteration); skip it on convergence to avoid a wasted linearization.
-          if (!converged) {
+          // Re-linearize at the accepted iterate (the candidate checks above already handled
+          // the terminal case, so an accepted step here always continues).
+          {
+            const auto tt = std::chrono::steady_clock::now();
             double cc = 0.0;
             linearize(H, grad, cc, exec);
+            t_linearize += seconds_since(tt);
           }
           break;
         } else {
@@ -650,9 +751,15 @@ SolverSummary Problem::Solve(const SolverOptions &options) {
         summary.message = "time budget reached";
         break;
       }
-      if (!solve_step(H, grad, lambda, lm_delta_)) {
+      bool solved;
+      {
+        const auto ts = std::chrono::steady_clock::now();
+        solved = solve_step(H, grad, lambda, lm_delta_);
+        t_linsolve += seconds_since(ts);
+      }
+      if (!solved) {
         lambda *= nu;
-        nu *= 2.0;
+        nu *= options.lm_nu_growth;
         if (lambda > options.max_lambda) {
           summary.message = "linear solve failed (rank deficient gauge?)";
           break;
@@ -663,18 +770,49 @@ SolverSummary Problem::Solve(const SolverOptions &options) {
       // Predicted reduction of the quadratic model: 0.5 * delta^T (lambda*D*delta - grad).
       const double pred = 0.5 * lm_delta_.dot((lambda * lm_Dvec_.cwiseProduct(lm_delta_)) - grad);
 
-      snapshot(backup);
+      const double x_norm = snapshot(backup);
       apply_delta(lm_delta_);
       // CHEAP TRIAL: evaluate the COST ONLY (residual pass, no Jacobian) to score the step.
       // The expensive linearization is deferred to the accept-and-continue branch below, so a
       // rejected step costs only a residual pass (Ceres' "lazy" evaluation).
-      const double cost_new = evaluate_cost();
+      double cost_new;
+      {
+        const auto tr = std::chrono::steady_clock::now();
+        cost_new = evaluate_cost(exec);
+        t_residual += seconds_since(tr);
+      }
       const double actual = cost - cost_new;
       const double rho = (pred > 0.0) ? (actual / pred) : (actual > 0.0 ? 1.0 : -1.0);
+      const double step_norm = lm_delta_.norm();
+
+      // CERES-ORDER TERMINATION (TrustRegionMinimizer::Minimize, verified against tag 2.2.0):
+      // parameter- and function-tolerance are checked on the CANDIDATE step BEFORE the
+      // accept/reject decision (the ptol check additionally requires one prior successful
+      // step, per Ceres 2.2.0's atleast_one_successful_step guard). This is what lets Ceres
+      // exit a flat valley (the free-S2 gravity <-> accel-bias ambiguity) after ONE negligible
+      // trial; checking only ACCEPTED steps kept rejecting trials while lambda escalated to
+      // max_lambda -- ~10 extra Schur solves + residual passes per S2 solve. One deviation
+      // from Ceres (which always discards the terminal candidate): we KEEP it iff it decreased
+      // the cost -- never worse than Ceres' iterate, identical trial counts, and identical to
+      // the pre-candidate-check terminal behavior on accepted steps.
+      if ((summary.successful_steps > 0 &&
+           step_norm <= options.parameter_tolerance * (x_norm + options.parameter_tolerance)) ||
+          std::abs(actual) <= options.function_tolerance * std::abs(cost)) {
+        if (actual > 0.0) {
+          cost = cost_new;
+          summary.successful_steps++;
+        } else {
+          restore(backup);
+        }
+        converged = true;
+        summary.message = (step_norm <= options.parameter_tolerance * (x_norm + options.parameter_tolerance))
+                              ? "parameter tolerance"
+                              : "function tolerance";
+        break;
+      }
 
       if (rho > options.min_relative_decrease) {
         const double rel = actual / std::max(1e-12, cost);
-        const double step_norm = lm_delta_.norm();
         cost = cost_new;
         const double f = 2.0 * rho - 1.0;
         lambda *= std::max(1.0 / 3.0, 1.0 - f * f * f);
@@ -682,30 +820,23 @@ SolverSummary Problem::Solve(const SolverOptions &options) {
         nu = 2.0;
         summary.successful_steps++;
         step_taken = true;
-        if (rel >= 0.0 && rel < options.function_tolerance) {
-          converged = true;
-          summary.message = "function tolerance";
-        }
-        if (step_norm < options.parameter_tolerance) {
-          converged = true;
-          summary.message = "parameter tolerance";
-        }
         if (options.verbose)
           std::fprintf(stderr, "[zbft/lm] it=%2d cost=%.8e rel=%.3e gnorm=%.3e lambda=%.2e rho=%.3f\n", iter, cost, rel,
                        grad.lpNorm<Eigen::Infinity>(), lambda, rho);
-        // Re-linearize at the accepted iterate ONLY if we are continuing -- the Hessian/gradient
-        // are needed solely by the next iteration. On convergence we skip it (this is the single
-        // wasted linearization that previously made the LM path ~1 linearize/solve slower than Ceres).
-        if (!converged) {
+        // Re-linearize at the accepted iterate (the candidate checks above already handled the
+        // terminal case, so an accepted step here always continues to the next iteration).
+        {
+          const auto tt = std::chrono::steady_clock::now();
           double relin_cost = 0.0;
           linearize(H, grad, relin_cost, exec);
+          t_linearize += seconds_since(tt);
         }
         break;
       } else {
         restore(backup);
         summary.rejected_steps++;
         lambda *= nu;
-        nu *= 2.0;
+        nu *= options.lm_nu_growth;
         if (lambda > options.max_lambda) {
           // No descent direction even at maximum damping => a (local) stationary point: this is
           // CONVERGENCE, not failure. The free-gravity init's gravity/accel-bias ambiguity makes the
@@ -730,6 +861,9 @@ SolverSummary Problem::Solve(const SolverOptions &options) {
   summary.solve_time_seconds = seconds_since(t0);
   summary.jacobian_evals = n_jac_evals_;
   summary.residual_evals = n_res_evals_;
+  summary.time_linearize_seconds = t_linearize;
+  summary.time_linear_solve_seconds = t_linsolve;
+  summary.time_residual_seconds = t_residual;
   return summary;
 }
 
@@ -757,15 +891,29 @@ bool Problem::ComputeCovariance(const std::vector<double *> &blocks, Eigen::Matr
   linearize(H, grad, cov_cost, exec); // at the current (solved) iterate, undamped
 
   // Reduced navigation information with landmarks marginalized (lambda = 0).
+  // H holds only the used lower triangle: B^T = H(land-rows, nav-cols) is stored directly,
+  // the nav-nav block is materialized from its lower half.
   Eigen::MatrixXd Hred;
   if (n_land_ == 0) {
-    Hred = H.topLeftCorner(n_nav_, n_nav_);
+    Hred = H.topLeftCorner(n_nav_, n_nav_).selfadjointView<Eigen::Lower>();
   } else {
+    // Hred = Hnn - (B * D^-1) * B^T with D BLOCK-diagonal: scale B's landmark column-blocks by
+    // the small (lsize x lsize) inverses directly -- never materialize the dense
+    // n_land x n_land D^-1 (that costs an O(n_land^2) zero-fill plus an O(n_nav*n_land^2)
+    // gemm for what is O(n_nav*n_land*lsize) work).
     // Small ridge keeps weakly-observed (near-singular) landmark blocks invertible;
     // it perturbs the marginal only at the ~1e-8 level for well-observed landmarks.
-    const Eigen::MatrixXd Dinv = Problem_build_Dinv(H, n_nav_, n_land_, land_diag_, 1e-10);
-    const Eigen::MatrixXd B = H.block(0, n_nav_, n_nav_, n_land_);
-    Hred = H.topLeftCorner(n_nav_, n_nav_) - (B * Dinv) * B.transpose();
+    const auto Bt = H.block(n_nav_, 0, n_land_, n_nav_); // = B^T (landmark row-strip, always written)
+    Eigen::MatrixXd BD(n_nav_, n_land_);
+    for (const auto &od : land_diag_) {
+      const int off = od.first;
+      const int ls = od.second;
+      Eigen::MatrixXd Dblk =
+          Eigen::MatrixXd(H.block(n_nav_ + off, n_nav_ + off, ls, ls).selfadjointView<Eigen::Lower>());
+      Dblk.diagonal().array() += 1e-10;
+      BD.middleCols(off, ls).noalias() = Bt.middleRows(off, ls).transpose() * Dblk.inverse();
+    }
+    Hred = Eigen::MatrixXd(H.topLeftCorner(n_nav_, n_nav_).selfadjointView<Eigen::Lower>()) - BD * Bt;
   }
 
   // Invert (requires the gauge to be anchored -> PD). Marginal covariance = Hred^{-1}.

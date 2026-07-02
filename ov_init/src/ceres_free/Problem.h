@@ -62,6 +62,14 @@ struct SolverOptions {
   double min_lambda = 1e-12;
   double max_lambda = 1e12;
 
+  // Rejected-trial escalation: lambda *= nu; nu *= lm_nu_growth (Ceres LevenbergMarquardtStrategy
+  // uses growth 2.0). On problems with a flat-valley regime change (the free-S2 gravity <->
+  // accel-bias ambiguity) the Ceres schedule first lets lambda crash ~5 decades during the easy
+  // phase (bounded below by min_lambda), then pays ~9 REJECTED trials -- each a full Schur solve
+  // + residual pass -- climbing back. Raising min_lambda (e.g. 1e-7) bounds the crash and a larger
+  // lm_nu_growth (e.g. 4.0) accelerates the climb. Defaults preserve Ceres-exact behavior.
+  double lm_nu_growth = 2.0;
+
   // Powell dogleg trust region (default; the per-iteration win: ONE factorization per
   // linearization, rejected trials are cheap GN/Cauchy blends). use_dogleg=false -> LM.
   bool use_dogleg = false;
@@ -88,6 +96,10 @@ struct SolverSummary {
   double initial_cost = 0.0;
   double final_cost = 0.0;
   double solve_time_seconds = 0.0;
+  // Wall-clock split of solve_time_seconds (P0.4 instrumentation; ~zero overhead):
+  double time_linearize_seconds = 0.0;    ///< residual+Jacobian+Hessian accumulation passes
+  double time_linear_solve_seconds = 0.0; ///< damped (Schur) linear solves, incl. rejected trials
+  double time_residual_seconds = 0.0;     ///< residual-only trial scoring (evaluate_cost)
   bool converged = false;
   std::string message;
 };
@@ -157,16 +169,16 @@ private:
   };
 
   int block_index(double *values) const;
-  void assign_ordering();                                   // fills offsets, n_nav_, n_land_, n_total_, land_diag_
-  double evaluate_cost() const;                             // 0.5 * sum rho(||r||^2) at current x
+  void assign_ordering();                                    // fills offsets, n_nav_, n_land_, n_total_, land_diag_
+  double evaluate_cost(ParallelExecutor &exec) const;        // 0.5 * sum rho(||r||^2) at current x (parallel, worker-ordered reduction)
   void linearize(Eigen::MatrixXd &H, Eigen::VectorXd &grad, double &cost, // GN Hessian + gradient + robustified cost, one pass
                  ParallelExecutor &exec) const;
   /// Solve (H + lambda*diag(H)) delta = -grad. Uses the visibility-aware arrowhead Schur
   /// complement when landmark blocks are present, else a plain damped dense Cholesky.
   bool solve_step(const Eigen::MatrixXd &H, const Eigen::VectorXd &grad, double lambda, Eigen::VectorXd &delta) const;
-  void apply_delta(const Eigen::VectorXd &delta); // x <- x (+) delta
-  void snapshot(std::vector<double> &backup) const; // save variable-block ambient values
-  void restore(const std::vector<double> &backup);  // restore variable-block ambient values
+  void apply_delta(const Eigen::VectorXd &delta);    // x <- x (+) delta
+  double snapshot(std::vector<double> &backup) const; // save variable-block ambient values; returns ||x|| (Ceres x_norm)
+  void restore(const std::vector<double> &backup);   // restore variable-block ambient values
 
   std::vector<Block> blocks_;
   std::vector<Residual> residuals_;
@@ -186,7 +198,7 @@ private:
   mutable std::vector<double> cw_;             // per-worker cost accumulators
   mutable Eigen::MatrixXd Hd_, Hred_;          // damped full H (landmark-free path), reduced nav H (Schur path)
   mutable Eigen::VectorXd rhs_, da_;           // reduced rhs and nav step
-  mutable Eigen::LLT<Eigen::MatrixXd> lltRed_; // Cholesky (SPD): faster than LDLT; the reduced H is PD via the gauge prior
+  // (The Cholesky runs IN-PLACE on Hd_/Hred_ via LLT<Ref<MatrixXd>> -- no factor-storage copy per trial.)
   mutable Eigen::VectorXd dgn_, Hg_, Hdl_;     // dogleg: Gauss-Newton step, H*grad, the trust-region step
   mutable Eigen::VectorXd lm_delta_, lm_Dvec_; // LM: preallocated step and Marquardt damping diagonal
 
@@ -194,6 +206,7 @@ private:
   // schur_off_[k] = nav offset of pose block k, schur_W_[k] = H[off_k, landmark], schur_Ma_[k] = W_k * V^-1.
   mutable std::vector<Eigen::Matrix3d> schur_W_, schur_Ma_;
   mutable std::vector<int> schur_off_;
+  std::vector<double> plus_tmp_; // apply_delta Plus() scratch, sized once to the max ambient block size
 
   // Diagnostics (reset each Solve), surfaced in SolverSummary: linearization / cost-eval counts.
   mutable int n_jac_evals_ = 0;
@@ -206,6 +219,15 @@ private:
   std::vector<std::pair<int, int>> land_diag_; // (offset_within_land_partition, lsize) per landmark block
   std::vector<int> land_block_idx_;            // blocks_ index of each landmark (parallel to land_diag_)
   std::vector<std::vector<int>> land_adj_;     // per landmark: adjacent nav block indices (its observing poses)
+
+  // LOWER-TRIANGLE Hessian storage: H (and the per-worker accumulators) only ever hold the
+  // lower triangle of the used sparsity -- column j holds rows [j, col_tail_end_[j]). For nav
+  // columns the tail runs to n_total_ (nav-nav lower + the landmark W^T strip); for a landmark
+  // column it ends at its own 3x3 diagonal block (landmark-landmark coupling is structurally
+  // zero). Everything above/outside is NEVER written, zeroed, reduced, or read -- that cuts the
+  // dominant zero+reduce memory traffic of linearize() by ~2.5x and halves the scatter writes.
+  // Consumers read via selfadjoint/transposed-lower access (see solve_step/ComputeCovariance).
+  std::vector<int> col_tail_end_; // per column: one-past-the-end row of the used lower tail
 };
 
 } // namespace zbft_sfm

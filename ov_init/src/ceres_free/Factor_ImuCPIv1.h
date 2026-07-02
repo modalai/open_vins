@@ -59,6 +59,10 @@ public:
   // Sqrt of the preintegration information
   Eigen::Matrix<double, 15, 15> sqrtI_save;
 
+  // Gravity columns of sqrtI folded once at construction (see .cpp):
+  // J_grav = sqrtI * [0; 0; R_1*dt; 0; 0.5*R_1*dt^2] == sqrtI_grav_fold * R_1
+  Eigen::Matrix<double, 15, 3> sqrtI_grav_fold;
+
   // Gravity
   Eigen::Vector3d grav_save;
 
