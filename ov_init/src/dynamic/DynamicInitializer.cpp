@@ -199,11 +199,41 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
     return false;
   }
 
-  // Bias initial guesses specified by the launch file
-  // We don't go through the effort to recover the biases right now since they should be
-  // Semi-well known before launching or can be considered to be near zero...
-  Eigen::Vector3d gyroscope_bias = params.init_dyn_bias_g;
-  Eigen::Vector3d accelerometer_bias = params.init_dyn_bias_a;
+  // Bias initial guesses: config seeds by default; on a SOFT RESET the live filter's biases
+  // (threaded via ResetContext from VioManager::soft_reset) replace them. This is the single
+  // biggest conditioner of the free-S2 gravity<->accel-bias valley: with a trustworthy ba the
+  // MLE's tightened bias prior (below) collapses the near-null direction instead of letting
+  // gravity and ba trade off. The prior is gated -- validity, norm bounds, sigma caps after
+  // random-walk AGE inflation, divergence inflation -- so a corrupted filter degrades exactly
+  // to the legacy config-seed behavior.
+  ResetBiasPrior reset_prior = (reset_ctx != nullptr) ? reset_ctx->prior() : ResetBiasPrior();
+  bool use_reset_prior = params.init_dyn_reset_prior_use && reset_prior.valid;
+  Eigen::Vector3d reset_sig_bg = Eigen::Vector3d::Zero(), reset_sig_ba = Eigen::Vector3d::Zero();
+  if (use_reset_prior) {
+    const double age = std::max(0.0, newest_cam_time - reset_prior.t_snapshot);
+    reset_sig_bg = (reset_prior.sigma_bg.array().square() + params.sigma_wb * params.sigma_wb * age).sqrt().matrix();
+    reset_sig_ba = (reset_prior.sigma_ba.array().square() + params.sigma_ab * params.sigma_ab * age).sqrt().matrix();
+    if (reset_prior.cause == 1) { // divergence-triggered reset: distrust the snapshot
+      reset_sig_bg *= params.init_dyn_reset_prior_divergence_infl;
+      reset_sig_ba *= params.init_dyn_reset_prior_divergence_infl;
+    }
+    use_reset_prior = reset_prior.bg.norm() <= params.init_dyn_reset_prior_max_bg &&
+                      reset_prior.ba.norm() <= params.init_dyn_reset_prior_max_ba &&
+                      reset_sig_bg.maxCoeff() <= params.init_dyn_reset_prior_max_sigma_bg &&
+                      reset_sig_ba.maxCoeff() <= params.init_dyn_reset_prior_max_sigma_ba;
+    if (use_reset_prior) {
+      PRINT_INFO("[init-d]: reset bias prior ACTIVE (age %.2fs, max sig_bg %.4f, max sig_ba %.4f, cause %d)\n", age,
+                 reset_sig_bg.maxCoeff(), reset_sig_ba.maxCoeff(), reset_prior.cause);
+    } else {
+      PRINT_WARNING(YELLOW "[init-d]: reset bias prior REJECTED (|bg|=%.3f |ba|=%.3f max sig_bg=%.4f max sig_ba=%.4f cause=%d)\n" RESET,
+                    reset_prior.bg.norm(), reset_prior.ba.norm(), reset_sig_bg.maxCoeff(), reset_sig_ba.maxCoeff(), reset_prior.cause);
+    }
+  }
+  Eigen::Vector3d gyroscope_bias = use_reset_prior ? reset_prior.bg : params.init_dyn_bias_g;
+  Eigen::Vector3d accelerometer_bias = use_reset_prior ? reset_prior.ba : params.init_dyn_bias_a;
+  // Optional hard freeze of ba during a reset re-init (sqrtVINS-style "biases known" mode);
+  // requires an ACCEPTED prior and the explicit knob (covariance is spliced from the prior below).
+  const bool freeze_ba = use_reset_prior && params.init_dyn_fix_ba_on_reset;
 
   // Check that we have some angular velocity / orientation change
   double accel_inI_norm = 0.0;
@@ -827,6 +857,8 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
     problem.AddParameterBlock(var_vel, 3);
     problem.AddParameterBlock(var_bias_g, 3);
     problem.AddParameterBlock(var_bias_a, 3);
+    if (freeze_ba)
+      problem.SetParameterBlockConstant(var_bias_a); // reset-frozen ba (accepted prior + explicit knob)
 
     // Fix this first ever pose to constrain the problem
     // NOTE: If we don't do this, then the problem won't be full rank
@@ -852,8 +884,14 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
       Eigen::MatrixXd prior_Info = Eigen::MatrixXd::Identity(12, 12);
       prior_Info.block(0, 0, 3, 3) *= 1.0 / std::pow(0.001, 2);  // orientation: tight (~0.057 deg)
       prior_Info.block(3, 3, 3, 3) *= 1.0 / std::pow(0.001, 2);  // position: tight (~1 mm)
-      prior_Info.block(6, 6, 3, 3) *= 1.0 / std::pow(0.05, 2);   // bias_g prior
-      prior_Info.block(9, 9, 3, 3) *= 1.0 / std::pow(0.10, 2);   // bias_a prior
+      // Bias priors: legacy literals by default (bit-for-bit); per-axis tightened from the reset
+      // prior's floored marginal sigmas when a soft-reset episode is active (the valley killer).
+      for (int j = 0; j < 3; j++) {
+        const double sbg = use_reset_prior ? std::max(params.init_dyn_reset_prior_sigma_floor_bg, reset_sig_bg(j)) : 0.05;
+        const double sba = use_reset_prior ? std::max(params.init_dyn_reset_prior_sigma_floor_ba, reset_sig_ba(j)) : 0.10;
+        prior_Info(6 + j, 6 + j) = 1.0 / std::pow(sbg, 2); // bias_g prior
+        prior_Info(9 + j, 9 + j) = 1.0 / std::pow(sba, 2); // bias_a prior
+      }
 
       // Construct state type and ceres parameter pointers
       std::vector<std::string> x_types;
@@ -884,8 +922,13 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
       Eigen::MatrixXd prior_grad = Eigen::MatrixXd::Zero(10, 1);
       Eigen::MatrixXd prior_Info = Eigen::MatrixXd::Identity(10, 10);
       prior_Info.block(0, 0, 4, 4) *= 1.0 / std::pow(1e-5, 2); // 4dof unobservable yaw and position
-      prior_Info.block(4, 4, 3, 3) *= 1.0 / std::pow(0.05, 2); // bias_g prior
-      prior_Info.block(7, 7, 3, 3) *= 1.0 / std::pow(0.10, 2); // bias_a prior
+      // Bias priors: legacy literals by default; per-axis reset-prior tightening (see S2 block)
+      for (int j = 0; j < 3; j++) {
+        const double sbg = use_reset_prior ? std::max(params.init_dyn_reset_prior_sigma_floor_bg, reset_sig_bg(j)) : 0.05;
+        const double sba = use_reset_prior ? std::max(params.init_dyn_reset_prior_sigma_floor_ba, reset_sig_ba(j)) : 0.10;
+        prior_Info(4 + j, 4 + j) = 1.0 / std::pow(sbg, 2); // bias_g prior
+        prior_Info(7 + j, 7 + j) = 1.0 / std::pow(sba, 2); // bias_a prior
+      }
 
       // Construct state type and ceres parameter pointers
       std::vector<std::string> x_types;
@@ -1115,8 +1158,11 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
   bool cov_ok = false;
   {
     int sidx = map_states[newest_cam_time];
-    std::vector<double *> cb = {ceres_vars_ori[sidx], ceres_vars_pos[sidx], ceres_vars_vel[sidx], ceres_vars_bias_g[sidx],
-                                ceres_vars_bias_a[sidx]};
+    // When ba is reset-frozen it is a CONSTANT block: ComputeCovariance rejects constant blocks,
+    // so it is omitted from the request and its prior variance is spliced back in below.
+    std::vector<double *> cb = {ceres_vars_ori[sidx], ceres_vars_pos[sidx], ceres_vars_vel[sidx], ceres_vars_bias_g[sidx]};
+    if (!freeze_ba)
+      cb.push_back(ceres_vars_bias_a[sidx]);
     if (warmstart) {
       // Clones in ascending-time order -> matches _clones_IMU (std::map) iteration, the inflation/
       // T-transform block layout, and the injection contract in StateHelper::set_initial_state_warmstart.
@@ -1130,6 +1176,24 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
       PRINT_WARNING(YELLOW "[init-d]: covariance recovery failed...\n" RESET);
       free_state_memory();
       return false;
+    }
+    if (freeze_ba) {
+      // Re-insert the frozen ba block at rows/cols 12-14 with its (floored, age-inflated) prior
+      // variance and ZERO cross-covariance -- BEFORE the realign similarity and the congruence
+      // inflation, which both index the [theta,p,v,bg,ba | clones...] layout. A zero ba variance
+      // here would freeze ba in the EKF forever; the prior variance keeps it honest.
+      const int n_in = (int)cov_inject.rows(); // 12 (+ 6*n_clones when warm)
+      Eigen::MatrixXd cov_full = Eigen::MatrixXd::Zero(n_in + 3, n_in + 3);
+      cov_full.topLeftCorner(12, 12) = cov_inject.topLeftCorner(12, 12);
+      for (int j = 0; j < 3; j++)
+        cov_full(12 + j, 12 + j) = std::pow(std::max(params.init_dyn_reset_prior_sigma_floor_ba, reset_sig_ba(j)), 2);
+      const int n_rest = n_in - 12;
+      if (n_rest > 0) {
+        cov_full.block(15, 15, n_rest, n_rest) = cov_inject.block(12, 12, n_rest, n_rest);
+        cov_full.block(0, 15, 12, n_rest) = cov_inject.block(0, 12, 12, n_rest);
+        cov_full.block(15, 0, n_rest, 12) = cov_inject.block(12, 0, n_rest, 12);
+      }
+      cov_inject = cov_full;
     }
   }
 
@@ -1442,6 +1506,16 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
   covariance.block(9, 12, 3, 3) = covtmp.eval();
   covariance.block(12, 9, 3, 3) = covtmp.transpose().eval();
 
+  // Reset-frozen ba: Ceres returns ZERO covariance for constant blocks -- overwrite the ba
+  // diagonal with the (floored, age-inflated) prior variance so the EKF can keep estimating it.
+  if (freeze_ba) {
+    covariance.block(12, 12, 3, 3).setZero();
+    covariance.block(0, 12, 12, 3).setZero();
+    covariance.block(12, 0, 3, 12).setZero();
+    for (int j = 0; j < 3; j++)
+      covariance(12 + j, 12 + j) = std::pow(std::max(params.init_dyn_reset_prior_sigma_floor_ba, reset_sig_ba(j)), 2);
+  }
+
 #endif // USE_CERES_FREE_INIT
 
   // Inflate as a proper congruence S*Cov*S^T (scales cross-covariances consistently, not just the
@@ -1456,7 +1530,8 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
     sd.segment<3>(3).setConstant(std::sqrt(params.init_dyn_inflation_position));
     sd.segment<3>(6).setConstant(std::sqrt(params.init_dyn_inflation_velocity));
     sd.segment<3>(9).setConstant(std::sqrt(params.init_dyn_inflation_bias_gyro));
-    sd.segment<3>(12).setConstant(std::sqrt(params.init_dyn_inflation_bias_accel));
+    // Reset-frozen ba carries its PRIOR variance (spliced above) -- already honest, do not inflate.
+    sd.segment<3>(12).setConstant(freeze_ba ? 1.0 : std::sqrt(params.init_dyn_inflation_bias_accel));
     // Warm-start clone poses inflate with the SAME orientation/position factors as the IMU pose block,
     // so the newest clone (which shares the IMU pose) stays bit-identical to the IMU's (theta,p)
     // sub-block and every cross-covariance scales as a proper congruence. Loop is a no-op when 15x15.

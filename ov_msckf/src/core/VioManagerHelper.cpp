@@ -192,6 +192,7 @@ bool VioManager::try_to_initialize(const ov_core::CameraData &message) {
       PRINT_DEBUG(YELLOW "[init]: moved the state forward %.2f seconds\n" RESET, state->_timestamp - timestamp);
       // Soft-reset re-init episode is over; the next init cold-starts unless another soft_reset() arms it.
       warmstart_next_init.store(false);
+      initializer->clear_reset_prior(); // disarm the bias-prior episode too (lives in ov_init)
       thread_init_success = true;
       camera_queue_init.clear();
 

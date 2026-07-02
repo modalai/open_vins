@@ -192,7 +192,30 @@ VioManager::VioManager(VioManagerOptions &params_) : thread_init_running(false),
   }
 }
 
-void VioManager::soft_reset() {
+void VioManager::soft_reset(SoftResetCause cause) {
+
+  // SNAPSHOT the live bias state FIRST (before the EKF is torn down below): on a mid-ops reset the
+  // filter's converged bg/ba (+ their marginal sigmas from _Cov) are the best available bias
+  // knowledge, and the dynamic initializer consumes them as a GATED prior (CPI linearization
+  // points, MLE seed, tightened first-pose bias prior -- see init_dyn_reset_prior_*). The caller
+  // has already quiesced sensor callbacks, so reading the state here is race-free. An invalid
+  // snapshot (never-initialized filter) still arms the context, which clears any stale prior.
+  ov_init::ResetBiasPrior bias_prior;
+  if (is_initialized_vio && timelastupdate != -1 && state != nullptr) {
+    bias_prior.bg = state->_imu->bias_g();
+    bias_prior.ba = state->_imu->bias_a();
+    std::vector<std::shared_ptr<ov_type::Type>> bias_vars = {state->_imu->bg(), state->_imu->ba()};
+    Eigen::MatrixXd Pbb = StateHelper::get_marginal_covariance(state, bias_vars); // 6x6 [bg, ba]
+    bias_prior.sigma_bg = Pbb.block(0, 0, 3, 3).diagonal().cwiseMax(0.0).cwiseSqrt();
+    bias_prior.sigma_ba = Pbb.block(3, 3, 3, 3).diagonal().cwiseMax(0.0).cwiseSqrt();
+    bias_prior.t_snapshot = state->_timestamp;
+    bias_prior.cause = (int)cause;
+    bias_prior.valid = true;
+    PRINT_INFO("[soft-reset]: bias prior snapshot |bg|=%.4f |ba|=%.4f (max sig %.4f/%.4f, cause=%d)\n", bias_prior.bg.norm(),
+               bias_prior.ba.norm(), bias_prior.sigma_bg.maxCoeff(), bias_prior.sigma_ba.maxCoeff(), (int)cause);
+  }
+  if (initializer != nullptr)
+    initializer->set_reset_prior(bias_prior);
 
   // Stop/clear the async initialization machinery (the caller has already quiesced sensor callbacks).
   {

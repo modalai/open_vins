@@ -27,6 +27,7 @@
 #include <unordered_map>
 
 #include "init/InertialInitializerOptions.h"
+#include "init/ResetPrior.h"
 
 namespace ov_core {
 class FeatureDatabase;
@@ -116,9 +117,22 @@ public:
                   std::shared_ptr<ov_type::IMU> t_imu, std::map<double, std::shared_ptr<ov_type::PoseJPL>> &clones_IMU,
                   std::unordered_map<size_t, std::shared_ptr<ov_type::Landmark>> &features_SLAM, bool wait_for_jerk = true);
 
+  /**
+   * @brief Arm the reset context with the live filter's bias snapshot (called from soft reset).
+   * The next dynamic-init attempts consume it as CPI linearization points, MLE seed, and a
+   * tightened first-pose bias prior (see init_dyn_reset_prior_* options). Thread-safe.
+   */
+  void set_reset_prior(const ResetBiasPrior &prior);
+
+  /// Disarm the reset context (successful init or explicit teardown). Thread-safe.
+  void clear_reset_prior();
+
 protected:
   /// Initialization parameters
   InertialInitializerOptions params;
+
+  /// Soft-reset hand-off context (bias prior episode), shared with the dynamic initializer
+  std::shared_ptr<ResetContext> reset_ctx;
 
   /// Feature tracker database with all features in it
   std::shared_ptr<ov_core::FeatureDatabase> _db;

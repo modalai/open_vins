@@ -170,6 +170,25 @@ struct InertialInitializerOptions {
   /// gravity/accel-bias valley -- an alternative worth A/B-ing on target for reset-heavy profiles.
   double init_dyn_mle_lm_initial_lambda = 1e-4;
 
+  /// SOFT-RESET bias prior: use the live filter's bg/ba (+ marginal sigmas) threaded through
+  /// VioManager::soft_reset as the dynamic init's bias seeds, CPI linearization points, and a
+  /// per-axis tightened first-pose bias prior. The dominant conditioner of the free-S2
+  /// gravity<->accel-bias valley. Gated by validity/norm/sigma caps below; a rejected prior
+  /// degrades bit-for-bit to the legacy config-seed behavior. Cold boot is unaffected.
+  bool init_dyn_reset_prior_use = true;
+  double init_dyn_reset_prior_max_bg = 0.2;        ///< reject prior if |bg| exceeds this (rad/s)
+  double init_dyn_reset_prior_max_ba = 1.0;        ///< reject prior if |ba| exceeds this (m/s^2)
+  double init_dyn_reset_prior_max_sigma_bg = 0.05; ///< reject if any bg sigma (age-inflated) exceeds this
+  double init_dyn_reset_prior_max_sigma_ba = 0.5;  ///< reject if any ba sigma (age-inflated) exceeds this
+  double init_dyn_reset_prior_sigma_floor_bg = 0.005; ///< floor on the tightened bg prior sigma
+  double init_dyn_reset_prior_sigma_floor_ba = 0.02;  ///< floor on the tightened ba prior sigma
+  double init_dyn_reset_prior_divergence_infl = 3.0;  ///< sigma inflation when the reset was divergence-triggered
+
+  /// Hard-freeze ba during a soft-reset re-init (sqrtVINS-style "biases known"): ba blocks are
+  /// held constant in the MLE and the injected ba covariance is the (floored) prior variance.
+  /// Requires an ACCEPTED reset prior; default off (the tightened prior alone is the safe mode).
+  bool init_dyn_fix_ba_on_reset = false;
+
   /**
    * @brief This function will load print out all initializer settings loaded.
    * This allows for visual checking that everything was loaded properly from ROS/CMD parsers.
@@ -210,6 +229,15 @@ struct InertialInitializerOptions {
       parser->parse_config("init_dyn_mle_lm_min_lambda", init_dyn_mle_lm_min_lambda, false);        // optional; zbft LM lambda floor
       parser->parse_config("init_dyn_mle_lm_nu_growth", init_dyn_mle_lm_nu_growth, false);          // optional; zbft LM reject escalation growth
       parser->parse_config("init_dyn_mle_lm_initial_lambda", init_dyn_mle_lm_initial_lambda, false); // optional; zbft LM initial damping
+      parser->parse_config("init_dyn_reset_prior_use", init_dyn_reset_prior_use, false);             // optional; soft-reset bias prior
+      parser->parse_config("init_dyn_reset_prior_max_bg", init_dyn_reset_prior_max_bg, false);
+      parser->parse_config("init_dyn_reset_prior_max_ba", init_dyn_reset_prior_max_ba, false);
+      parser->parse_config("init_dyn_reset_prior_max_sigma_bg", init_dyn_reset_prior_max_sigma_bg, false);
+      parser->parse_config("init_dyn_reset_prior_max_sigma_ba", init_dyn_reset_prior_max_sigma_ba, false);
+      parser->parse_config("init_dyn_reset_prior_sigma_floor_bg", init_dyn_reset_prior_sigma_floor_bg, false);
+      parser->parse_config("init_dyn_reset_prior_sigma_floor_ba", init_dyn_reset_prior_sigma_floor_ba, false);
+      parser->parse_config("init_dyn_reset_prior_divergence_infl", init_dyn_reset_prior_divergence_infl, false);
+      parser->parse_config("init_dyn_fix_ba_on_reset", init_dyn_fix_ba_on_reset, false);
     }
     PRINT_DEBUG("  - init_window_time: %.2f\n", init_window_time);
     PRINT_DEBUG("  - init_imu_thresh: %.2f\n", init_imu_thresh);
@@ -260,6 +288,12 @@ struct InertialInitializerOptions {
     PRINT_DEBUG("  - init_dyn_mle_lm_min_lambda: %.3e\n", init_dyn_mle_lm_min_lambda);
     PRINT_DEBUG("  - init_dyn_mle_lm_nu_growth: %.2f\n", init_dyn_mle_lm_nu_growth);
     PRINT_DEBUG("  - init_dyn_mle_lm_initial_lambda: %.3e\n", init_dyn_mle_lm_initial_lambda);
+    PRINT_DEBUG("  - init_dyn_reset_prior_use: %d\n", init_dyn_reset_prior_use);
+    PRINT_DEBUG("  - init_dyn_reset_prior gates: |bg|<%.2f |ba|<%.2f sig_bg<%.3f sig_ba<%.3f floors %.3f/%.3f div_infl %.1f\n",
+                init_dyn_reset_prior_max_bg, init_dyn_reset_prior_max_ba, init_dyn_reset_prior_max_sigma_bg,
+                init_dyn_reset_prior_max_sigma_ba, init_dyn_reset_prior_sigma_floor_bg, init_dyn_reset_prior_sigma_floor_ba,
+                init_dyn_reset_prior_divergence_infl);
+    PRINT_DEBUG("  - init_dyn_fix_ba_on_reset: %d\n", init_dyn_fix_ba_on_reset);
     PRINT_DEBUG("  - init_dyn_grav_gate_deg: %.2f\n", init_dyn_grav_gate_deg);
   }
 

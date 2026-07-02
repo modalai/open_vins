@@ -201,6 +201,12 @@ static Eigen::Vector4d perturb_q(const Eigen::Vector4d &q, const Eigen::Vector3d
   dq << 0.5 * dth, 1.0;
   return quatnorm(quat_multiply(quatnorm(dq), q));
 }
+// Reset-prior mode knobs (argv): ba first-pose prior sigma (0.10 = legacy config-seed mode;
+// ~0.02 = soft-reset tightened prior) and the ba seed error the sim draws (0.02 = legacy;
+// larger with a tight sigma = the corrupted-prior failure mode the production gates exist for).
+static double g_ba_prior_sigma = 0.10;
+static double g_ba_seed_err = 0.03; // matches the legacy MC seed draw
+
 static InitGuess make_init(const Sim &s, std::mt19937 &rng, double grav_perturb_deg = 0.0) {
   InitGuess g;
   g.q = s.q;
@@ -217,7 +223,7 @@ static InitGuess make_init(const Sim &s, std::mt19937 &rng, double grav_perturb_
   for (int j = 0; j < s.M; ++j)
     g.lm[j] = s.lm[j] + randn3(rng, 0.08);
   g.bg = s.bg_gt + randn3(rng, 0.01);
-  g.ba = s.ba_gt + randn3(rng, 0.03);
+  g.ba = s.ba_gt + randn3(rng, g_ba_seed_err);
   g.grav = s.grav;
   if (grav_perturb_deg > 0) {
     Eigen::Vector3d axis = randn3(rng, 1.0).normalized();
@@ -240,7 +246,7 @@ static Factor_GenericPrior *make_prior_s2(const double *q0, const double *p0, co
   info.block(0, 0, 3, 3) *= 1.0 / std::pow(0.001, 2); // orientation (full quat)
   info.block(3, 3, 3, 3) *= 1.0 / std::pow(0.001, 2); // position
   info.block(6, 6, 3, 3) *= 1.0 / std::pow(0.05, 2);  // bias_g
-  info.block(9, 9, 3, 3) *= 1.0 / std::pow(0.10, 2);  // bias_a
+  info.block(9, 9, 3, 3) *= 1.0 / std::pow(g_ba_prior_sigma, 2);  // bias_a (reset mode: tightened)
   std::vector<std::string> types = {"quat", "vec3", "vec3", "vec3"};
   return new Factor_GenericPrior(x_lin, types, info, Eigen::MatrixXd::Zero(12, 1));
 }
@@ -398,6 +404,8 @@ int main(int argc, char **argv) {
   int K = (argc > 1) ? atoi(argv[1]) : 500;
   int gmode = (argc > 2) ? atoi(argv[2]) : 0;     // 0=free, 1=free+prior, 2=fixed@GT
   int do_inflate = (argc > 3) ? atoi(argv[3]) : 0; // apply the production init_dyn_inflation_* as a congruence
+  g_ba_prior_sigma = (argc > 4) ? atof(argv[4]) : 0.10; // ba prior sigma (0.10 legacy; ~0.02 reset-prior mode)
+  g_ba_seed_err = (argc > 5) ? atof(argv[5]) : 0.03;    // ba seed error (0.03 legacy; raise w/ tight sigma = corrupted prior)
   const char *mname[3] = {"free-S2", "free-S2 + grav-prior", "gravity-FIXED@GT"};
   std::printf("==== zbft_sfm init NEES consistency (%d trials, gravity=%s, inflation=%s) ====\n", K,
               mname[(gmode < 0 || gmode > 2) ? 0 : gmode], do_inflate ? "ON" : "off");

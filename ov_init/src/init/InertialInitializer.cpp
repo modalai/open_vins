@@ -42,10 +42,21 @@ InertialInitializer::InertialInitializer(InertialInitializerOptions &params_, st
   // Vector of our IMU data
   imu_data = std::make_shared<std::vector<ov_core::ImuData>>();
 
+  // Soft-reset hand-off context (bias prior episode; armed from VioManager::soft_reset)
+  reset_ctx = std::make_shared<ResetContext>();
+
   // Create initializers
   init_static = std::make_shared<StaticInitializer>(params, _db, imu_data);
-  init_dynamic = std::make_shared<DynamicInitializer>(params, _db, imu_data);
+  init_dynamic = std::make_shared<DynamicInitializer>(params, _db, imu_data, reset_ctx);
 }
+
+void InertialInitializer::set_reset_prior(const ResetBiasPrior &prior) {
+  // Arm the episode; the short-window flag is reserved for the dual-window reset mode (R3)
+  // and stays false until init_window_time_reset is configured and plumbed.
+  reset_ctx->arm(prior, false);
+}
+
+void InertialInitializer::clear_reset_prior() { reset_ctx->disarm(); }
 
 void InertialInitializer::feed_imu(const ov_core::ImuData &message, double oldest_time) {
 

@@ -129,8 +129,14 @@ public:
    * reset latency. Contrast the hard reset, which destroys + recreates the whole VioManager.
    *
    * The caller MUST have quiesced sensor callbacks (no concurrent feed_*) before calling this.
+   *
+   * The live filter's bias estimates (+ marginal sigmas) are SNAPSHOTTED here and handed to the
+   * initializer as a gated prior (see init_dyn_reset_prior_*) -- the dominant conditioner of the
+   * free-S2 gravity/accel-bias valley on re-init. A DIVERGENCE-suspected cause inflates the
+   * snapshot sigmas so a poisoned filter cannot seed the re-init with false confidence.
    */
-  void soft_reset();
+  enum class SoftResetCause { CLIENT = 0, DIVERGENCE = 1 };
+  void soft_reset(SoftResetCause cause = SoftResetCause::CLIENT);
 
   /// Accessor to get the current propagator
   std::shared_ptr<Propagator> get_propagator() { return propagator; }

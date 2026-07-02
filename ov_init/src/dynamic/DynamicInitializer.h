@@ -23,6 +23,7 @@
 #define OV_INIT_DYNAMICINITIALIZER_H
 
 #include "init/InertialInitializerOptions.h"
+#include "init/ResetPrior.h"
 
 namespace ov_core {
 class FeatureDatabase;
@@ -66,10 +67,12 @@ public:
    * @param params_ Parameters loaded from either ROS or CMDLINE
    * @param db Feature tracker database with all features in it
    * @param imu_data_ Shared pointer to our IMU vector of historical information
+   * @param reset_ctx_ Optional soft-reset hand-off context (live bias prior episode)
    */
   explicit DynamicInitializer(const InertialInitializerOptions &params_, std::shared_ptr<ov_core::FeatureDatabase> db,
-                              std::shared_ptr<std::vector<ov_core::ImuData>> imu_data_)
-      : params(params_), _db(db), imu_data(imu_data_) {}
+                              std::shared_ptr<std::vector<ov_core::ImuData>> imu_data_,
+                              std::shared_ptr<ResetContext> reset_ctx_ = nullptr)
+      : params(params_), _db(db), imu_data(imu_data_), reset_ctx(reset_ctx_) {}
 
   /**
    * @brief Try to get the initialized system
@@ -95,6 +98,9 @@ private:
 
   /// Our history of IMU messages (time, angular, linear)
   std::shared_ptr<std::vector<ov_core::ImuData>> imu_data;
+
+  /// Soft-reset hand-off context (may be null; then config bias seeds are used)
+  std::shared_ptr<ResetContext> reset_ctx;
 };
 
 } // namespace ov_init
