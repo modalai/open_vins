@@ -33,6 +33,7 @@
 #include "cpi/CpiV1.h"
 #include "feat/Feature.h"
 #include "feat/FeatureDatabase.h"
+#include "feat/FeatureInitializer.h"
 #include "types/IMU.h"
 #include "types/Landmark.h"
 #include "utils/colors.h"
@@ -376,6 +377,30 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
     last_camera_timestamp = current_time;
   }
 
+  // ================== STAGE-1 LINEAR SEED (method-selectable) ==================
+  // 0 = Dong-Si (features-in-state, legacy); 1 = feature-less 6x6 [v,g] only;
+  // 2 = feature-less with in-call Dong-Si fallback. The feature-less path solves no feature
+  // positions (O(features) assembly, low-parallax robust) -- the short-reset-window fast path.
+  Eigen::Vector3d v_I0inI0 = Eigen::Vector3d::Zero();
+  Eigen::Vector3d gravity_inI0 = Eigen::Vector3d::Zero();
+  Eigen::MatrixXd x_hat;                  // Dong-Si only: [features, velocity, gravity] solution
+  std::map<size_t, int> A_index_features; // Dong-Si only: feature index in x_hat
+  bool seed_from_featureless = false;
+  boost::posix_time::ptime rT3;
+  if (params.init_dyn_linear_method != 0) {
+    seed_from_featureless = linear_seed_featureless(features, map_features_num_meas, min_num_meas_to_optimize, map_camera_times,
+                                                    map_camera_cpi_I0toIi, oldest_camera_time, v_I0inI0, gravity_inI0);
+    if (!seed_from_featureless) {
+      if (params.init_dyn_linear_method == 1) {
+        PRINT_WARNING(YELLOW "[init-d]: feature-less linear seed failed (method=1, no fallback)\n" RESET);
+        return false;
+      }
+      PRINT_WARNING(YELLOW "[init-d]: feature-less linear seed failed -> Dong-Si fallback\n" RESET);
+    }
+  }
+  if (seed_from_featureless) {
+    rT3 = boost::posix_time::microsec_clock::local_time();
+  } else {
   // Loop through each feature observation and accumulate the NORMAL EQUATIONS directly --
   // the dense (num_measurements x system_size) A matrix, its Gram matrix inverse, and the
   // (num_measurements x num_measurements) projector of the old path are never materialized.
@@ -386,7 +411,6 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
   PRINT_DEBUG("[init-d]: system of %d measurement x %d states created (%d features, %s)\n", num_measurements, system_size, num_features,
               (have_stereo) ? "stereo" : "mono");
   int idx_feat = 0;
-  std::map<size_t, int> A_index_features;
   // Per-feature normal-equation blocks: F_j (feat-feat), C_j (feat-vel), G_j (feat-grav), y_fj
   std::vector<Eigen::Matrix3d> NE_F, NE_C, NE_G;
   std::vector<Eigen::Vector3d> NE_yf;
@@ -473,7 +497,7 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
       }
     }
   }
-  auto rT3 = boost::posix_time::microsec_clock::local_time();
+  rT3 = boost::posix_time::microsec_clock::local_time();
 
   // ======================================================
   // ======================================================
@@ -582,23 +606,24 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
   // per-feature p_FinI0 = xf_j - Xfg_j*g and velocity v = xv - Xvg*g (identical to the old
   // dense back-substitution, no measurement-sized products).
   const Eigen::Vector3d g_sol = state_grav;
-  Eigen::MatrixXd x_hat = Eigen::MatrixXd::Zero(system_size, 1);
+  x_hat = Eigen::MatrixXd::Zero(system_size, 1);
   for (int jj = 0; jj < num_features; ++jj) {
     x_hat.block(size_feature * jj, 0, 3, 1) = xf[jj] - Xfg[jj] * g_sol;
   }
   x_hat.block(size_feature * num_features + 0, 0, 3, 1) = xv - Xvg * g_sol;
   x_hat.block(size_feature * num_features + 3, 0, 3, 1) = state_grav;
-  Eigen::Vector3d v_I0inI0 = x_hat.block(size_feature * num_features + 0, 0, 3, 1);
+  v_I0inI0 = x_hat.block(size_feature * num_features + 0, 0, 3, 1);
   PRINT_INFO("[init-d]: velocity in I0 was %.3f,%.3f,%.3f and |v| = %.4f\n", v_I0inI0(0), v_I0inI0(1), v_I0inI0(2), v_I0inI0.norm());
 
   // Check gravity magnitude to see if converged
-  Eigen::Vector3d gravity_inI0 = x_hat.block(size_feature * num_features + 3, 0, 3, 1);
+  gravity_inI0 = x_hat.block(size_feature * num_features + 3, 0, 3, 1);
   double init_max_grav_difference = 1e-3;
   if (std::abs(gravity_inI0.norm() - params.gravity_mag) > init_max_grav_difference) {
     PRINT_WARNING(YELLOW "[init-d]: gravity did not converge (%.3f > %.3f)\n" RESET, std::abs(gravity_inI0.norm() - params.gravity_mag),
                   init_max_grav_difference);
     return false;
   }
+  } // end Dong-Si fallback (!seed_from_featureless)
   PRINT_INFO("[init-d]: gravity in I0 was %.3f,%.3f,%.3f and |g| = %.4f\n", gravity_inI0(0), gravity_inI0(1), gravity_inI0(2),
              gravity_inI0.norm());
 
@@ -648,38 +673,41 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
     vel_IiinI0.insert({time, v_IkinI0});
   }
 
-  // Recover the features in the first IMU frame
+  // Recover the features in the first IMU frame (Dong-Si path only: features were solved in
+  // x_hat; the feature-less path triangulates them AFTER the gravity alignment below).
   count_valid_features = 0;
   std::map<size_t, Eigen::Vector3d> features_inI0;
-  for (auto const &feat : features) {
-    if (map_features_num_meas[feat.first] < min_num_meas_to_optimize)
-      continue;
-    Eigen::Vector3d p_FinI0;
-    if (size_feature == 1) {
-      assert(false);
-      // double depth = x_hat(size_feature * A_index_features.at(feat.first), 0);
-      // p_FinI0 = depth * features_bearings.at(feat.first) - R_ItoC.transpose() * p_IinC;
-    } else {
-      p_FinI0 = x_hat.block(size_feature * A_index_features.at(feat.first), 0, 3, 1);
-    }
-    bool is_behind = false;
-    for (auto const &camtime : feat.second->timestamps) {
-      size_t cam_id = camtime.first;
-      Eigen::Vector4d q_ItoC = params.camera_extrinsics.at(cam_id).block(0, 0, 4, 1);
-      Eigen::Vector3d p_IinC = params.camera_extrinsics.at(cam_id).block(4, 0, 3, 1);
-      Eigen::Vector3d p_FinC0 = quat_2_Rot(q_ItoC) * p_FinI0 + p_IinC;
-      if (p_FinC0(2) < 0) {
-        is_behind = true;
+  if (!seed_from_featureless) {
+    for (auto const &feat : features) {
+      if (map_features_num_meas[feat.first] < min_num_meas_to_optimize)
+        continue;
+      Eigen::Vector3d p_FinI0;
+      if (size_feature == 1) {
+        assert(false);
+        // double depth = x_hat(size_feature * A_index_features.at(feat.first), 0);
+        // p_FinI0 = depth * features_bearings.at(feat.first) - R_ItoC.transpose() * p_IinC;
+      } else {
+        p_FinI0 = x_hat.block(size_feature * A_index_features.at(feat.first), 0, 3, 1);
+      }
+      bool is_behind = false;
+      for (auto const &camtime : feat.second->timestamps) {
+        size_t cam_id = camtime.first;
+        Eigen::Vector4d q_ItoC = params.camera_extrinsics.at(cam_id).block(0, 0, 4, 1);
+        Eigen::Vector3d p_IinC = params.camera_extrinsics.at(cam_id).block(4, 0, 3, 1);
+        Eigen::Vector3d p_FinC0 = quat_2_Rot(q_ItoC) * p_FinI0 + p_IinC;
+        if (p_FinC0(2) < 0) {
+          is_behind = true;
+        }
+      }
+      if (!is_behind) {
+        features_inI0.insert({feat.first, p_FinI0});
+        count_valid_features++;
       }
     }
-    if (!is_behind) {
-      features_inI0.insert({feat.first, p_FinI0});
-      count_valid_features++;
+    if (count_valid_features < min_valid_features) {
+      PRINT_ERROR(YELLOW "[init-d]: not enough features for our mle (%zu < %d)!\n" RESET, count_valid_features, min_valid_features);
+      return false;
     }
-  }
-  if (count_valid_features < min_valid_features) {
-    PRINT_ERROR(YELLOW "[init-d]: not enough features for our mle (%zu < %d)!\n" RESET, count_valid_features, min_valid_features);
-    return false;
   }
 
   // Convert our states to be a gravity aligned global frame of reference
@@ -698,6 +726,64 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
   }
   for (auto const &feat : features_inI0) {
     features_inG[feat.first] = R_GtoI0.transpose() * feat.second;
+  }
+
+  // Feature seed for the MLE (feature-less path): the linear stage solved no feature positions,
+  // so triangulate the candidates against the aligned clone poses now. Features that fail the
+  // triangulator's cond/min-max-dist checks are simply dropped (the MLE skips absent features).
+  if (seed_from_featureless) {
+    ov_core::FeatureInitializerOptions fi_opts;
+    fi_opts.triangulate_1d = false;
+    fi_opts.refine_features = true;
+    fi_opts.min_dist = params.init_dyn_fl_tri_min_dist;
+    fi_opts.max_dist = params.init_dyn_fl_tri_max_dist;
+    ov_core::FeatureInitializer featinit(fi_opts);
+    std::unordered_map<size_t, std::unordered_map<double, ov_core::FeatureInitializer::ClonePose>> clonesCAM;
+    for (auto const &cam : params.camera_extrinsics) {
+      Eigen::Matrix3d R_ItoC = quat_2_Rot(cam.second.block(0, 0, 4, 1));
+      Eigen::Vector3d p_IinC = cam.second.block(4, 0, 3, 1);
+      std::unordered_map<double, ov_core::FeatureInitializer::ClonePose> clones;
+      for (auto const &tp : map_camera_times) {
+        Eigen::Matrix3d R_GtoIi = quat_2_Rot(Eigen::Vector4d(ori_GtoIi.at(tp.first)));
+        Eigen::Matrix3d R_GtoCi = R_ItoC * R_GtoIi;
+        Eigen::Vector3d p_CiinG = Eigen::Vector3d(pos_IiinG.at(tp.first)) - R_GtoCi.transpose() * p_IinC;
+        clones.insert({tp.first, ov_core::FeatureInitializer::ClonePose(R_GtoCi, p_CiinG)});
+      }
+      clonesCAM.insert({cam.first, clones});
+    }
+    count_valid_features = 0;
+    for (auto const &feat : features) {
+      if (map_features_num_meas[feat.first] < min_num_meas_to_optimize)
+        continue;
+      // Copy with observations PRUNED to the selected pose times (the triangulator indexes
+      // clonesCAM by every timestamp the feature carries -- unselected times have no clone).
+      auto featcopy = std::make_shared<Feature>();
+      featcopy->featid = feat.second->featid;
+      for (auto const &camtime : feat.second->timestamps) {
+        const size_t cid = camtime.first;
+        for (size_t i = 0; i < camtime.second.size(); i++) {
+          const double t = camtime.second.at(i);
+          if (map_camera_times.find(t) == map_camera_times.end())
+            continue;
+          featcopy->timestamps[cid].push_back(t);
+          featcopy->uvs[cid].push_back(feat.second->uvs.at(cid).at(i));
+          featcopy->uvs_norm[cid].push_back(feat.second->uvs_norm.at(cid).at(i));
+        }
+      }
+      bool ok = featinit.single_triangulation(featcopy, clonesCAM);
+      if (ok && fi_opts.refine_features)
+        ok = featinit.single_gaussnewton(featcopy, clonesCAM);
+      if (!ok)
+        continue;
+      features_inG.insert({feat.first, featcopy->p_FinG});
+      count_valid_features++;
+    }
+    if (count_valid_features < min_valid_features) {
+      PRINT_ERROR(YELLOW "[init-d]: featureless path: only %d features triangulated (%d needed)!\n" RESET, count_valid_features,
+                  min_valid_features);
+      return false;
+    }
+    PRINT_DEBUG("[init-d]: featureless path: %d features triangulated for the MLE seed\n", count_valid_features);
   }
 
   // ======================================================
@@ -1567,5 +1653,262 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
   PRINT_DEBUG("[TIME]: %.4f sec for ceres-free covariance\n", (rT7 - rT6).total_microseconds() * 1e-6);
   PRINT_DEBUG("[TIME]: %.4f sec total for initialization\n", (rT7 - rT1).total_microseconds() * 1e-6);
   free_state_memory();
+  return true;
+}
+
+// =====================================================================================================
+// Feature-less linear seed (sqrtVINS Stage-A style). See DynamicInitializer.h for the method summary.
+// =====================================================================================================
+bool DynamicInitializer::linear_seed_featureless(const std::unordered_map<size_t, std::shared_ptr<ov_core::Feature>> &features,
+                                                 const std::map<size_t, int> &map_features_num_meas, int min_num_meas,
+                                                 const std::map<double, bool> &map_camera_times,
+                                                 const std::map<double, std::shared_ptr<ov_core::CpiV1>> &map_camera_cpi_I0toIi,
+                                                 double oldest_camera_time, Eigen::Vector3d &v_I0inI0,
+                                                 Eigen::Vector3d &gravity_inI0) const {
+  (void)oldest_camera_time;
+
+  // Per-time preintegration values (nullptr entry at the first pose = identity/zero)
+  struct PoseInt {
+    double DT = 0.0;
+    Eigen::Matrix3d R_I0toIk = Eigen::Matrix3d::Identity();
+    Eigen::Vector3d alpha = Eigen::Vector3d::Zero();
+  };
+  std::map<double, PoseInt> poseint;
+  for (auto const &tp : map_camera_times) {
+    PoseInt pi;
+    auto it = map_camera_cpi_I0toIi.find(tp.first);
+    if (it != map_camera_cpi_I0toIi.end() && it->second != nullptr) {
+      pi.DT = it->second->DT;
+      pi.R_I0toIk = it->second->R_k2tau;
+      pi.alpha = it->second->alpha_tau;
+    }
+    poseint[tp.first] = pi;
+  }
+
+  // Camera constants: R_ItoC, and the camera-center offset in the IMU frame p_CinI = -R_ItoC^T p_IinC
+  std::map<size_t, Eigen::Matrix3d> R_ItoC_map;
+  std::map<size_t, Eigen::Vector3d> p_CinI_map;
+  for (auto const &cam : params.camera_extrinsics) {
+    Eigen::Matrix3d R_ItoC = quat_2_Rot(cam.second.block(0, 0, 4, 1));
+    Eigen::Vector3d p_IinC = cam.second.block(4, 0, 3, 1);
+    R_ItoC_map[cam.first] = R_ItoC;
+    p_CinI_map[cam.first] = -R_ItoC.transpose() * p_IinC;
+  }
+
+  // Scatter bearings (rotated into I0) into per-(time, cam) maps: featid -> b_I0.
+  // One pass over all observations; pairs below then only intersect hash maps.
+  std::map<std::pair<double, size_t>, std::unordered_map<size_t, Eigen::Vector3d>> obs_tc;
+  for (auto const &feat : features) {
+    if (map_features_num_meas.at(feat.first) < min_num_meas)
+      continue;
+    for (auto const &camtime : feat.second->timestamps) {
+      const size_t cam_id = camtime.first;
+      const Eigen::Matrix3d R_CtoI = R_ItoC_map.at(cam_id).transpose();
+      for (size_t i = 0; i < camtime.second.size(); i++) {
+        const double time = camtime.second.at(i);
+        if (map_camera_times.find(time) == map_camera_times.end())
+          continue;
+        Eigen::Vector3d b_C((double)feat.second->uvs_norm.at(cam_id).at(i)(0), (double)feat.second->uvs_norm.at(cam_id).at(i)(1), 1.0);
+        obs_tc[{time, cam_id}][feat.first] = poseint.at(time).R_I0toIk.transpose() * (R_CtoI * b_C);
+      }
+    }
+  }
+
+  // Pair loop: every ordered TIME pair (t_i < t_j) and camera combo. Same-time stereo pairs carry
+  // no [v,g] information (their baseline is the fixed extrinsic) and are excluded by construction.
+  Eigen::Matrix<double, 6, 6> N = Eigen::Matrix<double, 6, 6>::Zero();
+  Eigen::Matrix<double, 6, 1> yvec = Eigen::Matrix<double, 6, 1>::Zero();
+  int used_pairs = 0;
+  std::vector<double> parallax_deg_all;
+  std::vector<size_t> common_ids;
+  std::vector<Eigen::Vector3d> pair_normals;
+  for (auto it_i = obs_tc.begin(); it_i != obs_tc.end(); ++it_i) {
+    for (auto it_j = std::next(it_i); it_j != obs_tc.end(); ++it_j) {
+      const double t_i = it_i->first.first, t_j = it_j->first.first;
+      if (t_i >= t_j)
+        continue; // same-time (stereo) combos or reversed order carry no [v,g] information
+      const size_t cam_a = it_i->first.second, cam_b = it_j->first.second;
+
+      // Co-observed features for this (time,cam)x(time,cam) combo
+      common_ids.clear();
+      pair_normals.clear();
+      const auto &map_i = it_i->second;
+      const auto &map_j = it_j->second;
+      const auto &small = (map_i.size() < map_j.size()) ? map_i : map_j;
+      const auto &large = (map_i.size() < map_j.size()) ? map_j : map_i;
+      for (auto const &ob : small) {
+        if (large.find(ob.first) != large.end())
+          common_ids.push_back(ob.first);
+      }
+      if ((int)common_ids.size() < params.init_dyn_fl_min_feats_per_pair)
+        continue;
+
+      // Epipolar-plane normals (unnormalized: parallax-weighted) + parallax bookkeeping
+      for (size_t k = 0; k < common_ids.size(); k++) {
+        const Eigen::Vector3d &bi = map_i.at(common_ids[k]);
+        const Eigen::Vector3d &bj = map_j.at(common_ids[k]);
+        const Eigen::Vector3d n = bi.cross(bj);
+        pair_normals.push_back(n);
+        const double sin_ang = n.norm() / std::max(1e-12, bi.norm() * bj.norm());
+        parallax_deg_all.push_back(std::asin(std::min(1.0, sin_ang)) * 180.0 / M_PI);
+      }
+
+      // Translation direction from M = sum n n^T (smallest eigenvector), with ONE 3sigma-MAD refit
+      auto eig_of = [&](const std::vector<Eigen::Vector3d> &normals, Eigen::Matrix3d &evecs, Eigen::Vector3d &evals) -> bool {
+        Eigen::Matrix3d M = Eigen::Matrix3d::Zero();
+        for (auto const &n : normals)
+          M.noalias() += n * n.transpose();
+        Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> es(M);
+        if (es.info() != Eigen::Success)
+          return false;
+        evecs = es.eigenvectors(); // ascending eigenvalues: col(0) = translation direction
+        evals = es.eigenvalues();
+        return true;
+      };
+      Eigen::Matrix3d evecs;
+      Eigen::Vector3d evals;
+      if (!eig_of(pair_normals, evecs, evals))
+        continue;
+      // Outlier filter: residuals of the epipolar constraint n_hat . t, robust 3sigma-MAD, refit once
+      {
+        Eigen::Vector3d t_dir = evecs.col(0);
+        std::vector<double> res;
+        res.reserve(pair_normals.size());
+        for (auto const &n : pair_normals)
+          res.push_back(std::abs(n.normalized().dot(t_dir)));
+        std::vector<double> tmp = res;
+        std::nth_element(tmp.begin(), tmp.begin() + tmp.size() / 2, tmp.end());
+        const double med = tmp[tmp.size() / 2];
+        for (auto &v : tmp)
+          v = std::abs(v - med);
+        std::nth_element(tmp.begin(), tmp.begin() + tmp.size() / 2, tmp.end());
+        const double mad = tmp[tmp.size() / 2];
+        const double thr = med + 3.0 * 1.4826 * std::max(1e-6, mad);
+        std::vector<Eigen::Vector3d> kept;
+        kept.reserve(pair_normals.size());
+        for (size_t k = 0; k < pair_normals.size(); k++)
+          if (res[k] <= thr)
+            kept.push_back(pair_normals[k]);
+        if ((int)kept.size() < params.init_dyn_fl_min_feats_per_pair)
+          continue;
+        if (kept.size() != pair_normals.size()) {
+          if (!eig_of(kept, evecs, evals))
+            continue;
+        }
+      }
+      // Direction well-defined: middle-vs-smallest eigenvalue separation
+      if (evals(1) / std::max(1e-12, evals(0)) < params.init_dyn_fl_eig_ratio)
+        continue;
+
+      // Two scale-free rows: e^T [ (DTj-DTi) I | -0.5 (DTj^2-DTi^2) I ] x = -e^T (dalpha + lever)
+      const PoseInt &pi = poseint.at(t_i);
+      const PoseInt &pj = poseint.at(t_j);
+      const Eigen::Matrix<double, 3, 2> e = evecs.rightCols<2>();
+      const double c_v = pj.DT - pi.DT;
+      const double c_g = -0.5 * (pj.DT * pj.DT - pi.DT * pi.DT);
+      Eigen::Matrix<double, 2, 6> H;
+      H.block<2, 3>(0, 0) = c_v * e.transpose();
+      H.block<2, 3>(0, 3) = c_g * e.transpose();
+      const Eigen::Vector3d lever = pj.R_I0toIk.transpose() * p_CinI_map.at(cam_b) - pi.R_I0toIk.transpose() * p_CinI_map.at(cam_a);
+      const Eigen::Vector2d r = -e.transpose() * ((pj.alpha - pi.alpha) + lever);
+      N.noalias() += H.transpose() * H;
+      yvec.noalias() += H.transpose() * r;
+      used_pairs++;
+    }
+  }
+
+  if (used_pairs < params.init_dyn_fl_min_pairs) {
+    PRINT_DEBUG(YELLOW "[init-d]: featureless seed: only %d usable pairs (%d needed)\n" RESET, used_pairs, params.init_dyn_fl_min_pairs);
+    return false;
+  }
+
+  // Static gate 1: median feature parallax
+  if (!parallax_deg_all.empty()) {
+    std::nth_element(parallax_deg_all.begin(), parallax_deg_all.begin() + parallax_deg_all.size() / 2, parallax_deg_all.end());
+    const double med_par = parallax_deg_all[parallax_deg_all.size() / 2];
+    if (med_par < params.init_dyn_fl_min_parallax_deg) {
+      PRINT_DEBUG(YELLOW "[init-d]: featureless seed: median parallax %.3f deg < %.3f (static?)\n" RESET, med_par,
+                  params.init_dyn_fl_min_parallax_deg);
+      return false;
+    }
+  }
+
+  // Conditioning of the 6x6 normal system
+  {
+    Eigen::SelfAdjointEigenSolver<Eigen::Matrix<double, 6, 6>> esN(N);
+    if (esN.info() != Eigen::Success || esN.eigenvalues()(0) <= 0.0 ||
+        esN.eigenvalues()(5) / esN.eigenvalues()(0) > params.init_dyn_fl_max_cond) {
+      PRINT_DEBUG(YELLOW "[init-d]: featureless seed: N ill-conditioned (cond %.2e)\n" RESET,
+                  (esN.info() == Eigen::Success && esN.eigenvalues()(0) > 0.0) ? esN.eigenvalues()(5) / esN.eigenvalues()(0) : -1.0);
+      return false;
+    }
+  }
+
+  // |g| = G constrained solve: eliminate velocity, run the Dong-Si polynomial on the 3x3 system
+  const Eigen::Matrix3d Nvv = N.topLeftCorner<3, 3>();
+  const Eigen::Matrix3d Nvg = N.topRightCorner<3, 3>();
+  const Eigen::Matrix3d Ngg = N.bottomRightCorner<3, 3>();
+  const Eigen::Vector3d yv = yvec.head<3>();
+  const Eigen::Vector3d yg = yvec.tail<3>();
+  const Eigen::LLT<Eigen::Matrix3d> Nvv_llt(Nvv);
+  Eigen::MatrixXd D = Ngg - Nvg.transpose() * Nvv_llt.solve(Nvg);
+  Eigen::MatrixXd d = yg - Nvg.transpose() * Nvv_llt.solve(yv);
+  bool grav_found = false;
+  Eigen::Vector3d g_sol = Eigen::Vector3d::Zero();
+  {
+    Eigen::Matrix<double, 7, 1> coeff = InitializerHelper::compute_dongsi_coeff(D, d, params.gravity_mag);
+    Eigen::Matrix<double, 6, 6> cm = Eigen::Matrix<double, 6, 6>::Zero();
+    cm.diagonal(-1).setOnes();
+    cm.col(5) = -coeff.reverse().head(6);
+    Eigen::EigenSolver<Eigen::Matrix<double, 6, 6>> solver(cm, false);
+    if (solver.info() == Eigen::Success) {
+      double best_cost = INFINITY;
+      const Eigen::Matrix3d I3 = Eigen::Matrix3d::Identity();
+      for (int i = 0; i < solver.eigenvalues().size(); i++) {
+        if (solver.eigenvalues()(i).imag() != 0)
+          continue;
+        const double lam = solver.eigenvalues()(i).real();
+        const Eigen::Vector3d g = (D - lam * I3).llt().solve(I3) * Eigen::Vector3d(d);
+        const double cost = std::abs(g.norm() - params.gravity_mag);
+        if (cost < best_cost) {
+          best_cost = cost;
+          g_sol = g;
+          grav_found = true;
+        }
+      }
+    }
+  }
+  if (!grav_found) {
+    // Fallback: unconstrained 6x6 solve, then project gravity to the sphere
+    const Eigen::Matrix<double, 6, 1> x = N.ldlt().solve(yvec);
+    g_sol = x.tail<3>();
+    PRINT_DEBUG(YELLOW "[init-d]: featureless seed: no real polynomial root, using unconstrained+project\n" RESET);
+  }
+  if (std::abs(g_sol.norm() - params.gravity_mag) > params.init_dyn_fl_grav_tol || g_sol.norm() < 1e-6) {
+    PRINT_DEBUG(YELLOW "[init-d]: featureless seed: |g|=%.3f too far from %.3f (tol %.2f)\n" RESET, g_sol.norm(), params.gravity_mag,
+                params.init_dyn_fl_grav_tol);
+    return false;
+  }
+  g_sol *= params.gravity_mag / g_sol.norm(); // exact sphere projection (the MLE refines on S2 anyway)
+  const Eigen::Vector3d v_sol = Nvv_llt.solve(yv - Nvg * g_sol);
+
+  // Static gate 2: implied camera translation across the window
+  {
+    double max_trans = 0.0;
+    for (auto const &pp : poseint) {
+      const Eigen::Vector3d p = v_sol * pp.second.DT - 0.5 * g_sol * pp.second.DT * pp.second.DT + pp.second.alpha;
+      max_trans = std::max(max_trans, p.norm());
+    }
+    if (max_trans < params.init_dyn_fl_min_translation) {
+      PRINT_DEBUG(YELLOW "[init-d]: featureless seed: implied translation %.3f m < %.3f (static?)\n" RESET, max_trans,
+                  params.init_dyn_fl_min_translation);
+      return false;
+    }
+  }
+
+  v_I0inI0 = v_sol;
+  gravity_inI0 = g_sol;
+  PRINT_INFO("[init-d]: featureless seed: %d pairs | v = %.3f,%.3f,%.3f |v| = %.4f | g = %.3f,%.3f,%.3f\n", used_pairs, v_sol(0),
+             v_sol(1), v_sol(2), v_sol.norm(), g_sol(0), g_sol(1), g_sol(2));
   return true;
 }

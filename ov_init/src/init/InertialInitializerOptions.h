@@ -189,6 +189,21 @@ struct InertialInitializerOptions {
   /// Requires an ACCEPTED reset prior; default off (the tightened prior alone is the safe mode).
   bool init_dyn_fix_ba_on_reset = false;
 
+  /// Stage-1 linear seed method: 0 = Dong-Si (features-in-state, legacy), 1 = feature-less
+  /// epipolar-normal 6x6 [v,g] seed only, 2 = feature-less with in-call Dong-Si fallback.
+  /// The feature-less seed is O(features) (no feature positions solved), robust to low parallax,
+  /// and viable on short reset windows where Dong-Si's (3F+6) system is not.
+  int init_dyn_linear_method = 0;
+  int init_dyn_fl_min_pairs = 5;            ///< min keyframe pairs surviving the gates (>=3 for 6 dof)
+  int init_dyn_fl_min_feats_per_pair = 10;  ///< min co-observed features for a pair to contribute
+  double init_dyn_fl_eig_ratio = 20.0;      ///< min lambda_mid/lambda_min of M (translation direction well-defined)
+  double init_dyn_fl_min_parallax_deg = 0.6; ///< static gate: median feature parallax below this -> reject
+  double init_dyn_fl_max_cond = 1e6;        ///< max condition number of the 6x6 normal matrix
+  double init_dyn_fl_grav_tol = 1.0;        ///< max | ||g|| - gravity_mag | before sphere projection (m/s^2)
+  double init_dyn_fl_min_translation = 0.05; ///< static gate: max implied camera translation below this -> reject (m)
+  double init_dyn_fl_tri_min_dist = 0.10;   ///< feature triangulation min distance (seed for the MLE)
+  double init_dyn_fl_tri_max_dist = 60.0;   ///< feature triangulation max distance
+
   /**
    * @brief This function will load print out all initializer settings loaded.
    * This allows for visual checking that everything was loaded properly from ROS/CMD parsers.
@@ -238,6 +253,16 @@ struct InertialInitializerOptions {
       parser->parse_config("init_dyn_reset_prior_sigma_floor_ba", init_dyn_reset_prior_sigma_floor_ba, false);
       parser->parse_config("init_dyn_reset_prior_divergence_infl", init_dyn_reset_prior_divergence_infl, false);
       parser->parse_config("init_dyn_fix_ba_on_reset", init_dyn_fix_ba_on_reset, false);
+      parser->parse_config("init_dyn_linear_method", init_dyn_linear_method, false); // optional; 0=dongsi 1=featureless 2=fl+fallback
+      parser->parse_config("init_dyn_fl_min_pairs", init_dyn_fl_min_pairs, false);
+      parser->parse_config("init_dyn_fl_min_feats_per_pair", init_dyn_fl_min_feats_per_pair, false);
+      parser->parse_config("init_dyn_fl_eig_ratio", init_dyn_fl_eig_ratio, false);
+      parser->parse_config("init_dyn_fl_min_parallax_deg", init_dyn_fl_min_parallax_deg, false);
+      parser->parse_config("init_dyn_fl_max_cond", init_dyn_fl_max_cond, false);
+      parser->parse_config("init_dyn_fl_grav_tol", init_dyn_fl_grav_tol, false);
+      parser->parse_config("init_dyn_fl_min_translation", init_dyn_fl_min_translation, false);
+      parser->parse_config("init_dyn_fl_tri_min_dist", init_dyn_fl_tri_min_dist, false);
+      parser->parse_config("init_dyn_fl_tri_max_dist", init_dyn_fl_tri_max_dist, false);
     }
     PRINT_DEBUG("  - init_window_time: %.2f\n", init_window_time);
     PRINT_DEBUG("  - init_imu_thresh: %.2f\n", init_imu_thresh);
@@ -294,6 +319,11 @@ struct InertialInitializerOptions {
                 init_dyn_reset_prior_max_sigma_ba, init_dyn_reset_prior_sigma_floor_bg, init_dyn_reset_prior_sigma_floor_ba,
                 init_dyn_reset_prior_divergence_infl);
     PRINT_DEBUG("  - init_dyn_fix_ba_on_reset: %d\n", init_dyn_fix_ba_on_reset);
+    PRINT_DEBUG("  - init_dyn_linear_method: %d (0=dongsi,1=featureless,2=fl+fallback)\n", init_dyn_linear_method);
+    PRINT_DEBUG("  - init_dyn_fl gates: pairs>=%d feats/pair>=%d eig_ratio>=%.1f parallax>=%.2fdeg cond<=%.1e gtol %.2f trans>=%.3f tri [%.2f,%.1f]\n",
+                init_dyn_fl_min_pairs, init_dyn_fl_min_feats_per_pair, init_dyn_fl_eig_ratio, init_dyn_fl_min_parallax_deg,
+                init_dyn_fl_max_cond, init_dyn_fl_grav_tol, init_dyn_fl_min_translation, init_dyn_fl_tri_min_dist,
+                init_dyn_fl_tri_max_dist);
     PRINT_DEBUG("  - init_dyn_grav_gate_deg: %.2f\n", init_dyn_grav_gate_deg);
   }
 

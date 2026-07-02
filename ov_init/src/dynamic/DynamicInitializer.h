@@ -28,6 +28,8 @@
 namespace ov_core {
 class FeatureDatabase;
 struct ImuData;
+class Feature;
+class CpiV1;
 } // namespace ov_core
 namespace ov_type {
 class Type;
@@ -90,6 +92,31 @@ public:
                   std::unordered_map<size_t, std::shared_ptr<ov_type::Landmark>> &_features_SLAM);
 
 private:
+  /**
+   * @brief Feature-less linear seed (sqrtVINS Stage-A style): recovers ONLY [v_I0, gravity_I0]
+   * from a 6x6 system -- no feature positions in the state, O(pairs x co-observed) assembly.
+   *
+   * Per keyframe pair (and camera combo), the gyro-preintegrated rotation makes each co-observed
+   * feature's epipolar-plane normal n = b_i x b_j (bearings in I0) perpendicular to the camera
+   * translation direction t: the smallest eigenvector of M = sum n n^T gives t, and the other two
+   * eigenvectors e annihilate the unknown scale, so projecting the preintegrated position equation
+   * onto e yields 2 scale-free rows per pair in [v, g]. |g| is enforced with the same Dong-Si
+   * polynomial machinery on the velocity-eliminated 3x3 system, then g is projected to the sphere.
+   * Robust to low parallax (features are never inverted) -- this is the reset-window fast path.
+   *
+   * Gates (init_dyn_fl_*): per-pair min co-observed features + M eigen-ratio (t well defined) +
+   * 3sigma-MAD outlier filter on n^T t (one refit); global min pairs, cond(N), |g| tolerance,
+   * and static detection (median parallax / implied translation) -> false so the caller can fall
+   * back (method=2) or fail out (method=1).
+   *
+   * @return true and fills v_I0inI0 / gravity_inI0 on success
+   */
+  bool linear_seed_featureless(const std::unordered_map<size_t, std::shared_ptr<ov_core::Feature>> &features,
+                               const std::map<size_t, int> &map_features_num_meas, int min_num_meas,
+                               const std::map<double, bool> &map_camera_times,
+                               const std::map<double, std::shared_ptr<ov_core::CpiV1>> &map_camera_cpi_I0toIi,
+                               double oldest_camera_time, Eigen::Vector3d &v_I0inI0, Eigen::Vector3d &gravity_inI0) const;
+
   /// Initialization parameters
   InertialInitializerOptions params;
 
