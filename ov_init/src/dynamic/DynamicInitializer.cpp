@@ -273,10 +273,22 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
     return false;
   }
 
-  // Now lets pre-integrate from the first time to the last
+  // Now lets pre-integrate each CONSECUTIVE camera interval in a single sweep over the IMU
+  // stream, then COMPOSE the I0->Ii preintegrations from the interval results. The CPI value
+  // recursion (R, alpha, beta, DT) is associative, so composing consecutive intervals is
+  // algebraically the direct I0->Ii integration -- and the interval CPIs are exactly what the
+  // MLE consumes, so stage-1 and stage-2 now share ONE discrete trajectory model. This halves
+  // the "linsys setup" preintegration cost (previously two full sweeps per pose: I0->Ii AND
+  // Ii->Ii+1). Values only: the linear system evaluates alpha/beta/R at the fixed bias
+  // linearization point, so the composed objects carry no bias Jacobians (the MLE's IMU
+  // factors take those from the interval CPIs, unchanged).
   assert(oldest_camera_time < newest_cam_time);
   double last_camera_timestamp = 0.0;
   std::map<double, std::shared_ptr<ov_core::CpiV1>> map_camera_cpi_I0toIi, map_camera_cpi_IitoIi1;
+  double comp_DT = 0.0;                                          // running I0->Ii composition
+  Eigen::Matrix3d comp_R_I0toIk = Eigen::Matrix3d::Identity();   // R_I0toIk
+  Eigen::Vector3d comp_alpha = Eigen::Vector3d::Zero();          // alpha_I0toIk (in I0)
+  Eigen::Vector3d comp_beta = Eigen::Vector3d::Zero();           // beta_I0toIk (in I0)
   for (auto const &timepair : map_camera_times) {
 
     // No preintegration at the first timestamp
@@ -288,31 +300,7 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
       continue;
     }
 
-    // Perform our preintegration from I0 to Ii (used in the linear system)
-    double cpiI0toIi1_time0_in_imu = oldest_camera_time + params.calib_camimu_dt;
-    double cpiI0toIi1_time1_in_imu = current_time + params.calib_camimu_dt;
-    auto cpiI0toIi1 = std::make_shared<ov_core::CpiV1>(params.sigma_w, params.sigma_wb, params.sigma_a, params.sigma_ab, true);
-    cpiI0toIi1->setLinearizationPoints(gyroscope_bias, accelerometer_bias);
-    std::vector<ov_core::ImuData> cpiI0toIi1_readings =
-        InitializerHelper::select_imu_readings(*imu_data, cpiI0toIi1_time0_in_imu, cpiI0toIi1_time1_in_imu);
-    if (cpiI0toIi1_readings.size() < 2) {
-      PRINT_DEBUG(YELLOW "[init-d]: camera %.2f in has %zu IMU readings!\n" RESET, (cpiI0toIi1_time1_in_imu - cpiI0toIi1_time0_in_imu),
-                  cpiI0toIi1_readings.size());
-      return false;
-    }
-    double cpiI0toIi1_dt_imu = cpiI0toIi1_readings.at(cpiI0toIi1_readings.size() - 1).timestamp - cpiI0toIi1_readings.at(0).timestamp;
-    if (std::abs(cpiI0toIi1_dt_imu - (cpiI0toIi1_time1_in_imu - cpiI0toIi1_time0_in_imu)) > 0.01) {
-      PRINT_DEBUG(YELLOW "[init-d]: camera IMU was only propagated %.3f of %.3f\n" RESET, cpiI0toIi1_dt_imu,
-                  (cpiI0toIi1_time1_in_imu - cpiI0toIi1_time0_in_imu));
-      return false;
-    }
-    for (size_t k = 0; k < cpiI0toIi1_readings.size() - 1; k++) {
-      auto imu0 = cpiI0toIi1_readings.at(k);
-      auto imu1 = cpiI0toIi1_readings.at(k + 1);
-      cpiI0toIi1->feed_IMU(imu0.timestamp, imu1.timestamp, imu0.wm, imu0.am, imu1.wm, imu1.am);
-    }
-
-    // Perform our preintegration from Ii to Ii1 (used in the mle optimization)
+    // Perform our preintegration from Ii to Ii1 (used in the mle optimization, composed below)
     double cpiIitoIi1_time0_in_imu = last_camera_timestamp + params.calib_camimu_dt;
     double cpiIitoIi1_time1_in_imu = current_time + params.calib_camimu_dt;
     auto cpiIitoIi1 = std::make_shared<ov_core::CpiV1>(params.sigma_w, params.sigma_wb, params.sigma_a, params.sigma_ab, true);
@@ -336,28 +324,64 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
       cpiIitoIi1->feed_IMU(imu0.timestamp, imu1.timestamp, imu0.wm, imu0.am, imu1.wm, imu1.am);
     }
 
+    // Compose the I0->Ii values from this interval's result:
+    //   alpha_I0toIk = alpha_I0toIk-1 + beta_I0toIk-1*dt_k + R_I0toIk-1^T * alpha_Ik-1toIk
+    //   beta_I0toIk  = beta_I0toIk-1 + R_I0toIk-1^T * beta_Ik-1toIk
+    //   R_I0toIk     = R_Ik-1toIk * R_I0toIk-1
+    comp_alpha += comp_beta * cpiIitoIi1->DT + comp_R_I0toIk.transpose() * cpiIitoIi1->alpha_tau;
+    comp_beta += comp_R_I0toIk.transpose() * cpiIitoIi1->beta_tau;
+    comp_R_I0toIk = cpiIitoIi1->R_k2tau * comp_R_I0toIk;
+    comp_DT += cpiIitoIi1->DT;
+    auto cpiI0toIi1 = std::make_shared<ov_core::CpiV1>(params.sigma_w, params.sigma_wb, params.sigma_a, params.sigma_ab, true);
+    cpiI0toIi1->setLinearizationPoints(gyroscope_bias, accelerometer_bias);
+    cpiI0toIi1->DT = comp_DT;
+    cpiI0toIi1->R_k2tau = comp_R_I0toIk;
+    cpiI0toIi1->q_k2tau = rot_2_quat(comp_R_I0toIk);
+    cpiI0toIi1->alpha_tau = comp_alpha;
+    cpiI0toIi1->beta_tau = comp_beta;
+
     // Finally push back our integrations!
     map_camera_cpi_I0toIi.insert({current_time, cpiI0toIi1});
     map_camera_cpi_IitoIi1.insert({current_time, cpiIitoIi1});
     last_camera_timestamp = current_time;
   }
 
-  // Loop through each feature observation and append it!
-  // State ordering is: [features, velocity, gravity]
-  Eigen::MatrixXd A = Eigen::MatrixXd::Zero(num_measurements, system_size);
-  Eigen::VectorXd b = Eigen::VectorXd::Zero(num_measurements);
+  // Loop through each feature observation and accumulate the NORMAL EQUATIONS directly --
+  // the dense (num_measurements x system_size) A matrix, its Gram matrix inverse, and the
+  // (num_measurements x num_measurements) projector of the old path are never materialized.
+  // State ordering is: [features, velocity, gravity]. Every observation's block row is
+  // [ Y | -DT*Y | 0.5*DT^2*Y ] with ONE shared 2x3 Y, so every Gram block is a scalar multiple
+  // of S = Y^T*Y and every rhs block of t = Y^T*b_i. The feature-feature Gram is BLOCK-DIAGONAL
+  // (each row touches exactly one feature), which the constrained solve below exploits.
   PRINT_DEBUG("[init-d]: system of %d measurement x %d states created (%d features, %s)\n", num_measurements, system_size, num_features,
               (have_stereo) ? "stereo" : "mono");
-  int index_meas = 0;
   int idx_feat = 0;
   std::map<size_t, int> A_index_features;
+  // Per-feature normal-equation blocks: F_j (feat-feat), C_j (feat-vel), G_j (feat-grav), y_fj
+  std::vector<Eigen::Matrix3d> NE_F, NE_C, NE_G;
+  std::vector<Eigen::Vector3d> NE_yf;
+  NE_F.reserve(num_features);
+  NE_C.reserve(num_features);
+  NE_G.reserve(num_features);
+  NE_yf.reserve(num_features);
+  // Velocity/gravity normal-equation blocks
+  Eigen::Matrix3d NE_V = Eigen::Matrix3d::Zero();  // vel-vel
+  Eigen::Matrix3d NE_W = Eigen::Matrix3d::Zero();  // vel-grav
+  Eigen::Matrix3d NE_GG = Eigen::Matrix3d::Zero(); // grav-grav
+  Eigen::Vector3d NE_yv = Eigen::Vector3d::Zero();
+  Eigen::Vector3d NE_yg = Eigen::Vector3d::Zero();
   for (auto const &feat : features) {
     if (map_features_num_meas[feat.first] < min_num_meas_to_optimize)
       continue;
     if (A_index_features.find(feat.first) == A_index_features.end()) {
       A_index_features.insert({feat.first, idx_feat});
       idx_feat += 1;
+      NE_F.emplace_back(Eigen::Matrix3d::Zero());
+      NE_C.emplace_back(Eigen::Matrix3d::Zero());
+      NE_G.emplace_back(Eigen::Matrix3d::Zero());
+      NE_yf.emplace_back(Eigen::Vector3d::Zero());
     }
+    const int fj = A_index_features.at(feat.first);
     for (auto const &camtime : feat.second->timestamps) {
 
       // This camera
@@ -380,40 +404,42 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
 
         // Preintegration values
         double DT = 0.0;
-        Eigen::MatrixXd R_I0toIk = Eigen::MatrixXd::Identity(3, 3);
-        Eigen::MatrixXd alpha_I0toIk = Eigen::MatrixXd::Zero(3, 1);
+        Eigen::Matrix3d R_I0toIk = Eigen::Matrix3d::Identity();
+        Eigen::Vector3d alpha_I0toIk = Eigen::Vector3d::Zero();
         if (map_camera_cpi_I0toIi.find(time) != map_camera_cpi_I0toIi.end() && map_camera_cpi_I0toIi.at(time) != nullptr) {
           DT = map_camera_cpi_I0toIi.at(time)->DT;
           R_I0toIk = map_camera_cpi_I0toIi.at(time)->R_k2tau;
           alpha_I0toIk = map_camera_cpi_I0toIi.at(time)->alpha_tau;
         }
 
-        // Create the linear system based on the feature reprojection
+        // Measurement model (identical to the old dense row):
         // [ 1 0 -u ] p_FinCi = [ 0 ]
         // [ 0 1 -v ]           [ 0 ]
         // where
         // p_FinCi = R_C0toCi * R_ItoC * (p_FinI0 - p_IiinI0) + p_IinC
         //         = R_C0toCi * R_ItoC * (p_FinI0 - v_I0inI0 * dt - 0.5 * grav_inI0 * dt^2 - alpha) + p_IinC
-        Eigen::MatrixXd H_proj = Eigen::MatrixXd::Zero(2, 3);
-        H_proj << 1, 0, -uv_norm(0), 0, 1, -uv_norm(1);
-        Eigen::MatrixXd Y = H_proj * R_ItoC * R_I0toIk;
-        Eigen::MatrixXd H_i = Eigen::MatrixXd::Zero(2, system_size);
-        Eigen::MatrixXd b_i = Y * alpha_I0toIk - H_proj * p_IinC;
         if (size_feature == 1) {
-          assert(false);
-          // Substitute in p_FinI0 = z*bearing_inC0_rotI0 - R_ItoC^T*p_IinC
-          // H_i.block(0, size_feature * A_index_features.at(feat.first), 2, 1) = Y * features_bearings.at(feat.first);
-          // b_i += Y * R_ItoC.transpose() * p_IinC;
-        } else {
-          H_i.block(0, size_feature * A_index_features.at(feat.first), 2, 3) = Y; // feat
+          assert(false); // single-depth parameterization not supported on this path
         }
-        H_i.block(0, size_feature * num_features + 0, 2, 3) = -DT * Y;            // vel
-        H_i.block(0, size_feature * num_features + 3, 2, 3) = 0.5 * DT * DT * Y;  // grav
+        Eigen::Matrix<double, 2, 3> H_proj;
+        H_proj << 1, 0, -uv_norm(0), 0, 1, -uv_norm(1);
+        const Eigen::Matrix<double, 2, 3> Y = H_proj * R_ItoC * R_I0toIk;
+        const Eigen::Vector2d b_i = Y * alpha_I0toIk - H_proj * p_IinC;
 
-        // Else lets append this to our system!
-        A.block(index_meas, 0, 2, A.cols()) = H_i;
-        b.block(index_meas, 0, 2, 1) = b_i;
-        index_meas += 2;
+        // Accumulate: S/t scaled by the DT monomials of [feat | vel | grav] = [1 | -DT | 0.5*DT^2]
+        const Eigen::Matrix3d S = Y.transpose() * Y;
+        const Eigen::Vector3d t = Y.transpose() * b_i;
+        const double c_v = -DT;
+        const double c_g = 0.5 * DT * DT;
+        NE_F[fj] += S;
+        NE_C[fj] += c_v * S;
+        NE_G[fj] += c_g * S;
+        NE_yf[fj] += t;
+        NE_V += (c_v * c_v) * S;
+        NE_W += (c_v * c_g) * S;
+        NE_GG += (c_g * c_g) * S;
+        NE_yv += c_v * t;
+        NE_yg += c_g * t;
       }
     }
   }
@@ -422,19 +448,43 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
   // ======================================================
   // ======================================================
 
-  // Solve the linear system without constraint
-  // Eigen::MatrixXd AtA = A.transpose() * A;
-  // Eigen::MatrixXd Atb = A.transpose() * b;
-  // Eigen::MatrixXd x_hat = AtA.colPivHouseholderQr().solve(Atb);
-
-  // Constrained solving |g| = 9.81 constraint
-  Eigen::MatrixXd A1 = A.block(0, 0, A.rows(), A.cols() - 3);
-  // Eigen::MatrixXd A1A1_inv = (A1.transpose() * A1).inverse();
-  Eigen::MatrixXd A1A1_inv = (A1.transpose() * A1).llt().solve(Eigen::MatrixXd::Identity(A1.cols(), A1.cols()));
-  Eigen::MatrixXd A2 = A.block(0, A.cols() - 3, A.rows(), 3);
-  Eigen::MatrixXd Temp = A2.transpose() * (Eigen::MatrixXd::Identity(A1.rows(), A1.rows()) - A1 * A1A1_inv * A1.transpose());
-  Eigen::MatrixXd D = Temp * A2;
-  Eigen::MatrixXd d = Temp * b;
+  // Constrained solving |g| = 9.81 constraint (Dong-Si), via the arrowhead-reduced normal
+  // equations. With N = A^T*A partitioned into x1 = [features, velocity] and x2 = gravity:
+  //   D = N_22 - N_12^T N_11^{-1} N_12,   d = y_2 - N_12^T N_11^{-1} y_1
+  // (algebraically identical to the old A2^T (I - A1 (A1^T A1)^{-1} A1^T) [A2 | b] projector,
+  // without ever forming the measurement-sized projector or the dense (3F+3) Gram inverse).
+  // N_11 = [blkdiag(F_j), C_j; C_j^T, V] is an arrowhead: eliminate each feature with its own
+  // 3x3 inverse, solve the 3x3 velocity Schur system once, and keep the partial solves -- they
+  // also give the closed-form recovery of [features, velocity] once gravity is known.
+  // (A rank-deficient no-parallax feature makes its F_j near-singular; the old dense LLT was
+  //  equally undefined there, so behavior under degeneracy is unchanged.)
+  Eigen::Matrix3d Vs = NE_V;   // velocity Schur complement after feature elimination
+  Eigen::Matrix3d Rvg = NE_W;  // velocity rows of the gravity coupling after elimination
+  Eigen::Vector3d rv = NE_yv;  // velocity rhs after elimination
+  std::vector<Eigen::Matrix3d> NE_Finv(num_features);
+  for (int jj = 0; jj < num_features; ++jj) {
+    NE_Finv[jj] = NE_F[jj].inverse();
+    const Eigen::Matrix3d CtFinv = NE_C[jj].transpose() * NE_Finv[jj];
+    Vs.noalias() -= CtFinv * NE_C[jj];
+    Rvg.noalias() -= CtFinv * NE_G[jj];
+    rv.noalias() -= CtFinv * NE_yf[jj];
+  }
+  const Eigen::LLT<Eigen::Matrix3d> Vs_llt(Vs);
+  const Eigen::Matrix3d Xvg = Vs_llt.solve(Rvg);  // velocity block of N_11^{-1} N_12
+  const Eigen::Vector3d xv = Vs_llt.solve(rv);    // velocity block of N_11^{-1} y_1
+  // Feature blocks of N_11^{-1} N_12 / N_11^{-1} y_1 (kept for the recovery below)
+  std::vector<Eigen::Matrix3d> Xfg(num_features);
+  std::vector<Eigen::Vector3d> xf(num_features);
+  Eigen::MatrixXd D = NE_GG;
+  Eigen::MatrixXd d = NE_yg;
+  D.noalias() -= NE_W.transpose() * Xvg;
+  d.noalias() -= NE_W.transpose() * xv;
+  for (int jj = 0; jj < num_features; ++jj) {
+    Xfg[jj] = NE_Finv[jj] * (NE_G[jj] - NE_C[jj] * Xvg);
+    xf[jj] = NE_Finv[jj] * (NE_yf[jj] - NE_C[jj] * xv);
+    D.noalias() -= NE_G[jj].transpose() * Xfg[jj];
+    d.noalias() -= NE_G[jj].transpose() * xf[jj];
+  }
   Eigen::Matrix<double, 7, 1> coeff = InitializerHelper::compute_dongsi_coeff(D, d, params.gravity_mag);
 
   // Create companion matrix of our polynomial
@@ -498,9 +548,15 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
   Eigen::VectorXd state_grav = D_lambdaI_inv * d;
 
   // Overwrite our state: [features, velocity, gravity]
-  Eigen::VectorXd state_feat_vel = -A1A1_inv * A1.transpose() * A2 * state_grav + A1A1_inv * A1.transpose() * b;
+  // Closed-form recovery from the kept partial solves: x_1 = N_11^{-1}(y_1 - N_12*g), i.e.
+  // per-feature p_FinI0 = xf_j - Xfg_j*g and velocity v = xv - Xvg*g (identical to the old
+  // dense back-substitution, no measurement-sized products).
+  const Eigen::Vector3d g_sol = state_grav;
   Eigen::MatrixXd x_hat = Eigen::MatrixXd::Zero(system_size, 1);
-  x_hat.block(0, 0, size_feature * num_features + 3, 1) = state_feat_vel;
+  for (int jj = 0; jj < num_features; ++jj) {
+    x_hat.block(size_feature * jj, 0, 3, 1) = xf[jj] - Xfg[jj] * g_sol;
+  }
+  x_hat.block(size_feature * num_features + 0, 0, 3, 1) = xv - Xvg * g_sol;
   x_hat.block(size_feature * num_features + 3, 0, 3, 1) = state_grav;
   Eigen::Vector3d v_I0inI0 = x_hat.block(size_feature * num_features + 0, 0, 3, 1);
   PRINT_INFO("[init-d]: velocity in I0 was %.3f,%.3f,%.3f and |v| = %.4f\n", v_I0inI0(0), v_I0inI0(1), v_I0inI0(2), v_I0inI0.norm());
