@@ -50,14 +50,7 @@ InertialInitializer::InertialInitializer(InertialInitializerOptions &params_, st
   init_dynamic = std::make_shared<DynamicInitializer>(params, _db, imu_data, reset_ctx);
 }
 
-void InertialInitializer::set_reset_prior(const ResetBiasPrior &prior) {
-  // Arm the episode. The short-window mode additionally requires a VALID bias prior: a short
-  // window with unknown biases is exactly the regime where the gravity/ba valley is unobservable.
-  const bool short_window = params.init_window_time_reset > 0.0 && prior.valid;
-  reset_ctx->arm(prior, short_window);
-  if (short_window)
-    PRINT_INFO("[init]: short-window reset armed (%.2fs of %.2fs)\n", params.init_window_time_reset, params.init_window_time);
-}
+void InertialInitializer::set_reset_prior(const ResetBiasPrior &prior) { reset_ctx->arm(prior); }
 
 void InertialInitializer::clear_reset_prior() { reset_ctx->disarm(); }
 
@@ -179,19 +172,7 @@ bool InertialInitializer::initialize(double &timestamp, Eigen::MatrixXd &covaria
     PRINT_DEBUG(GREEN "[init]: USING DYNAMIC INITIALIZER METHOD!\n" RESET);
     // Forward the caller's maps so the recovered window clones + the joint covariance survive (the
     // dynamic init previously dropped these locals here -> the filter always cold-started).
-    bool ok = init_dynamic->initialize(timestamp, covariance, order, t_imu, clones_IMU, features_SLAM);
-    // Short-window reset escalation: after too many failed short-window attempts, fall back to the
-    // full window (the bias prior stays armed and ages out on its own). The tracker kept appending
-    // while we tried, so the long window is already (re)filled.
-    if (!ok && reset_ctx->short_window_armed()) {
-      const int fails = reset_ctx->bump_failed_attempts();
-      if (params.init_dyn_reset_max_fails > 0 && fails >= params.init_dyn_reset_max_fails) {
-        reset_ctx->disarm_window();
-        PRINT_WARNING(YELLOW "[init]: %d short-window reset attempts failed -> escalating to the full %.1fs window\n" RESET, fails,
-                      params.init_window_time);
-      }
-    }
-    return ok;
+    return init_dynamic->initialize(timestamp, covariance, order, t_imu, clones_IMU, features_SLAM);
   } else {
     std::string msg = (has_jerk) ? "" : "no accel jerk detected";
     msg += (has_jerk || is_still) ? "" : ", ";

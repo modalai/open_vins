@@ -184,41 +184,16 @@ struct InertialInitializerOptions {
   double init_dyn_reset_prior_sigma_floor_ba = 0.02;  ///< floor on the tightened ba prior sigma
   double init_dyn_reset_prior_divergence_infl = 3.0;  ///< sigma inflation when the reset was divergence-triggered
 
+  /// MLE function tolerance (relative cost decrease termination). Legacy hardcode was 1e-5
+  /// (kept as the default); Ceres' own default is 1e-6. In shallow gravity-valley regimes
+  /// (weak excitation, short feature tracks) 1e-5 can exit a few iterations early -- tighten
+  /// on target if the injected tilt looks systematically lazy.
+  double init_dyn_mle_ftol = 1e-5;
+
   /// Hard-freeze ba during a soft-reset re-init (sqrtVINS-style "biases known"): ba blocks are
   /// held constant in the MLE and the injected ba covariance is the (floored) prior variance.
   /// Requires an ACCEPTED reset prior; default off (the tightened prior alone is the safe mode).
   bool init_dyn_fix_ba_on_reset = false;
-
-  /// Stage-1 linear seed method: 0 = Dong-Si (features-in-state, legacy), 1 = feature-less
-  /// epipolar-normal 6x6 [v,g] seed only, 2 = feature-less with in-call Dong-Si fallback.
-  /// The feature-less seed is O(features) (no feature positions solved), robust to low parallax,
-  /// and viable on short reset windows where Dong-Si's (3F+6) system is not.
-  int init_dyn_linear_method = 0;
-  int init_dyn_fl_min_pairs = 5;            ///< min keyframe pairs surviving the gates (>=3 for 6 dof)
-  int init_dyn_fl_min_feats_per_pair = 10;  ///< min co-observed features for a pair to contribute
-  double init_dyn_fl_eig_ratio = 20.0;      ///< min lambda_mid/lambda_min of M (translation direction well-defined)
-  double init_dyn_fl_min_parallax_deg = 0.6; ///< static gate: median feature parallax below this -> reject
-  double init_dyn_fl_max_cond = 1e6;        ///< max condition number of the 6x6 normal matrix
-  double init_dyn_fl_grav_tol = 1.0;        ///< max | ||g|| - gravity_mag | before sphere projection (m/s^2)
-  double init_dyn_fl_min_translation = 0.05; ///< static gate: max implied camera translation below this -> reject (m)
-  double init_dyn_fl_tri_min_dist = 0.10;   ///< feature triangulation min distance (seed for the MLE)
-  double init_dyn_fl_tri_max_dist = 60.0;   ///< feature triangulation max distance
-
-  /// DUAL-WINDOW soft reset: while a reset episode with a VALID bias prior is armed, the dynamic
-  /// init selects poses/measurements from only the most recent init_window_time_reset seconds
-  /// (clamped to [0.3, init_window_time]; <= 0 disables = always the full window). Cuts
-  /// reset-to-usable latency by ~window/window_reset; DB/IMU cleanup keeps the FULL window so a
-  /// failed short attempt never starves the fallback. Pair with init_dyn_linear_method=2.
-  double init_window_time_reset = -1;
-  int init_dyn_num_pose_reset = -1;    ///< poses within the reset window (-1 = keep init_dyn_num_pose)
-  double init_dyn_min_deg_reset = -1;  ///< rotation gate for the reset window (-1 = auto-scale by window ratio)
-  int init_dyn_reset_max_fails = 30;   ///< failed short-window attempts before escalating to the full window (<=0 never)
-
-  /// Min measurements for a feature to enter the linear system / MLE (-1 = legacy
-  /// (int)window_eff, HARD-FLOORED at 2: one-observation features make the Dong-Si feature
-  /// Gram blocks singular and the MLE landmark blocks rank-deficient -- the legacy int
-  /// truncation allowed exactly that for windows under 2 s).
-  int init_dyn_min_num_meas = -1;
 
   /**
    * @brief This function will load print out all initializer settings loaded.
@@ -269,21 +244,7 @@ struct InertialInitializerOptions {
       parser->parse_config("init_dyn_reset_prior_sigma_floor_ba", init_dyn_reset_prior_sigma_floor_ba, false);
       parser->parse_config("init_dyn_reset_prior_divergence_infl", init_dyn_reset_prior_divergence_infl, false);
       parser->parse_config("init_dyn_fix_ba_on_reset", init_dyn_fix_ba_on_reset, false);
-      parser->parse_config("init_dyn_linear_method", init_dyn_linear_method, false); // optional; 0=dongsi 1=featureless 2=fl+fallback
-      parser->parse_config("init_dyn_fl_min_pairs", init_dyn_fl_min_pairs, false);
-      parser->parse_config("init_dyn_fl_min_feats_per_pair", init_dyn_fl_min_feats_per_pair, false);
-      parser->parse_config("init_dyn_fl_eig_ratio", init_dyn_fl_eig_ratio, false);
-      parser->parse_config("init_dyn_fl_min_parallax_deg", init_dyn_fl_min_parallax_deg, false);
-      parser->parse_config("init_dyn_fl_max_cond", init_dyn_fl_max_cond, false);
-      parser->parse_config("init_dyn_fl_grav_tol", init_dyn_fl_grav_tol, false);
-      parser->parse_config("init_dyn_fl_min_translation", init_dyn_fl_min_translation, false);
-      parser->parse_config("init_dyn_fl_tri_min_dist", init_dyn_fl_tri_min_dist, false);
-      parser->parse_config("init_dyn_fl_tri_max_dist", init_dyn_fl_tri_max_dist, false);
-      parser->parse_config("init_window_time_reset", init_window_time_reset, false); // optional; <=0 disables the short reset window
-      parser->parse_config("init_dyn_num_pose_reset", init_dyn_num_pose_reset, false);
-      parser->parse_config("init_dyn_min_deg_reset", init_dyn_min_deg_reset, false);
-      parser->parse_config("init_dyn_reset_max_fails", init_dyn_reset_max_fails, false);
-      parser->parse_config("init_dyn_min_num_meas", init_dyn_min_num_meas, false);
+      parser->parse_config("init_dyn_mle_ftol", init_dyn_mle_ftol, false);
     }
     PRINT_DEBUG("  - init_window_time: %.2f\n", init_window_time);
     PRINT_DEBUG("  - init_imu_thresh: %.2f\n", init_imu_thresh);
@@ -340,13 +301,7 @@ struct InertialInitializerOptions {
                 init_dyn_reset_prior_max_sigma_ba, init_dyn_reset_prior_sigma_floor_bg, init_dyn_reset_prior_sigma_floor_ba,
                 init_dyn_reset_prior_divergence_infl);
     PRINT_DEBUG("  - init_dyn_fix_ba_on_reset: %d\n", init_dyn_fix_ba_on_reset);
-    PRINT_DEBUG("  - init_dyn_linear_method: %d (0=dongsi,1=featureless,2=fl+fallback)\n", init_dyn_linear_method);
-    PRINT_DEBUG("  - init_window_time_reset: %.2f (poses %d, min_deg %.2f, max_fails %d, min_meas %d)\n", init_window_time_reset,
-                init_dyn_num_pose_reset, init_dyn_min_deg_reset, init_dyn_reset_max_fails, init_dyn_min_num_meas);
-    PRINT_DEBUG("  - init_dyn_fl gates: pairs>=%d feats/pair>=%d eig_ratio>=%.1f parallax>=%.2fdeg cond<=%.1e gtol %.2f trans>=%.3f tri [%.2f,%.1f]\n",
-                init_dyn_fl_min_pairs, init_dyn_fl_min_feats_per_pair, init_dyn_fl_eig_ratio, init_dyn_fl_min_parallax_deg,
-                init_dyn_fl_max_cond, init_dyn_fl_grav_tol, init_dyn_fl_min_translation, init_dyn_fl_tri_min_dist,
-                init_dyn_fl_tri_max_dist);
+    PRINT_DEBUG("  - init_dyn_mle_ftol: %.1e\n", init_dyn_mle_ftol);
     PRINT_DEBUG("  - init_dyn_grav_gate_deg: %.2f\n", init_dyn_grav_gate_deg);
   }
 

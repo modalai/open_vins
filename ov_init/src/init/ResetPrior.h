@@ -45,26 +45,16 @@ struct ResetBiasPrior {
 /// Episode-scoped reset context shared between VioManager (producer) and the initializer (consumer).
 class ResetContext {
 public:
-  /// Arm with a fresh snapshot (health thread, from soft_reset). Resets the failure counter.
-  void arm(const ResetBiasPrior &p, bool short_window) {
+  /// Arm with a fresh snapshot (health thread, from soft_reset).
+  void arm(const ResetBiasPrior &p) {
     std::lock_guard<std::mutex> lk(mtx_);
     prior_ = p;
-    short_window_ = short_window;
-    fails_ = 0;
   }
 
-  /// Clear everything (successful init or explicit teardown).
+  /// Clear the episode (successful init or explicit teardown).
   void disarm() {
     std::lock_guard<std::mutex> lk(mtx_);
     prior_ = ResetBiasPrior();
-    short_window_ = false;
-    fails_ = 0;
-  }
-
-  /// Give up on the short window only (bias prior kept; it ages out via random-walk inflation).
-  void disarm_window() {
-    std::lock_guard<std::mutex> lk(mtx_);
-    short_window_ = false;
   }
 
   /// Copy-out of the current prior (init thread, once per attempt).
@@ -73,23 +63,9 @@ public:
     return prior_;
   }
 
-  /// True while a short-window reset episode is armed.
-  bool short_window_armed() const {
-    std::lock_guard<std::mutex> lk(mtx_);
-    return short_window_;
-  }
-
-  /// Count a failed dynamic-init attempt while armed; returns the new count.
-  int bump_failed_attempts() {
-    std::lock_guard<std::mutex> lk(mtx_);
-    return ++fails_;
-  }
-
 private:
   mutable std::mutex mtx_;
   ResetBiasPrior prior_;
-  bool short_window_ = false;
-  int fails_ = 0;
 };
 
 } // namespace ov_init
