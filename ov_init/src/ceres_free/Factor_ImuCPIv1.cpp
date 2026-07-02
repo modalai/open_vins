@@ -83,10 +83,11 @@ bool Factor_ImuCPIv1::Evaluate(double const *const *parameters, double *residual
 
   // Get the local variables (these would be different if we relinearized)
   // Gravity comes from parameters[10] (S² on the sphere, explicit optimization)
+  // (const refs: the old by-value locals copied 15x15+3+3 doubles per evaluation)
   Eigen::Vector3d gravity = Eigen::Map<const Eigen::Vector3d>(parameters[10]);
-  Eigen::Matrix<double, 15, 15> sqrtI = sqrtI_save;
-  Eigen::Vector3d b_w_lin = b_w_lin_save;
-  Eigen::Vector3d b_a_lin = b_a_lin_save;
+  const Eigen::Matrix<double, 15, 15> &sqrtI = sqrtI_save;
+  const Eigen::Vector3d &b_w_lin = b_w_lin_save;
+  const Eigen::Vector3d &b_a_lin = b_a_lin_save;
 
   // Get the state estimates from the parameters.
   // Each clone is stored in the canonical VINS format: q, bw, v, ba, p

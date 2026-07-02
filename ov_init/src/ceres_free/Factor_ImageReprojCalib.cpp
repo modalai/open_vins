@@ -62,27 +62,23 @@ bool Factor_ImageReprojCalib::Evaluate(double const *const *parameters, double *
   // Square-root information and gate
   Eigen::Matrix<double, 2, 2> sqrtQ_gate = gate * sqrtQ;
 
-  // Get the distorted raw image coordinate using the camera model
+  // Get the distorted raw image coordinate using the camera model.
+  // The camera objects are THREAD-LOCAL and reused across evaluations: constructing a
+  // CamRadtan/CamEqui per call heap-allocates its internal VectorXd and rebuilds the OpenCV
+  // matrices -- measurable at ~1e4-1e5 evaluations per initialization. set_value() still runs
+  // every call (the intrinsics are a parameter block and may be optimized), but into reused
+  // storage; the Jacobian buffers are likewise per-thread resize-once. Math is unchanged.
   Eigen::Vector2d uv_dist;
-  Eigen::MatrixXd H_dz_dzn, H_dz_dzeta;
-  if (is_fisheye) {
-    ov_core::CamEqui cam(0, 0);
-    cam.set_value(camera_vals);
-    uv_dist = cam.distort_d(uv_norm);
-    if (jacobians) {
-      cam.compute_distort_jacobian(uv_norm, H_dz_dzn, H_dz_dzeta);
-      H_dz_dzn = sqrtQ_gate * H_dz_dzn;
-      H_dz_dzeta = sqrtQ_gate * H_dz_dzeta;
-    }
-  } else {
-    ov_core::CamRadtan cam(0, 0);
-    cam.set_value(camera_vals);
-    uv_dist = cam.distort_d(uv_norm);
-    if (jacobians) {
-      cam.compute_distort_jacobian(uv_norm, H_dz_dzn, H_dz_dzeta);
-      H_dz_dzn = sqrtQ_gate * H_dz_dzn;
-      H_dz_dzeta = sqrtQ_gate * H_dz_dzeta;
-    }
+  static thread_local Eigen::MatrixXd H_dz_dzn, H_dz_dzeta;
+  static thread_local ov_core::CamEqui cam_eq(0, 0);
+  static thread_local ov_core::CamRadtan cam_rt(0, 0);
+  ov_core::CamBase &cam = is_fisheye ? static_cast<ov_core::CamBase &>(cam_eq) : static_cast<ov_core::CamBase &>(cam_rt);
+  cam.set_value(camera_vals);
+  uv_dist = cam.distort_d(uv_norm);
+  if (jacobians) {
+    cam.compute_distort_jacobian(uv_norm, H_dz_dzn, H_dz_dzeta);
+    H_dz_dzn = sqrtQ_gate * H_dz_dzn;
+    H_dz_dzeta = sqrtQ_gate * H_dz_dzeta;
   }
 
   // Compute residual (see upstream notes on sign convention)
@@ -94,10 +90,10 @@ bool Factor_ImageReprojCalib::Evaluate(double const *const *parameters, double *
   // Compute jacobians if requested
   if (jacobians) {
 
-    // Normalized coordinates in respect to projection function
-    Eigen::MatrixXd H_dzn_dpfc = Eigen::MatrixXd::Zero(2, 3);
+    // Normalized coordinates in respect to projection function (fixed-size: no heap per eval)
+    Eigen::Matrix<double, 2, 3> H_dzn_dpfc;
     H_dzn_dpfc << 1.0 / p_FinCi(2), 0, -p_FinCi(0) / std::pow(p_FinCi(2), 2), 0, 1.0 / p_FinCi(2), -p_FinCi(1) / std::pow(p_FinCi(2), 2);
-    Eigen::MatrixXd H_dz_dpfc = H_dz_dzn * H_dzn_dpfc;
+    Eigen::Matrix<double, 2, 3> H_dz_dpfc = H_dz_dzn * H_dzn_dpfc;
 
     // Jacobian wrt q_GtoIi
     if (jacobians[0]) {
