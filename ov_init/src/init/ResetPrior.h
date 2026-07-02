@@ -9,8 +9,9 @@
  * into the next dynamic initialization attempt. Rationale: the free-S2 initializer's dominant
  * ill-conditioning is the gravity <-> accel-bias ambiguity; at a soft reset the filter's
  * converged biases are available and (unless the reset was divergence-triggered) far better
- * than the static config seeds, collapsing that valley (sqrtVINS T-RO'25 assumes exactly this
- * "biases from prior calibration"; ORB-SLAM3 uses scheduled tight bias priors).
+ * than the static config seeds, collapsing that valley (the same assumption sqrtVINS [Peng et
+ * al., T-RO 2025] makes with "biases from prior calibration"; ORB-SLAM3 uses scheduled tight
+ * bias priors for the same reason).
  *
  * Threading: the health thread arms the context inside soft_reset() (sensor callbacks already
  * drained); the detached init thread copies it out once per attempt. A plain mutex with

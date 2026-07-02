@@ -1,5 +1,5 @@
 /*
- * R0 Stage-1 equivalence gate (host-only, no OpenCV / no Ceres / no ROS).
+ * Stage-1 equivalence gate (host-only, no OpenCV / no Ceres / no ROS).
  * Contributor: Joao Leonardo Silva Cotta (@zauberflote1)
  *
  * Validates the two behavior-identical Stage-1 rewrites in DynamicInitializer::initialize:

@@ -234,7 +234,7 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
   }
   Eigen::Vector3d gyroscope_bias = use_reset_prior ? reset_prior.bg : params.init_dyn_bias_g;
   Eigen::Vector3d accelerometer_bias = use_reset_prior ? reset_prior.ba : params.init_dyn_bias_a;
-  // Optional hard freeze of ba during a reset re-init (sqrtVINS-style "biases known" mode);
+  // Optional hard freeze of ba during a reset re-init ("biases known" mode);
   // requires an ACCEPTED prior and the explicit knob (covariance is spliced from the prior below).
   const bool freeze_ba = use_reset_prior && params.init_dyn_fix_ba_on_reset;
 
@@ -888,7 +888,8 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
       prior_Info.block(0, 0, 3, 3) *= 1.0 / std::pow(0.001, 2);  // orientation: tight (~0.057 deg)
       prior_Info.block(3, 3, 3, 3) *= 1.0 / std::pow(0.001, 2);  // position: tight (~1 mm)
       // Bias priors: legacy literals by default (bit-for-bit); per-axis tightened from the reset
-      // prior's floored marginal sigmas when a soft-reset episode is active (the valley killer).
+      // prior's floored marginal sigmas when a soft-reset episode is active (this is the main
+      // conditioner of the gravity <-> accel-bias ambiguity on re-init).
       for (int j = 0; j < 3; j++) {
         const double sbg = use_reset_prior ? std::max(params.init_dyn_reset_prior_sigma_floor_bg, reset_sig_bg(j)) : 0.05;
         const double sba = use_reset_prior ? std::max(params.init_dyn_reset_prior_sigma_floor_ba, reset_sig_ba(j)) : 0.10;

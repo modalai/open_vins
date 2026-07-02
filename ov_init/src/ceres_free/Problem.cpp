@@ -553,7 +553,7 @@ SolverSummary Problem::Solve(const SolverOptions &options) {
 
   ParallelExecutor exec(options.num_threads, options.worker_init_fn);
 
-  // P0.4 wall-clock split (a handful of steady_clock reads per iteration; not in inner loops).
+  // Wall-clock split (a handful of steady_clock reads per iteration; not in inner loops).
   double t_linearize = 0.0, t_linsolve = 0.0, t_residual = 0.0;
 
   Eigen::MatrixXd H;

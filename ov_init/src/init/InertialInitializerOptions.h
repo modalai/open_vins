@@ -190,7 +190,7 @@ struct InertialInitializerOptions {
   /// on target if the injected tilt looks systematically lazy.
   double init_dyn_mle_ftol = 1e-5;
 
-  /// Hard-freeze ba during a soft-reset re-init (sqrtVINS-style "biases known"): ba blocks are
+  /// Hard-freeze ba during a soft-reset re-init ("biases known" mode): ba blocks are
   /// held constant in the MLE and the injected ba covariance is the (floored) prior variance.
   /// Requires an ACCEPTED reset prior; default off (the tightened prior alone is the safe mode).
   bool init_dyn_fix_ba_on_reset = false;

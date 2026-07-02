@@ -96,7 +96,7 @@ struct SolverSummary {
   double initial_cost = 0.0;
   double final_cost = 0.0;
   double solve_time_seconds = 0.0;
-  // Wall-clock split of solve_time_seconds (P0.4 instrumentation; ~zero overhead):
+  // Wall-clock split of solve_time_seconds (timing instrumentation; ~zero overhead):
   double time_linearize_seconds = 0.0;    ///< residual+Jacobian+Hessian accumulation passes
   double time_linear_solve_seconds = 0.0; ///< damped (Schur) linear solves, incl. rejected trials
   double time_residual_seconds = 0.0;     ///< residual-only trial scoring (evaluate_cost)

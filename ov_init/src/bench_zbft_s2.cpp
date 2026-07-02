@@ -229,7 +229,7 @@ struct Result {
   int iters = 0;
   double time_ms = 0, cost0 = 0, cost1 = 0;
   int rejected = 0, jac_evals = 0, res_evals = 0;
-  double t_lin_ms = 0, t_sol_ms = 0, t_res_ms = 0; // solver wall-clock split (P0.4)
+  double t_lin_ms = 0, t_sol_ms = 0, t_res_ms = 0; // solver wall-clock split
   std::vector<Eigen::Vector4d> q;
   std::vector<Eigen::Vector3d> p, v;
   Eigen::Vector3d bg, ba;  // Shared biases
