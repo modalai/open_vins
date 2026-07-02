@@ -204,6 +204,22 @@ struct InertialInitializerOptions {
   double init_dyn_fl_tri_min_dist = 0.10;   ///< feature triangulation min distance (seed for the MLE)
   double init_dyn_fl_tri_max_dist = 60.0;   ///< feature triangulation max distance
 
+  /// DUAL-WINDOW soft reset: while a reset episode with a VALID bias prior is armed, the dynamic
+  /// init selects poses/measurements from only the most recent init_window_time_reset seconds
+  /// (clamped to [0.3, init_window_time]; <= 0 disables = always the full window). Cuts
+  /// reset-to-usable latency by ~window/window_reset; DB/IMU cleanup keeps the FULL window so a
+  /// failed short attempt never starves the fallback. Pair with init_dyn_linear_method=2.
+  double init_window_time_reset = -1;
+  int init_dyn_num_pose_reset = -1;    ///< poses within the reset window (-1 = keep init_dyn_num_pose)
+  double init_dyn_min_deg_reset = -1;  ///< rotation gate for the reset window (-1 = auto-scale by window ratio)
+  int init_dyn_reset_max_fails = 30;   ///< failed short-window attempts before escalating to the full window (<=0 never)
+
+  /// Min measurements for a feature to enter the linear system / MLE (-1 = legacy
+  /// (int)window_eff, HARD-FLOORED at 2: one-observation features make the Dong-Si feature
+  /// Gram blocks singular and the MLE landmark blocks rank-deficient -- the legacy int
+  /// truncation allowed exactly that for windows under 2 s).
+  int init_dyn_min_num_meas = -1;
+
   /**
    * @brief This function will load print out all initializer settings loaded.
    * This allows for visual checking that everything was loaded properly from ROS/CMD parsers.
@@ -263,6 +279,11 @@ struct InertialInitializerOptions {
       parser->parse_config("init_dyn_fl_min_translation", init_dyn_fl_min_translation, false);
       parser->parse_config("init_dyn_fl_tri_min_dist", init_dyn_fl_tri_min_dist, false);
       parser->parse_config("init_dyn_fl_tri_max_dist", init_dyn_fl_tri_max_dist, false);
+      parser->parse_config("init_window_time_reset", init_window_time_reset, false); // optional; <=0 disables the short reset window
+      parser->parse_config("init_dyn_num_pose_reset", init_dyn_num_pose_reset, false);
+      parser->parse_config("init_dyn_min_deg_reset", init_dyn_min_deg_reset, false);
+      parser->parse_config("init_dyn_reset_max_fails", init_dyn_reset_max_fails, false);
+      parser->parse_config("init_dyn_min_num_meas", init_dyn_min_num_meas, false);
     }
     PRINT_DEBUG("  - init_window_time: %.2f\n", init_window_time);
     PRINT_DEBUG("  - init_imu_thresh: %.2f\n", init_imu_thresh);
@@ -320,6 +341,8 @@ struct InertialInitializerOptions {
                 init_dyn_reset_prior_divergence_infl);
     PRINT_DEBUG("  - init_dyn_fix_ba_on_reset: %d\n", init_dyn_fix_ba_on_reset);
     PRINT_DEBUG("  - init_dyn_linear_method: %d (0=dongsi,1=featureless,2=fl+fallback)\n", init_dyn_linear_method);
+    PRINT_DEBUG("  - init_window_time_reset: %.2f (poses %d, min_deg %.2f, max_fails %d, min_meas %d)\n", init_window_time_reset,
+                init_dyn_num_pose_reset, init_dyn_min_deg_reset, init_dyn_reset_max_fails, init_dyn_min_num_meas);
     PRINT_DEBUG("  - init_dyn_fl gates: pairs>=%d feats/pair>=%d eig_ratio>=%.1f parallax>=%.2fdeg cond<=%.1e gtol %.2f trans>=%.3f tri [%.2f,%.1f]\n",
                 init_dyn_fl_min_pairs, init_dyn_fl_min_feats_per_pair, init_dyn_fl_eig_ratio, init_dyn_fl_min_parallax_deg,
                 init_dyn_fl_max_cond, init_dyn_fl_grav_tol, init_dyn_fl_min_translation, init_dyn_fl_tri_min_dist,

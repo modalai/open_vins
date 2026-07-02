@@ -24,7 +24,10 @@
  *       $OVC/feat/FeatureInitializer.cpp $OVC/utils/print.cpp \
  *       -lpthread -o /tmp/test_linear_seed && /tmp/test_linear_seed 10 2.0 12
  *
- * Usage: test_linear_seed [K_trials=10] [window_s=2.0] [num_pose=12]
+ * Usage: test_linear_seed [K_trials=10] [window_s=2.0] [num_pose=12] [reset_window_s=-1]
+ *   reset_window_s > 0: R3 dual-window mode -- the sim spans window_s but an ARMED reset episode
+ *   (valid bias prior) restricts selection to the newest reset_window_s seconds; also verifies the
+ *   older feature-DB content survives a failed/successful short attempt (filter, don't erase).
  */
 
 #include <chrono>
@@ -38,6 +41,7 @@
 
 #include "cam/CamRadtan.h"
 #include "cpi/CpiV1.h"
+#include "feat/Feature.h"
 #include "feat/FeatureDatabase.h"
 #include "types/IMU.h"
 #include "types/Landmark.h"
@@ -48,6 +52,7 @@
 
 #include "dynamic/DynamicInitializer.h"
 #include "init/InertialInitializerOptions.h"
+#include "init/ResetPrior.h"
 
 using namespace ov_core;
 using namespace ov_init;
@@ -176,6 +181,7 @@ int main(int argc, char **argv) {
   const int K = (argc > 1) ? atoi(argv[1]) : 10;
   const double window_s = (argc > 2) ? atof(argv[2]) : 2.0;
   const int n_pose = (argc > 3) ? atoi(argv[3]) : 12;
+  const double reset_window_s = (argc > 4) ? atof(argv[4]) : -1.0;
   const int n_feats = 60;
   ov_core::Printer::setPrintLevel("WARNING");
 
@@ -207,6 +213,12 @@ int main(int argc, char **argv) {
       params.init_dyn_grav_gate_deg = 89.0; // sim attitude is arbitrary; disable the +Z gate
       params.init_warmstart_inject = false;
       params.init_dyn_linear_method = method;
+      params.init_window_time_reset = reset_window_s;
+      if (reset_window_s > 0) {
+        // scale pose count/rotation gate to the short window (production would set the *_reset knobs)
+        params.init_dyn_num_pose_reset = std::max(4, (int)(n_pose * reset_window_s / window_s));
+        params.init_dyn_min_deg_reset = -1; // auto-scale
+      }
       params.num_cameras = 1;
       // cam0: identity extrinsics, radtan zero distortion
       Eigen::VectorXd ext = Eigen::VectorXd::Zero(7);
@@ -220,7 +232,22 @@ int main(int argc, char **argv) {
 
       SimOut sim = make_sim(rng, params, window_s, n_pose, n_feats);
 
-      DynamicInitializer init(params, sim.db, sim.imu);
+      // R3: armed reset episode with a VALID (near-GT) bias prior enables the short window
+      std::shared_ptr<ResetContext> rctx;
+      if (reset_window_s > 0) {
+        rctx = std::make_shared<ResetContext>();
+        ResetBiasPrior prior;
+        prior.bg = sim.bg_gt + randn3(rng, 0.002);
+        prior.ba = sim.ba_gt + randn3(rng, 0.01);
+        prior.sigma_bg = Eigen::Vector3d::Constant(0.003);
+        prior.sigma_ba = Eigen::Vector3d::Constant(0.015);
+        prior.t_snapshot = 10.0 + window_s; // "just before" the newest time
+        prior.cause = 0;
+        prior.valid = true;
+        rctx->arm(prior, true);
+      }
+      DynamicInitializer init(params, sim.db, sim.imu, rctx);
+      const size_t db_feats_before = sim.db->get_internal_data().size();
       double timestamp = -1;
       Eigen::MatrixXd covariance;
       std::vector<std::shared_ptr<ov_type::Type>> order;
@@ -232,6 +259,23 @@ int main(int argc, char **argv) {
       const bool ok = init.initialize(timestamp, covariance, order, imu_t, clones, feats_slam);
       const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tt0).count();
       sum_ms += ms;
+      if (reset_window_s > 0 && reset_window_s < window_s - 1e-9) {
+        // Filter-don't-erase: the full-window DB content must survive the short attempt
+        // (only meaningful when pre-reset-window observations exist at all)
+        if (sim.db->get_internal_data().size() != db_feats_before)
+          std::printf("  [FAIL] DB shrank across a short-window attempt (%zu -> %zu)\n", db_feats_before,
+                      sim.db->get_internal_data().size());
+        bool all_have_old = true;
+        for (auto const &f : sim.db->get_internal_data()) {
+          bool has_old = false;
+          for (auto const &ct : f.second->timestamps)
+            for (double t : ct.second)
+              has_old |= (t < 10.0 + window_s - reset_window_s - 1e-6);
+          all_have_old &= has_old;
+        }
+        if (!all_have_old)
+          std::printf("  [FAIL] pre-reset-window observations were erased\n");
+      }
       if (!ok)
         continue;
       ok_count++;

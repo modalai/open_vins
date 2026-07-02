@@ -97,6 +97,24 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
     return false;
   }
 
+  // DUAL-WINDOW soft-reset mode: while a reset episode with a VALID bias prior is armed and
+  // init_window_time_reset is configured, select poses/measurements only from the most recent
+  // window_eff seconds. The DB/IMU cleanup below still uses the FULL window (erasure is
+  // destructive -- a failed short attempt must not starve the full-window fallback); the short
+  // window is applied by FILTERING the selection instead.
+  const bool short_window = (reset_ctx != nullptr) && reset_ctx->short_window_armed() && params.init_window_time_reset > 0.0;
+  const double window_eff = short_window ? std::max(0.3, std::min(params.init_window_time_reset, params.init_window_time))
+                                         : params.init_window_time;
+  const double oldest_time_eff = newest_cam_time - window_eff;
+  const int num_pose_eff = (short_window && params.init_dyn_num_pose_reset > 0) ? params.init_dyn_num_pose_reset : params.init_dyn_num_pose;
+  const double min_deg_eff = short_window ? ((params.init_dyn_min_deg_reset >= 0.0)
+                                                 ? params.init_dyn_min_deg_reset
+                                                 : params.init_dyn_min_deg * window_eff / params.init_window_time)
+                                          : params.init_dyn_min_deg;
+  if (short_window)
+    PRINT_DEBUG("[init-d]: SHORT reset window active: %.2fs (of %.2fs), %d poses, min %.2f deg\n", window_eff,
+                params.init_window_time, num_pose_eff, min_deg_eff);
+
   // Remove all measurements that are older than our initialization window
   // Then we will try to use all features that are in the feature database!
   _db->cleanup_measurements(oldest_time);
@@ -134,7 +152,8 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
   // ======================================================
 
   // Settings
-  const int min_num_meas_to_optimize = (int)params.init_window_time;
+  const int min_num_meas_to_optimize =
+      (params.init_dyn_min_num_meas > 0) ? params.init_dyn_min_num_meas : std::max(2, (int)window_eff);
   const int min_valid_features = 8;
 
   // Validation information for features we can use
@@ -146,7 +165,7 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
   std::map<double, bool> map_camera_times;
   map_camera_times[newest_cam_time] = true; // always insert final pose
   std::map<size_t, bool> map_camera_ids;
-  double pose_dt_avg = params.init_window_time / (double)(params.init_dyn_num_pose + 1);
+  double pose_dt_avg = window_eff / (double)(num_pose_eff + 1);
   for (auto const &feat : features) {
 
     // Loop through each timestamp and make sure it is a valid pose
@@ -154,6 +173,8 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
     std::map<size_t, bool> camids;
     for (auto const &camtime : feat.second->timestamps) {
       for (double time : camtime.second) {
+        if (time < oldest_time_eff - 1e-9)
+          continue; // outside the effective (possibly shortened reset) window
         double time_dt = INFINITY;
         for (auto const &tmp : map_camera_times) {
           time_dt = std::min(time_dt, std::abs(time - tmp.first));
@@ -192,7 +213,7 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
 
   // Return if we do not have our full window or not enough measurements
   // Also check that we have enough features to initialize with
-  if ((int)map_camera_times.size() < params.init_dyn_num_pose) {
+  if ((int)map_camera_times.size() < num_pose_eff) {
     return false;
   }
   if (count_valid_features < min_valid_features) {
@@ -253,9 +274,9 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
     accel_inI_norm += am.norm();
   }
   accel_inI_norm /= (double)(readings.size() - 1);
-  if (180.0 / M_PI * theta_inI_norm < params.init_dyn_min_deg) {
+  if (180.0 / M_PI * theta_inI_norm < min_deg_eff) {
     PRINT_WARNING(YELLOW "[init-d]: gyroscope only %.2f degree change (%.2f thresh)\n" RESET, 180.0 / M_PI * theta_inI_norm,
-                  params.init_dyn_min_deg);
+                  min_deg_eff);
     return false;
   }
   PRINT_DEBUG("[init-d]: |theta_I| = %.4f deg and |accel| = %.4f\n", 180.0 / M_PI * theta_inI_norm, accel_inI_norm);
