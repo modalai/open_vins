@@ -116,7 +116,7 @@ public:
    * @param state Pointer to state
    * @param timestamp Time to propagate to and clone at (CAM clock frame)
    */
-  void propagate_and_clone(std::shared_ptr<State> state, double timestamp);
+  bool propagate_and_clone(std::shared_ptr<State> state, double timestamp);
 
   /**
    * @brief Gets what the state and its covariance will be at a given timestamp

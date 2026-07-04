@@ -135,6 +135,8 @@ struct VioManagerOptions {
     if (parser != nullptr) {
       parser->parse_config("dt_slam_delay", dt_slam_delay);
       parser->parse_config("try_zupt", try_zupt);
+      parser->parse_config("epoch_mode", epoch_mode, false);
+      parser->parse_config("epoch_bind_factor", epoch_bind_factor, false);
       parser->parse_config("async_ring_size", async_ring_size, false);
       parser->parse_config("async_guard", async_guard, false);
       parser->parse_config("async_stale_factor", async_stale_factor, false);
@@ -232,6 +234,15 @@ struct VioManagerOptions {
 
   /// Rotation from accelerometer to the "IMU" gyroscope frame frame
   Eigen::Matrix<double, 4, 1> q_GYROtoIMU;
+
+  /// Epoch-anchored cloning: clones are created only at REFERENCE-camera frame times; other
+  /// cameras' frames snap onto the previous epoch clone (known residual enters the measurement
+  /// model) instead of spawning their own clones. Restores the full clone-window baseline for
+  /// unsynced multi-camera rigs (defect B1). Frames with no bindable epoch fall back to cloning.
+  bool epoch_mode = false;
+
+  /// Epoch binding horizon as a multiple of the reference camera's frame period
+  double epoch_bind_factor = 1.2;
 
   /// Async camera ingest: per-camera ring capacity (frames)
   int async_ring_size = 16;

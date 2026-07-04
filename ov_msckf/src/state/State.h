@@ -288,6 +288,22 @@ public:
   /// Kinematic metadata at each clone time (metadata, not in state/covariance)
   std::map<double, CloneKinematics> _clones_kinematics;
 
+  /// Epoch-mode KNOWN time residuals: for a frame of camera c snapped onto the epoch clone at
+  /// time t, _epoch_residuals[t][c] = t_raw - t_epoch (its true sampling instant relative to the
+  /// clone, in the camera clock). Consumed additively in the measurement models' dt_total.
+  /// Metadata only; erased with the clone at marginalization.
+  std::map<double, std::map<size_t, double>> _epoch_residuals;
+
+  /// KNOWN epoch time residual for (camera, clone time); 0 when none was recorded
+  double epoch_residual(size_t cam_id, double clone_time) const {
+    auto it = _epoch_residuals.find(clone_time);
+    if (it == _epoch_residuals.end()) {
+      return 0.0;
+    }
+    auto it2 = it->second.find(cam_id);
+    return (it2 == it->second.end()) ? 0.0 : it2->second;
+  }
+
   /// Calibration poses for each camera (R_ItoC, p_IinC)
   std::unordered_map<size_t, std::shared_ptr<ov_type::PoseJPL>> _calib_IMUtoCAM;
 

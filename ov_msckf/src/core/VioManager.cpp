@@ -349,6 +349,46 @@ void VioManager::feed_measurement_camera(const ov_core::CameraData &message) {
   }
 }
 
+bool VioManager::apply_epoch_snap(double &timestamp, const std::vector<int> &sensor_ids) {
+  if (!params.epoch_mode || !is_initialized_vio) {
+    return false;
+  }
+  const int ref_id = state->cam_imu_dt_ref_camid();
+  const bool has_ref = std::find(sensor_ids.begin(), sensor_ids.end(), ref_id) != sensor_ids.end();
+  if (has_ref) {
+    if (last_ref_frame_time > 0 && timestamp > last_ref_frame_time) {
+      const double period = timestamp - last_ref_frame_time;
+      ref_period_ema = (ref_period_ema > 0) ? (0.9 * ref_period_ema + 0.1 * period) : period;
+    }
+    last_ref_frame_time = timestamp; // this frame IS the new epoch
+    return false;
+  }
+  const double t_raw = timestamp;
+  const double horizon = ((ref_period_ema > 0) ? ref_period_ema : 0.05) * params.epoch_bind_factor;
+  bool can_bind = last_ref_frame_time > 0 && t_raw >= last_ref_frame_time && (t_raw - last_ref_frame_time) <= horizon &&
+                  state->_clones_IMU.find(last_ref_frame_time) != state->_clones_IMU.end();
+  if (can_bind) {
+    // One frame per (camera, epoch): a rate-beat collision falls back to its own clone
+    auto res_it = state->_epoch_residuals.find(last_ref_frame_time);
+    for (int cid : sensor_ids) {
+      if (res_it != state->_epoch_residuals.end() && res_it->second.count((size_t)cid) > 0) {
+        can_bind = false;
+      }
+    }
+  }
+  if (!can_bind) {
+    epoch_fallbacks++;
+    return false;
+  }
+  auto &residuals = state->_epoch_residuals[last_ref_frame_time];
+  for (int cid : sensor_ids) {
+    residuals[(size_t)cid] = t_raw - last_ref_frame_time;
+  }
+  timestamp = last_ref_frame_time;
+  epoch_snapped++;
+  return true;
+}
+
 void VioManager::drain_camera_buffer() {
   if (camera_buffer == nullptr) {
     return;
@@ -412,6 +452,9 @@ void VioManager::feed_measurement_simulation(double timestamp, const std::vector
     }
     PRINT_WARNING(RED "[SIM]: casting our tracker to a TrackSIM object!\n" RESET);
   }
+
+  // Epoch-anchored cloning applies to the simulation path too (obs must land at clone times)
+  apply_epoch_snap(timestamp, camids);
 
   // Feed our simulation tracker
   trackSIM->feed_measurement_simulation(timestamp, camids, feats);
@@ -482,6 +525,14 @@ void VioManager::track_image_and_update(const ov_core::CameraData &message_const
     message.masks.at(i) = mask_temp;
   }
 
+  // Epoch-anchored cloning: only REFERENCE-camera frames define clone times; a non-reference
+  // frame arriving within the binding horizon of the newest epoch is SNAPPED onto it -- its
+  // timestamp becomes the epoch time (bit-exact, so every obs time equals a clone time across
+  // the whole pipeline) and its KNOWN residual t_raw - t_epoch enters the measurement model's
+  // dt_total. This keeps the clone rate at the reference rate and the window baseline intact
+  // for unsynced rigs. Frames with no bindable epoch clone fall back to cloning (counted).
+  apply_epoch_snap(message.timestamp, message.sensor_ids);
+
   // Perform our feature tracking!
   trackFEATS->feed_new_camera(message);
 
@@ -545,7 +596,9 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
   // NOTE: if the state is already at the given time (can happen in sim)
   // NOTE: then no need to prop since we already are at the desired timestep
   if (state->_timestamp != message.timestamp) {
-    propagator->propagate_and_clone(state, message.timestamp);
+    if (!propagator->propagate_and_clone(state, message.timestamp)) {
+      return; // no clone for this frame (duplicate/backward request): skip its update
+    }
   }
   rT3 = boost::posix_time::microsec_clock::local_time();
 

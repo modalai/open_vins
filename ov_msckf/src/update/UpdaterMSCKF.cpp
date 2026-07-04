@@ -104,15 +104,17 @@ void UpdaterMSCKF::update(std::shared_ptr<State> state, std::vector<std::shared_
     const double dt_cam_delta = state->cam_imu_dt_delta(clone_calib.first);
     for (const auto &clone_imu : state->_clones_IMU) {
 
-      // Get current IMU pose (with async camera timeoffset correction)
+      // Get current IMU pose (with async camera timeoffset correction; the KNOWN epoch residual
+      // of this camera's observation snapped onto this clone adds per-clone)
       Eigen::Matrix<double, 3, 3> R_GtoIi = clone_imu.second->Rot();
       Eigen::Matrix<double, 3, 1> p_IiinG = clone_imu.second->pos();
-      if (std::abs(dt_cam_delta) > 1e-10) {
+      const double dt_corr = dt_cam_delta + state->epoch_residual(clone_calib.first, clone_imu.first);
+      if (std::abs(dt_corr) > 1e-10) {
         // Tolerant lookup: warm-restored clones may have no kinematics -> zero correction (counted)
         auto kin_it = state->_clones_kinematics.find(clone_imu.first);
         if (kin_it != state->_clones_kinematics.end()) {
-          R_GtoIi = (Eigen::Matrix3d::Identity() - skew_x(kin_it->second.omega) * dt_cam_delta) * R_GtoIi;
-          p_IiinG = p_IiinG + kin_it->second.vel * dt_cam_delta;
+          R_GtoIi = (Eigen::Matrix3d::Identity() - skew_x(kin_it->second.omega) * dt_corr) * R_GtoIi;
+          p_IiinG = p_IiinG + kin_it->second.vel * dt_corr;
         } else {
           state->_kin_miss_count++;
         }

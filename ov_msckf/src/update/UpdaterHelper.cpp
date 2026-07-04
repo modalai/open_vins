@@ -89,10 +89,12 @@ void UpdaterHelper::get_feature_jacobian_representation(std::shared_ptr<State> s
   Eigen::Vector3d p_IinG = state->_clones_IMU.at(feature.anchor_clone_timestamp)->pos();
   Eigen::Vector3d p_FinA = feature.p_FinA;
 
-  // Camera time offset delta for anchor camera (consistent with get_feature_jacobian_full)
-  double dt_camoff_anc = state->cam_imu_dt_delta(feature.anchor_cam_id);
-  double dt_camoff_anc_lin = state->_options.do_calib_camera_timeoffset
-      ? state->cam_imu_dt_delta_fej(feature.anchor_cam_id) : dt_camoff_anc;
+  // Camera time offset delta for anchor camera (consistent with get_feature_jacobian_full);
+  // the KNOWN epoch residual of the anchor observation adds to both linearizations
+  const double dt_epoch_anc = state->epoch_residual((size_t)feature.anchor_cam_id, feature.anchor_clone_timestamp);
+  double dt_camoff_anc = state->cam_imu_dt_delta(feature.anchor_cam_id) + dt_epoch_anc;
+  double dt_camoff_anc_lin = (state->_options.do_calib_camera_timeoffset
+      ? state->cam_imu_dt_delta_fej(feature.anchor_cam_id) : state->cam_imu_dt_delta(feature.anchor_cam_id)) + dt_epoch_anc;
 
   // Rolling shutter readout for anchor camera (map is populated for every camera at construction)
   std::shared_ptr<Vec> readout_anc = state->_calib_camera_readout.at(feature.anchor_cam_id);
@@ -415,7 +417,8 @@ void UpdaterHelper::get_feature_jacobian_full(std::shared_ptr<State> state, Upda
     Eigen::Matrix3d R_GtoI = state->_clones_IMU.at(feature.anchor_clone_timestamp)->Rot();
     Eigen::Vector3d p_IinG = state->_clones_IMU.at(feature.anchor_clone_timestamp)->pos();
     // Apply async camera timeoffset correction and rolling shutter correction for anchor pose
-    double dt_camoff_anc = state->cam_imu_dt_delta(feature.anchor_cam_id);
+    double dt_camoff_anc =
+        state->cam_imu_dt_delta(feature.anchor_cam_id) + state->epoch_residual((size_t)feature.anchor_cam_id, feature.anchor_clone_timestamp);
     double t_readout_anc = state->_calib_camera_readout.at(feature.anchor_cam_id)->value()(0);
     double dt_total_anc = dt_camoff_anc;
     if (std::abs(t_readout_anc) > 1e-10) {
@@ -521,16 +524,20 @@ void UpdaterHelper::get_feature_jacobian_full(std::shared_ptr<State> state, Upda
       Eigen::Vector3d p_IiinG = clone_Ii->pos();
 
       // Rolling shutter correction: compute per-row time offset and adjust pose.
+      // The KNOWN epoch residual (this camera's true sampling instant relative to the clone it
+      // was snapped onto) adds to the estimated dt delta; identical in value and FEJ paths.
       // Tolerant kinematics lookup: a warm-restored clone may have none -> zero correction/columns
-      double dt_total = dt_camoff;
+      const double clone_time = cam_timestamps.at(m);
+      const double dt_epoch = state->epoch_residual(cam_id, clone_time);
+      const bool need_obs_terms = need_rs_terms || std::abs(dt_epoch) > 1e-12;
+      double dt_total = dt_camoff + dt_epoch;
       Eigen::Vector3d omega_clone_val = Eigen::Vector3d::Zero();
       Eigen::Vector3d v_clone_val = Eigen::Vector3d::Zero();
       Eigen::Vector3d omega_clone_lin = Eigen::Vector3d::Zero();
       Eigen::Vector3d v_clone_lin = Eigen::Vector3d::Zero();
       bool have_clone_kin = false;
       double v_pixel = (double)cam_uvs.at(m)(1);
-      if (need_rs_terms) {
-        double clone_time = cam_timestamps.at(m);
+      if (need_obs_terms) {
         auto kin_it = state->_clones_kinematics.find(clone_time);
         if (kin_it != state->_clones_kinematics.end()) {
           have_clone_kin = true;
@@ -583,9 +590,10 @@ void UpdaterHelper::get_feature_jacobian_full(std::shared_ptr<State> state, Upda
       if (state->_options.do_fej) {
         R_GtoIi = clone_Ii->Rot_fej();
         p_IiinG = clone_Ii->pos_fej();
-        // Apply async timeoffset and RS correction to FEJ values
-        if (need_rs_terms) {
-          double dt_total_fej = dt_camoff_lin;
+        // Apply async timeoffset and RS correction to FEJ values (the epoch residual is a KNOWN
+        // constant, so it enters both linearizations identically)
+        if (need_obs_terms) {
+          double dt_total_fej = dt_camoff_lin + dt_epoch;
           if (rs_on_linearization) {
             dt_total_fej += (v_pixel * inv_img_h) * t_readout_lin;
           }

@@ -73,7 +73,7 @@ int main(int argc, char **argv) {
   std::string config_path = argv[1];
   std::string traj_path, csv_path, name = "run";
   double phase1 = 0.0, readout1 = 0.0;
-  bool has_dt0 = false, has_dt1 = false, mono = false, jitter = false;
+  bool has_dt0 = false, has_dt1 = false, mono = false, jitter = false, epoch = false;
   double dt0 = 0.0, dt1 = 0.0;
   int seed = -1;
   double assert_pos_rmse = -1, assert_ori_rmse = -1, assert_nees_max = -1;
@@ -100,6 +100,8 @@ int main(int argc, char **argv) {
       mono = true;
     else if (arg == "--jitter")
       jitter = true;
+    else if (arg == "--epoch")
+      epoch = true;
     else if (arg == "--seed")
       seed = std::atoi(argv[++i]);
     else if (arg == "--assert-pos-rmse")
@@ -127,6 +129,8 @@ int main(int argc, char **argv) {
     params.sim_traj_path = traj_path;
   if (mono)
     params.use_stereo = false;
+  if (epoch)
+    params.epoch_mode = true;
   if (seed >= 0) {
     params.sim_seed_measurements = seed;
     params.sim_seed_state_init = seed + 1;

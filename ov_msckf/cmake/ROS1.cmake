@@ -182,6 +182,15 @@ if (OV_MSCKF_BUILD_TESTS)
             --phase1 0.0073 --dt1 0.012
             --name async_baseline --assert-pos-rmse 1.0 --assert-ori-rmse 0.6 --assert-nees-max 50)
     set_tests_properties(test_async_dual_baseline_KNOWNFAIL PROPERTIES WILL_FAIL TRUE)
+    # Epoch-anchored cloning (S4): window baseline restored (0.333 s @ 60 Hz updates), dt1
+    # converges to truth, divergence arrested (37.6 -> 5.7 m). Thresholds = the S4 envelope;
+    # the remaining error is the first-order snap extrapolation, which the S5 preintegration
+    # bridge replaces -- S5 must tighten these toward the synced envelope (<=1.0/0.6/50).
+    add_test(NAME test_async_dual_epoch COMMAND test_async_dual
+            ${CMAKE_CURRENT_SOURCE_DIR}/../config/voxl_sim/estimator_config.yaml
+            --traj ${CMAKE_CURRENT_SOURCE_DIR}/../ov_data/sim/udel_gore.txt
+            --phase1 0.0073 --dt1 0.012 --epoch
+            --name async_epoch --assert-pos-rmse 8.0 --assert-ori-rmse 15.0 --assert-nees-max 2500)
 endif ()
 
 

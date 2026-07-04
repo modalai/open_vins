@@ -188,7 +188,9 @@ bool VioManager::try_to_initialize(const ov_core::CameraData &message) {
       // Propagating over multiple seconds will become an issue if the initial biases are bad
       size_t clone_rate = (size_t)((double)camera_timestamps_to_init.size() / (double)params.state_options.max_clone_size) + 1;
       for (size_t i = 0; i < camera_timestamps_to_init.size(); i += clone_rate) {
-        propagator->propagate_and_clone(state, camera_timestamps_to_init.at(i));
+        if (!propagator->propagate_and_clone(state, camera_timestamps_to_init.at(i))) {
+          continue; // duplicate/backward replay time (should not happen with ordered ingest)
+        }
         StateHelper::marginalize_old_clone(state);
       }
       PRINT_DEBUG(YELLOW "[init]: moved the state forward %.2f seconds\n" RESET, state->_timestamp - timestamp);
@@ -255,7 +257,7 @@ void VioManager::retriangulate_active_tracks(const ov_core::CameraData &message)
     // IMU historical clone
     Eigen::Matrix3d R_GtoI = state->_clones_IMU.at(active_tracks_time)->Rot();
     Eigen::Vector3d p_IinG = state->_clones_IMU.at(active_tracks_time)->pos();
-    const double dt_cam_delta = state->cam_imu_dt_delta(cam_id);
+    const double dt_cam_delta = state->cam_imu_dt_delta(cam_id) + state->epoch_residual(cam_id, active_tracks_time);
     if (std::abs(dt_cam_delta) > 1e-10 && state->_clones_kinematics.find(active_tracks_time) != state->_clones_kinematics.end()) {
       const State::CloneKinematics &kin = state->_clones_kinematics.at(active_tracks_time);
       R_GtoI = (Eigen::Matrix3d::Identity() - skew_x(kin.omega) * dt_cam_delta) * R_GtoI;

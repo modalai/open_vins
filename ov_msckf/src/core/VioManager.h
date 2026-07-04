@@ -257,6 +257,16 @@ protected:
    */
   void drain_camera_buffer();
 
+  /**
+   * @brief Epoch-anchored cloning decision for one incoming frame (VIO thread).
+   *
+   * Reference-camera frames define epochs; a non-reference frame within the binding horizon of
+   * the newest epoch CLONE is snapped onto it: `timestamp` is rewritten to the epoch time
+   * (bit-exact) and the known residual t_raw - t_epoch is recorded per camera for the
+   * measurement models. Returns true if the frame was snapped.
+   */
+  bool apply_epoch_snap(double &timestamp, const std::vector<int> &sensor_ids);
+
   /// Lock-free async multi-camera ingest (per-stream rings + ordered release)
   std::shared_ptr<AsyncCameraBuffer> camera_buffer;
 
@@ -265,6 +275,22 @@ protected:
 
   /// Newest IMU timestamp fed to the estimator (VIO thread only; gates frame release)
   double newest_imu_time = -std::numeric_limits<double>::infinity();
+
+  /// @name Epoch-anchored cloning state (VIO thread only)
+  /// @{
+  /// Timestamp of the newest reference-camera frame (the current epoch)
+  double last_ref_frame_time = -1;
+  /// EMA of the reference camera's frame period (binding horizon scale)
+  double ref_period_ema = -1;
+
+public:
+  /// Frames snapped onto an epoch clone instead of spawning their own (telemetry)
+  uint64_t epoch_snapped = 0;
+  /// Non-reference frames that fell back to creating their own clone (telemetry)
+  uint64_t epoch_fallbacks = 0;
+
+protected:
+  /// @}
 
   /**
    * @brief Given a new set of camera images, this will track them.

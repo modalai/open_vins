@@ -30,20 +30,18 @@ using namespace ov_core;
 using namespace ov_type;
 using namespace ov_msckf;
 
-void Propagator::propagate_and_clone(std::shared_ptr<State> state, double timestamp) {
+bool Propagator::propagate_and_clone(std::shared_ptr<State> state, double timestamp) {
 
-  // If the difference between the current update time and state is zero
-  // We should crash, as this means we would have two clones at the same time!!!!
+  // A clone already exists at this exact time, or the request goes backwards: refuse instead of
+  // aborting the process -- callers skip that frame's clone/update and keep running
   if (state->_timestamp == timestamp) {
-    PRINT_ERROR(RED "Propagator::propagate_and_clone(): Propagation called again at same timestep at last update timestep!!!!\n" RESET);
-    std::exit(EXIT_FAILURE);
+    PRINT_WARNING(YELLOW "Propagator::propagate_and_clone(): called again at the last update timestep, skipping\n" RESET);
+    return false;
   }
-
-  // We should crash if we are trying to propagate backwards
   if (state->_timestamp > timestamp) {
-    PRINT_ERROR(RED "Propagator::propagate_and_clone(): Propagation called trying to propagate backwards in time!!!!\n" RESET);
-    PRINT_ERROR(RED "Propagator::propagate_and_clone(): desired propagation = %.4f\n" RESET, (timestamp - state->_timestamp));
-    std::exit(EXIT_FAILURE);
+    PRINT_WARNING(YELLOW "Propagator::propagate_and_clone(): asked to propagate backwards (%.4f s), skipping\n" RESET,
+                  (timestamp - state->_timestamp));
+    return false;
   }
 
   //===================================================================================
@@ -143,6 +141,7 @@ void Propagator::propagate_and_clone(std::shared_ptr<State> state, double timest
 
   // Now perform stochastic cloning
   StateHelper::augment_clone(state, last_w, last_w_fej);
+  return true;
 }
 
 bool Propagator::fast_state_propagate(std::shared_ptr<State> state, double timestamp, Eigen::Matrix<double, 13, 1> &state_plus,
