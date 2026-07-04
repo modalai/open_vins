@@ -137,6 +137,7 @@ struct VioManagerOptions {
       parser->parse_config("try_zupt", try_zupt);
       parser->parse_config("epoch_mode", epoch_mode, false);
       parser->parse_config("epoch_bind_factor", epoch_bind_factor, false);
+      parser->parse_config("epoch_bridge_bias_cols", epoch_bridge_bias_cols, false);
       parser->parse_config("async_ring_size", async_ring_size, false);
       parser->parse_config("async_guard", async_guard, false);
       parser->parse_config("async_stale_factor", async_stale_factor, false);
@@ -243,6 +244,10 @@ struct VioManagerOptions {
 
   /// Epoch binding horizon as a multiple of the reference camera's frame period
   double epoch_bind_factor = 1.2;
+
+  /// Analytic IMU-bias columns from the preintegration bridge (escape hatch: set false if
+  /// vibration/mismodeling lets camera residuals over-drive the biases)
+  bool epoch_bridge_bias_cols = true;
 
   /// Async camera ingest: per-camera ring capacity (frames)
   int async_ring_size = 16;

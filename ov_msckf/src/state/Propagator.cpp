@@ -144,6 +144,119 @@ bool Propagator::propagate_and_clone(std::shared_ptr<State> state, double timest
   return true;
 }
 
+bool Propagator::compute_bridge(std::shared_ptr<State> state, double t0_imu, double t1_imu, BridgeData &out) {
+
+  out = BridgeData();
+  if (!(t1_imu > t0_imu)) {
+    return false;
+  }
+
+  // Collect the (boundary-interpolated) IMU samples spanning the interval
+  std::vector<ov_core::ImuData> prop_data;
+  {
+    std::lock_guard<std::mutex> lck(imu_data_mtx);
+    prop_data = Propagator::select_imu_readings(imu_data, t0_imu, t1_imu, false);
+  }
+  if (prop_data.size() < 2) {
+    return false;
+  }
+
+  // Static intrinsics and the build-time bias linearization (ACI2 partial-fixed estimates)
+  const Eigen::Matrix3d Dw = State::Dm(state->_options.imu_model, state->_calib_imu_dw->value());
+  const Eigen::Matrix3d Da = State::Dm(state->_options.imu_model, state->_calib_imu_da->value());
+  const Eigen::Matrix3d Tg = State::Tg(state->_calib_imu_tg->value());
+  const Eigen::Matrix3d R_ACCtoIMU = state->_calib_imu_ACCtoIMU->Rot();
+  const Eigen::Matrix3d R_GYROtoIMU = state->_calib_imu_GYROtoIMU->Rot();
+  out.bg0 = state->_imu->bias_g();
+  out.ba0 = state->_imu->bias_a();
+
+  // Relative accumulators (see BridgeData docs). J blocks: rows th(0:3), alpha(3:6), beta(6:9);
+  // cols bg(0:3), ba(3:6). J_th is kept in the CURRENT interval's start frame during each step
+  // (that is what the alpha/beta chain rules consume), then transported by the step rotation.
+  Eigen::Matrix3d DR = Eigen::Matrix3d::Identity();
+  Eigen::Vector3d alpha = Eigen::Vector3d::Zero(), beta = Eigen::Vector3d::Zero();
+  Eigen::Matrix3d J_th_g = Eigen::Matrix3d::Zero();
+  Eigen::Matrix3d J_a_g = Eigen::Matrix3d::Zero(), J_a_a = Eigen::Matrix3d::Zero();
+  Eigen::Matrix3d J_b_g = Eigen::Matrix3d::Zero(), J_b_a = Eigen::Matrix3d::Zero();
+  Eigen::Matrix<double, 9, 9> Q = Eigen::Matrix<double, 9, 9>::Zero();
+
+  for (size_t i = 0; i + 1 < prop_data.size(); i++) {
+    const double dt = prop_data.at(i + 1).timestamp - prop_data.at(i).timestamp;
+    if (!(dt > 0)) {
+      continue;
+    }
+
+    // Bias/intrinsics-corrected signals (identical chain to predict_and_compute)
+    Eigen::Vector3d a_hat1 = R_ACCtoIMU * Da * (prop_data.at(i).am - out.ba0);
+    Eigen::Vector3d a_hat2 = R_ACCtoIMU * Da * (prop_data.at(i + 1).am - out.ba0);
+    Eigen::Vector3d a_hat = 0.5 * (a_hat1 + a_hat2);
+    Eigen::Vector3d w_hat1 = R_GYROtoIMU * Dw * (prop_data.at(i).wm - out.bg0 - Tg * a_hat1);
+    Eigen::Vector3d w_hat2 = R_GYROtoIMU * Dw * (prop_data.at(i + 1).wm - out.bg0 - Tg * a_hat2);
+    Eigen::Vector3d w_hat = 0.5 * (w_hat1 + w_hat2);
+    out.w_end = w_hat2;
+
+    // Analytic integration components for this step (shared closed forms, small-omega safe)
+    Eigen::Matrix<double, 3, 18> Xi_sum = Eigen::Matrix<double, 3, 18>::Zero();
+    compute_Xi_sum(state, dt, w_hat, a_hat, Xi_sum);
+    const Eigen::Matrix3d R_step = Xi_sum.block(0, 0, 3, 3); // exp_so3(-w dt) = R_{I_i -> I_i+1}
+    const Eigen::Matrix3d Xi_1 = Xi_sum.block(0, 3, 3, 3);
+    const Eigen::Matrix3d Xi_2 = Xi_sum.block(0, 6, 3, 3);
+    const Eigen::Matrix3d Jr_step = Xi_sum.block(0, 9, 3, 3); // Jr_so3(-w dt)
+    const Eigen::Matrix3d Xi_3 = Xi_sum.block(0, 12, 3, 3);
+    const Eigen::Matrix3d Xi_4 = Xi_sum.block(0, 15, 3, 3);
+
+    const Eigen::Matrix3d A = DR.transpose(); // maps I_i-frame vectors into the I_k frame
+    const Eigen::Vector3d X1a = Xi_1 * a_hat;
+    const Eigen::Vector3d X2a = Xi_2 * a_hat;
+
+    // ---- noise propagation (before the mean/Jacobian state advances) ----
+    Eigen::Matrix<double, 9, 9> Phi = Eigen::Matrix<double, 9, 9>::Identity();
+    Phi.block(0, 0, 3, 3) = R_step;
+    Phi.block(3, 0, 3, 3) = A * ov_core::skew_x(X2a); // sign consistent with the J_th convention
+    Phi.block(3, 6, 3, 3) = dt * Eigen::Matrix3d::Identity();
+    Phi.block(6, 0, 3, 3) = A * ov_core::skew_x(X1a);
+    Eigen::Matrix<double, 9, 6> G = Eigen::Matrix<double, 9, 6>::Zero();
+    G.block(0, 0, 3, 3) = -Jr_step * dt; // theta noise: n_g enters like -delta(bg) of the same step
+    G.block(3, 0, 3, 3) = A * Xi_4;
+    G.block(3, 3, 3, 3) = -A * Xi_2;
+    G.block(6, 0, 3, 3) = A * Xi_3;
+    G.block(6, 3, 3, 3) = -A * Xi_1;
+    Eigen::Matrix<double, 6, 6> Qd = Eigen::Matrix<double, 6, 6>::Zero();
+    Qd.block(0, 0, 3, 3) = (_noises.sigma_w_2 / dt) * Eigen::Matrix3d::Identity();
+    Qd.block(3, 3, 3, 3) = (_noises.sigma_a_2 / dt) * Eigen::Matrix3d::Identity();
+    Q = Phi * Q * Phi.transpose() + G * Qd * G.transpose();
+
+    // ---- bias Jacobians (consume the PRE-transport J_th, then advance everything).
+    // Coupling sign matches THIS file's J_th convention (DR(b) = exp_so3(J_th db) DR(b0)),
+    // pinned by the finite-difference oracle in test_preint_bridge ----
+    J_a_g += J_b_g * dt + A * (Xi_4 + ov_core::skew_x(X2a) * J_th_g);
+    J_a_a += J_b_a * dt - A * Xi_2;
+    J_b_g += A * (Xi_3 + ov_core::skew_x(X1a) * J_th_g);
+    J_b_a += -A * Xi_1;
+    J_th_g = R_step * J_th_g + Jr_step * dt; // sign fixed against the FD oracle (test_preint_bridge)
+
+    // ---- mean (alpha consumes the PRE-update beta) ----
+    alpha += beta * dt + A * X2a;
+    beta += A * X1a;
+    DR = R_step * DR;
+  }
+
+  out.dt = t1_imu - t0_imu;
+  out.DR = DR;
+  out.alpha = alpha;
+  out.beta = beta;
+  out.p_grav = -0.5 * _gravity * out.dt * out.dt;
+  out.v_grav = -_gravity * out.dt;
+  out.J_b.block(0, 0, 3, 3) = J_th_g;
+  out.J_b.block(3, 0, 3, 3) = J_a_g;
+  out.J_b.block(3, 3, 3, 3) = J_a_a;
+  out.J_b.block(6, 0, 3, 3) = J_b_g;
+  out.J_b.block(6, 3, 3, 3) = J_b_a;
+  out.Q_tp = Q.block(0, 0, 6, 6);
+  out.valid = true;
+  return true;
+}
+
 bool Propagator::fast_state_propagate(std::shared_ptr<State> state, double timestamp, Eigen::Matrix<double, 13, 1> &state_plus,
                                       Eigen::Matrix<double, 12, 12> &covariance) {
 

@@ -366,6 +366,28 @@ void UpdaterHelper::get_feature_jacobian_full(std::shared_ptr<State> state, Upda
     total_hx += dt_ref_var->size();
   }
 
+  // If any observation rides a preintegration bridge, its pose depends on the IMU biases: add the
+  // bias columns once (analytic H_bias from the bridge Jacobians)
+  int bias_g_hx_col = -1, bias_a_hx_col = -1;
+  {
+    bool any_bridge = false;
+    for (auto const &pair : state->_options.epoch_bridge_bias_cols ? feature.timestamps : decltype(feature.timestamps)()) {
+      for (size_t m = 0; m < pair.second.size() && !any_bridge; m++) {
+        any_bridge = (state->epoch_bridge(pair.first, pair.second.at(m)) != nullptr);
+      }
+    }
+    if (any_bridge) {
+      bias_g_hx_col = total_hx;
+      map_hx.insert({state->_imu->bg(), total_hx});
+      x_order.push_back(state->_imu->bg());
+      total_hx += state->_imu->bg()->size();
+      bias_a_hx_col = total_hx;
+      map_hx.insert({state->_imu->ba(), total_hx});
+      x_order.push_back(state->_imu->ba());
+      total_hx += state->_imu->ba()->size();
+    }
+  }
+
   // If we are using an anchored representation, make sure that the anchor is also added
   if (LandmarkRepresentation::is_relative_representation(feature.feat_representation)) {
 
@@ -523,20 +545,28 @@ void UpdaterHelper::get_feature_jacobian_full(std::shared_ptr<State> state, Upda
       Eigen::Matrix3d R_GtoIi = clone_Ii->Rot();
       Eigen::Vector3d p_IiinG = clone_Ii->pos();
 
-      // Rolling shutter correction: compute per-row time offset and adjust pose.
-      // The KNOWN epoch residual (this camera's true sampling instant relative to the clone it
-      // was snapped onto) adds to the estimated dt delta; identical in value and FEJ paths.
-      // Tolerant kinematics lookup: a warm-restored clone may have none -> zero correction/columns
+      // Time correction of this observation's pose to its true sampling instant.
+      // With a bridge (epoch-snapped frame): EXACT ACI2 composition over the KNOWN residual,
+      // bias-corrected to first order via J_b (never re-integrated); only the small ESTIMATED
+      // parts (dt delta drift since build + RS row time) remain first-order, linearized at the
+      // bridge ENDPOINT kinematics. Without a bridge: the S4 first-order model over the whole
+      // dt_total. Tolerant kinematics lookup throughout (warm-restored clones may have none).
       const double clone_time = cam_timestamps.at(m);
       const double dt_epoch = state->epoch_residual(cam_id, clone_time);
+      const PreintBridgeData *bridge = state->epoch_bridge(cam_id, clone_time);
       const bool need_obs_terms = need_rs_terms || std::abs(dt_epoch) > 1e-12;
-      double dt_total = dt_camoff + dt_epoch;
+      // First-order part: with a bridge the KNOWN residual is integrated exactly, so it drops out
+      double dt_total = dt_camoff + ((bridge == nullptr) ? dt_epoch : 0.0);
       Eigen::Vector3d omega_clone_val = Eigen::Vector3d::Zero();
       Eigen::Vector3d v_clone_val = Eigen::Vector3d::Zero();
       Eigen::Vector3d omega_clone_lin = Eigen::Vector3d::Zero();
       Eigen::Vector3d v_clone_lin = Eigen::Vector3d::Zero();
       bool have_clone_kin = false;
       double v_pixel = (double)cam_uvs.at(m)(1);
+      // Bridge-endpoint kinematics for the Jacobian columns / extra shifts (filled below)
+      Eigen::Vector3d omega_end_lin = Eigen::Vector3d::Zero();
+      Eigen::Vector3d v_end_lin = Eigen::Vector3d::Zero();
+      Eigen::Matrix3d R_clone_lin = Eigen::Matrix3d::Identity(); // clone rotation at the Jacobian linearization
       if (need_obs_terms) {
         auto kin_it = state->_clones_kinematics.find(clone_time);
         if (kin_it != state->_clones_kinematics.end()) {
@@ -560,7 +590,29 @@ void UpdaterHelper::get_feature_jacobian_full(std::shared_ptr<State> state, Upda
         if (rs_on_value) {
           dt_total += (v_pixel * inv_img_h) * t_readout;
         }
-        if (have_clone_kin && std::abs(dt_total) > 1e-10) {
+        if (bridge != nullptr) {
+          // EXACT composition of the clone pose over the known residual, with the first-order
+          // bias correction at the current estimates (ACI2 partial-fixed linearization)
+          Eigen::Matrix<double, 6, 1> db;
+          db.head<3>() = state->_imu->bias_g() - bridge->bg0;
+          db.tail<3>() = state->_imu->bias_a() - bridge->ba0;
+          const Eigen::Vector3d d_th = bridge->J_b.block(0, 0, 3, 6) * db;
+          const Eigen::Vector3d d_al = bridge->J_b.block(3, 0, 3, 6) * db;
+          const Eigen::Vector3d d_be = bridge->J_b.block(6, 0, 3, 6) * db;
+          const Eigen::Matrix3d R_clone_val = R_GtoIi;
+          R_GtoIi = ov_core::exp_so3(d_th) * bridge->DR * R_clone_val;
+          p_IiinG = p_IiinG + v_clone_val * bridge->dt + bridge->p_grav + R_clone_val.transpose() * (bridge->alpha + d_al);
+          const Eigen::Vector3d v_end_val = v_clone_val + bridge->v_grav + R_clone_val.transpose() * (bridge->beta + d_be);
+          // Linearization kinematics for the temporal columns (FEJ path overwrites when active)
+          omega_end_lin = bridge->w_end;
+          v_end_lin = v_end_val;
+          R_clone_lin = R_clone_val;
+          // Remaining ESTIMATED shift, first-order at the endpoint kinematics
+          if (have_clone_kin && std::abs(dt_total) > 1e-10) {
+            R_GtoIi = (Eigen::Matrix3d::Identity() - skew_x(bridge->w_end) * dt_total) * R_GtoIi;
+            p_IiinG = p_IiinG + v_end_val * dt_total;
+          }
+        } else if (have_clone_kin && std::abs(dt_total) > 1e-10) {
           R_GtoIi = (Eigen::Matrix3d::Identity() - skew_x(omega_clone_val) * dt_total) * R_GtoIi;
           p_IiinG = p_IiinG + v_clone_val * dt_total;
         }
@@ -590,14 +642,26 @@ void UpdaterHelper::get_feature_jacobian_full(std::shared_ptr<State> state, Upda
       if (state->_options.do_fej) {
         R_GtoIi = clone_Ii->Rot_fej();
         p_IiinG = clone_Ii->pos_fej();
-        // Apply async timeoffset and RS correction to FEJ values (the epoch residual is a KNOWN
-        // constant, so it enters both linearizations identically)
+        // Apply async timeoffset and RS correction to FEJ values. With a bridge, the KNOWN
+        // residual composes at the FIXED build-time linearization (b0), which is exactly what
+        // FEJ prescribes; the estimated remainder stays first-order at the endpoint kinematics.
+        R_clone_lin = R_GtoIi;
         if (need_obs_terms) {
-          double dt_total_fej = dt_camoff_lin + dt_epoch;
+          double dt_total_fej = dt_camoff_lin + ((bridge == nullptr) ? dt_epoch : 0.0);
           if (rs_on_linearization) {
             dt_total_fej += (v_pixel * inv_img_h) * t_readout_lin;
           }
-          if (have_clone_kin && std::abs(dt_total_fej) > 1e-10) {
+          if (bridge != nullptr) {
+            const Eigen::Matrix3d R_clone_fej = R_GtoIi;
+            R_GtoIi = bridge->DR * R_clone_fej;
+            p_IiinG = p_IiinG + v_clone_lin * bridge->dt + bridge->p_grav + R_clone_fej.transpose() * bridge->alpha;
+            v_end_lin = v_clone_lin + bridge->v_grav + R_clone_fej.transpose() * bridge->beta;
+            omega_end_lin = bridge->w_end;
+            if (have_clone_kin && std::abs(dt_total_fej) > 1e-10) {
+              R_GtoIi = (Eigen::Matrix3d::Identity() - skew_x(omega_end_lin) * dt_total_fej) * R_GtoIi;
+              p_IiinG = p_IiinG + v_end_lin * dt_total_fej;
+            }
+          } else if (have_clone_kin && std::abs(dt_total_fej) > 1e-10) {
             R_GtoIi = (Eigen::Matrix3d::Identity() - skew_x(omega_clone_lin) * dt_total_fej) * R_GtoIi;
             p_IiinG = p_IiinG + v_clone_lin * dt_total_fej;
           }
@@ -665,11 +729,16 @@ void UpdaterHelper::get_feature_jacobian_full(std::shared_ptr<State> state, Upda
         H_x.block(2 * c, map_hx[distortion], 2, distortion->size()) = dz_dzeta;
       }
 
+      // Temporal-column linearization kinematics: bridge endpoint when available (the sampling
+      // instant), else the clone-time cache
+      const Eigen::Vector3d &w_col = (bridge != nullptr) ? omega_end_lin : omega_clone_lin;
+      const Eigen::Vector3d &v_col = (bridge != nullptr) ? v_end_lin : v_clone_lin;
+
       // Derivative of measurement in respect to rolling shutter readout time
       // (column skipped when the window motion is degenerate or this clone has no kinematics)
       if (state->_options.do_calib_camera_readout && dt_rs_cols_active && have_clone_kin) {
         double v_frac = v_pixel * inv_img_h;
-        Eigen::Vector3d dpfI_dtrd = -(skew_x(omega_clone_lin) * p_FinIi + R_GtoIi * v_clone_lin) * v_frac;
+        Eigen::Vector3d dpfI_dtrd = -(skew_x(w_col) * p_FinIi + R_GtoIi * v_col) * v_frac;
         H_x.block(2 * c, readout_hx_col, 2, 1).noalias() += dz_dpfc * R_ItoC * dpfI_dtrd;
       }
 
@@ -678,10 +747,22 @@ void UpdaterHelper::get_feature_jacobian_full(std::shared_ptr<State> state, Upda
       // camera's own measurements contribute nothing by construction)
       if (state->_options.do_calib_camera_timeoffset && dt_rs_cols_active && have_clone_kin && dt_cam_hx_col >= 0 &&
           dt_ref_hx_col >= 0 && dt_cam_hx_col != dt_ref_hx_col) {
-        Eigen::Vector3d dpfI_ddt = -(skew_x(omega_clone_lin) * p_FinIi + R_GtoIi * v_clone_lin);
+        Eigen::Vector3d dpfI_ddt = -(skew_x(w_col) * p_FinIi + R_GtoIi * v_col);
         Eigen::Matrix<double, 2, 1> dz_ddt = dz_dpfc * R_ItoC * dpfI_ddt;
         H_x.block(2 * c, dt_cam_hx_col, 2, 1).noalias() += dz_ddt;
         H_x.block(2 * c, dt_ref_hx_col, 2, 1).noalias() -= dz_ddt;
+      }
+
+      // Analytic IMU-bias columns from the bridge: the composed pose depends on the biases through
+      // the preintegration (d theta_m/db = J_th, d p_m/db = R_k^T J_alpha), a consistency term the
+      // first-order schemes drop entirely
+      if (bridge != nullptr && bias_g_hx_col >= 0 && bias_a_hx_col >= 0) {
+        const Eigen::Matrix<double, 3, 6> dth_db = bridge->J_b.block(0, 0, 3, 6);
+        const Eigen::Matrix<double, 3, 6> dal_db = bridge->J_b.block(3, 0, 3, 6);
+        const Eigen::Matrix<double, 2, 6> H_bias =
+            dz_dpfc * (R_ItoC * skew_x(p_FinIi) * dth_db + (-R_ItoC * R_GtoIi) * (R_clone_lin.transpose() * dal_db));
+        H_x.block(2 * c, bias_g_hx_col, 2, 3).noalias() += H_bias.block(0, 0, 2, 3);
+        H_x.block(2 * c, bias_a_hx_col, 2, 3).noalias() += H_bias.block(0, 3, 2, 3);
       }
 
       // Move the Jacobian and residual index forward

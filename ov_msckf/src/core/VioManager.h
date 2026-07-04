@@ -290,6 +290,12 @@ public:
   uint64_t epoch_fallbacks = 0;
 
 protected:
+  /// Epoch mode: the oldest clone is marginalized when the epoch COMPLETES (next new-time message)
+  bool epoch_marg_pending = false;
+
+public:
+
+protected:
   /// @}
 
   /**

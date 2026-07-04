@@ -294,10 +294,11 @@ int main(int argc, char **argv) {
   double est_dt1 = (st != nullptr && num_cams > 1) ? st->cam_imu_dt(1) : 0.0;
   double est_rd1 = (st != nullptr && num_cams > 1) ? st->_calib_camera_readout.at(1)->value()(0) : 0.0;
   std::printf("[RESULT] name=%s pos_rmse=%.4f ori_rmse=%.4f nees_avg=%.2f updates_cam0=%zu updates_cam1=%zu drops=%zu "
-              "clones_avg=%.1f window_avg=%.3f events=%zu samples=%zu est_dt0=%.6f est_dt1=%.6f est_rd1=%.6f kin_miss=%" PRIu64 "\n",
+              "clones_avg=%.1f window_avg=%.3f events=%zu samples=%zu est_dt0=%.6f est_dt1=%.6f est_rd1=%.6f kin_miss=%" PRIu64
+              " snapped=%" PRIu64 " fallbacks=%" PRIu64 "\n",
               name.c_str(), pos_rmse, ori_rmse, nees_avg, updates_per_cam.at(0), (num_cams > 1 ? updates_per_cam.at(1) : 0),
               drops_out_of_order, clones_avg, window_avg, events_fed, n_err, est_dt0, est_dt1, est_rd1,
-              (st != nullptr) ? st->_kin_miss_count : 0);
+              (st != nullptr) ? st->_kin_miss_count : 0, sys->epoch_snapped, sys->epoch_fallbacks);
 
   // -------------------- assertions --------------------
   bool ok = true;

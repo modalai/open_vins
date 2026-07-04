@@ -759,6 +759,7 @@ void StateHelper::marginalize_old_clone(std::shared_ptr<State> state) {
     state->_clones_IMU.erase(marginal_time);
     state->_clones_kinematics.erase(marginal_time);
     state->_epoch_residuals.erase(marginal_time);
+    state->_epoch_bridges.erase(marginal_time);
   }
 }
 

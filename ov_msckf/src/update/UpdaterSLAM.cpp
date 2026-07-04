@@ -107,17 +107,28 @@ void UpdaterSLAM::delayed_init(std::shared_ptr<State> state, std::vector<std::sh
     const double dt_cam_delta = state->cam_imu_dt_delta(clone_calib.first);
     for (const auto &clone_imu : state->_clones_IMU) {
 
-      // Get current IMU pose (with async camera timeoffset correction; the KNOWN epoch residual
-      // of this camera's observation snapped onto this clone adds per-clone)
+      // Get current IMU pose corrected to this camera's sampling instant: EXACT bridge
+      // composition when the frame was epoch-snapped (bias correction unnecessary at
+      // triangulation accuracy), else the first-order model over the full correction
       Eigen::Matrix<double, 3, 3> R_GtoIi = clone_imu.second->Rot();
       Eigen::Matrix<double, 3, 1> p_IiinG = clone_imu.second->pos();
-      const double dt_corr = dt_cam_delta + state->epoch_residual(clone_calib.first, clone_imu.first);
-      if (std::abs(dt_corr) > 1e-10) {
-        // Tolerant lookup: warm-restored clones may have no kinematics -> zero correction (counted)
-        auto kin_it = state->_clones_kinematics.find(clone_imu.first);
-        if (kin_it != state->_clones_kinematics.end()) {
-          R_GtoIi = (Eigen::Matrix3d::Identity() - skew_x(kin_it->second.omega) * dt_corr) * R_GtoIi;
-          p_IiinG = p_IiinG + kin_it->second.vel * dt_corr;
+      const PreintBridgeData *br = state->epoch_bridge(clone_calib.first, clone_imu.first);
+      const double dt_extra = dt_cam_delta + ((br == nullptr) ? state->epoch_residual(clone_calib.first, clone_imu.first) : 0.0);
+      auto kin_it = state->_clones_kinematics.find(clone_imu.first);
+      const bool have_kin = (kin_it != state->_clones_kinematics.end());
+      if (br != nullptr && have_kin) {
+        const Eigen::Matrix3d R_clone = R_GtoIi;
+        R_GtoIi = br->DR * R_clone;
+        p_IiinG = p_IiinG + kin_it->second.vel * br->dt + br->p_grav + R_clone.transpose() * br->alpha;
+        if (std::abs(dt_extra) > 1e-10) {
+          const Eigen::Vector3d v_end = kin_it->second.vel + br->v_grav + R_clone.transpose() * br->beta;
+          R_GtoIi = (Eigen::Matrix3d::Identity() - skew_x(br->w_end) * dt_extra) * R_GtoIi;
+          p_IiinG = p_IiinG + v_end * dt_extra;
+        }
+      } else if (std::abs(dt_extra) > 1e-10) {
+        if (have_kin) {
+          R_GtoIi = (Eigen::Matrix3d::Identity() - skew_x(kin_it->second.omega) * dt_extra) * R_GtoIi;
+          p_IiinG = p_IiinG + kin_it->second.vel * dt_extra;
         } else {
           state->_kin_miss_count++;
         }

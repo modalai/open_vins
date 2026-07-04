@@ -163,6 +163,11 @@ if (OV_MSCKF_BUILD_TESTS)
     add_test(NAME test_async_buffer COMMAND test_async_buffer
             ${CMAKE_CURRENT_SOURCE_DIR}/../config/voxl_sim/estimator_config.yaml)
 
+    # ACI2 preintegration bridge oracles (dense-integration mean check, FD bias-Jacobian check)
+    add_executable(test_preint_bridge src/test_preint_bridge.cpp)
+    target_link_libraries(test_preint_bridge ov_msckf_lib ${thirdparty_libraries})
+    add_test(NAME test_preint_bridge COMMAND test_preint_bridge)
+
     # Synced baseline on the production-equivalent voxl_sim config (shipped fpv key-set):
     # the golden non-regression gate. Thresholds frozen from the measured S0 baseline
     # (udel_gore, seed 6: pos 0.5893 m / ori 0.3006 deg / NEES 27.38) with ~25-35% headroom
@@ -182,15 +187,15 @@ if (OV_MSCKF_BUILD_TESTS)
             --phase1 0.0073 --dt1 0.012
             --name async_baseline --assert-pos-rmse 1.0 --assert-ori-rmse 0.6 --assert-nees-max 50)
     set_tests_properties(test_async_dual_baseline_KNOWNFAIL PROPERTIES WILL_FAIL TRUE)
-    # Epoch-anchored cloning (S4): window baseline restored (0.333 s @ 60 Hz updates), dt1
-    # converges to truth, divergence arrested (37.6 -> 5.7 m). Thresholds = the S4 envelope;
-    # the remaining error is the first-order snap extrapolation, which the S5 preintegration
-    # bridge replaces -- S5 must tighten these toward the synced envelope (<=1.0/0.6/50).
+    # Epoch-anchored cloning + ACI2 bridge + deferred epoch marginalization: the unsynced dual
+    # rig now MEETS/BEATS the synced envelope (measured 0.385 m / 0.60 deg / NEES 11.2 vs synced
+    # 0.436 / 0.40 / 32 -- the staggered second camera adds temporal diversity and the per-cam dt
+    # model is more honest than the single-dt lump). Thresholds carry ~50% headroom.
     add_test(NAME test_async_dual_epoch COMMAND test_async_dual
             ${CMAKE_CURRENT_SOURCE_DIR}/../config/voxl_sim/estimator_config.yaml
             --traj ${CMAKE_CURRENT_SOURCE_DIR}/../ov_data/sim/udel_gore.txt
             --phase1 0.0073 --dt1 0.012 --epoch
-            --name async_epoch --assert-pos-rmse 8.0 --assert-ori-rmse 15.0 --assert-nees-max 2500)
+            --name async_epoch --assert-pos-rmse 0.60 --assert-ori-rmse 1.0 --assert-nees-max 25)
 endif ()
 
 

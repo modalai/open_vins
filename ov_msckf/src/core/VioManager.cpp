@@ -71,6 +71,9 @@ VioManager::VioManager(VioManagerOptions &params_) : thread_init_running(false),
   cv::setNumThreads(params.num_opencv_threads);
   cv::setRNGSeed(0);
 
+  // Forward manager-level knobs consumed inside the state/updaters
+  params.state_options.epoch_bridge_bias_cols = params.epoch_bridge_bias_cols;
+
   // Create the state!!
   state = std::make_shared<State>(params.state_options);
 
@@ -384,6 +387,19 @@ bool VioManager::apply_epoch_snap(double &timestamp, const std::vector<int> &sen
   for (int cid : sensor_ids) {
     residuals[(size_t)cid] = t_raw - last_ref_frame_time;
   }
+
+  // Build the exact ACI2 bridge over the KNOWN residual, at the current bias estimates (IMU
+  // coverage is guaranteed by the ingest release gate). If it cannot be built the updaters
+  // degrade to the first-order model for this frame -- still snapped, still consistent.
+  Propagator::BridgeData bd;
+  const double t0_imu = last_ref_frame_time + state->cam_imu_dt_ref();
+  if (propagator->compute_bridge(state, t0_imu, t0_imu + (t_raw - last_ref_frame_time), bd)) {
+    auto &bmap = state->_epoch_bridges[last_ref_frame_time];
+    for (int cid : sensor_ids) {
+      bmap[(size_t)cid] = bd;
+    }
+  }
+
   timestamp = last_ref_frame_time;
   epoch_snapped++;
   return true;
@@ -589,6 +605,15 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
     PRINT_WARNING(YELLOW "image received out of order, unable to do anything (prop dt = %3f)\n" RESET,
                   (message.timestamp - state->_timestamp));
     return;
+  }
+
+  // Epoch mode defers the old-clone marginalization until the epoch is COMPLETE (a message with
+  // a NEW time arrives): every camera's own update call must still see the full window, otherwise
+  // non-reference tracks can never reach max-track length and never graduate to SLAM features
+  // (they would be consumed as short MSCKF scraps at the reference camera's call instead).
+  if (epoch_marg_pending && state->_timestamp != message.timestamp) {
+    StateHelper::marginalize_old_clone(state);
+    epoch_marg_pending = false;
   }
 
   // Propagate the state forward to the current update time
@@ -879,7 +904,14 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
   }
 
   // Finally marginalize the oldest clone if needed
-  StateHelper::marginalize_old_clone(state);
+  if (params.epoch_mode) {
+    // Defer: the epoch's remaining (snapped) camera calls must still see the full window so their
+    // tracks can reach max-track length and graduate to SLAM; executed when the next NEW-time
+    // message arrives (see the top of this function)
+    epoch_marg_pending = ((int)state->_clones_IMU.size() > state->_options.max_clone_size);
+  } else {
+    StateHelper::marginalize_old_clone(state);
+  }
   rT7 = boost::posix_time::microsec_clock::local_time();
 
   //===================================================================================

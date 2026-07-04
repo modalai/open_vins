@@ -59,6 +59,9 @@ struct StateOptions {
   /// Bool to determine whether or not to calibrate camera rolling shutter readout time
   bool do_calib_camera_readout = false;
 
+  /// Analytic IMU-bias columns from the preintegration bridge (see VioManagerOptions)
+  bool epoch_bridge_bias_cols = true;
+
   /// Freeze dt/readout Jacobian columns while the window motion is degenerate for temporal
   /// calibration (MVIS degenerate motions: static / constant velocity / slow pure rotation)
   bool dt_calib_gate = true;

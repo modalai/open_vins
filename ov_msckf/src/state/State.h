@@ -31,6 +31,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "PreintegrationBridge.h"
 #include "StateOptions.h"
 #include "cam/CamBase.h"
 #include "types/IMU.h"
@@ -302,6 +303,20 @@ public:
     }
     auto it2 = it->second.find(cam_id);
     return (it2 == it->second.end()) ? 0.0 : it2->second;
+  }
+
+  /// ACI2 preintegration bridges for epoch-snapped frames, keyed like _epoch_residuals.
+  /// Built once per (camera, epoch) at bind time; erased with the clone.
+  std::map<double, std::map<size_t, PreintBridgeData>> _epoch_bridges;
+
+  /// Bridge lookup for (camera, clone time); nullptr when none exists (first-order fallback)
+  const PreintBridgeData *epoch_bridge(size_t cam_id, double clone_time) const {
+    auto it = _epoch_bridges.find(clone_time);
+    if (it == _epoch_bridges.end()) {
+      return nullptr;
+    }
+    auto it2 = it->second.find(cam_id);
+    return (it2 == it->second.end() || !it2->second.valid) ? nullptr : &it2->second;
   }
 
   /// Calibration poses for each camera (R_ItoC, p_IinC)
