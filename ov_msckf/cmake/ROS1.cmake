@@ -49,6 +49,7 @@ list(APPEND LIBRARY_SOURCES
         src/state/State.cpp
         src/state/StateHelper.cpp
         src/state/Propagator.cpp
+        src/core/AsyncCameraBuffer.cpp
         src/core/VioManager.cpp
         src/core/VioManagerHelper.cpp
         src/update/UpdaterHelper.cpp
@@ -155,6 +156,12 @@ if (OV_MSCKF_BUILD_TESTS)
     # Async dual-camera A/B harness (RMSE/NEES vs ground truth, per-cam phase/dt/readout truth injection)
     add_executable(test_async_dual src/test_async_dual.cpp)
     target_link_libraries(test_async_dual ov_msckf_lib ${thirdparty_libraries})
+
+    # Lock-free ingest unit tests (threaded producers, staleness, bundling, disposal accounting)
+    add_executable(test_async_buffer src/test_async_buffer.cpp)
+    target_link_libraries(test_async_buffer ov_msckf_lib ${thirdparty_libraries})
+    add_test(NAME test_async_buffer COMMAND test_async_buffer
+            ${CMAKE_CURRENT_SOURCE_DIR}/../config/voxl_sim/estimator_config.yaml)
 
     # Synced baseline on the production-equivalent voxl_sim config (shipped fpv key-set):
     # the golden non-regression gate. Thresholds frozen from the measured S0 baseline

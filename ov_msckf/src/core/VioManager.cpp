@@ -111,6 +111,19 @@ VioManager::VioManager(VioManagerOptions &params_) : thread_init_running(false),
   // The initializer runs in the reference camera's clock
   params.init_options.calib_camimu_dt = state->cam_imu_dt_ref();
 
+  // Lock-free async multi-camera ingest: one SPSC ring per stream, ordered release from the IMU
+  // feed. Dropped frames flow through the processed-callback with processed=false so the owner can
+  // release external image handles exactly once.
+  AsyncCameraBuffer::Options buf_opts;
+  buf_opts.ring_capacity = (size_t)std::max(2, params.async_ring_size);
+  buf_opts.guard = params.async_guard;
+  buf_opts.stale_factor = params.async_stale_factor;
+  camera_buffer = std::make_shared<AsyncCameraBuffer>(state->_options.num_cameras, buf_opts, [this](const ov_core::CameraData &msg) {
+    if (camera_processed_cb) {
+      camera_processed_cb(msg, false);
+    }
+  });
+
   //===================================================================================
   //===================================================================================
   //===================================================================================
@@ -320,10 +333,32 @@ void VioManager::feed_measurement_batch_imu(const std::vector<ov_core::ImuData>&
         initializer->feed_imu_batch(processed_messages, oldest_time);
     }
 
-    if (is_initialized_vio && updaterZUPT != nullptr && 
+    if (is_initialized_vio && updaterZUPT != nullptr &&
         (!params.zupt_only_at_beginning || !has_moved_since_zupt)) {
         updaterZUPT->feed_imu_batch(processed_messages, oldest_time);
     }
+
+    // Release every buffered camera frame whose global ordering this batch has decided
+    newest_imu_time = std::max(newest_imu_time, messages.back().timestamp);
+    drain_camera_buffer();
+}
+
+void VioManager::feed_measurement_camera(const ov_core::CameraData &message) {
+  if (camera_buffer != nullptr) {
+    camera_buffer->push(message);
+  }
+}
+
+void VioManager::drain_camera_buffer() {
+  if (camera_buffer == nullptr) {
+    return;
+  }
+  camera_buffer->drain(
+      newest_imu_time, [this](const std::vector<int> &sensor_ids) { return state->cam_imu_dt_max_for_ids(sensor_ids); },
+      [this](ov_core::CameraData &&msg) {
+        track_image_and_update(msg);
+        return (camera_processed_cb == nullptr) || camera_processed_cb(msg, true);
+      });
 }
 
 void VioManager::feed_measurement_imu(const ov_core::ImuData &message) {
@@ -349,6 +384,10 @@ void VioManager::feed_measurement_imu(const ov_core::ImuData &message) {
   if (is_initialized_vio && updaterZUPT != nullptr && (!params.zupt_only_at_beginning || !has_moved_since_zupt)) {
     updaterZUPT->feed_imu(message, oldest_time);
   }
+
+  // Release every buffered camera frame whose global ordering this sample has decided
+  newest_imu_time = std::max(newest_imu_time, message.timestamp);
+  drain_camera_buffer();
 }
 
 void VioManager::feed_measurement_simulation(double timestamp, const std::vector<int> &camids,

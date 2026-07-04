@@ -65,7 +65,14 @@ cmd_variant() { # name sed-expr args...
 cmd_ctest() { ctest --test-dir "$BUILD/ov_msckf" --output-on-failure 2>&1 | tail -20; }
 
 cmd_parity() {
-  [ -x "$SCRATCH/sim_hash_branch" ] && [ -x "$SCRATCH/sim_hash_head" ] || die "parity jigs missing (see S0 notes)"
+  [ -f "$SCRATCH/sim_hash.cpp" ] || die "parity jig source missing ($SCRATCH/sim_hash.cpp)"
+  [ -x "$SCRATCH/sim_hash_head" ] || die "HEAD parity jig missing (see S0 notes)"
+  # The branch jig links branch libs whose ABI moves every stage: recompile it fresh each time
+  local FLAGS="-march=native -O3 -ffast-math -fomit-frame-pointer -fno-signed-zeros -fno-math-errno -funroll-loops -ftree-vectorize -std=c++17"
+  g++ $FLAGS "$SCRATCH/sim_hash.cpp" -I"$OV/ov_msckf/src" -I"$OV/ov_core/src" -I"$OV/ov_init/src" -I/usr/include/eigen3 \
+    $(pkg-config --cflags opencv4) -L"$BUILD/ov_msckf" -L"$BUILD/ov_core" -L"$BUILD/ov_init" \
+    -lov_msckf_lib -lov_core_lib -lov_init_lib $(pkg-config --libs opencv4) -lboost_filesystem -lboost_system \
+    -Wl,-rpath,"$BUILD/ov_msckf:$BUILD/ov_core:$BUILD/ov_init" -o "$SCRATCH/sim_hash_branch" || die "branch jig compile failed"
   local b h
   b=$("$SCRATCH/sim_hash_branch" "$OV/config/rpng_sim/estimator_config.yaml" "$TRAJ" 2>/dev/null | tail -1)
   h=$("$SCRATCH/sim_hash_head" "$SCRATCH/ov_head/config/rpng_sim/estimator_config.yaml" "$TRAJ" 2>/dev/null | tail -1)

@@ -27,6 +27,8 @@
 #include <atomic>
 #include <boost/filesystem.hpp>
 #include <fstream>
+#include <functional>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -35,6 +37,7 @@
 #include <CL/cl.h> // cl_context used by the HAVE_OPENCL-guarded get_ocl_context() below (matches TrackBase.h)
 #endif
 
+#include "AsyncCameraBuffer.h"
 #include "VioManagerOptions.h"
 
 namespace ov_core {
@@ -79,10 +82,34 @@ public:
   void feed_measurement_imu(const ov_core::ImuData &message);
 
   /**
-   * @brief Feed function for camera measurements
+   * @brief Feed function for camera measurements (thread-safe, non-blocking).
+   *
+   * Pushes into this camera stream's lock-free ring; the IMU feed on the VIO thread releases
+   * frames in global timestamp order, gated on IMU availability and cross-camera ordering
+   * (see AsyncCameraBuffer). One producer thread per camera stream.
    * @param message Contains our timestamp, images, and camera ids
    */
-  void feed_measurement_camera(const ov_core::CameraData &message) { track_image_and_update(message); }
+  void feed_measurement_camera(const ov_core::CameraData &message);
+
+  /**
+   * @brief Per-frame post-processing hook, run on the VIO thread after a frame is consumed.
+   * @param cb cb(msg, processed): processed=false for frames the ingest dropped (release any
+   * external image handles there); return false to pause draining this round (e.g. reset pending).
+   * NOTE: the processed=false path can also run on a producer thread (ring-full last resort).
+   */
+  void set_camera_processed_callback(std::function<bool(const ov_core::CameraData &msg, bool processed)> cb) {
+    camera_processed_cb = std::move(cb);
+  }
+
+  /// Dispose every buffered camera frame (VIO thread; use when resetting)
+  void clear_camera_buffers() {
+    if (camera_buffer != nullptr) {
+      camera_buffer->clear();
+    }
+  }
+
+  /// Ingest buffer telemetry access
+  std::shared_ptr<AsyncCameraBuffer> get_camera_buffer() { return camera_buffer; }
 
   /**
    * @brief Feed function for a synchronized simulated cameras
@@ -224,6 +251,21 @@ public:
   bool get_did_zupt_update() const { return did_zupt_update; }
 
 protected:
+  /**
+   * @brief Release every camera frame whose global ordering is decided into the estimator.
+   * VIO thread only; called at the end of the IMU feeds.
+   */
+  void drain_camera_buffer();
+
+  /// Lock-free async multi-camera ingest (per-stream rings + ordered release)
+  std::shared_ptr<AsyncCameraBuffer> camera_buffer;
+
+  /// Per-frame post-processing hook (see set_camera_processed_callback)
+  std::function<bool(const ov_core::CameraData &msg, bool processed)> camera_processed_cb;
+
+  /// Newest IMU timestamp fed to the estimator (VIO thread only; gates frame release)
+  double newest_imu_time = -std::numeric_limits<double>::infinity();
+
   /**
    * @brief Given a new set of camera images, this will track them.
    *

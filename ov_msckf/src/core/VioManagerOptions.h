@@ -135,6 +135,9 @@ struct VioManagerOptions {
     if (parser != nullptr) {
       parser->parse_config("dt_slam_delay", dt_slam_delay);
       parser->parse_config("try_zupt", try_zupt);
+      parser->parse_config("async_ring_size", async_ring_size, false);
+      parser->parse_config("async_guard", async_guard, false);
+      parser->parse_config("async_stale_factor", async_stale_factor, false);
       parser->parse_config("zupt_max_velocity", zupt_max_velocity);
       parser->parse_config("zupt_noise_multiplier", zupt_noise_multiplier);
       parser->parse_config("zupt_max_disparity", zupt_max_disparity);
@@ -229,6 +232,15 @@ struct VioManagerOptions {
 
   /// Rotation from accelerometer to the "IMU" gyroscope frame frame
   Eigen::Matrix<double, 4, 1> q_GYROtoIMU;
+
+  /// Async camera ingest: per-camera ring capacity (frames)
+  int async_ring_size = 16;
+
+  /// Async camera ingest: IMU margin (s) beyond the per-camera offset before a frame releases
+  double async_guard = 0.002;
+
+  /// Async camera ingest: a camera is stale after this many EMA frame periods of silence
+  double async_stale_factor = 1.5;
 
   /// Time offset between camera and IMU (the REFERENCE camera's offset).
   double calib_camimu_dt = 0.0;
