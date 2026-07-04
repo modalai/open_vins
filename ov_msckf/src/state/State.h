@@ -22,6 +22,9 @@
 #ifndef OV_MSCKF_STATE_H
 #define OV_MSCKF_STATE_H
 
+#include <algorithm>
+#include <cmath>
+#include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -49,6 +52,25 @@ namespace ov_msckf {
 class State {
 
 public:
+  /// Per-clone kinematic metadata (velocity and corrected angular rate at clone time, plus their
+  /// FEJ twins). Consumed by the per-camera time-offset / rolling-shutter measurement models as the
+  /// CLONE-SIDE Jacobian linearization point. Metadata only -- never in the state vector/covariance.
+  ///
+  /// Design rationale: freezing these at augment time is exactly what FEJ prescribes for
+  /// clone-anchored Jacobians (the fej twins), and cheaper by ~2x in clone-block covariance work
+  /// than carrying velocity inside each clone. Value-side pose shifts to measurement time must NOT
+  /// rely on the cached velocity over long gaps -- the preintegration bridge integrates the actual
+  /// IMU samples for that; the cached values remain only linearization points. omega is the
+  /// intrinsics/bias-corrected gyro at the clone instant (select_imu_readings boundary-interpolated),
+  /// matching the dnc_dt = [w; v] augment Jacobian. Lifecycle: augment_clone stores, marginalize
+  /// erases, warmstart restore rebuilds by finite differences; consumers must use tolerant lookups.
+  struct CloneKinematics {
+    Eigen::Vector3d vel = Eigen::Vector3d::Zero();
+    Eigen::Vector3d omega = Eigen::Vector3d::Zero();
+    Eigen::Vector3d vel_fej = Eigen::Vector3d::Zero();
+    Eigen::Vector3d omega_fej = Eigen::Vector3d::Zero();
+  };
+
   /**
    * @brief Default Constructor (will initialize variables to defaults)
    * @param options_ Options structure containing filter options
@@ -134,6 +156,69 @@ public:
     return sz;
   }
 
+  /// Returns the camera id used as propagation/cloning time reference
+  int cam_imu_dt_ref_camid() const { return _options.cam_imu_dt_ref_camid; }
+
+  /// Returns per-camera timeoffset variable (falls back to reference variable if camera id not found)
+  std::shared_ptr<ov_type::Vec> cam_imu_dt_var(size_t cam_id) const {
+    auto it = _calib_dt_CAMtoIMU_map.find(cam_id);
+    if (it != _calib_dt_CAMtoIMU_map.end()) {
+      return it->second;
+    }
+    return _calib_dt_CAMtoIMU;
+  }
+
+  /// Returns current per-camera dt value
+  double cam_imu_dt(size_t cam_id) const { return cam_imu_dt_var(cam_id)->value()(0); }
+
+  /// Returns FEJ per-camera dt value
+  double cam_imu_dt_fej(size_t cam_id) const { return cam_imu_dt_var(cam_id)->fej()(0); }
+
+  /// Returns current reference camera dt value
+  double cam_imu_dt_ref() const { return cam_imu_dt((size_t)cam_imu_dt_ref_camid()); }
+
+  /// Returns FEJ reference camera dt value
+  double cam_imu_dt_ref_fej() const { return cam_imu_dt_fej((size_t)cam_imu_dt_ref_camid()); }
+
+  /// Returns delta dt between camera and reference camera
+  double cam_imu_dt_delta(size_t cam_id) const { return cam_imu_dt(cam_id) - cam_imu_dt_ref(); }
+
+  /// Returns FEJ delta dt between camera and reference camera
+  double cam_imu_dt_delta_fej(size_t cam_id) const { return cam_imu_dt_fej(cam_id) - cam_imu_dt_ref_fej(); }
+
+  /// Returns min dt across all cameras
+  double cam_imu_dt_min() const {
+    double dt_min = std::numeric_limits<double>::infinity();
+    for (int i = 0; i < _options.num_cameras; i++) {
+      dt_min = std::min(dt_min, cam_imu_dt((size_t)i));
+    }
+    return std::isfinite(dt_min) ? dt_min : cam_imu_dt_ref();
+  }
+
+  /// Returns max dt across all cameras
+  double cam_imu_dt_max() const {
+    double dt_max = -std::numeric_limits<double>::infinity();
+    for (int i = 0; i < _options.num_cameras; i++) {
+      dt_max = std::max(dt_max, cam_imu_dt((size_t)i));
+    }
+    return std::isfinite(dt_max) ? dt_max : cam_imu_dt_ref();
+  }
+
+  /// Returns max dt among specific camera ids
+  double cam_imu_dt_max_for_ids(const std::vector<int> &cam_ids) const {
+    if (cam_ids.empty()) {
+      return cam_imu_dt_ref();
+    }
+    double dt_max = -std::numeric_limits<double>::infinity();
+    for (const int cam_id : cam_ids) {
+      if (cam_id < 0) {
+        continue;
+      }
+      dt_max = std::max(dt_max, cam_imu_dt((size_t)cam_id));
+    }
+    return std::isfinite(dt_max) ? dt_max : cam_imu_dt_ref();
+  }
+
   /// Mutex for locking access to the state
   std::mutex _mutex_state;
 
@@ -152,8 +237,18 @@ public:
   /// Our current set of SLAM features (3d positions)
   std::unordered_map<size_t, std::shared_ptr<ov_type::Landmark>> _features_SLAM;
 
-  /// Time offset base IMU to camera (t_imu = t_cam + t_off)
+  /// Time offset base IMU to camera (t_imu = t_cam + t_off); ALIASES the reference camera's
+  /// entry in _calib_dt_CAMtoIMU_map (kept for the single-offset call sites)
   std::shared_ptr<ov_type::Vec> _calib_dt_CAMtoIMU;
+
+  /// Per-camera time offset base IMU to camera (t_imu = t_cam_i + t_off_i)
+  std::unordered_map<size_t, std::shared_ptr<ov_type::Vec>> _calib_dt_CAMtoIMU_map;
+
+  /// Rolling shutter readout time per camera (seconds; 0 = global shutter)
+  std::unordered_map<size_t, std::shared_ptr<ov_type::Vec>> _calib_camera_readout;
+
+  /// Kinematic metadata at each clone time (metadata, not in state/covariance)
+  std::map<double, CloneKinematics> _clones_kinematics;
 
   /// Calibration poses for each camera (R_ItoC, p_IinC)
   std::unordered_map<size_t, std::shared_ptr<ov_type::PoseJPL>> _calib_IMUtoCAM;

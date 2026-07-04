@@ -86,21 +86,30 @@ VioManager::VioManager(VioManagerOptions &params_) : thread_init_running(false),
   state->_calib_imu_ACCtoIMU->set_value(params.q_ACCtoIMU);
   state->_calib_imu_ACCtoIMU->set_fej(params.q_ACCtoIMU);
 
-  // Timeoffset from camera to IMU
-  Eigen::VectorXd temp_camimu_dt;
-  temp_camimu_dt.resize(1);
-  temp_camimu_dt(0) = params.calib_camimu_dt;
-  state->_calib_dt_CAMtoIMU->set_value(temp_camimu_dt);
-  state->_calib_dt_CAMtoIMU->set_fej(temp_camimu_dt);
-
   // Loop through and load each of the cameras
   state->_cam_intrinsics_cameras = params.camera_intrinsics;
   for (int i = 0; i < state->_options.num_cameras; i++) {
+
+    // Timeoffset from this camera to IMU (t_imu = t_cam_i + t_off_i); ref cam fills the legacy alias
+    Eigen::VectorXd dt_val(1);
+    dt_val(0) = params.camera_imu_dt.count(i) ? params.camera_imu_dt.at(i) : params.calib_camimu_dt;
+    state->cam_imu_dt_var((size_t)i)->set_value(dt_val);
+    state->cam_imu_dt_var((size_t)i)->set_fej(dt_val);
+
     state->_cam_intrinsics.at(i)->set_value(params.camera_intrinsics.at(i)->get_value());
     state->_cam_intrinsics.at(i)->set_fej(params.camera_intrinsics.at(i)->get_value());
     state->_calib_IMUtoCAM.at(i)->set_value(params.camera_extrinsics.at(i));
     state->_calib_IMUtoCAM.at(i)->set_fej(params.camera_extrinsics.at(i));
+
+    // Rolling shutter readout time (0 = global shutter)
+    Eigen::VectorXd readout_val(1);
+    readout_val(0) = params.camera_readout_time.count(i) ? params.camera_readout_time.at(i) : 0.0;
+    state->_calib_camera_readout.at(i)->set_value(readout_val);
+    state->_calib_camera_readout.at(i)->set_fej(readout_val);
   }
+
+  // The initializer runs in the reference camera's clock
+  params.init_options.calib_camimu_dt = state->cam_imu_dt_ref();
 
   //===================================================================================
   //===================================================================================
@@ -256,16 +265,20 @@ void VioManager::soft_reset(SoftResetCause cause) {
   state->_calib_imu_GYROtoIMU->set_fej(params.q_GYROtoIMU);
   state->_calib_imu_ACCtoIMU->set_value(params.q_ACCtoIMU);
   state->_calib_imu_ACCtoIMU->set_fej(params.q_ACCtoIMU);
-  Eigen::VectorXd temp_camimu_dt(1);
-  temp_camimu_dt(0) = params.calib_camimu_dt;
-  state->_calib_dt_CAMtoIMU->set_value(temp_camimu_dt);
-  state->_calib_dt_CAMtoIMU->set_fej(temp_camimu_dt);
   state->_cam_intrinsics_cameras = params.camera_intrinsics;
   for (int i = 0; i < state->_options.num_cameras; i++) {
+    Eigen::VectorXd dt_val(1);
+    dt_val(0) = params.camera_imu_dt.count(i) ? params.camera_imu_dt.at(i) : params.calib_camimu_dt;
+    state->cam_imu_dt_var((size_t)i)->set_value(dt_val);
+    state->cam_imu_dt_var((size_t)i)->set_fej(dt_val);
     state->_cam_intrinsics.at(i)->set_value(params.camera_intrinsics.at(i)->get_value());
     state->_cam_intrinsics.at(i)->set_fej(params.camera_intrinsics.at(i)->get_value());
     state->_calib_IMUtoCAM.at(i)->set_value(params.camera_extrinsics.at(i));
     state->_calib_IMUtoCAM.at(i)->set_fej(params.camera_extrinsics.at(i));
+    Eigen::VectorXd readout_val(1);
+    readout_val(0) = params.camera_readout_time.count(i) ? params.camera_readout_time.at(i) : 0.0;
+    state->_calib_camera_readout.at(i)->set_value(readout_val);
+    state->_calib_camera_readout.at(i)->set_fej(readout_val);
   }
 
   PRINT_INFO("[soft-reset]: EKF reset; feature DB + IMU history preserved for fast re-init\n");
@@ -281,7 +294,7 @@ void VioManager::feed_measurement_batch_imu(const std::vector<ov_core::ImuData>&
     }
     if (!is_initialized_vio) {
         oldest_time = messages.back().timestamp - params.init_options.init_window_time +
-                     state->_calib_dt_CAMtoIMU->value()(0) - params.zupt_prop_window;
+                     state->cam_imu_dt_min() - params.zupt_prop_window;
     }
 
     // Downsample if requested
@@ -322,7 +335,7 @@ void VioManager::feed_measurement_imu(const ov_core::ImuData &message) {
     oldest_time = -1;
   }
   if (!is_initialized_vio) {
-    oldest_time = message.timestamp - params.init_options.init_window_time + state->_calib_dt_CAMtoIMU->value()(0) - params.zupt_prop_window;
+    oldest_time = message.timestamp - params.init_options.init_window_time + state->cam_imu_dt_min() - params.zupt_prop_window;
   }
   propagator->feed_imu(message, oldest_time);
 
@@ -375,8 +388,10 @@ void VioManager::feed_measurement_simulation(double timestamp, const std::vector
     }
     if (did_zupt_update) {
       assert(state->_timestamp == timestamp);
-      propagator->clean_old_imu_measurements(timestamp + state->_calib_dt_CAMtoIMU->value()(0) - params.prop_window);
-      updaterZUPT->clean_old_imu_measurements(timestamp + state->_calib_dt_CAMtoIMU->value()(0) - params.prop_window);
+      // Clean against the SMALLEST per-cam offset: strictly conservative (keeps every sample any
+      // camera's pending frame could still need; the per-cam dt spread is << prop_window)
+      propagator->clean_old_imu_measurements(timestamp + state->cam_imu_dt_min() - params.prop_window);
+      updaterZUPT->clean_old_imu_measurements(timestamp + state->cam_imu_dt_min() - params.prop_window);
       propagator->invalidate_cache();
       // timelastupdate = timestamp;
       return;
@@ -449,8 +464,9 @@ void VioManager::track_image_and_update(const ov_core::CameraData &message_const
     }
     if (did_zupt_update) {
       assert(state->_timestamp == message.timestamp);
-      propagator->clean_old_imu_measurements(message.timestamp + state->_calib_dt_CAMtoIMU->value()(0) - params.prop_window);
-      updaterZUPT->clean_old_imu_measurements(message.timestamp + state->_calib_dt_CAMtoIMU->value()(0) - params.prop_window);
+      // Conservative clean horizon (see feed_measurement_simulation note)
+      propagator->clean_old_imu_measurements(message.timestamp + state->cam_imu_dt_min() - params.prop_window);
+      updaterZUPT->clean_old_imu_measurements(message.timestamp + state->cam_imu_dt_min() - params.prop_window);
       propagator->invalidate_cache();
       // timelastupdate = message.timestamp;
       return;
@@ -809,7 +825,7 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
   if (params.record_timing_information && of_statistics.is_open()) {
     // We want to publish in the IMU clock frame
     // The timestamp in the state will be the last camera time
-    double t_ItoC = state->_calib_dt_CAMtoIMU->value()(0);
+    double t_ItoC = state->cam_imu_dt_ref();
     double timestamp_inI = state->_timestamp + t_ItoC;
     // Append to the file
     of_statistics << std::fixed << std::setprecision(15) << timestamp_inI << "," << std::fixed << std::setprecision(5) << time_track << ","
@@ -837,7 +853,9 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
 
   // Debug for camera imu offset
   if (state->_options.do_calib_camera_timeoffset) {
-    PRINT_INFO("camera-imu timeoffset = %.5f\n", state->_calib_dt_CAMtoIMU->value()(0));
+    for (int i = 0; i < state->_options.num_cameras; i++) {
+      PRINT_INFO("cam%d-imu timeoffset = %.5f\n", i, state->cam_imu_dt((size_t)i));
+    }
   }
 
   // Debug for camera intrinsics

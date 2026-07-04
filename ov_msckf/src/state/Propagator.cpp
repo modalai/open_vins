@@ -52,12 +52,12 @@ void Propagator::propagate_and_clone(std::shared_ptr<State> state, double timest
 
   // Set the last time offset value if we have just started the system up
   if (!have_last_prop_time_offset) {
-    last_prop_time_offset = state->_calib_dt_CAMtoIMU->value()(0);
+    last_prop_time_offset = state->cam_imu_dt_ref();
     have_last_prop_time_offset = true;
   }
 
   // Get what our IMU-camera offset should be (t_imu = t_cam + calib_dt)
-  double t_off_new = state->_calib_dt_CAMtoIMU->value()(0);
+  double t_off_new = state->cam_imu_dt_ref();
 
   // First lets construct an IMU vector of measurements we need
   double time0 = state->_timestamp + last_prop_time_offset;
@@ -104,12 +104,20 @@ void Propagator::propagate_and_clone(std::shared_ptr<State> state, double timest
   // Remember to correct them before we store them
   Eigen::Vector3d last_a = Eigen::Vector3d::Zero();
   Eigen::Vector3d last_w = Eigen::Vector3d::Zero();
+  Eigen::Vector3d last_a_fej = Eigen::Vector3d::Zero();
+  Eigen::Vector3d last_w_fej = Eigen::Vector3d::Zero();
   if (!prop_data.empty()) {
     Eigen::Matrix3d Dw = State::Dm(state->_options.imu_model, state->_calib_imu_dw->value());
     Eigen::Matrix3d Da = State::Dm(state->_options.imu_model, state->_calib_imu_da->value());
     Eigen::Matrix3d Tg = State::Tg(state->_calib_imu_tg->value());
+    Eigen::Matrix3d Dw_fej = State::Dm(state->_options.imu_model, state->_calib_imu_dw->fej());
+    Eigen::Matrix3d Da_fej = State::Dm(state->_options.imu_model, state->_calib_imu_da->fej());
+    Eigen::Matrix3d Tg_fej = State::Tg(state->_calib_imu_tg->fej());
     last_a = state->_calib_imu_ACCtoIMU->Rot() * Da * (prop_data.at(prop_data.size() - 1).am - state->_imu->bias_a());
     last_w = state->_calib_imu_GYROtoIMU->Rot() * Dw * (prop_data.at(prop_data.size() - 1).wm - state->_imu->bias_g() - Tg * last_a);
+    last_a_fej = state->_calib_imu_ACCtoIMU->Rot_fej() * Da_fej * (prop_data.at(prop_data.size() - 1).am - state->_imu->bias_a_fej());
+    last_w_fej =
+        state->_calib_imu_GYROtoIMU->Rot_fej() * Dw_fej * (prop_data.at(prop_data.size() - 1).wm - state->_imu->bias_g_fej() - Tg_fej * last_a_fej);
   }
 
   // Do the update to the covariance with our "summed" state transition and IMU noise addition...
@@ -134,7 +142,7 @@ void Propagator::propagate_and_clone(std::shared_ptr<State> state, double timest
   last_prop_time_offset = t_off_new;
 
   // Now perform stochastic cloning
-  StateHelper::augment_clone(state, last_w);
+  StateHelper::augment_clone(state, last_w, last_w_fej);
 }
 
 bool Propagator::fast_state_propagate(std::shared_ptr<State> state, double timestamp, Eigen::Matrix<double, 13, 1> &state_plus,
@@ -145,7 +153,7 @@ bool Propagator::fast_state_propagate(std::shared_ptr<State> state, double times
     cache_state_time = state->_timestamp;
     cache_state_est = state->_imu->value();
     cache_state_covariance = StateHelper::get_marginal_covariance(state, {state->_imu});
-    cache_t_off = state->_calib_dt_CAMtoIMU->value()(0);
+    cache_t_off = state->cam_imu_dt_ref();
     cache_imu_valid = true;
   }
 

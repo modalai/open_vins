@@ -291,6 +291,7 @@ int main(int argc, char **argv) {
 
   // -------------------- assertions --------------------
   bool ok = true;
+  bool any_assert = (assert_pos_rmse > 0 || assert_ori_rmse > 0 || assert_nees_max > 0);
   if (n_err == 0) {
     std::printf("[FAIL] no error samples collected (estimator never initialized or diverged early)\n");
     ok = false;
@@ -307,6 +308,7 @@ int main(int argc, char **argv) {
     std::printf("[FAIL] nees_avg %.2f > %.2f\n", nees_avg, assert_nees_max);
     ok = false;
   }
-  std::printf("%s\n", ok ? "[PASS]" : "[FAILED]");
+  // A run without thresholds proves nothing -- never print PASS for it
+  std::printf("%s\n", !ok ? "[FAILED]" : (any_assert ? "[PASS]" : "[DONE unverified]"));
   return ok ? EXIT_SUCCESS : EXIT_FAILURE;
 }

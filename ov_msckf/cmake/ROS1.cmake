@@ -164,15 +164,17 @@ if (OV_MSCKF_BUILD_TESTS)
             ${CMAKE_CURRENT_SOURCE_DIR}/../config/voxl_sim/estimator_config.yaml
             --traj ${CMAKE_CURRENT_SOURCE_DIR}/../ov_data/sim/udel_gore.txt
             --name synced --assert-pos-rmse 0.75 --assert-ori-rmse 0.40 --assert-nees-max 40)
-    # Async dual-mono baseline: documents the pre-fix failure envelope (S0 measured:
-    # 41.9 m / 25.8 deg / NEES 5041, window halved to 0.167 s = defects B1+B5; with --jitter
-    # additionally 1135 dropped frames = B3). No accuracy asserts yet: the run must merely
-    # complete with samples. S4/S5 tighten these toward the synced envelope.
-    add_test(NAME test_async_dual_async COMMAND test_async_dual
+    # Async dual-mono: asserts the TARGET envelope (near-synced) and currently FAILS it by design
+    # (S0 measured: 41.9 m / 25.8 deg / NEES 5041, window halved to 0.167 s = defects B1+B5; with
+    # --jitter additionally 1135/10220 frames dropped = B3). WILL_FAIL inverts the exit code so the
+    # suite stays green while the log documents the real [FAILED]; the S4/S5 stages must REMOVE the
+    # WILL_FAIL property (and keep these asserts) to claim the async fix.
+    add_test(NAME test_async_dual_baseline_KNOWNFAIL COMMAND test_async_dual
             ${CMAKE_CURRENT_SOURCE_DIR}/../config/voxl_sim/estimator_config.yaml
             --traj ${CMAKE_CURRENT_SOURCE_DIR}/../ov_data/sim/udel_gore.txt
             --phase1 0.0073 --dt1 0.012
-            --name async_baseline)
+            --name async_baseline --assert-pos-rmse 1.0 --assert-ori-rmse 0.6 --assert-nees-max 50)
+    set_tests_properties(test_async_dual_baseline_KNOWNFAIL PROPERTIES WILL_FAIL TRUE)
 endif ()
 
 

@@ -230,8 +230,14 @@ struct VioManagerOptions {
   /// Rotation from accelerometer to the "IMU" gyroscope frame frame
   Eigen::Matrix<double, 4, 1> q_GYROtoIMU;
 
-  /// Time offset between camera and IMU.
+  /// Time offset between camera and IMU (the REFERENCE camera's offset).
   double calib_camimu_dt = 0.0;
+
+  /// Per-camera time offset between camera and IMU.
+  std::map<size_t, double> camera_imu_dt;
+
+  /// Map between camid and rolling shutter readout time (seconds). 0.0 = global shutter.
+  std::map<size_t, double> camera_readout_time;
 
   /// Map between camid and camera intrinsics (fx, fy, cx, cy, d1...d4, cam_w, cam_h)
   std::unordered_map<size_t, std::shared_ptr<ov_core::CamBase>> camera_intrinsics;
@@ -254,12 +260,18 @@ struct VioManagerOptions {
   void print_and_load_state(const std::shared_ptr<ov_core::YamlParser> &parser = nullptr) {
     if (parser != nullptr) {
       parser->parse_config("gravity_mag", gravity_mag);
+      if (state_options.cam_imu_dt_ref_camid < 0 || state_options.cam_imu_dt_ref_camid >= state_options.num_cameras) {
+        PRINT_WARNING(YELLOW "cam_imu_dt_ref_camid (%d) is out of range, falling back to cam0\n" RESET, state_options.cam_imu_dt_ref_camid);
+        state_options.cam_imu_dt_ref_camid = 0;
+      }
       for (int i = 0; i < state_options.num_cameras; i++) {
 
-        // Time offset (use the first one)
-        // TODO: support multiple time offsets between cameras
-        if (i == 0) {
-          parser->parse_external("relative_config_imucam", "cam" + std::to_string(i), "timeshift_cam_imu", calib_camimu_dt, false);
+        // Time offset (per camera; the reference camera's value also fills the legacy scalar)
+        double dt_camimu = calib_camimu_dt;
+        parser->parse_external("relative_config_imucam", "cam" + std::to_string(i), "timeshift_cam_imu", dt_camimu, false);
+        camera_imu_dt[(size_t)i] = dt_camimu;
+        if (i == state_options.cam_imu_dt_ref_camid) {
+          calib_camimu_dt = dt_camimu;
         }
 
         // Distortion model
@@ -303,6 +315,11 @@ struct VioManagerOptions {
           camera_intrinsics.at(i)->set_value(cam_calib);
         }
         camera_extrinsics.insert({i, cam_eigen});
+
+        // Rolling shutter readout time (optional; absent/0 = global shutter)
+        double t_readout = 0.0;
+        parser->parse_external("relative_config_imucam", "cam" + std::to_string(i), "t_readout", t_readout, false);
+        camera_readout_time.insert({i, t_readout});
       }
       parser->parse_config("use_mask", use_mask);
       if (use_mask) {
@@ -388,7 +405,7 @@ struct VioManagerOptions {
                   state_options.num_cameras);
       std::exit(EXIT_FAILURE);
     }
-    PRINT_DEBUG("  - calib_camimu_dt: %.4f\n", calib_camimu_dt);
+    PRINT_DEBUG("  - calib_camimu_dt_ref(cam%d): %.4f\n", state_options.cam_imu_dt_ref_camid, calib_camimu_dt);
     PRINT_DEBUG("CAMERA PARAMETERS:\n");
     for (int n = 0; n < state_options.num_cameras; n++) {
       std::stringstream ss;
@@ -404,6 +421,8 @@ struct VioManagerOptions {
       T_CtoI.block(0, 0, 3, 3) = ov_core::quat_2_Rot(camera_extrinsics.at(n).block(0, 0, 4, 1)).transpose();
       T_CtoI.block(0, 3, 3, 1) = -T_CtoI.block(0, 0, 3, 3) * camera_extrinsics.at(n).block(4, 0, 3, 1);
       ss << "T_C" << n << "toI:" << std::endl << T_CtoI << std::endl << std::endl;
+      ss << "cam_" << n << "_dt_camimu:" << (camera_imu_dt.count(n) ? camera_imu_dt.at(n) : calib_camimu_dt) << std::endl;
+      ss << "cam_" << n << "_t_readout:" << (camera_readout_time.count(n) ? camera_readout_time.at(n) : 0.0) << std::endl;
       PRINT_DEBUG(ss.str().c_str());
     }
     PRINT_DEBUG("IMU PARAMETERS:\n");

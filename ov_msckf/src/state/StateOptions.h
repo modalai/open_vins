@@ -52,6 +52,13 @@ struct StateOptions {
   /// Bool to determine whether or not to calibrate camera to IMU time offset
   bool do_calib_camera_timeoffset = false;
 
+  /// Reference camera id whose cam-IMU time offset drives propagation/cloning; other cameras'
+  /// offsets are estimated as deltas against this one at measurement time
+  int cam_imu_dt_ref_camid = 0;
+
+  /// Bool to determine whether or not to calibrate camera rolling shutter readout time
+  bool do_calib_camera_readout = false;
+
   /// Bool to determine whether or not to calibrate the IMU intrinsics
   bool do_calib_imu_intrinsics = false;
 
@@ -115,6 +122,8 @@ struct StateOptions {
       parser->parse_config("calib_cam_extrinsics", do_calib_camera_pose);
       parser->parse_config("calib_cam_intrinsics", do_calib_camera_intrinsics);
       parser->parse_config("calib_cam_timeoffset", do_calib_camera_timeoffset);
+      parser->parse_config("cam_imu_dt_ref_camid", cam_imu_dt_ref_camid, false);
+      parser->parse_config("calib_cam_readout", do_calib_camera_readout, false);
       parser->parse_config("calib_imu_intrinsics", do_calib_imu_intrinsics);
       parser->parse_config("calib_imu_g_sensitivity", do_calib_imu_g_sensitivity);
 
@@ -160,6 +169,8 @@ struct StateOptions {
     PRINT_DEBUG("  - calib_cam_extrinsics: %d\n", do_calib_camera_pose);
     PRINT_DEBUG("  - calib_cam_intrinsics: %d\n", do_calib_camera_intrinsics);
     PRINT_DEBUG("  - calib_cam_timeoffset: %d\n", do_calib_camera_timeoffset);
+    PRINT_DEBUG("  - cam_imu_dt_ref_camid: %d\n", cam_imu_dt_ref_camid);
+    PRINT_DEBUG("  - calib_cam_readout: %d\n", do_calib_camera_readout);
     PRINT_DEBUG("  - calib_imu_intrinsics: %d\n", do_calib_imu_intrinsics);
     PRINT_DEBUG("  - calib_imu_g_sensitivity: %d\n", do_calib_imu_g_sensitivity);
     PRINT_DEBUG("  - imu_model: %d\n", imu_model);

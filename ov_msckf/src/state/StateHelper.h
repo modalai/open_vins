@@ -229,9 +229,11 @@ public:
    * \f}
    *
    * @param state Pointer to state
-   * @param last_w The estimated angular velocity at cloning time (used to estimate imu-cam time offset)
+   * @param last_w The estimated angular velocity at cloning time (current linearization)
+   * @param last_w_fej The estimated angular velocity at cloning time (FEJ linearization)
    */
-  static void augment_clone(std::shared_ptr<State> state, Eigen::Matrix<double, 3, 1> last_w);
+  static void augment_clone(std::shared_ptr<State> state, Eigen::Matrix<double, 3, 1> last_w,
+                            Eigen::Matrix<double, 3, 1> last_w_fej);
 
   /**
    * @brief Remove the oldest clone, if we have more then the max clone count!!
