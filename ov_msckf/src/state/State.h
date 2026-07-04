@@ -219,6 +219,44 @@ public:
     return std::isfinite(dt_max) ? dt_max : cam_imu_dt_ref();
   }
 
+  /**
+   * @brief True when the current window's motion cannot observe the temporal calibration states.
+   *
+   * MVIS-style degenerate-motion gate: under (near-)static, constant-velocity, or pure-slow-rotation
+   * windows the cam-IMU time offsets / readout are weakly observable and their estimates wander,
+   * injecting correlated error (hover is the canonical case). The gate checks the CLONE WINDOW's
+   * excitation from the stored kinematics: peak |omega| and the velocity spread (a window-scale
+   * acceleration proxy). Consumers freeze the dt/readout Jacobian COLUMNS while degenerate --
+   * the values keep being USED, they just stop being updated.
+   */
+  bool dt_calib_degenerate() const {
+    if (!_options.dt_calib_gate) {
+      return false;
+    }
+    if (_clones_kinematics.empty()) {
+      return true; // no evidence of excitation -> freeze
+    }
+    double omega_max = 0.0;
+    Eigen::Vector3d vel_mean = Eigen::Vector3d::Zero();
+    for (const auto &kv : _clones_kinematics) {
+      omega_max = std::max(omega_max, kv.second.omega.norm());
+      vel_mean += kv.second.vel;
+    }
+    if (omega_max >= _options.dt_calib_gate_min_omega) {
+      return false;
+    }
+    vel_mean /= (double)_clones_kinematics.size();
+    double vel_spread = 0.0;
+    for (const auto &kv : _clones_kinematics) {
+      vel_spread = std::max(vel_spread, (kv.second.vel - vel_mean).norm());
+    }
+    return vel_spread < _options.dt_calib_gate_min_vel_spread;
+  }
+
+  /// Count of measurement-model lookups that found no clone kinematics (telemetry; expected only
+  /// briefly after a warm-started reset window; the consumers degrade to zero correction/columns)
+  uint64_t _kin_miss_count = 0;
+
   /// Mutex for locking access to the state
   std::mutex _mutex_state;
 

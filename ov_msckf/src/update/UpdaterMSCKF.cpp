@@ -34,6 +34,7 @@
 
 #include <boost/date_time/posix_time/posix_time.hpp>
 #include <boost/math/distributions/chi_squared.hpp>
+#include <cmath>
 
 using namespace ov_core;
 using namespace ov_type;
@@ -100,11 +101,26 @@ void UpdaterMSCKF::update(std::shared_ptr<State> state, std::vector<std::shared_
 
     // For this camera, create the vector of camera poses
     std::unordered_map<double, FeatureInitializer::ClonePose> clones_cami;
+    const double dt_cam_delta = state->cam_imu_dt_delta(clone_calib.first);
     for (const auto &clone_imu : state->_clones_IMU) {
 
+      // Get current IMU pose (with async camera timeoffset correction)
+      Eigen::Matrix<double, 3, 3> R_GtoIi = clone_imu.second->Rot();
+      Eigen::Matrix<double, 3, 1> p_IiinG = clone_imu.second->pos();
+      if (std::abs(dt_cam_delta) > 1e-10) {
+        // Tolerant lookup: warm-restored clones may have no kinematics -> zero correction (counted)
+        auto kin_it = state->_clones_kinematics.find(clone_imu.first);
+        if (kin_it != state->_clones_kinematics.end()) {
+          R_GtoIi = (Eigen::Matrix3d::Identity() - skew_x(kin_it->second.omega) * dt_cam_delta) * R_GtoIi;
+          p_IiinG = p_IiinG + kin_it->second.vel * dt_cam_delta;
+        } else {
+          state->_kin_miss_count++;
+        }
+      }
+
       // Get current camera pose
-      Eigen::Matrix<double, 3, 3> R_GtoCi = clone_calib.second->Rot() * clone_imu.second->Rot();
-      Eigen::Matrix<double, 3, 1> p_CioinG = clone_imu.second->pos() - R_GtoCi.transpose() * clone_calib.second->pos();
+      Eigen::Matrix<double, 3, 3> R_GtoCi = clone_calib.second->Rot() * R_GtoIi;
+      Eigen::Matrix<double, 3, 1> p_CioinG = p_IiinG - R_GtoCi.transpose() * clone_calib.second->pos();
 
       // Append to our map
       clones_cami.insert({clone_imu.first, FeatureInitializer::ClonePose(R_GtoCi, p_CioinG)});
@@ -114,22 +130,71 @@ void UpdaterMSCKF::update(std::shared_ptr<State> state, std::vector<std::shared_
     clones_cam.insert({clone_calib.first, clones_cami});
   }
 
+  // Check if any camera has rolling shutter (for triangulation RS correction)
+  bool has_rolling_shutter = false;
+  for (const auto &pair : state->_calib_camera_readout) {
+    if (std::abs(pair.second->value()(0)) > 1e-10) {
+      has_rolling_shutter = true;
+      break;
+    }
+  }
+
   // 3. Try to triangulate all MSCKF or new SLAM features that have measurements
   auto it1 = feature_vec.begin();
   while (it1 != feature_vec.end()) {
 
+    // Apply per-observation rolling shutter correction to clone poses for this feature
+    std::unordered_map<size_t, std::unordered_map<double, FeatureInitializer::ClonePose>> clones_cam_rs;
+    auto *clones_for_tri = &clones_cam;
+    if (has_rolling_shutter) {
+      clones_cam_rs = clones_cam;
+      for (const auto &obs_pair : (*it1)->timestamps) {
+        size_t cam_id = obs_pair.first;
+        if (state->_calib_camera_readout.find(cam_id) == state->_calib_camera_readout.end()) continue;
+        double t_readout = state->_calib_camera_readout.at(cam_id)->value()(0);
+        if (std::abs(t_readout) < 1e-10) continue;
+        if (state->_cam_intrinsics_cameras.find(cam_id) == state->_cam_intrinsics_cameras.end()) continue;
+        double inv_img_h = 1.0 / (double)state->_cam_intrinsics_cameras.at(cam_id)->h();
+        Eigen::Matrix3d R_ItoC = state->_calib_IMUtoCAM.at(cam_id)->Rot();
+        Eigen::Vector3d p_IinC = state->_calib_IMUtoCAM.at(cam_id)->pos();
+        for (size_t m = 0; m < obs_pair.second.size(); m++) {
+          double clone_time = obs_pair.second.at(m);
+          if (clones_cam_rs.find(cam_id) == clones_cam_rs.end()) continue;
+          if (clones_cam_rs.at(cam_id).find(clone_time) == clones_cam_rs.at(cam_id).end()) continue;
+          if (state->_clones_kinematics.find(clone_time) == state->_clones_kinematics.end()) continue;
+          double v_pixel = (double)(*it1)->uvs.at(cam_id).at(m)(1);
+          double dt_rs = (v_pixel * inv_img_h) * t_readout;
+          if (std::abs(dt_rs) < 1e-10) continue;
+          // Recover IMU pose from camera pose (undo camera transform)
+          Eigen::Matrix3d R_GtoCi = clones_cam_rs.at(cam_id).at(clone_time).Rot();
+          Eigen::Vector3d p_CiinG = clones_cam_rs.at(cam_id).at(clone_time).pos();
+          Eigen::Matrix3d R_GtoIi = R_ItoC.transpose() * R_GtoCi;
+          Eigen::Vector3d p_IiinG = p_CiinG + R_GtoCi.transpose() * p_IinC;
+          // Apply RS correction in IMU frame
+          const State::CloneKinematics &kin = state->_clones_kinematics.at(clone_time);
+          R_GtoIi = (Eigen::Matrix3d::Identity() - skew_x(kin.omega) * dt_rs) * R_GtoIi;
+          p_IiinG = p_IiinG + kin.vel * dt_rs;
+          // Recompute camera pose
+          R_GtoCi = R_ItoC * R_GtoIi;
+          p_CiinG = p_IiinG - R_GtoCi.transpose() * p_IinC;
+          clones_cam_rs[cam_id][clone_time] = FeatureInitializer::ClonePose(R_GtoCi, p_CiinG);
+        }
+      }
+      clones_for_tri = &clones_cam_rs;
+    }
+
     // Triangulate the feature and remove if it fails
     bool success_tri = true;
     if (initializer_feat->config().triangulate_1d) {
-      success_tri = initializer_feat->single_triangulation_1d(*it1, clones_cam);
+      success_tri = initializer_feat->single_triangulation_1d(*it1, *clones_for_tri);
     } else {
-      success_tri = initializer_feat->single_triangulation(*it1, clones_cam);
+      success_tri = initializer_feat->single_triangulation(*it1, *clones_for_tri);
     }
 
     // Gauss-newton refine the feature
     bool success_refine = true;
     if (initializer_feat->config().refine_features) {
-      success_refine = initializer_feat->single_gaussnewton(*it1, clones_cam);
+      success_refine = initializer_feat->single_gaussnewton(*it1, *clones_for_tri);
     }
 
     // Remove the feature if not a success

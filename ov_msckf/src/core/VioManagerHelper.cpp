@@ -36,6 +36,8 @@
 #include "state/State.h"
 #include "state/StateHelper.h"
 
+#include <cmath>
+
 using namespace ov_core;
 using namespace ov_type;
 using namespace ov_msckf;
@@ -253,6 +255,12 @@ void VioManager::retriangulate_active_tracks(const ov_core::CameraData &message)
     // IMU historical clone
     Eigen::Matrix3d R_GtoI = state->_clones_IMU.at(active_tracks_time)->Rot();
     Eigen::Vector3d p_IinG = state->_clones_IMU.at(active_tracks_time)->pos();
+    const double dt_cam_delta = state->cam_imu_dt_delta(cam_id);
+    if (std::abs(dt_cam_delta) > 1e-10 && state->_clones_kinematics.find(active_tracks_time) != state->_clones_kinematics.end()) {
+      const State::CloneKinematics &kin = state->_clones_kinematics.at(active_tracks_time);
+      R_GtoI = (Eigen::Matrix3d::Identity() - skew_x(kin.omega) * dt_cam_delta) * R_GtoI;
+      p_IinG = p_IinG + kin.vel * dt_cam_delta;
+    }
 
     // Calibration for this cam_id
     Eigen::Matrix3d R_ItoC = state->_calib_IMUtoCAM.at(cam_id)->Rot();

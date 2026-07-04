@@ -59,6 +59,16 @@ struct StateOptions {
   /// Bool to determine whether or not to calibrate camera rolling shutter readout time
   bool do_calib_camera_readout = false;
 
+  /// Freeze dt/readout Jacobian columns while the window motion is degenerate for temporal
+  /// calibration (MVIS degenerate motions: static / constant velocity / slow pure rotation)
+  bool dt_calib_gate = true;
+
+  /// Gate threshold: window peak |omega| (rad/s) below which rotation provides no dt excitation
+  double dt_calib_gate_min_omega = 0.10;
+
+  /// Gate threshold: window velocity spread (m/s) below which translation provides no dt excitation
+  double dt_calib_gate_min_vel_spread = 0.10;
+
   /// Bool to determine whether or not to calibrate the IMU intrinsics
   bool do_calib_imu_intrinsics = false;
 
@@ -124,6 +134,9 @@ struct StateOptions {
       parser->parse_config("calib_cam_timeoffset", do_calib_camera_timeoffset);
       parser->parse_config("cam_imu_dt_ref_camid", cam_imu_dt_ref_camid, false);
       parser->parse_config("calib_cam_readout", do_calib_camera_readout, false);
+      parser->parse_config("dt_calib_gate", dt_calib_gate, false);
+      parser->parse_config("dt_calib_gate_min_omega", dt_calib_gate_min_omega, false);
+      parser->parse_config("dt_calib_gate_min_vel_spread", dt_calib_gate_min_vel_spread, false);
       parser->parse_config("calib_imu_intrinsics", do_calib_imu_intrinsics);
       parser->parse_config("calib_imu_g_sensitivity", do_calib_imu_g_sensitivity);
 
