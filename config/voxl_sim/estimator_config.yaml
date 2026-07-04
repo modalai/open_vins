@@ -1,0 +1,170 @@
+%YAML:1.0
+
+verbosity: "INFO"
+
+use_fej: true
+integration: "rk4"
+use_stereo: false
+max_cameras: 2
+
+calib_cam_extrinsics: true
+calib_cam_intrinsics: true
+calib_cam_timeoffset: true
+calib_imu_intrinsics: false
+calib_imu_g_sensitivity: false
+
+max_clones: 11
+max_slam: 30
+max_slam_in_update: 15
+max_msckf_in_update: 10
+dt_slam_delay: 2
+
+gravity_mag: 9.81
+
+feat_rep_msckf: "ANCHORED_MSCKF_INVERSE_DEPTH"
+feat_rep_slam: "ANCHORED_MSCKF_INVERSE_DEPTH"
+feat_rep_aruco: "ANCHORED_MSCKF_INVERSE_DEPTH"
+
+# zero velocity update parameters we can use
+# we support either IMU-based or disparity detection.
+try_zupt: true
+zupt_chi2_multipler: 1.0
+zupt_max_velocity: 0.03
+zupt_noise_multiplier: 1
+# SIM DEVIATION (production ships 8): the simulation starts already in slow motion, and the
+# disparity-based ZUPT then clamps a moving state (measured: 3.75m/16.5deg/NEES 992 vs
+# 0.59m/0.30deg/NEES 27 without it). 0 keeps the ZUPT path enabled but IMU-gated only,
+# which never mis-fires while moving. Real boots are static, so production keeps 8.
+zupt_max_disparity: 0
+zupt_only_at_beginning: true
+prop_window: 0.1
+zupt_prop_window: 0.1
+
+# ==================================================================
+# ==================================================================
+
+init_window_time: 2.0
+init_imu_thresh: 1.0
+init_max_disparity: 20.0
+init_max_features: 50
+
+init_dyn_use: true
+init_dyn_mle_opt_calib: false
+init_dyn_mle_max_iter: 50
+init_dyn_mle_max_time: 0.05
+init_dyn_mle_max_threads: 4
+init_dyn_num_pose: 8
+init_dyn_min_deg: 5.0
+
+init_dyn_inflation_ori: 30
+init_dyn_inflation_vel: 150
+init_dyn_inflation_bg: 10
+init_dyn_inflation_ba: 150
+init_dyn_min_rec_cond: 1e-12
+init_warmstart_inject: true
+
+init_dyn_bias_g: [ 0.001, 0.001, 0.001 ]
+init_dyn_bias_a: [ 0.001, 0.001, 0.001 ]
+init_gravity_max_angle: 85.0
+init_static_gravity_max_angle: 5.0
+init_dyn_grav_prior_sigma: 0.5
+init_dyn_grav_gate_deg: 30.0
+init_dyn_mle_lm_min_lambda: 1.0e-12
+init_dyn_mle_lm_nu_growth: 2.0
+init_dyn_mle_lm_initial_lambda: 1.0e-4
+init_dyn_reset_prior_use: true
+init_dyn_reset_prior_max_bg: 0.2
+init_dyn_reset_prior_max_ba: 1.0
+init_dyn_reset_prior_max_sigma_bg: 0.05
+init_dyn_reset_prior_max_sigma_ba: 0.5
+init_dyn_reset_prior_sigma_floor_bg: 0.005
+init_dyn_reset_prior_sigma_floor_ba: 0.02
+init_dyn_reset_prior_divergence_infl: 3.0
+init_dyn_fix_ba_on_reset: false
+init_dyn_mle_ftol: 1.0e-6
+# ==================================================================
+# ==================================================================
+
+record_timing_information: false
+record_timing_filepath: "/tmp/traj_timing.txt"
+
+# if we want to save the simulation state and its diagional covariance
+# use this with rosrun ov_eval error_simulation
+save_total_state: false
+filepath_est: "/tmp/ov_estimate.txt"
+filepath_std: "/tmp/ov_estimate_std.txt"
+filepath_gt: "/tmp/ov_groundtruth.txt"
+
+# ==================================================================
+# ==================================================================
+
+# our front-end feature tracking parameters
+# we have a KLT and descriptor based (KLT is better implemented...)
+use_klt: true
+use_gpu: true
+num_pts: 50
+fast_threshold: 15
+grid_x: 5
+grid_y: 5
+min_px_dist: 50
+knn_ratio: 0.70
+track_frequency: 30.0
+downsample_cameras: false
+num_opencv_threads: 4
+histogram_method: "HISTOGRAM"
+
+
+fi_min_dist: 0.1
+fi_max_dist: 60
+fi_max_baseline: 40
+fi_refine_features: true
+fi_max_runs: 5
+# aruco tag tracker for the system
+# DICT_6X6_1000 from https://chev.me/arucogen/
+use_aruco: false
+num_aruco: 1024
+downsize_aruco: true
+
+# ==================================================================
+# ==================================================================
+
+# camera noises and chi-squared threshold multipliers
+up_msckf_sigma_px: 1.2
+up_msckf_chi2_multipler: 20.0
+up_slam_sigma_px: 1.2
+up_slam_chi2_multipler: 1.0
+up_aruco_sigma_px: 1.0
+up_aruco_chi2_multipler: 3.5
+
+# masks for our images
+use_mask: false
+
+
+# imu and camera spacial-temporal
+# imu config should also have the correct noise values
+relative_config_imu: "kalibr_imu_chain.yaml"
+relative_config_imucam: "kalibr_imucam_chain.yaml"
+
+# ==================================================================
+# ==================================================================
+
+# SIMULATION: production-equivalent baseline for the async dual-camera A/B harness
+# (test_async_dual). Estimator keys above are the shipped fpv production set, verbatim;
+# cameras are fpv cam0/cam1 (dual-mono fisheye, per-cam timeshift). Rates match VOXL.
+sim_seed_state_init: 0
+sim_seed_preturb: 0
+sim_seed_measurements: 6
+sim_do_perturbation: false
+sim_traj_path: "unset_use_traj_flag.txt"
+sim_distance_threshold: 1.2
+sim_freq_cam: 30.0
+sim_freq_imu: 800.0
+sim_min_feature_gen_dist: 5.0
+sim_max_feature_gen_dist: 10.0
+# per-camera truth (defaults: phase 0, dt = calib_camimu_dt, readout 0);
+# the async tests override via --phase1/--dt0/--dt1/--readout1
+
+
+
+
+

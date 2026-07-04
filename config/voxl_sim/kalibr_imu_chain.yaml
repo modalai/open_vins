@@ -1,0 +1,53 @@
+%YAML:1.0
+
+imu0:
+  T_i_b:
+    - [1.0, 0.0, 0.0, 0.0]
+    - [0.0, 1.0, 0.0, 0.0]
+    - [0.0, 0.0, 1.0, 0.0]
+    - [0.0, 0.0, 0.0, 1.0]
+  # Values from allan plots of ~20hour dataset
+  # Inflated values (to account for unmodelled effects)
+  #  - white noise multiplied by 5
+  #  - bias random walk multiplied by 10
+  accelerometer_noise_density: 0.023136207780007564 #a 0.0038947538150776763 -->.Conf
+  accelerometer_random_walk: 0.0023820141447201062 #ab 5.538346201712153e-05 -->.Conf
+  gyroscope_noise_density: 9.713209226853757e-04 #w 0.00013990944749616306 -->.Conf
+  gyroscope_random_walk: 6.866492640738187e-04 #wb 4.1189724174615527e-07 -->.Conf
+  rostopic: imu_apps #THIS IS NOT A ROSTOPIC, THIS IS A MPA PIPE
+  time_offset: 0.0
+  update_rate: 1000.0 # Hz ODR CLOCK FROM IMU HAS SOME OFFSET --> CORRECT IN IMU BATCH PROCESS -> NOT USED IF USING RK45
+  # three different modes supported:
+  # "calibrated" (same as "kalibr"), "kalibr", "rpng"
+  model: "kalibr"
+  # how to get from Kalibr imu.yaml result file:
+  #   - Tw is imu0:gyroscopes:M:
+  #   - R_IMUtoGYRO: is imu0:gyroscopes:C_gyro_i:
+  #   - Ta is imu0:accelerometers:M:
+  #   - R_IMUtoACC not used by Kalibr
+  #   - Tg is imu0:gyroscopes:A:
+
+
+  Tw:
+    - [0.9997323670804602, 0.0, 0.0]
+    - [0.002801733560789309, 0.9970169416012006, 0.0]
+    - [0.003311665043775355, 0.0027701051391494443, 1.0053667502453665]
+  R_IMUtoGYRO:
+    - [0.9999979264083573, -0.0008939823920238908, 0.00182974710536515]
+    - [0.0008936600888908022, 0.9999995850289746, 0.00017695628070186307]
+    - [-0.001829904541872222, -0.0001753207418059699, 0.9999983103545756]
+  Ta:
+    - [1.002669031976652, 0.0, 0.0]
+    - [0.0020319890294534237, 1.0019588795194763, 0.0]
+    - [0.0003078250434341827, -0.002727746288560053, 1.0099765846223379]
+  R_IMUtoACC:
+    - [ 1.0, 0.0, 0.0 ]
+    - [ 0.0, 1.0, 0.0 ]
+    - [ 0.0, 0.0, 1.0 ]
+  Tg:
+    - [0.00016936198368736497, -7.077679573254428e-05, 2.7561052954580983e-05]
+    - [0.0001209192305822145, 2.4115190439334907e-06, 0.00013067562651830332]
+    - [-7.292769694377731e-05, -0.0003830201181624743, 9.93288838102848e-05]
+
+
+

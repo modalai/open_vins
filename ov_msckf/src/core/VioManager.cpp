@@ -26,7 +26,9 @@
 #include "feat/FeatureInitializer.h"
 #include "track/TrackAruco.h"
 #include "track/TrackDescriptor.h"
+#if OV_HAVE_MODAL_FLOW
 #include "track/TrackOCL/TrackOCL.h"
+#endif
 #ifndef DISABLE_TRACK_KLT
 #include "track/TrackKLT.h"
 #endif
@@ -133,6 +135,13 @@ VioManager::VioManager(VioManagerOptions &params_) : thread_init_running(false),
   // NOTE: we will split the total number of features over all cameras uniformly
   int init_max_features = std::floor((double)params.init_options.init_max_features / (double)params.state_options.num_cameras);
   if (params.use_klt) {
+#if !OV_HAVE_MODAL_FLOW
+    // Host/test builds without the VOXL sysroot have no TrackOCL: fall back to the CPU tracker
+    if (params.use_gpu) {
+      fprintf(stderr, "[VioManager] use_gpu requested but modal_flow/OpenCL is unavailable in this build; using CPU tracker\n");
+    }
+    if (false) {
+#else
     if (params.use_gpu) {
       auto track_ocl = std::make_shared<TrackOCL>(state->_cam_intrinsics_cameras, init_max_features,
                                                   state->_options.max_aruco_features, params.use_stereo,
@@ -152,6 +161,7 @@ VioManager::VioManager(VioManagerOptions &params_) : thread_init_running(false),
                         "populated; stereo features will stay mono-only\n");
       }
       trackFEATS = std::static_pointer_cast<TrackBase>(track_ocl);
+#endif
     } else {
 #ifndef DISABLE_TRACK_KLT
       trackFEATS = std::shared_ptr<TrackBase>(new TrackKLT(state->_cam_intrinsics_cameras, init_max_features,

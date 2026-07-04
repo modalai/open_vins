@@ -29,7 +29,21 @@
 #include <string>
 #include <vector>
 
+// libmodal-flow is a VOXL sysroot dependency (installed by install_build_deps.sh). Host x86 test
+// builds do not have it: gate on header presence, mirroring ov_core's optional-OpenCL handling
+// (TrackOCL is only compiled when OpenCL/modal_flow exist). All TUs in a given environment agree
+// on this macro, so the struct layout stays consistent within every build.
+#if defined(__has_include)
+#if __has_include(<modal_flow/StereoMatcher.hpp>)
+#define OV_HAVE_MODAL_FLOW 1
+#endif
+#endif
+#ifndef OV_HAVE_MODAL_FLOW
+#define OV_HAVE_MODAL_FLOW 0
+#endif
+#if OV_HAVE_MODAL_FLOW
 #include <modal_flow/StereoMatcher.hpp>
+#endif
 
 #include "state/StateOptions.h"
 #include "update/UpdaterOptions.h"
@@ -418,7 +432,9 @@ struct VioManagerOptions {
   // VoxlConfigure (intrinsics + composed extrinsic) and marked valid once the
   // full pack is filled in. VioManager passes it into TrackOCL via
   // enable_zncc_stereo_matcher at startup.
+#if OV_HAVE_MODAL_FLOW
   modal_flow::StereoCalib stereo_calib{};
+#endif
   bool                    stereo_calib_valid = false;
 
   // Depth-sweep bounds for the epipolar search. Defaults cover near-touch
@@ -566,6 +582,18 @@ struct VioManagerOptions {
   /// Feature distance we generate features from (maximum)
   double sim_max_feature_gen_distance = 10;
 
+  /// Per-camera frame phase offsets in seconds (frame k of camera i fires at start + offset_i + k/sim_freq_cam).
+  /// All-zero (default) reproduces the legacy fully-synced simulation bit-exactly. Keys: sim_phase_offset_camN.
+  std::vector<double> sim_cam_phase_offsets;
+
+  /// Per-camera TRUE cam-IMU time offsets in seconds (reported frame stamp = event time - dt_i).
+  /// Defaults to calib_camimu_dt for every camera (legacy single-offset behavior). Keys: sim_camimu_dt_camN.
+  std::vector<double> sim_camimu_dts;
+
+  /// Per-camera TRUE rolling-shutter readout times in seconds (row v sampled at event time + (v/h)*readout).
+  /// Zero (default) = global shutter, which short-circuits to the legacy projection path. Keys: sim_readout_camN.
+  std::vector<double> sim_cam_readouts;
+
   /**
    * @brief This function will load print out all simulated parameters.
    * This allows for visual checking that everything was loaded properly from ROS/CMD parsers.
@@ -585,6 +613,18 @@ struct VioManagerOptions {
       parser->parse_config("sim_min_feature_gen_dist", sim_min_feature_gen_distance);
       parser->parse_config("sim_max_feature_gen_dist", sim_max_feature_gen_distance);
     }
+    // Per-camera truth schedules: sized to the camera count, scalar key per camera so plain YAML parses them
+    int num_cams_sim = std::max(1, state_options.num_cameras);
+    sim_cam_phase_offsets.assign(num_cams_sim, 0.0);
+    sim_camimu_dts.assign(num_cams_sim, calib_camimu_dt);
+    sim_cam_readouts.assign(num_cams_sim, 0.0);
+    if (parser != nullptr) {
+      for (int i = 0; i < num_cams_sim; i++) {
+        parser->parse_config("sim_phase_offset_cam" + std::to_string(i), sim_cam_phase_offsets.at(i), false);
+        parser->parse_config("sim_camimu_dt_cam" + std::to_string(i), sim_camimu_dts.at(i), false);
+        parser->parse_config("sim_readout_cam" + std::to_string(i), sim_cam_readouts.at(i), false);
+      }
+    }
     PRINT_DEBUG("SIMULATION PARAMETERS:\n");
     PRINT_WARNING(BOLDRED "  - state init seed: %d \n" RESET, sim_seed_state_init);
     PRINT_WARNING(BOLDRED "  - perturb seed: %d \n" RESET, sim_seed_preturb);
@@ -596,6 +636,10 @@ struct VioManagerOptions {
     PRINT_DEBUG("  - imu feq: %.2f\n", sim_freq_imu);
     PRINT_DEBUG("  - min feat dist: %.2f\n", sim_min_feature_gen_distance);
     PRINT_DEBUG("  - max feat dist: %.2f\n", sim_max_feature_gen_distance);
+    for (int i = 0; i < num_cams_sim; i++) {
+      PRINT_DEBUG("  - cam%d truth: phase %.6f s | camimu dt %.6f s | readout %.6f s\n", i, sim_cam_phase_offsets.at(i),
+                  sim_camimu_dts.at(i), sim_cam_readouts.at(i));
+    }
   }
 };
 

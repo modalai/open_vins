@@ -95,8 +95,14 @@ public:
   bool get_next_imu(double &time_imu, Eigen::Vector3d &wm, Eigen::Vector3d &am);
 
   /**
-   * @brief Gets the next inertial reading if we have one.
-   * @param time_cam Time that this measurement occured at
+   * @brief Gets the next camera frame event if we have one.
+   *
+   * Each camera runs its own schedule (start + sim_cam_phase_offsets[i] + k/sim_freq_cam) and reports
+   * stamps in its own clock (event time - sim_camimu_dts[i]). This call emits the earliest pending
+   * event; cameras whose event time AND reported stamp are bit-equal are bundled into one return
+   * (which reproduces the legacy fully-synced behavior when all phases/dts match).
+   *
+   * @param time_cam Reported (camera-clock) time of this frame event
    * @param camids Camera ids that the corresponding vectors match
    * @param feats Noisy uv measurements and ids for the returned time
    * @return True if we have a measurement
@@ -139,6 +145,26 @@ protected:
    */
   void generate_points(const Eigen::Matrix3d &R_GtoI, const Eigen::Vector3d &p_IinG, int camid,
                        std::unordered_map<size_t, Eigen::Vector3d> &feats, int numpts);
+
+  /**
+   * @brief Rolling-shutter projection: each feature's row determines its sampling time.
+   *
+   * Row v is sampled at time_event + (v/h)*readout (frame stamp = start of readout, matching the
+   * estimator's dt_rs convention). Solved per feature with a two-iteration fixed point on the row,
+   * re-sampling the spline pose each iteration.
+   *
+   * @param time_event Frame event time (IMU clock) = start of readout
+   * @param camid Camera id of the camera sensor we want to project into
+   * @param feats Our set of 3d features
+   * @param readout Rolling-shutter readout time in seconds (> 0)
+   * @return True distorted raw image measurements and their ids for the specified camera
+   */
+  std::vector<std::pair<size_t, Eigen::VectorXf>> project_pointcloud_rs(double time_event, int camid,
+                                                                        const std::unordered_map<size_t, Eigen::Vector3d> &feats,
+                                                                        double readout);
+
+  /// Earliest next camera frame event time (IMU clock) across all cameras
+  double next_cam_event_time();
 
   //===================================================================
   // Configuration variables
@@ -186,8 +212,10 @@ protected:
   /// Last time we had an IMU reading
   double timestamp_last_imu;
 
-  /// Last time we had an CAMERA reading
-  double timestamp_last_cam;
+  /// Per-camera last frame event time (IMU clock); camera i's next event fires at
+  /// timestamp_last_cams[i] + 1/sim_freq_cam. All entries evolve identically (bit-exact) when the
+  /// configured phase offsets are zero, reproducing the legacy single shared cadence.
+  std::vector<double> timestamp_last_cams;
 
   /// Our running acceleration bias
   Eigen::Vector3d true_bias_accel = Eigen::Vector3d::Zero();
