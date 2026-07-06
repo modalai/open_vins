@@ -1,5 +1,6 @@
 /*
  * OpenVINS: An Open Platform for Visual-Inertial Research
+ * Copyright (C) 2025-2026 Joao Leonardo Silva Cotta
  * Copyright (C) 2018-2023 Patrick Geneva
  * Copyright (C) 2018-2023 Guoquan Huang
  * Copyright (C) 2018-2023 OpenVINS Contributors
@@ -194,15 +195,6 @@ public:
       dt_min = std::min(dt_min, cam_imu_dt((size_t)i));
     }
     return std::isfinite(dt_min) ? dt_min : cam_imu_dt_ref();
-  }
-
-  /// Returns max dt across all cameras
-  double cam_imu_dt_max() const {
-    double dt_max = -std::numeric_limits<double>::infinity();
-    for (int i = 0; i < _options.num_cameras; i++) {
-      dt_max = std::max(dt_max, cam_imu_dt((size_t)i));
-    }
-    return std::isfinite(dt_max) ? dt_max : cam_imu_dt_ref();
   }
 
   /// Returns max dt among specific camera ids

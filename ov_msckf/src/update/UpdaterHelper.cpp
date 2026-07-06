@@ -1,5 +1,6 @@
 /*
  * OpenVINS: An Open Platform for Visual-Inertial Research
+ * Copyright (C) 2025-2026 Joao Leonardo Silva Cotta
  * Copyright (C) 2018-2023 Patrick Geneva
  * Copyright (C) 2018-2023 Guoquan Huang
  * Copyright (C) 2018-2023 OpenVINS Contributors
@@ -96,16 +97,18 @@ void UpdaterHelper::get_feature_jacobian_representation(std::shared_ptr<State> s
   double dt_camoff_anc_lin = (state->_options.do_calib_camera_timeoffset
       ? state->cam_imu_dt_delta_fej(feature.anchor_cam_id) : state->cam_imu_dt_delta(feature.anchor_cam_id)) + dt_epoch_anc;
 
-  // Rolling shutter readout for anchor camera (map is populated for every camera at construction)
+  // Rolling shutter readout for anchor camera (map is populated for every camera at construction;
+  // id >= 0 iff this camera's readout is an ESTIMATED state -- declared rolling under calib)
   std::shared_ptr<Vec> readout_anc = state->_calib_camera_readout.at(feature.anchor_cam_id);
+  const bool readout_anc_est = readout_anc->id() >= 0;
   double t_readout_anc = readout_anc->value()(0);
-  double t_readout_anc_lin = state->_options.do_calib_camera_readout ? readout_anc->fej()(0) : t_readout_anc;
+  double t_readout_anc_lin = readout_anc_est ? readout_anc->fej()(0) : t_readout_anc;
   Eigen::Vector3d omega_anc_val = Eigen::Vector3d::Zero();
   Eigen::Vector3d v_anc_val = Eigen::Vector3d::Zero();
   Eigen::Vector3d omega_anc_lin = Eigen::Vector3d::Zero();
   Eigen::Vector3d v_anc_lin = Eigen::Vector3d::Zero();
   double v_frac_anc = 0.0;
-  bool need_anchor_correction = state->_options.do_calib_camera_readout || state->_options.do_calib_camera_timeoffset ||
+  bool need_anchor_correction = readout_anc_est || state->_options.do_calib_camera_timeoffset ||
       std::abs(dt_camoff_anc) > 1e-10 || std::abs(dt_camoff_anc_lin) > 1e-10 ||
       std::abs(t_readout_anc) > 1e-10 || std::abs(t_readout_anc_lin) > 1e-10;
   if (need_anchor_correction) {
@@ -202,7 +205,7 @@ void UpdaterHelper::get_feature_jacobian_representation(std::shared_ptr<State> s
   // p_FinG = R_GtoI^T * R_ItoC^T * (p_FinA - p_IinC) + p_IinG
   // d(p_FinG)/d(t_rd) = (R_GtoI^T * [ω]× * R_ItoC^T * (p_FinA - p_IinC) + v) * v_frac
   // Column skipped while the window motion is degenerate for temporal calibration (values still used)
-  if (state->_options.do_calib_camera_readout && !state->dt_calib_degenerate()) {
+  if (readout_anc_est && !state->dt_calib_degenerate()) {
     Eigen::Vector3d p_FinI_anc = R_ItoC.transpose() * (p_FinA - p_IinC);
     Eigen::Matrix<double, 3, 1> H_readout_anc;
     H_readout_anc = (R_GtoI.transpose() * skew_x(omega_anc_lin) * p_FinI_anc + v_anc_lin) * v_frac_anc;
@@ -336,10 +339,10 @@ void UpdaterHelper::get_feature_jacobian_full(std::shared_ptr<State> state, Upda
       }
     }
 
-    // If doing rolling shutter readout calibration
-    if (state->_options.do_calib_camera_readout) {
+    // If this camera's readout is an estimated state (declared rolling under calib)
+    {
       std::shared_ptr<Vec> readout = state->_calib_camera_readout.at(pair.first);
-      if (map_hx.find(readout) == map_hx.end()) {
+      if (readout->id() >= 0 && map_hx.find(readout) == map_hx.end()) {
         map_hx.insert({readout, total_hx});
         x_order.push_back(readout);
         total_hx += readout->size();
@@ -514,8 +517,9 @@ void UpdaterHelper::get_feature_jacobian_full(std::shared_ptr<State> state, Upda
     double inv_img_h = 1.0 / (double)img_h;
 
     std::shared_ptr<Vec> readout = state->_calib_camera_readout.at(cam_id);
+    const bool readout_est = readout->id() >= 0;
     double t_readout = readout->value()(0);
-    double t_readout_lin = state->_options.do_calib_camera_readout ? readout->fej()(0) : t_readout;
+    double t_readout_lin = readout_est ? readout->fej()(0) : t_readout;
     std::shared_ptr<Vec> dt_cam_var = state->cam_imu_dt_var(cam_id);
     double dt_camoff = dt_cam_var->value()(0) - dt_ref_val;
     double dt_camoff_lin = (state->_options.do_calib_camera_timeoffset ? dt_cam_var->fej()(0) : dt_cam_var->value()(0)) - dt_ref_lin;
@@ -523,10 +527,10 @@ void UpdaterHelper::get_feature_jacobian_full(std::shared_ptr<State> state, Upda
     bool rs_on_linearization = std::abs(t_readout_lin) > 1e-10;
     bool dt_on_value = std::abs(dt_camoff) > 1e-10;
     bool dt_on_linearization = std::abs(dt_camoff_lin) > 1e-10;
-    bool need_rs_terms = state->_options.do_calib_camera_readout || state->_options.do_calib_camera_timeoffset || rs_on_value ||
+    bool need_rs_terms = readout_est || state->_options.do_calib_camera_timeoffset || rs_on_value ||
                          rs_on_linearization || dt_on_value || dt_on_linearization;
     int readout_hx_col = -1;
-    if (state->_options.do_calib_camera_readout) {
+    if (readout_est) {
       readout_hx_col = map_hx.at(readout);
     }
     int dt_cam_hx_col = -1;
@@ -736,7 +740,7 @@ void UpdaterHelper::get_feature_jacobian_full(std::shared_ptr<State> state, Upda
 
       // Derivative of measurement in respect to rolling shutter readout time
       // (column skipped when the window motion is degenerate or this clone has no kinematics)
-      if (state->_options.do_calib_camera_readout && dt_rs_cols_active && have_clone_kin) {
+      if (readout_hx_col >= 0 && dt_rs_cols_active && have_clone_kin) {
         double v_frac = v_pixel * inv_img_h;
         Eigen::Vector3d dpfI_dtrd = -(skew_x(w_col) * p_FinIi + R_GtoIi * v_col) * v_frac;
         H_x.block(2 * c, readout_hx_col, 2, 1).noalias() += dz_dpfc * R_ItoC * dpfI_dtrd;

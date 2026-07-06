@@ -1,5 +1,6 @@
 /*
  * OpenVINS: An Open Platform for Visual-Inertial Research
+ * Copyright (C) 2025-2026 Joao Leonardo Silva Cotta
  * Copyright (C) 2018-2023 Patrick Geneva
  * Copyright (C) 2018-2023 Guoquan Huang
  * Copyright (C) 2018-2023 OpenVINS Contributors
@@ -178,7 +179,6 @@ bool Propagator::compute_bridge(std::shared_ptr<State> state, double t0_imu, dou
   Eigen::Matrix3d J_th_g = Eigen::Matrix3d::Zero();
   Eigen::Matrix3d J_a_g = Eigen::Matrix3d::Zero(), J_a_a = Eigen::Matrix3d::Zero();
   Eigen::Matrix3d J_b_g = Eigen::Matrix3d::Zero(), J_b_a = Eigen::Matrix3d::Zero();
-  Eigen::Matrix<double, 9, 9> Q = Eigen::Matrix<double, 9, 9>::Zero();
 
   for (size_t i = 0; i + 1 < prop_data.size(); i++) {
     const double dt = prop_data.at(i + 1).timestamp - prop_data.at(i).timestamp;
@@ -209,23 +209,6 @@ bool Propagator::compute_bridge(std::shared_ptr<State> state, double t0_imu, dou
     const Eigen::Vector3d X1a = Xi_1 * a_hat;
     const Eigen::Vector3d X2a = Xi_2 * a_hat;
 
-    // ---- noise propagation (before the mean/Jacobian state advances) ----
-    Eigen::Matrix<double, 9, 9> Phi = Eigen::Matrix<double, 9, 9>::Identity();
-    Phi.block(0, 0, 3, 3) = R_step;
-    Phi.block(3, 0, 3, 3) = A * ov_core::skew_x(X2a); // sign consistent with the J_th convention
-    Phi.block(3, 6, 3, 3) = dt * Eigen::Matrix3d::Identity();
-    Phi.block(6, 0, 3, 3) = A * ov_core::skew_x(X1a);
-    Eigen::Matrix<double, 9, 6> G = Eigen::Matrix<double, 9, 6>::Zero();
-    G.block(0, 0, 3, 3) = -Jr_step * dt; // theta noise: n_g enters like -delta(bg) of the same step
-    G.block(3, 0, 3, 3) = A * Xi_4;
-    G.block(3, 3, 3, 3) = -A * Xi_2;
-    G.block(6, 0, 3, 3) = A * Xi_3;
-    G.block(6, 3, 3, 3) = -A * Xi_1;
-    Eigen::Matrix<double, 6, 6> Qd = Eigen::Matrix<double, 6, 6>::Zero();
-    Qd.block(0, 0, 3, 3) = (_noises.sigma_w_2 / dt) * Eigen::Matrix3d::Identity();
-    Qd.block(3, 3, 3, 3) = (_noises.sigma_a_2 / dt) * Eigen::Matrix3d::Identity();
-    Q = Phi * Q * Phi.transpose() + G * Qd * G.transpose();
-
     // ---- bias Jacobians (consume the PRE-transport J_th, then advance everything).
     // Coupling sign matches THIS file's J_th convention (DR(b) = exp_so3(J_th db) DR(b0)),
     // pinned by the finite-difference oracle in test_preint_bridge ----
@@ -252,7 +235,6 @@ bool Propagator::compute_bridge(std::shared_ptr<State> state, double t0_imu, dou
   out.J_b.block(3, 3, 3, 3) = J_a_a;
   out.J_b.block(6, 0, 3, 3) = J_b_g;
   out.J_b.block(6, 3, 3, 3) = J_b_a;
-  out.Q_tp = Q.block(0, 0, 6, 6);
   out.valid = true;
   return true;
 }

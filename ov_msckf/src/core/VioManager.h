@@ -1,5 +1,6 @@
 /*
  * OpenVINS: An Open Platform for Visual-Inertial Research
+ * Copyright (C) 2025-2026 Joao Leonardo Silva Cotta
  * Copyright (C) 2018-2023 Patrick Geneva
  * Copyright (C) 2018-2023 Guoquan Huang
  * Copyright (C) 2018-2023 OpenVINS Contributors
@@ -204,6 +205,11 @@ public:
   /// Returns used features map organized by timestamp
   std::map<double, std::vector<std::shared_ptr<ov_core::Feature>>> get_used_features_map() { return used_features_map; }
 
+  /// Zero-copy view of the used-features map. VIO-thread-only: the camera-processed callback runs
+  /// synchronously on the update thread, so the reference stays valid for the duration of the
+  /// callback -- the caller must never re-enter feed/drain while holding it.
+  const std::map<double, std::vector<std::shared_ptr<ov_core::Feature>>> &get_used_features_map_ref() const { return used_features_map; }
+
   /// Returns used features for a specific timestamp
   std::vector<std::shared_ptr<ov_core::Feature>> get_used_features_at_timestamp(double timestamp) {
     auto it = used_features_map.find(timestamp);
@@ -293,9 +299,6 @@ protected:
   /// Epoch mode: the oldest clone is marginalized when the epoch COMPLETES (next new-time message)
   bool epoch_marg_pending = false;
 
-public:
-
-protected:
   /// @}
 
   /**

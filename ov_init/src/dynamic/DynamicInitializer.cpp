@@ -1,10 +1,10 @@
 /*
  * OpenVINS: An Open Platform for Visual-Inertial Research
+ * Copyright (C) 2025-2026 Joao Leonardo Silva Cotta
  * Copyright (C) 2018-2023 Patrick Geneva
  * Copyright (C) 2018-2023 Guoquan Huang
  * Copyright (C) 2018-2023 OpenVINS Contributors
  * Copyright (C) 2018-2019 Kevin Eckenhoff
- * Contributor: Joao Leonardo Silva Cotta (@zauberflote1)
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -46,10 +46,12 @@ using namespace ov_init;
 
 // ===================================================================================
 // Backend selection for the dynamic-init MLE refinement + covariance recovery.
-// Default = Ceres. Define USE_CERES_FREE_INIT (CMake: -DOV_INIT_CERES_FREE=ON) to use
-// the in-tree, lock-free, RT-friendly ov_init::zbft_sfm solver instead. The shared graph
-// assembly below is written against these aliases; only the options / solve / Schur /
-// covariance steps diverge (guarded by #ifdef USE_CERES_FREE_INIT).
+// Default = the in-tree, lock-free, RT-friendly ov_init::zbft_sfm solver (the build defines
+// USE_CERES_FREE_INIT; CMake option OV_INIT_CERES_FREE, ON by default). Configuring with
+// -DOV_INIT_CERES_FREE=OFF falls back to the original Ceres factors -- A/B only; it needs a
+// Ceres install, which the VOXL target no longer ships. The shared graph assembly below is
+// written against these aliases; only the options / solve / Schur / covariance steps diverge
+// (guarded by #ifdef USE_CERES_FREE_INIT).
 // ===================================================================================
 #ifdef USE_CERES_FREE_INIT
 #include "ceres_free/Factor_GenericPrior.h"
@@ -706,7 +708,7 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
   // ======================================================
   // ======================================================
 
-  // MLE problem (Ceres by default; ov_init::zbft_sfm when USE_CERES_FREE_INIT).
+  // MLE problem (ov_init::zbft_sfm in the default build; Ceres when OV_INIT_CERES_FREE=OFF).
   // NOTE: By default the problem takes ownership of the added factors/params.
   MleProblem problem;
 #ifdef USE_CERES_FREE_INIT

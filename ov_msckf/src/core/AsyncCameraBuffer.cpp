@@ -1,5 +1,6 @@
 /*
  * OpenVINS: An Open Platform for Visual-Inertial Research
+ * Copyright (C) 2025-2026 Joao Leonardo Silva Cotta
  * Copyright (C) 2018-2023 Patrick Geneva
  * Copyright (C) 2018-2023 Guoquan Huang
  * Copyright (C) 2018-2023 OpenVINS Contributors
@@ -18,7 +19,6 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-// Author: Joao Leonardo Silva Cotta (@zauberflote1)
 
 #include "AsyncCameraBuffer.h"
 
@@ -38,6 +38,11 @@ AsyncCameraBuffer::AsyncCameraBuffer(int num_cams, Options options, Disposer dis
   streams.reserve(std::max(1, num_cams));
   for (int i = 0; i < std::max(1, num_cams); i++) {
     streams.emplace_back(std::make_unique<Stream>(opts.ring_capacity));
+    // Declared nominal period seeds the staleness EMA (the stream's own cadence replaces it
+    // after two frames: the producer EMA blends 90/10 from this starting point)
+    if ((size_t)i < opts.initial_periods.size() && opts.initial_periods[i] > 0) {
+      streams.back()->ema_period.store(opts.initial_periods[i], std::memory_order_relaxed);
+    }
   }
 }
 
@@ -127,10 +132,7 @@ void AsyncCameraBuffer::drain(double newest_imu_time, const DtMaxFn &dt_max_for_
     for (auto &sp : streams) {
       Stream &s = *sp;
       if (&s == head || s.has_staged) {
-        if (s.has_staged && s.staged.timestamp < t_head) {
-          // cannot happen (head is the minimum) -- kept as the invariant statement
-          continue;
-        }
+        // staged.timestamp >= t_head by construction (head is the minimum staged time)
         continue;
       }
       const double last_ts = s.last_enqueued_ts.load(std::memory_order_acquire);

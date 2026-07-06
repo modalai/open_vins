@@ -1,5 +1,6 @@
 /*
  * OpenVINS: An Open Platform for Visual-Inertial Research
+ * Copyright (C) 2025-2026 Joao Leonardo Silva Cotta
  * Copyright (C) 2018-2023 Patrick Geneva
  * Copyright (C) 2018-2023 Guoquan Huang
  * Copyright (C) 2018-2023 OpenVINS Contributors
@@ -74,6 +75,32 @@ VioManager::VioManager(VioManagerOptions &params_) : thread_init_running(false),
   // Forward manager-level knobs consumed inside the state/updaters
   params.state_options.epoch_bridge_bias_cols = params.epoch_bridge_bias_cols;
 
+  // Shutter declarations decide which cameras carry an ESTIMATED readout state under
+  // calib_cam_readout (undeclared legacy rigs infer from a nonzero readout value)
+  for (int i = 0; i < params.state_options.num_cameras; i++) {
+    const bool rolling = params.camera_shutter_rolling.count((size_t)i)
+                             ? params.camera_shutter_rolling.at((size_t)i)
+                             : (params.camera_readout_time.count((size_t)i) && params.camera_readout_time.at((size_t)i) != 0.0);
+    params.state_options.camera_estimate_readout[(size_t)i] = rolling;
+  }
+
+  // Config-drift guard: an unsynced multi-camera rig running WITHOUT epoch-anchored cloning
+  // clones at every camera's frame time, so the shared window covers only window/N seconds per
+  // camera -- no track can reach max-track length (SLAM starves at zero features forever) and
+  // near-hover MSCKF triangulation collapses with the baseline. This is exactly what a STALE
+  // deployed estimator_config.yaml (missing the async block, epoch_mode defaulting to false)
+  // looks like, and it dead-reckons into a health auto-reset loop on hardware.
+  if (params.state_options.num_cameras >= 2 && !params.use_stereo && !params.epoch_mode) {
+    PRINT_WARNING(RED "=======================================================================\n" RESET);
+    PRINT_WARNING(RED "VioManager(): %d UNSYNCED cameras with epoch_mode DISABLED!\n" RESET, params.state_options.num_cameras);
+    PRINT_WARNING(RED "Per-frame cloning divides the clone window across cameras: SLAM features\n" RESET);
+    PRINT_WARNING(RED "cannot reach max-track length and MSCKF triangulation loses its baseline.\n" RESET);
+    PRINT_WARNING(RED "Set epoch_mode: true (async rigs) or use_stereo: true (synced pairs).\n" RESET);
+    PRINT_WARNING(RED "If you DID set it, the DEPLOYED estimator_config.yaml is an older file\n" RESET);
+    PRINT_WARNING(RED "that lacks the async block -- regenerate the on-target config.\n" RESET);
+    PRINT_WARNING(RED "=======================================================================\n" RESET);
+  }
+
   // Create the state!!
   state = std::make_shared<State>(params.state_options);
 
@@ -114,6 +141,32 @@ VioManager::VioManager(VioManagerOptions &params_) : thread_init_running(false),
   // The initializer runs in the reference camera's clock
   params.init_options.calib_camimu_dt = state->cam_imu_dt_ref();
 
+  // Declared nominal frame rates seed the rate estimators that otherwise need frames to settle:
+  // the epoch binding horizon runs at design width from the FIRST reference frame (fresh start
+  // and every hard reset), instead of a 50ms bootstrap guess.
+  {
+    const int ref_id = params.state_options.cam_imu_dt_ref_camid;
+    if (params.camera_fps.count((size_t)ref_id) && params.camera_fps.at((size_t)ref_id) > 0.0) {
+      ref_period_ema = 1.0 / params.camera_fps.at((size_t)ref_id);
+    }
+
+    // Epoch-anchoring constraint: the reference must be the FASTEST declared camera. A slower
+    // reference makes a faster camera deliver >1 frame per epoch; the extras hit the
+    // one-frame-per-(camera,epoch) rule and fall back to their own clones, fragmenting the
+    // window into mixed epoch/fallback times -- the fast camera's tracks split across them,
+    // max-track/SLAM graduation starves, and the few surviving MSCKF features drag the
+    // calibration (observed on hardware with ref=30Hz vs 42Hz: calib random-walk, divergence).
+    if (params.epoch_mode) {
+      for (auto const &fps : params.camera_fps) {
+        if (params.camera_fps.count((size_t)ref_id) && fps.second > params.camera_fps.at((size_t)ref_id) + 1e-6) {
+          PRINT_WARNING(RED "VioManager(): epoch reference cam%d (%.1f fps) is SLOWER than cam%zu (%.1f fps)!\n" RESET, ref_id,
+                        params.camera_fps.at((size_t)ref_id), fps.first, fps.second);
+          PRINT_WARNING(RED "\tExpect epoch-fallback churn and starved updates; set cam_imu_dt_ref_camid to the fastest camera.\n" RESET);
+        }
+      }
+    }
+  }
+
   // Lock-free async multi-camera ingest: one SPSC ring per stream, ordered release from the IMU
   // feed. Dropped frames flow through the processed-callback with processed=false so the owner can
   // release external image handles exactly once.
@@ -121,6 +174,12 @@ VioManager::VioManager(VioManagerOptions &params_) : thread_init_running(false),
   buf_opts.ring_capacity = (size_t)std::max(2, params.async_ring_size);
   buf_opts.guard = params.async_guard;
   buf_opts.stale_factor = params.async_stale_factor;
+  buf_opts.initial_periods.resize((size_t)state->_options.num_cameras, 0.0);
+  for (int i = 0; i < state->_options.num_cameras; i++) {
+    if (params.camera_fps.count((size_t)i) && params.camera_fps.at((size_t)i) > 0.0) {
+      buf_opts.initial_periods[(size_t)i] = 1.0 / params.camera_fps.at((size_t)i);
+    }
+  }
   camera_buffer = std::make_shared<AsyncCameraBuffer>(state->_options.num_cameras, buf_opts, [this](const ov_core::CameraData &msg) {
     if (camera_processed_cb) {
       camera_processed_cb(msg, false);
@@ -175,8 +234,8 @@ VioManager::VioManager(VioManagerOptions &params_) : thread_init_running(false),
       // the calibration has been packed by VoxlConfigure. It is the only
       // stereo-projection path in TrackOCL; without it, stereo features stay
       // mono-only.
-      printf("[VioManager] stereo: use_stereo=%d  calib_valid=%d\n",
-             (int)params.use_stereo, (int)params.stereo_calib_valid);
+      PRINT_DEBUG("[VioManager] stereo: use_stereo=%d  calib_valid=%d\n",
+                  (int)params.use_stereo, (int)params.stereo_calib_valid);
       if (params.use_stereo && params.stereo_calib_valid) {
         track_ocl->enable_zncc_stereo_matcher(params.stereo_calib,
                                               params.stereo_z_min,
@@ -296,6 +355,20 @@ void VioManager::soft_reset(SoftResetCause cause) {
     state->_calib_camera_readout.at(i)->set_value(readout_val);
     state->_calib_camera_readout.at(i)->set_fej(readout_val);
   }
+
+  // A soft reset starts a NEW estimation episode on a continuous sensor clock: purge everything
+  // keyed by pre-reset update times or scoped to the old episode, or downstream consumers
+  // (quality metric, extended packet) would present stale pre-reset evidence as current. The
+  // margtimestep-based map cleanup cannot do this -- a warm-started clone window reaches ~2 s
+  // back past the reset instant, so pre-reset entries would sit inside the new window.
+  used_features_map.clear();
+  // ZUPT episode flags are only written while initialized, so they would otherwise stay frozen
+  // at their pre-reset values: a stale did_zupt_update=true lets the publisher report CEP
+  // quality (fresh covariance => ~100) with state OK throughout the whole re-init, and a stale
+  // has_moved_since_zupt=true disables ZUPT for the entire new episode when
+  // zupt_only_at_beginning is set.
+  did_zupt_update = false;
+  has_moved_since_zupt = false;
 
   PRINT_INFO("[soft-reset]: EKF reset; feature DB + IMU history preserved for fast re-init\n");
 }
@@ -891,8 +964,9 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
       trackARUCO->get_feature_database()->cleanup_measurements(state->margtimestep());
     }
     
-    // Cleanup old entries from used_features_map
-    // change this for dynamic reset
+    // Cleanup old entries from used_features_map (steady-state pruning only; the dynamic-reset
+    // case is handled in soft_reset(), which purges the whole map -- margtimestep alone cannot,
+    // since a warm-started window reaches back past the reset instant)
     auto it = used_features_map.begin();
     while (it != used_features_map.end()) {
       if (it->first < state->margtimestep()) {
@@ -936,6 +1010,15 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
     PRINT_DEBUG(BLUE "[TIME]: %.4f seconds for SLAM delayed init (%d feats)\n" RESET, time_slam_delay, (int)feats_slam_DELAYED.size());
   }
   PRINT_DEBUG(BLUE "[TIME]: %.4f seconds for re-tri & marg (%d clones in state)\n" RESET, time_marg, (int)state->_clones_IMU.size());
+
+  // Epoch/ingest health: fallbacks should stay ~0 on a well-configured rig (fastest cam = ref).
+  // A climbing fallback count = fragmented clone window = starved updates (see the ctor guard).
+  if (params.epoch_mode && camera_buffer != nullptr) {
+    PRINT_DEBUG(BLUE "[EPOCH]: %llu snapped, %llu fallbacks | ingest: %llu late, %llu full, %llu bogus drops\n" RESET,
+                (unsigned long long)epoch_snapped, (unsigned long long)epoch_fallbacks,
+                (unsigned long long)camera_buffer->count_drop_late(), (unsigned long long)camera_buffer->count_drop_full(),
+                (unsigned long long)camera_buffer->count_drop_bogus());
+  }
 
   std::stringstream ss;
   ss << "[TIME]: " << std::setprecision(4) << time_total << " seconds for total (camera";

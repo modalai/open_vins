@@ -1,5 +1,6 @@
 /*
  * OpenVINS: An Open Platform for Visual-Inertial Research
+ * Copyright (C) 2025-2026 Joao Leonardo Silva Cotta
  * Copyright (C) 2018-2023 Patrick Geneva
  * Copyright (C) 2018-2023 Guoquan Huang
  * Copyright (C) 2018-2023 OpenVINS Contributors
@@ -137,10 +138,16 @@ State::State(StateOptions &options) {
       current_id += intrin->size();
     }
 
-    // Allocate rolling shutter readout time (1 DOF per camera; 0 = global shutter)
+    // Allocate rolling shutter readout time (1 DOF per camera; 0 = global shutter).
+    // Only cameras declared rolling get an ESTIMATED readout (id >= 0): a global-shutter
+    // camera's readout is physically zero, and estimating it anyway hands the filter a
+    // spurious DOF that absorbs residual junk on that stream. Empty map = legacy (all cams).
     auto readout = std::make_shared<Vec>(1);
     _calib_camera_readout.insert({i, readout});
-    if (_options.do_calib_camera_readout) {
+    bool estimate_readout = _options.do_calib_camera_readout &&
+                            (_options.camera_estimate_readout.empty() ||
+                             (_options.camera_estimate_readout.count((size_t)i) > 0 && _options.camera_estimate_readout.at((size_t)i)));
+    if (estimate_readout) {
       readout->set_local_id(current_id);
       _variables.push_back(readout);
       current_id += readout->size();
@@ -188,7 +195,11 @@ State::State(StateOptions &options) {
   }
   if (_options.do_calib_camera_readout) {
     for (int i = 0; i < _options.num_cameras; i++) {
-      _Cov(_calib_camera_readout.at(i)->id(), _calib_camera_readout.at(i)->id()) = std::pow(0.001, 2);
+      // Prior applies only to REGISTERED readout states (declared-rolling cameras)
+      if (_calib_camera_readout.at(i)->id() >= 0) {
+        _Cov(_calib_camera_readout.at(i)->id(), _calib_camera_readout.at(i)->id()) =
+            std::pow(_options.calib_cam_readout_init_sigma, 2);
+      }
     }
   }
 }

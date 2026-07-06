@@ -1,5 +1,6 @@
 /*
  * OpenVINS: An Open Platform for Visual-Inertial Research
+ * Copyright (C) 2025-2026 Joao Leonardo Silva Cotta
  * Copyright (C) 2018-2023 Patrick Geneva
  * Copyright (C) 2018-2023 Guoquan Huang
  * Copyright (C) 2018-2023 OpenVINS Contributors
@@ -41,7 +42,6 @@ namespace ov_msckf {
  * Convention for the bias correction (validated by the finite-difference oracle test):
  *   DR(b0+db) = exp_so3(J_th * db) * DR(b0),  alpha += J_alpha*db,  beta += J_beta*db.
  *
- * @author Joao Leonardo Silva Cotta (@zauberflote1)
  */
 struct PreintBridgeData {
   /// Integrated interval length (s)
@@ -56,8 +56,6 @@ struct PreintBridgeData {
   Eigen::Vector3d v_grav = Eigen::Vector3d::Zero();
   /// d(theta, alpha, beta)/d(bg, ba) at the build-time bias linearization (rows th,p,v; cols bg,ba)
   Eigen::Matrix<double, 9, 6> J_b = Eigen::Matrix<double, 9, 6>::Zero();
-  /// Preintegration noise on (theta, alpha) -- available for measurement-noise inflation
-  Eigen::Matrix<double, 6, 6> Q_tp = Eigen::Matrix<double, 6, 6>::Zero();
   /// Intrinsics/bias-corrected angular rate at the measurement instant (H_dt linearization)
   Eigen::Vector3d w_end = Eigen::Vector3d::Zero();
   /// Bias linearization points at build time (for the first-order J_b correction)

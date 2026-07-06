@@ -1,5 +1,6 @@
 /*
  * OpenVINS: An Open Platform for Visual-Inertial Research
+ * Copyright (C) 2025-2026 Joao Leonardo Silva Cotta
  * Copyright (C) 2018-2023 Patrick Geneva
  * Copyright (C) 2018-2023 Guoquan Huang
  * Copyright (C) 2018-2023 OpenVINS Contributors
@@ -35,8 +36,6 @@
 #include "state/Propagator.h"
 #include "state/State.h"
 #include "state/StateHelper.h"
-
-#include <cmath>
 
 using namespace ov_core;
 using namespace ov_type;

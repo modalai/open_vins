@@ -1,7 +1,7 @@
 /*
+ * Copyright (C) 2025-2026 Joao Leonardo Silva Cotta
  * Monte-Carlo NEES consistency gold standard for the ceres-free (ov_init::zbft_sfm)
  * S²-gravity dynamic initializer. NO OpenCV / NO Ceres dependency.
- * Contributor: Joao Leonardo Silva Cotta (@zauberflote1)
  *
  * Validates that the covariance recovered by Problem::ComputeCovariance() is statistically
  * consistent with the actual estimation error distribution. For a consistent estimator the

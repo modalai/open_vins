@@ -1,7 +1,7 @@
 /*
  * OpenVINS: An Open Platform for Visual-Inertial Research
+ * Copyright (C) 2025-2026 Joao Leonardo Silva Cotta
  * Copyright (C) 2018-2023 OpenVINS Contributors
- * Contributor: Joao Leonardo Silva Cotta (@zauberflote1)
  *
  * Phase-3 (warm-start) covariance validation for the Ceres-free solver core
  * (ov_init::zbft_sfm). Depends ONLY on Eigen + the solver core (Problem.cpp,

@@ -1,5 +1,6 @@
 /*
  * OpenVINS: An Open Platform for Visual-Inertial Research
+ * Copyright (C) 2025-2026 Joao Leonardo Silva Cotta
  * Copyright (C) 2018-2023 Patrick Geneva
  * Copyright (C) 2018-2023 Guoquan Huang
  * Copyright (C) 2018-2023 OpenVINS Contributors
@@ -151,6 +152,12 @@ struct VioManagerOptions {
       parser->parse_config("record_timing_filepath", record_timing_filepath);
     }
     PRINT_DEBUG("  - dt_slam_delay: %.1f\n", dt_slam_delay);
+    PRINT_DEBUG("  - epoch_mode: %d\n", epoch_mode);
+    PRINT_DEBUG("  - epoch_bind_factor: %.2f\n", epoch_bind_factor);
+    PRINT_DEBUG("  - epoch_bridge_bias_cols: %d\n", epoch_bridge_bias_cols);
+    PRINT_DEBUG("  - async_ring_size: %d\n", async_ring_size);
+    PRINT_DEBUG("  - async_guard: %.4f\n", async_guard);
+    PRINT_DEBUG("  - async_stale_factor: %.2f\n", async_stale_factor);
     PRINT_DEBUG("  - zero_velocity_update: %d\n", try_zupt);
     PRINT_DEBUG("  - zupt_max_velocity: %.2f\n", zupt_max_velocity);
     PRINT_DEBUG("  - zupt_noise_multiplier: %.2f\n", zupt_noise_multiplier);
@@ -267,6 +274,15 @@ struct VioManagerOptions {
   /// Map between camid and rolling shutter readout time (seconds). 0.0 = global shutter.
   std::map<size_t, double> camera_readout_time;
 
+  /// Per-camera shutter declaration from the estimator config: camN_shutter "global"/"rolling".
+  /// Missing entry = legacy behavior (shutter inferred from the readout time alone).
+  std::map<size_t, bool> camera_shutter_rolling;
+
+  /// Per-camera NOMINAL frame rate (Hz) from the estimator config (camN_fps). Used to seed the
+  /// epoch-period/staleness EMAs before they converge and to sanity-check the readout time.
+  /// 0 = undeclared.
+  std::map<size_t, double> camera_fps;
+
   /// Map between camid and camera intrinsics (fx, fy, cx, cy, d1...d4, cam_w, cam_h)
   std::unordered_map<size_t, std::shared_ptr<ov_core::CamBase>> camera_intrinsics;
 
@@ -344,9 +360,64 @@ struct VioManagerOptions {
         }
         camera_extrinsics.insert({i, cam_eigen});
 
-        // Rolling shutter readout time (optional; absent/0 = global shutter)
+        // Rolling shutter readout time. Two sources, main config wins over the kalibr chain:
+        //   camN_readout_time_s (estimator config, survives recalibration)  >  t_readout (kalibr chain)
+        // The explicit camN_shutter declaration ("global"/"rolling") validates the pair: a rolling
+        // camera MUST declare a positive readout (silent 0 = unmodeled RS distortion on every row),
+        // a global camera has any stale readout zeroed. Missing declaration = legacy inference.
         double t_readout = 0.0;
         parser->parse_external("relative_config_imucam", "cam" + std::to_string(i), "t_readout", t_readout, false);
+        double readout_cfg = -1.0;
+        parser->parse_config("cam" + std::to_string(i) + "_readout_time_s", readout_cfg, false);
+        if (readout_cfg >= 0.0) {
+          t_readout = readout_cfg;
+        }
+        std::string shutter = "";
+        parser->parse_config("cam" + std::to_string(i) + "_shutter", shutter, false);
+        double fps = 0.0;
+        parser->parse_config("cam" + std::to_string(i) + "_fps", fps, false);
+        if (fps < 0.0 || !std::isfinite(fps)) {
+          PRINT_ERROR(RED "VioManager(): cam%d_fps (%.3f) must be a finite rate in Hz (or omitted)\n" RESET, i, fps);
+          std::exit(EXIT_FAILURE);
+        }
+        camera_fps[(size_t)i] = fps;
+        if (shutter == "rolling") {
+          camera_shutter_rolling[(size_t)i] = true;
+          if (t_readout <= 0.0 && state_options.do_calib_camera_readout) {
+            // Refining readout ONLINE from a zero seed is the documented trap (FEJ linearizes the
+            // RS terms at 0 and the prior fights every step): calibration demands a real seed.
+            PRINT_ERROR(RED "VioManager(): cam%d declared ROLLING with calib_cam_readout ON but no positive readout seed!\n" RESET, i);
+            PRINT_ERROR(RED "\t- set cam%d_readout_time_s (seconds for the full frame, rows x line_time),\n" RESET, i);
+            PRINT_ERROR(RED "\t- or add t_readout to cam%d in the kalibr chain,\n" RESET, i);
+            PRINT_ERROR(RED "\t- or set calib_cam_readout: false to run RS deliberately unmodeled (bring-up only).\n" RESET);
+            std::exit(EXIT_FAILURE);
+          }
+          if (t_readout <= 0.0) {
+            // Deliberate bring-up state: RS declared but unmodeled. A WRONG readout is worse than
+            // none (its mean aliases into the camera's dt, its row-dependent part poisons the
+            // calibration), so zero is allowed -- loudly.
+            PRINT_WARNING(YELLOW "VioManager(): cam%d is ROLLING shutter with readout 0 -- RS is UNMODELED (bring-up only).\n" RESET, i);
+            PRINT_WARNING(YELLOW "\tRows carry up to f*|omega|*readout px of systematic error; measure and set the readout.\n" RESET);
+          }
+        } else if (shutter == "global") {
+          camera_shutter_rolling[(size_t)i] = false;
+          if (t_readout != 0.0) {
+            PRINT_WARNING(YELLOW "VioManager(): cam%d declared GLOBAL shutter; ignoring configured readout %.4fs\n" RESET, i, t_readout);
+            t_readout = 0.0;
+          }
+        } else if (!shutter.empty()) {
+          PRINT_ERROR(RED "VioManager(): cam%d_shutter must be \"global\" or \"rolling\", got \"%s\"\n" RESET, i, shutter.c_str());
+          std::exit(EXIT_FAILURE);
+        } else if (state_options.num_cameras > 1) {
+          // Undeclared on a multi-camera rig: infer, but say so (this is how a stale config hides)
+          PRINT_WARNING(YELLOW "VioManager(): cam%d has no camN_shutter declaration; inferring %s from readout %.4fs\n" RESET, i,
+                        (t_readout != 0.0) ? "ROLLING" : "GLOBAL", t_readout);
+        }
+        if (fps > 0.0 && std::abs(t_readout) > 1.0 / fps) {
+          PRINT_ERROR(RED "VioManager(): cam%d readout time %.4fs exceeds the frame period %.4fs (fps %.1f) -- impossible\n" RESET, i,
+                      t_readout, 1.0 / fps, fps);
+          std::exit(EXIT_FAILURE);
+        }
         camera_readout_time.insert({i, t_readout});
       }
       parser->parse_config("use_mask", use_mask);
@@ -451,6 +522,13 @@ struct VioManagerOptions {
       ss << "T_C" << n << "toI:" << std::endl << T_CtoI << std::endl << std::endl;
       ss << "cam_" << n << "_dt_camimu:" << (camera_imu_dt.count(n) ? camera_imu_dt.at(n) : calib_camimu_dt) << std::endl;
       ss << "cam_" << n << "_t_readout:" << (camera_readout_time.count(n) ? camera_readout_time.at(n) : 0.0) << std::endl;
+      ss << "cam_" << n << "_shutter:"
+         << (camera_shutter_rolling.count(n) ? (camera_shutter_rolling.at(n) ? "rolling" : "global")
+                                             : ((camera_readout_time.count(n) && camera_readout_time.at(n) != 0.0) ? "rolling(inferred)"
+                                                                                                                   : "global(inferred)"))
+         << std::endl;
+      ss << "cam_" << n << "_fps:" << ((camera_fps.count(n) && camera_fps.at(n) > 0.0) ? std::to_string(camera_fps.at(n)) : "undeclared")
+         << std::endl;
       PRINT_DEBUG(ss.str().c_str());
     }
     PRINT_DEBUG("IMU PARAMETERS:\n");

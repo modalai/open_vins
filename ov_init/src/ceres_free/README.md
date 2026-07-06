@@ -1,6 +1,7 @@
 # `ov_init::zbft_sfm` — Ceres-free, RT, lock-free initialization solver
 
-> Contributor: Joao Leonardo Silva Cotta (@zauberflote1)
+> Copyright (C) 2025-2026 Joao Leonardo Silva Cotta
+> Licensed under the GNU General Public License v3, under the same terms as the rest of OpenVINS.
 
 A small, deterministic, real-time-friendly nonlinear least-squares core that replaces
 **Ceres** in the OpenVINS dynamic-initialization path, plus the S²-gravity MLE, gauge

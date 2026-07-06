@@ -1,4 +1,5 @@
 /*
+ * Copyright (C) 2025-2026 Joao Leonardo Silva Cotta
  * Ceres vs ov_init::zbft_sfm — dynamic-init MLE parity & performance benchmark.
  *
  * Builds the SAME visual-inertial factor graph (CPI IMU factors + pinhole

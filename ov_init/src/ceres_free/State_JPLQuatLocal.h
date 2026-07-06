@@ -1,10 +1,10 @@
 /*
  * OpenVINS: An Open Platform for Visual-Inertial Research
+ * Copyright (C) 2025-2026 Joao Leonardo Silva Cotta
  * Copyright (C) 2018-2023 Patrick Geneva
  * Copyright (C) 2018-2023 Guoquan Huang
  * Copyright (C) 2018-2023 OpenVINS Contributors
  * Copyright (C) 2018-2019 Kevin Eckenhoff
- * Contributor: Joao Leonardo Silva Cotta (@zauberflote1)
  *
  * Ceres-free initialization backend (ov_init::zbft_sfm)
  * ------------------------------------------------

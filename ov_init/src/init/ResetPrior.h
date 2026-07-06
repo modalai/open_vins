@@ -1,9 +1,9 @@
 /*
  * OpenVINS: An Open Platform for Visual-Inertial Research
+ * Copyright (C) 2025-2026 Joao Leonardo Silva Cotta
  * Copyright (C) 2018-2023 Patrick Geneva
  * Copyright (C) 2018-2023 Guoquan Huang
  * Copyright (C) 2018-2023 OpenVINS Contributors
- * Contributor: Joao Leonardo Silva Cotta (@zauberflote1)
  *
  * Soft-reset hand-off buffer: carries the LIVE filter's bias estimates (+ marginal sigmas)
  * into the next dynamic initialization attempt. Rationale: the free-S2 initializer's dominant

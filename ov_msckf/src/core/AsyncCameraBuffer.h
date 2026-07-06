@@ -1,5 +1,6 @@
 /*
  * OpenVINS: An Open Platform for Visual-Inertial Research
+ * Copyright (C) 2025-2026 Joao Leonardo Silva Cotta
  * Copyright (C) 2018-2023 Patrick Geneva
  * Copyright (C) 2018-2023 Guoquan Huang
  * Copyright (C) 2018-2023 OpenVINS Contributors
@@ -22,7 +23,6 @@
 #define OV_MSCKF_ASYNC_CAMERA_BUFFER_H
 
 /**
- * @author Joao Leonardo Silva Cotta (@zauberflote1)
  *
  * Lock-free multi-camera ingest for asynchronous (unsynced) camera streams.
  *
@@ -70,6 +70,10 @@ public:
     double stale_factor = 1.5;
     /// Frames stamped further than this into the IMU future are broken timestamps: dropped.
     double bogus_future = 1.0;
+    /// Optional per-camera NOMINAL frame period seeds (seconds) for the staleness EMA, indexed
+    /// by camera id. Until a stream's own EMA settles, its declared period (instead of the
+    /// conservative 20 Hz default) decides how long the merge holds ordering for it.
+    std::vector<double> initial_periods;
   };
 
   /// Called for every frame the buffer discards (ring full / late / bogus). NEVER called for

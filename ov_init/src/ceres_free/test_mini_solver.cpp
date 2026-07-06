@@ -1,9 +1,9 @@
 /*
  * OpenVINS: An Open Platform for Visual-Inertial Research
+ * Copyright (C) 2025-2026 Joao Leonardo Silva Cotta
  * Copyright (C) 2018-2023 Patrick Geneva
  * Copyright (C) 2018-2023 Guoquan Huang
  * Copyright (C) 2018-2023 OpenVINS Contributors
- * Contributor: Joao Leonardo Silva Cotta (@zauberflote1)
  *
  * Standalone validation of the Ceres-free solver CORE (ov_init::zbft_sfm). It depends
  * ONLY on Eigen + the solver core (Problem.cpp, Parallel.cpp) -- NOT on ov_core --

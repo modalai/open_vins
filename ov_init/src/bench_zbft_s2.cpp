@@ -1,6 +1,6 @@
 /*
+ * Copyright (C) 2025-2026 Joao Leonardo Silva Cotta
  * S² gravity MLE benchmark (zbft_sfm only, no Ceres dependency).
- * Contributor: Joao Leonardo Silva Cotta (@zauberflote1)
  * Tests the S² gravity parameterization on synthetic VI-init problems.
  */
 

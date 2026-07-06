@@ -1,5 +1,6 @@
 /*
  * OpenVINS: An Open Platform for Visual-Inertial Research
+ * Copyright (C) 2025-2026 Joao Leonardo Silva Cotta
  * Copyright (C) 2018-2023 Patrick Geneva
  * Copyright (C) 2018-2023 Guoquan Huang
  * Copyright (C) 2018-2023 OpenVINS Contributors
@@ -19,7 +20,6 @@
  */
 
 /**
- * @author Joao Leonardo Silva Cotta (@zauberflote1)
  *
  * AsyncCameraBuffer unit tests (host, CTest): threaded producers with delivery jitter, camera
  * death + staleness unblocking, camera restart, bit-equal bundling, ring overflow disposal
