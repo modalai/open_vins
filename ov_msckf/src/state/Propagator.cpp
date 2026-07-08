@@ -201,6 +201,7 @@ bool Propagator::compute_bridge(std::shared_ptr<State> state, double t0_imu, dou
     const Eigen::Matrix3d R_step = Xi_sum.block(0, 0, 3, 3); // exp_so3(-w dt) = R_{I_i -> I_i+1}
     const Eigen::Matrix3d Xi_1 = Xi_sum.block(0, 3, 3, 3);
     const Eigen::Matrix3d Xi_2 = Xi_sum.block(0, 6, 3, 3);
+    const Eigen::Matrix3d Jr_step = Xi_sum.block(0, 9, 3, 3); // Jr_so3(-w dt), shared with the stock path
     const Eigen::Matrix3d Xi_3 = Xi_sum.block(0, 12, 3, 3);
     const Eigen::Matrix3d Xi_4 = Xi_sum.block(0, 15, 3, 3);
 
@@ -217,8 +218,10 @@ bool Propagator::compute_bridge(std::shared_ptr<State> state, double t0_imu, dou
     J_b_a += -A * Xi_1;
     // Exact increment for the left perturbation DR(b) = exp_so3(J_th db) DR(b0):
     // exp(-w dt + db dt) = R_step exp(Jr(-w dt) db dt) and R_step Jr(-w dt) = Jr(+w dt),
-    // hence the +w argument (Jr(-w dt) would err by O(|w| dt) per step; CpiV1 agrees).
-    J_th_g = R_step * J_th_g + ov_core::Jr_so3(w_hat * dt) * dt;
+    // so the increment needs the +w flavor (Jr(-w dt) alone errs O(|w| dt) per step).
+    // Factored to reuse the Jr(-w dt) block Xi_sum already carries -- no fresh Jr_so3
+    // evaluation on the RT path; identical math, pinned by test_preint_bridge.
+    J_th_g = R_step * (J_th_g + Jr_step * dt);
 
     // ---- mean (alpha consumes the PRE-update beta) ----
     alpha += beta * dt + A * X2a;
