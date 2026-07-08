@@ -1,5 +1,6 @@
 /*
  * OpenVINS: An Open Platform for Visual-Inertial Research
+ * Copyright (C) 2025-2026 Joao Leonardo Silva Cotta
  * Copyright (C) 2018-2023 Patrick Geneva
  * Copyright (C) 2018-2023 Guoquan Huang
  * Copyright (C) 2018-2023 OpenVINS Contributors
@@ -26,6 +27,7 @@
 #include <memory>
 #include <mutex>
 
+#include "state/PreintegrationBridge.h"
 #include "utils/sensor_data.h"
 
 #include "utils/NoiseManager.h"
@@ -116,7 +118,19 @@ public:
    * @param state Pointer to state
    * @param timestamp Time to propagate to and clone at (CAM clock frame)
    */
-  void propagate_and_clone(std::shared_ptr<State> state, double timestamp);
+  bool propagate_and_clone(std::shared_ptr<State> state, double timestamp);
+
+  /// ACI2 preintegration bridge payload (see state/PreintegrationBridge.h)
+  using BridgeData = PreintBridgeData;
+
+  /**
+   * @brief Build the ACI2 bridge over [t0_imu, t1_imu] (IMU clock) from buffered IMU samples.
+   *
+   * Integrates the actual IMU samples with the analytic Xi closed forms (compute_Xi_sum) at the
+   * CURRENT bias/intrinsics estimates. @return false when the interval cannot be covered
+   * (missing IMU) -- consumers then fall back to the first-order model.
+   */
+  bool compute_bridge(std::shared_ptr<State> state, double t0_imu, double t1_imu, BridgeData &out);
 
   /**
    * @brief Gets what the state and its covariance will be at a given timestamp

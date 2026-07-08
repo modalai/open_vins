@@ -3,6 +3,7 @@
 
 /*
  * MIT License
+ * Copyright (c) 2025-2026 Joao Leonardo Silva Cotta
  * Copyright (c) 2018 Kevin Eckenhoff
  * Copyright (c) 2018 Patrick Geneva
  * Copyright (c) 2018 Guoquan Huang

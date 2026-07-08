@@ -57,13 +57,27 @@ list(APPEND LIBRARY_SOURCES
         src/track/TrackAruco.cpp
         src/track/TrackDescriptor.cpp
         src/track/TrackSIM.cpp
-        src/track/TrackOCL/TrackOCL.cpp
         src/types/Landmark.cpp
         src/feat/Feature.cpp
         src/feat/FeatureDatabase.cpp
         src/feat/FeatureInitializer.cpp
         src/utils/print.cpp
 )
+# Only include TrackOCL if OpenCL is available
+if (OpenCL_FOUND)
+    list(APPEND LIBRARY_SOURCES src/track/TrackOCL/TrackOCL.cpp)
+    # TrackOCL.cpp DIRECTLY uses the modal_flow OCL manager, so link modal_flow into ov_core_lib: that
+    # gives the proper DT_NEEDED so the runtime loader auto-pulls the rest of the chain
+    # (modal_flow -> modal_pipe -> modal_json -> ...). We deliberately do NOT enumerate those INDIRECT
+    # deps -- they're already linked explicitly by the top-level binary, and the executable link
+    # tolerates the indirect undefined symbols via -Wl,--allow-shlib-undefined (set at the top level).
+    find_library(MODAL_FLOW_LIBRARY NAMES modal_flow)
+    if (NOT MODAL_FLOW_LIBRARY)
+        set(MODAL_FLOW_LIBRARY modal_flow) # fall back to -lmodal_flow
+    endif()
+    list(APPEND thirdparty_libraries ${MODAL_FLOW_LIBRARY})
+    message(STATUS "ov_core: linking modal_flow for TrackOCL: ${MODAL_FLOW_LIBRARY}")
+endif()
 # Only include TrackKLT if not disabled
 if (NOT DISABLE_TRACK_KLT)
     list(APPEND LIBRARY_SOURCES src/track/TrackKLT.cpp)

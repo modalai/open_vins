@@ -1,5 +1,6 @@
 /*
  * OpenVINS: An Open Platform for Visual-Inertial Research
+ * Copyright (C) 2025-2026 Joao Leonardo Silva Cotta
  * Copyright (C) 2018-2023 Patrick Geneva
  * Copyright (C) 2018-2023 Guoquan Huang
  * Copyright (C) 2018-2023 OpenVINS Contributors
@@ -141,25 +142,24 @@ public:
     // We need to ensure we normalize after each one such that we obtain unit vectors
     Eigen::Vector3d z_axis = gravity_inI / gravity_inI.norm();
     Eigen::Vector3d x_axis, y_axis;
-    Eigen::Vector3d e_1(1.0, 0.0, 0.0);
-    Eigen::Vector3d e_2(0.0, 1.0, 0.0);
-    // double inner1 = e_1.dot(z_axis) / z_axis.norm();
-    // double inner2 = e_2.dot(z_axis) / z_axis.norm();
-    // if (fabs(inner1) < fabs(inner2)) {
-    //   x_axis = z_axis.cross(e_1);
-    //   x_axis = x_axis / x_axis.norm();
-    //   y_axis = z_axis.cross(x_axis);
-    //   y_axis = y_axis / y_axis.norm();
-    // } else {
-    //   x_axis = z_axis.cross(e_2);
-    //   x_axis = x_axis / x_axis.norm();
-    //   y_axis = z_axis.cross(x_axis);
-    //   y_axis = y_axis / y_axis.norm();
-    // }
 
-    // Original method
-    // https://en.wikipedia.org/wiki/Gram%E2%80%93Schmidt_process
-    x_axis = e_1 - z_axis * z_axis.transpose() * e_1;
+    // Robust tangent seed: the world axis LEAST aligned with z (argmin_i |z_i|). The fixed-seed
+    // version (always e_1) degenerates when gravity points near that axis -- e.g. a ~90-deg pitched
+    // reset makes x_axis = e_1 - z*(z.e_1) -> 0, so x and y become ill-conditioned and "flip" (the
+    // exact failure that blocks accepting steep attitudes). Picking the least-aligned axis is
+    // well-conditioned for ANY gravity direction -- the SAME rule the S^2 GravityS2Parameterization
+    // uses -- so the world frame stays continuous and valid at arbitrary tilt (up to the gate angle).
+    int min_idx = 0;
+    double min_val = std::abs(z_axis(0));
+    for (int i = 1; i < 3; ++i) {
+      if (std::abs(z_axis(i)) < min_val) {
+        min_val = std::abs(z_axis(i));
+        min_idx = i;
+      }
+    }
+    Eigen::Vector3d seed = Eigen::Vector3d::Zero();
+    seed(min_idx) = 1.0;
+    x_axis = seed - z_axis * (z_axis.transpose() * seed);
     x_axis = x_axis / x_axis.norm();
     y_axis = ov_core::skew_x(z_axis) * x_axis;
     y_axis = y_axis / y_axis.norm();

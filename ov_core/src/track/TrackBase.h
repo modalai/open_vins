@@ -1,5 +1,6 @@
 /*
  * OpenVINS: An Open Platform for Visual-Inertial Research
+ * Copyright (C) 2025-2026 Joao Leonardo Silva Cotta
  * Copyright (C) 2018-2023 Patrick Geneva
  * Copyright (C) 2018-2023 Guoquan Huang
  * Copyright (C) 2018-2023 OpenVINS Contributors
@@ -33,7 +34,9 @@
 #include <opencv2/highgui/highgui.hpp>
 #include <opencv2/opencv.hpp>
 
+#if HAVE_OPENCL
 #include <CL/cl.h>
+#endif
 
 #include "utils/colors.h"
 #include "utils/print.h"
@@ -153,7 +156,9 @@ public:
   /// Setter method for number of active features
   void set_num_features(int _num_features) { num_features = _num_features; }
 
+#if HAVE_OPENCL
   virtual cl_context get_ocl_context() const { return nullptr; }
+#endif
 
 protected:
   /// Camera object which has all calibration in it

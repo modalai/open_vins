@@ -1,5 +1,6 @@
 /*
  * OpenVINS: An Open Platform for Visual-Inertial Research
+ * Copyright (C) 2025-2026 Joao Leonardo Silva Cotta
  * Copyright (C) 2018-2023 Patrick Geneva
  * Copyright (C) 2018-2023 Guoquan Huang
  * Copyright (C) 2018-2023 OpenVINS Contributors
@@ -96,6 +97,11 @@ struct InertialInitializerOptions {
   /// Magnitude we will inflate initial covariance of orientation
   double init_dyn_inflation_orientation = 10.0;
 
+  /// Magnitude we will inflate initial covariance of position. 1.0 = none (default, no behavior
+  /// change); the NEES gold standard shows the free-S2 init's position is mildly overconfident, so
+  /// a value >1 may be warranted -- tune on real reset data rather than baking in a sim-derived one.
+  double init_dyn_inflation_position = 1.0;
+
   /// Magnitude we will inflate initial covariance of velocity
   double init_dyn_inflation_velocity = 10.0;
 
@@ -104,6 +110,13 @@ struct InertialInitializerOptions {
 
   /// Magnitude we will inflate initial covariance of accelerometer bias
   double init_dyn_inflation_bias_accel = 100.0;
+
+  /// Warm-start injection: if true, the dynamic initializer returns the FULL joint covariance over the
+  /// IMU state + all window clones (landmark-marginalized) and the EKF is seeded with those clones, so
+  /// the filter can update immediately instead of cold-starting and re-collecting a fresh window. The
+  /// joint covariance, the gravity re-align similarity transform, and the congruence inflation are all
+  /// extended consistently to the clone blocks. Off => legacy IMU-only (15x15) seed, bit-for-bit.
+  bool init_warmstart_inject = false;
 
   /// Minimum reciprocal condition number acceptable for our covariance recovery (min_sigma / max_sigma <
   /// sqrt(min_reciprocal_condition_number))
@@ -118,6 +131,69 @@ struct InertialInitializerOptions {
   /// Maximum allowed angle (degrees) between measured gravity and expected direction for initialization
   /// This prevents initialization when the platform is upside down or severely tilted
   double init_gravity_max_angle = 45.0;
+
+  /// Maximum allowed gravity-direction angle (degrees) for the STATIC initializer specifically.
+  /// The static initializer assumes a near-level, stationary platform (it injects v~0 with a tight
+  /// covariance); a large tilt usually means the platform is NOT in that regime (hand-launch, ramp,
+  /// aggressive hold), so a confident static seed there would corrupt the filter. Kept SEPARATE from
+  /// init_gravity_max_angle so the dynamic S2 path can stay wide (reset at any attitude) while the
+  /// static path stays tight. Default 5 deg (historically the static value). Set < 0 to instead reuse
+  /// init_gravity_max_angle (legacy coupled behavior).
+  double init_static_gravity_max_angle = 5.0;
+
+  /// Weak prior sigma (m/s^2) pulling the ceres-free dynamic-init S2 gravity toward its +Z seed. Fights
+  /// the gravity<->accel-bias ambiguity and, critically, the flipped-gravity basin: at sigma~0.5 (~3 deg)
+  /// the post-solve flip gate goes 42/50 -> 49/50 in the NEES gold standard with negligible accuracy
+  /// cost (grav err 2.62 vs 2.64 deg). <= 0 disables it. Only used on the ceres-free (S2) dynamic path.
+  double init_dyn_grav_prior_sigma = 0.5;
+
+  /// Post-solve gravity reject gate (deg) for the ceres-free dynamic init: reject if the optimized
+  /// gravity ends up more than this from the expected +Z pole (flip/corruption guard before injection).
+  double init_dyn_grav_gate_deg = 30.0;
+
+  /// Ceres-free (zbft) LM lambda floor (SolverOptions::min_lambda). With the Ceres-parity default
+  /// (1e-12), the free-S2 solve first lets lambda crash ~5 decades below the useful range during its
+  /// easy phase, then pays ~9-12 REJECTED trials (each a full Schur solve + residual pass) climbing
+  /// back when it reaches the gravity<->accel-bias valley. Raising the floor (e.g. 1e-7) trims that
+  /// climb but can cost convergence-flag rate (bench_zbft_s2 fpv shape: 100/100 -> 84-97/100) -- A/B
+  /// on target before changing. Only used on the ceres-free dynamic path.
+  double init_dyn_mle_lm_min_lambda = 1e-12;
+
+  /// Ceres-free (zbft) LM rejected-trial escalation growth (SolverOptions::lm_nu_growth).
+  /// 2.0 is Ceres-exact (lambda *= nu; nu *= 2); larger climbs the valley wall in fewer rejected
+  /// trials, with the same convergence-flag caveat as init_dyn_mle_lm_min_lambda.
+  double init_dyn_mle_lm_nu_growth = 2.0;
+
+  /// Ceres-free (zbft) LM initial lambda (SolverOptions::initial_lambda). 1e-4 mirrors Ceres'
+  /// initial_trust_region_radius=1e4. ORB-SLAM3's inertial-only MAP instead starts HEAVILY damped
+  /// (g2o setUserLambdaInit(1e3)) so the early steps stay short and gradient-like in the
+  /// gravity/accel-bias valley -- an alternative worth A/B-ing on target for reset-heavy profiles.
+  double init_dyn_mle_lm_initial_lambda = 1e-4;
+
+  /// SOFT-RESET bias prior: use the live filter's bg/ba (+ marginal sigmas) threaded through
+  /// VioManager::soft_reset as the dynamic init's bias seeds, CPI linearization points, and a
+  /// per-axis tightened first-pose bias prior. The dominant conditioner of the free-S2
+  /// gravity<->accel-bias valley. Gated by validity/norm/sigma caps below; a rejected prior
+  /// degrades bit-for-bit to the legacy config-seed behavior. Cold boot is unaffected.
+  bool init_dyn_reset_prior_use = true;
+  double init_dyn_reset_prior_max_bg = 0.2;        ///< reject prior if |bg| exceeds this (rad/s)
+  double init_dyn_reset_prior_max_ba = 1.0;        ///< reject prior if |ba| exceeds this (m/s^2)
+  double init_dyn_reset_prior_max_sigma_bg = 0.05; ///< reject if any bg sigma (age-inflated) exceeds this
+  double init_dyn_reset_prior_max_sigma_ba = 0.5;  ///< reject if any ba sigma (age-inflated) exceeds this
+  double init_dyn_reset_prior_sigma_floor_bg = 0.005; ///< floor on the tightened bg prior sigma
+  double init_dyn_reset_prior_sigma_floor_ba = 0.02;  ///< floor on the tightened ba prior sigma
+  double init_dyn_reset_prior_divergence_infl = 3.0;  ///< sigma inflation when the reset was divergence-triggered
+
+  /// MLE function tolerance (relative cost decrease termination). Legacy hardcode was 1e-5
+  /// (kept as the default); Ceres' own default is 1e-6. In shallow gravity-valley regimes
+  /// (weak excitation, short feature tracks) 1e-5 can exit a few iterations early -- tighten
+  /// on target if the injected tilt looks systematically lazy.
+  double init_dyn_mle_ftol = 1e-5;
+
+  /// Hard-freeze ba during a soft-reset re-init ("biases known" mode): ba blocks are
+  /// held constant in the MLE and the injected ba covariance is the (floored) prior variance.
+  /// Requires an ACCEPTED reset prior; default off (the tightened prior alone is the safe mode).
+  bool init_dyn_fix_ba_on_reset = false;
 
   /**
    * @brief This function will load print out all initializer settings loaded.
@@ -140,9 +216,11 @@ struct InertialInitializerOptions {
       parser->parse_config("init_dyn_num_pose", init_dyn_num_pose);
       parser->parse_config("init_dyn_min_deg", init_dyn_min_deg);
       parser->parse_config("init_dyn_inflation_ori", init_dyn_inflation_orientation);
+      parser->parse_config("init_dyn_inflation_pos", init_dyn_inflation_position, false); // optional; keeps default if absent
       parser->parse_config("init_dyn_inflation_vel", init_dyn_inflation_velocity);
       parser->parse_config("init_dyn_inflation_bg", init_dyn_inflation_bias_gyro);
       parser->parse_config("init_dyn_inflation_ba", init_dyn_inflation_bias_accel);
+      parser->parse_config("init_warmstart_inject", init_warmstart_inject, false); // optional; keeps default if absent
       parser->parse_config("init_dyn_min_rec_cond", init_dyn_min_rec_cond);
       std::vector<double> bias_g = {0, 0, 0};
       std::vector<double> bias_a = {0, 0, 0};
@@ -151,6 +229,22 @@ struct InertialInitializerOptions {
       init_dyn_bias_g << bias_g.at(0), bias_g.at(1), bias_g.at(2);
       init_dyn_bias_a << bias_a.at(0), bias_a.at(1), bias_a.at(2);
       parser->parse_config("init_gravity_max_angle", init_gravity_max_angle);
+      parser->parse_config("init_static_gravity_max_angle", init_static_gravity_max_angle, false); // optional; <0 => use init_gravity_max_angle
+      parser->parse_config("init_dyn_grav_prior_sigma", init_dyn_grav_prior_sigma, false);          // optional; <=0 disables the gravity prior
+      parser->parse_config("init_dyn_grav_gate_deg", init_dyn_grav_gate_deg, false);                // optional; post-solve flip-reject gate
+      parser->parse_config("init_dyn_mle_lm_min_lambda", init_dyn_mle_lm_min_lambda, false);        // optional; zbft LM lambda floor
+      parser->parse_config("init_dyn_mle_lm_nu_growth", init_dyn_mle_lm_nu_growth, false);          // optional; zbft LM reject escalation growth
+      parser->parse_config("init_dyn_mle_lm_initial_lambda", init_dyn_mle_lm_initial_lambda, false); // optional; zbft LM initial damping
+      parser->parse_config("init_dyn_reset_prior_use", init_dyn_reset_prior_use, false);             // optional; soft-reset bias prior
+      parser->parse_config("init_dyn_reset_prior_max_bg", init_dyn_reset_prior_max_bg, false);
+      parser->parse_config("init_dyn_reset_prior_max_ba", init_dyn_reset_prior_max_ba, false);
+      parser->parse_config("init_dyn_reset_prior_max_sigma_bg", init_dyn_reset_prior_max_sigma_bg, false);
+      parser->parse_config("init_dyn_reset_prior_max_sigma_ba", init_dyn_reset_prior_max_sigma_ba, false);
+      parser->parse_config("init_dyn_reset_prior_sigma_floor_bg", init_dyn_reset_prior_sigma_floor_bg, false);
+      parser->parse_config("init_dyn_reset_prior_sigma_floor_ba", init_dyn_reset_prior_sigma_floor_ba, false);
+      parser->parse_config("init_dyn_reset_prior_divergence_infl", init_dyn_reset_prior_divergence_infl, false);
+      parser->parse_config("init_dyn_fix_ba_on_reset", init_dyn_fix_ba_on_reset, false);
+      parser->parse_config("init_dyn_mle_ftol", init_dyn_mle_ftol, false);
     }
     PRINT_DEBUG("  - init_window_time: %.2f\n", init_window_time);
     PRINT_DEBUG("  - init_imu_thresh: %.2f\n", init_imu_thresh);
@@ -181,9 +275,11 @@ struct InertialInitializerOptions {
     PRINT_DEBUG("  - init_dyn_num_pose: %d\n", init_dyn_num_pose);
     PRINT_DEBUG("  - init_dyn_min_deg: %.2f\n", init_dyn_min_deg);
     PRINT_DEBUG("  - init_dyn_inflation_ori: %.2e\n", init_dyn_inflation_orientation);
+    PRINT_DEBUG("  - init_dyn_inflation_pos: %.2e\n", init_dyn_inflation_position);
     PRINT_DEBUG("  - init_dyn_inflation_vel: %.2e\n", init_dyn_inflation_velocity);
     PRINT_DEBUG("  - init_dyn_inflation_bg: %.2e\n", init_dyn_inflation_bias_gyro);
     PRINT_DEBUG("  - init_dyn_inflation_ba: %.2e\n", init_dyn_inflation_bias_accel);
+    PRINT_DEBUG("  - init_warmstart_inject: %d\n", init_warmstart_inject);
     PRINT_DEBUG("  - init_dyn_min_rec_cond: %.2e\n", init_dyn_min_rec_cond);
     if (init_dyn_num_pose < 4) {
       PRINT_ERROR(RED "number of requested frames to init not enough!!\n" RESET);
@@ -193,6 +289,20 @@ struct InertialInitializerOptions {
     PRINT_DEBUG("  - init_dyn_bias_g: %.2f, %.2f, %.2f\n", init_dyn_bias_g(0), init_dyn_bias_g(1), init_dyn_bias_g(2));
     PRINT_DEBUG("  - init_dyn_bias_a: %.2f, %.2f, %.2f\n", init_dyn_bias_a(0), init_dyn_bias_a(1), init_dyn_bias_a(2));
     PRINT_DEBUG("  - init_gravity_max_angle: %.2f\n", init_gravity_max_angle);
+    PRINT_DEBUG("  - init_static_gravity_max_angle: %.2f%s\n", init_static_gravity_max_angle,
+                (init_static_gravity_max_angle < 0.0) ? " (<0: uses init_gravity_max_angle)" : "");
+    PRINT_DEBUG("  - init_dyn_grav_prior_sigma: %.3f\n", init_dyn_grav_prior_sigma);
+    PRINT_DEBUG("  - init_dyn_mle_lm_min_lambda: %.3e\n", init_dyn_mle_lm_min_lambda);
+    PRINT_DEBUG("  - init_dyn_mle_lm_nu_growth: %.2f\n", init_dyn_mle_lm_nu_growth);
+    PRINT_DEBUG("  - init_dyn_mle_lm_initial_lambda: %.3e\n", init_dyn_mle_lm_initial_lambda);
+    PRINT_DEBUG("  - init_dyn_reset_prior_use: %d\n", init_dyn_reset_prior_use);
+    PRINT_DEBUG("  - init_dyn_reset_prior gates: |bg|<%.2f |ba|<%.2f sig_bg<%.3f sig_ba<%.3f floors %.3f/%.3f div_infl %.1f\n",
+                init_dyn_reset_prior_max_bg, init_dyn_reset_prior_max_ba, init_dyn_reset_prior_max_sigma_bg,
+                init_dyn_reset_prior_max_sigma_ba, init_dyn_reset_prior_sigma_floor_bg, init_dyn_reset_prior_sigma_floor_ba,
+                init_dyn_reset_prior_divergence_infl);
+    PRINT_DEBUG("  - init_dyn_fix_ba_on_reset: %d\n", init_dyn_fix_ba_on_reset);
+    PRINT_DEBUG("  - init_dyn_mle_ftol: %.1e\n", init_dyn_mle_ftol);
+    PRINT_DEBUG("  - init_dyn_grav_gate_deg: %.2f\n", init_dyn_grav_gate_deg);
   }
 
   // NOISE / CHI2 ============================

@@ -1,5 +1,6 @@
 /*
  * OpenVINS: An Open Platform for Visual-Inertial Research
+ * Copyright (C) 2025-2026 Joao Leonardo Silva Cotta
  * Copyright (C) 2018-2022 Patrick Geneva
  * Copyright (C) 2018-2022 Guoquan Huang
  * Copyright (C) 2018-2022 OpenVINS Contributors
@@ -30,11 +31,40 @@
 #include "feat/Feature.h"
 #include "feat/FeatureDatabase.h"
 #include "utils/opencv_lambda_body.h"
+#include <modal_flow/ocl/StereoMatcherCL.hpp>
 #include "utils/print.h"
 
 using namespace ov_core;
 
 int test_feed_all = 0;
+
+// Compile-time toggle for the per-call [STEREO ZNCC] diagnostic prints in
+// perform_detection_stereo (top-off accept summary, top-off accept=0 per-gate
+// breakdown, mono-promote accept summary, mono-promote accept=0 breakdown).
+// Off by default so production logs stay clean; flip to true when investigating
+// accept-rate / lr_err / margin distributions. The entire stats-and-printf
+// block is dead-stripped under `if constexpr` when false, so there is zero
+// runtime cost in the off configuration.
+static constexpr bool kEnableStereoZnccDiag = false;
+
+
+void TrackOCL::enable_zncc_stereo_matcher(const modal_flow::StereoCalib &calib_in,
+                                          float z_min, float z_max)
+{
+    auto stm = std::make_unique<modal_flow::ocl::StereoMatcherCL>(dev_);
+    stm->set_lr_thresh(5.0f);
+    mgr_.set_stereo_matcher(std::move(stm));
+
+    modal_flow::StereoCalib c = calib_in;
+    c.z_min = z_min;
+    c.z_max = z_max;
+    mgr_.set_stereo_calibration(c);
+
+    stereo_cam_id_left_  = (size_t)c.left;
+    stereo_cam_id_right_ = (size_t)c.right;
+    printf("[TrackOCL] ZNCC-band stereo matcher enabled (src cam %zu -> dst cam %zu, z=[%.2f,%.1f]m)\n",
+           stereo_cam_id_left_, stereo_cam_id_right_, (double)z_min, (double)z_max);
+}
 
 void TrackOCL::feed_new_camera(const CameraData &message)
 {
@@ -58,14 +88,33 @@ void TrackOCL::feed_new_camera(const CameraData &message)
 
     size_t num_images = message.images.size();
 
+    // Stability guard: drop single-cam "MONO-fallback" messages when configured
+    // for stereo. CameraQueueFusion emits them at startup before both cam frames
+    // have landed; routing them to feed_monocular has triggered cv::resize() on
+    // empty masks and OclPyramidRing ABA throws. Stereo VIO can't use single-cam
+    // frames anyway. One-shot warning so we know if they fire at steady state.
+    if (use_stereo && num_images < 2)
+    {
+        static bool warned = false;
+        if (!warned) {
+            fprintf(stderr,
+                    "[TrackOCL] dropping MONO-fallback CameraData (num_images=%zu) "
+                    "because TrackOCL is in stereo mode -- this should only happen at "
+                    "startup before both cams have landed a frame. Subsequent drops "
+                    "are silent.\n", num_images);
+            warned = true;
+        }
+        return;
+    }
+
     for (size_t msg_id = 0; msg_id < num_images; msg_id++)
     {
         // Lock this data feed for this camera
         size_t cam_id = message.sensor_ids.at(msg_id);
         std::lock_guard<std::mutex> lck(mtx_feeds.at(cam_id));
-        
+
         modal_flow::Frame frame = message.img_frames[msg_id];
-    
+
         // upload image to flow manager
         if (img_buf_next_[cam_id]) {
             if (img_buf_prev_[cam_id]) {
@@ -238,11 +287,9 @@ void TrackOCL::feed_stereo(const CameraData &message, size_t msg_id_left, size_t
     std::lock_guard<std::mutex> lck1(mtx_feeds.at(cam_id_left));
     std::lock_guard<std::mutex> lck2(mtx_feeds.at(cam_id_right));
 
-    // Get our image objects for this image
-    cv::Mat img_left = img_curr.at(cam_id_left);
-    cv::Mat img_right = img_curr.at(cam_id_right);
-    std::vector<cv::Mat> imgpyr_left = img_pyramid_curr.at(cam_id_left);
-    std::vector<cv::Mat> imgpyr_right = img_pyramid_curr.at(cam_id_right);
+    // Get our mask objects for this image.
+    // NOTE: the OCL path keeps images/pyramids on the GPU (img_buf_*_), so the CPU
+    // img_curr / img_pyramid_curr maps are never populated here (unlike CPU TrackKLT).
     cv::Mat mask_left = message.masks.at(msg_id_left);
     cv::Mat mask_right = message.masks.at(msg_id_right);
 
@@ -254,29 +301,12 @@ void TrackOCL::feed_stereo(const CameraData &message, size_t msg_id_left, size_t
     int cam_width_right  = std::get<0>(dims_right);
     int cam_height_right = std::get<1>(dims_right);
 
-    modal_flow::Frame frame_left  = message.img_frames[msg_id_left];
-    modal_flow::Frame frame_right = message.img_frames[msg_id_right];
-    int64_t t1 = _apps_time_monotonic_ns();
-
-    // upload image to flow manager
-    if (img_buf_next_[cam_id_left]) {
-        if (img_buf_prev_[cam_id_left]) {
-            mgr_.release_pyramid((modal_flow::CameraId)cam_id_left, img_buf_prev_[cam_id_left]);
-        }
-        img_buf_prev_[cam_id_left] = img_buf_next_[cam_id_left];
-    }
-    img_buf_next_[cam_id_left] = mgr_.acquire_pyramid_buf((modal_flow::CameraId)cam_id_left);
-    mgr_.upload_frame_to_buf(frame_left, img_buf_next_[cam_id_left]);
+    // NOTE: do NOT re-upload frames here. feed_new_camera() already swapped prev<-next
+    // and uploaded the CURRENT frame for BOTH cameras before dispatching to feed_stereo().
+    // Re-uploading collapses prev==next (both = current frame), so temporal KLT matches a
+    // frame against itself -> 0.000 disparity (stuck in ZUPT). feed_monocular() relies on
+    // the same feed_new_camera() upload; mirror that behavior here.
     
-    if (img_buf_next_[cam_id_right]) {
-        if (img_buf_prev_[cam_id_right]) {
-            mgr_.release_pyramid((modal_flow::CameraId)cam_id_right, img_buf_prev_[cam_id_right]);
-        }
-        img_buf_prev_[cam_id_right] = img_buf_next_[cam_id_right];
-    }
-    img_buf_next_[cam_id_right] = mgr_.acquire_pyramid_buf((modal_flow::CameraId)cam_id_right);
-    mgr_.upload_frame_to_buf(frame_right, img_buf_next_[cam_id_right]);
-
     rT2 = boost::posix_time::microsec_clock::local_time();
     int64_t t2 = _apps_time_monotonic_ns();
 
@@ -288,10 +318,7 @@ void TrackOCL::feed_stereo(const CameraData &message, size_t msg_id_left, size_t
                                  cam_id_left, cam_id_right, good_left, good_right, good_ids_left, good_ids_right);
         // Save the current image and pyramid
         std::lock_guard<std::mutex> lckv(mtx_last_vars);
-        img_last[cam_id_left] = img_left;
-        img_last[cam_id_right] = img_right;
-        img_pyramid_last[cam_id_left] = imgpyr_left;
-        img_pyramid_last[cam_id_right] = imgpyr_right;
+        // img_last / img_pyramid_last are unused by the OCL tracker (images stay on the GPU)
         img_mask_last[cam_id_left] = mask_left;
         img_mask_last[cam_id_right] = mask_right;
         pts_last[cam_id_left] = good_left;
@@ -333,10 +360,7 @@ void TrackOCL::feed_stereo(const CameraData &message, size_t msg_id_left, size_t
     // If any of our masks are empty, that means we didn't have enough to do ransac, so just return
     if (mask_ll.empty() && mask_rr.empty()) {
         std::lock_guard<std::mutex> lckv(mtx_last_vars);
-        img_last[cam_id_left] = img_left;
-        img_last[cam_id_right] = img_right;
-        img_pyramid_last[cam_id_left] = imgpyr_left;
-        img_pyramid_last[cam_id_right] = imgpyr_right;
+        // img_last / img_pyramid_last are unused by the OCL tracker (images stay on the GPU)
         img_mask_last[cam_id_left] = mask_left;
         img_mask_last[cam_id_right] = mask_right;
         pts_last[cam_id_left].clear();
@@ -372,7 +396,7 @@ void TrackOCL::feed_stereo(const CameraData &message, size_t msg_id_left, size_t
         if (mask_ll[i] && found_right && mask_rr[index_right]) {
         // Ensure we do not have any bad KLT tracks (i.e., points are negative)
         if (pts_right_new.at(index_right).pt.x < 0 || pts_right_new.at(index_right).pt.y < 0 ||
-            (int)pts_right_new.at(index_right).pt.x >= img_right.cols || (int)pts_right_new.at(index_right).pt.y >= img_right.rows)
+            (int)pts_right_new.at(index_right).pt.x >= cam_width_right || (int)pts_right_new.at(index_right).pt.y >= cam_height_right)
             continue;
         good_left.push_back(pts_left_new.at(i));
         good_right.push_back(pts_right_new.at(index_right));
@@ -389,8 +413,8 @@ void TrackOCL::feed_stereo(const CameraData &message, size_t msg_id_left, size_t
     // Loop through all right points
     for (size_t i = 0; i < pts_right_new.size(); i++) {
         // Ensure we do not have any bad KLT tracks (i.e., points are negative)
-        if (pts_right_new.at(i).pt.x < 0 || pts_right_new.at(i).pt.y < 0 || (int)pts_right_new.at(i).pt.x >= img_right.cols ||
-            (int)pts_right_new.at(i).pt.y >= img_right.rows)
+        if (pts_right_new.at(i).pt.x < 0 || pts_right_new.at(i).pt.y < 0 || (int)pts_right_new.at(i).pt.x >= cam_width_right ||
+            (int)pts_right_new.at(i).pt.y >= cam_height_right)
         continue;
         // See if we have the same feature in the right
         bool added_already = (std::find(good_ids_right.begin(), good_ids_right.end(), ids_right_old.at(i)) != good_ids_right.end());
@@ -417,10 +441,7 @@ void TrackOCL::feed_stereo(const CameraData &message, size_t msg_id_left, size_t
     // Move forward in time
     {
         std::lock_guard<std::mutex> lckv(mtx_last_vars);
-        img_last[cam_id_left] = img_left;
-        img_last[cam_id_right] = img_right;
-        img_pyramid_last[cam_id_left] = imgpyr_left;
-        img_pyramid_last[cam_id_right] = imgpyr_right;
+        // img_last / img_pyramid_last are unused by the OCL tracker (images stay on the GPU)
         img_mask_last[cam_id_left] = mask_left;
         img_mask_last[cam_id_right] = mask_right;
         pts_last[cam_id_left] = good_left;
@@ -601,7 +622,7 @@ void TrackOCL::perform_detection_monocular(modal_flow::BufferId& buf_id, const c
 }
 
 void TrackOCL::perform_detection_stereo(modal_flow::BufferId buf_id_left, modal_flow::BufferId buf_id_right,
-                                        const cv::Mat &mask0, const cv::Mat &mask1, 
+                                        const cv::Mat &mask0, const cv::Mat &mask1,
                                         size_t cam_id_left, size_t cam_id_right,
                                         std::vector<cv::KeyPoint> &pts0, std::vector<cv::KeyPoint> &pts1,
                                         std::vector<size_t> &ids0, std::vector<size_t> &ids1)
@@ -724,63 +745,279 @@ void TrackOCL::perform_detection_stereo(modal_flow::BufferId buf_id_left, modal_
         }
 
 
-        // TODO: Project points from the left frame into the right frame
-        // TODO: This will not work for large baseline systems.....
-        // TODO: If we had some depth estimates we could do a better projection
-        // TODO: Or project and search along the epipolar line??
+        // Project the new left features into the right image via the ZNCC
+        // epipolar-band matcher (set up once at startup by
+        // enable_zncc_stereo_matcher). The matcher does forward+reverse ZNCC
+        // along the calibrated epipolar curve and gates on peak / margin /
+        // L-R round-trip consistency; per-feature confidence is stashed in
+        // stereo_confidence_ for downstream EKF measurement weighting.
         std::vector<cv::KeyPoint> kpts1_new;
-        std::vector<cv::Point2f> pts1_new;
+        std::vector<cv::Point2f>  pts1_new;
         kpts1_new = kpts0_new;
-        pts1_new = pts0_new;
+        pts1_new  = pts0_new;
 
-        // If we have points, do KLT tracking to get the valid projections into the right image
-        if (!pts0_new.empty()) {
-            // Do our KLT tracking from the left to the right frame of reference
-            // NOTE: we have a pretty big window size here since our projection might be bad
-            // NOTE: but this might cause failure in cases of repeated textures (eg. checkerboard)
-            std::vector<uchar> mask;
-            perform_matching(img_buf_next_[cam_id_left], img_buf_next_[cam_id_right], kpts0_new, kpts1_new, cam_id_left, cam_id_right, mask);
-            std::vector<float> error;
+        if (pts0_new.empty()) {
+            // nothing to project -- fall through to the right-image dedupe loop below
+        } else if (cam_id_left  == stereo_cam_id_left_ &&
+                   cam_id_right == stereo_cam_id_right_) {
+            // Pre-compute normalized cam0 bearings for every new left feature.
+            // camera_calib already exists in the base class and exposes the
+            // ov_core fisheye/radtan undistort -- exact match for what the
+            // GPU matcher expects (it does no iterative undistort itself).
+            modal_flow::StereoMatchInput in{};
+            in.left_cam_id   = (modal_flow::CameraId)cam_id_left;
+            in.right_cam_id  = (modal_flow::CameraId)cam_id_right;
+            // Match against the buffer this function was called for, NOT
+            // img_buf_next_. pts0_new and buf_id_* refer to the same frame
+            // (prev on subsequent-frame calls). Using img_buf_next_ would
+            // align positions to prev but images to next -- lr_err then
+            // measures inter-frame motion (~8-60 px) instead of the round-trip
+            // residual. perform_matching below carries accepted prev-frame
+            // pairs forward to current via temporal KLT.
+            in.left_img_buf  = buf_id_left;
+            in.right_img_buf = buf_id_right;
+            in.left_points  .reserve(pts0_new.size());
+            in.left_bearings.reserve(pts0_new.size());
+            for (const auto &p : pts0_new) {
+                Eigen::Vector2f n = camera_calib.at(cam_id_left)->undistort_f(Eigen::Vector2f(p.x, p.y));
+                in.left_points  .push_back({p.x, p.y, 0.f});
+                in.left_bearings.push_back({n(0), n(1), 0.f});
+            }
 
-            // TODO: implement left right matching
+            modal_flow::StereoMatchResult res = mgr_.match_stereo(in);
 
-            // cv::TermCriteria term_crit = cv::TermCriteria(cv::TermCriteria::COUNT | cv::TermCriteria::EPS, 30, 0.01);
-            // cv::calcOpticalFlowPyrLK(img0pyr, img1pyr, pts0_new, pts1_new, mask, error, win_size, pyr_levels, term_crit,
-            //                         cv::OPTFLOW_USE_INITIAL_FLOW);
+            // Per-call validation print so we can see L<->R correlation working live.
+            // Gated by kEnableStereoZnccDiag (compile-time, off in production).
+            if constexpr (kEnableStereoZnccDiag) {
+                int    n_accept = 0;
+                double sum_disp = 0, sum_peak = 0, sum_lr = 0;
+                for (size_t i = 0; i < pts0_new.size(); i++) {
+                    if (!res.status[i]) continue;
+                    float dx = res.right_points[i].x - pts0_new[i].x;
+                    float dy = res.right_points[i].y - pts0_new[i].y;
+                    sum_disp += std::sqrt(dx * dx + dy * dy);
+                    sum_peak += res.peak_zncc[i];
+                    sum_lr   += res.lr_err[i];
+                    n_accept++;
+                }
+                if (n_accept > 0) {
+                    printf("[STEREO ZNCC] cam %zu->%zu  new=%zu  accepted=%d (%.0f%%)  "
+                           "disp=%.1fpx  peakZNCC=%.2f  lrErr=%.2fpx\n",
+                           cam_id_left, cam_id_right, pts0_new.size(), n_accept,
+                           100.0 * n_accept / pts0_new.size(),
+                           sum_disp / n_accept, sum_peak / n_accept, sum_lr / n_accept);
+                } else {
+                    // Per-gate breakdown when no features accept. Thresholds must
+                    // mirror StereoMatcherCL's current settings (0.60 / 0.10 / 5.0).
+                    // We report both marginal counts and the joint (peak∧margin and
+                    // peak∧margin∧lr) -- marginals add to N even when joint is 0
+                    // because the three gates can have disjoint pass populations.
+                    const float zncc_min   = 0.60f;
+                    const float margin_min = 0.10f;
+                    const float lr_thresh  = 5.0f;
+                    int    n_oob = 0, n_peak_ok = 0, n_marg_ok = 0, n_lr_ok = 0;
+                    int    n_joint_pm = 0, n_full = 0;
+                    int    n_valid = 0;
+                    float  peak_min =  1e9f, peak_max = -1e9f, peak_sum = 0.f;
+                    float  marg_min =  1e9f, marg_max = -1e9f, marg_sum = 0.f;
+                    float  lr_min   =  1e9f, lr_max   = -1e9f, lr_sum   = 0.f;
+                    for (size_t i = 0; i < pts0_new.size(); i++) {
+                        const float p  = res.peak_zncc[i];
+                        const float m  = res.margin[i];
+                        const float lr = res.lr_err[i];
+                        if (p <= -1.5f) { n_oob++; continue; }
+                        n_valid++;
+                        if (p > peak_max) peak_max = p; if (p < peak_min) peak_min = p; peak_sum += p;
+                        if (m > marg_max) marg_max = m; if (m < marg_min) marg_min = m; marg_sum += m;
+                        if (lr > lr_max)  lr_max  = lr; if (lr < lr_min)  lr_min  = lr; lr_sum  += lr;
+                        const bool peak_ok = (p  >= zncc_min);
+                        const bool marg_ok = (m  >= margin_min);
+                        const bool lr_ok   = (lr <  lr_thresh);
+                        if (peak_ok) n_peak_ok++;
+                        if (marg_ok) n_marg_ok++;
+                        if (lr_ok)   n_lr_ok++;
+                        if (peak_ok && marg_ok)            n_joint_pm++;
+                        if (peak_ok && marg_ok && lr_ok)   n_full++;
+                    }
+                    printf("[STEREO ZNCC] cam %zu->%zu  new=%zu  accepted=0  oob=%d  "
+                           "peak>=%.2f:%d/%d  margin>=%.2f:%d/%d  lr<%.1fpx:%d/%d  "
+                           "JOINT pm:%d/%d  full:%d/%d\n",
+                           cam_id_left, cam_id_right, pts0_new.size(), n_oob,
+                           zncc_min, n_peak_ok, n_valid, margin_min, n_marg_ok, n_valid,
+                           lr_thresh, n_lr_ok, n_valid,
+                           n_joint_pm, n_valid, n_full, n_valid);
+                    if (n_valid > 0) {
+                        printf("[STEREO ZNCC]   new stats  peak[%.2f/%.2f/%.2f]  "
+                               "margin[%.2f/%.2f/%.2f]  lr_px[%.1f/%.1f/%.1f]\n",
+                               peak_min, peak_sum / n_valid, peak_max,
+                               marg_min, marg_sum / n_valid, marg_max,
+                               lr_min,   lr_sum   / n_valid, lr_max);
+                    }
+                }
+            }
 
-            // Loop through and record only ones that are valid
             for (size_t i = 0; i < pts0_new.size(); i++) {
+                bool oob_left = ((int)pts0_new.at(i).x < 0 || (int)pts0_new.at(i).x >= img_width0 ||
+                                 (int)pts0_new.at(i).y < 0 || (int)pts0_new.at(i).y >= img_height0);
+                if (oob_left) continue;
 
-                // Check to see if the feature is out of bounds (oob) in either image
-                bool oob_left = ((int)pts0_new.at(i).x < 0 || (int)pts0_new.at(i).x >= img_width0 || (int)pts0_new.at(i).y < 0 ||
-                                (int)pts0_new.at(i).y >= img_height0);
-                bool oob_right = ((int)pts1_new.at(i).x < 0 || (int)pts1_new.at(i).x >= img_width1 || (int)pts1_new.at(i).y < 0 ||
-                                (int)pts1_new.at(i).y >= img_height1);
+                if (res.status[i]) {
+                    cv::Point2f rpt(res.right_points[i].x, res.right_points[i].y);
+                    bool oob_right = ((int)rpt.x < 0 || (int)rpt.x >= img_width1 ||
+                                      (int)rpt.y < 0 || (int)rpt.y >= img_height1);
+                    if (!oob_right) {
+                        kpts0_new.at(i).pt = pts0_new.at(i);
+                        kpts1_new.at(i).pt = rpt;
+                        pts0.push_back(kpts0_new.at(i));
+                        pts1.push_back(kpts1_new.at(i));
+                        size_t temp = ++currid;
+                        ids0.push_back(temp);
+                        ids1.push_back(temp);
+                        // Stash confidence for the eventual EKF measurement-noise weighting.
+                        stereo_confidence_[temp] = StereoConfidence{
+                            res.peak_zncc[i], res.margin[i], res.lr_err[i]};
+                        continue;
+                    }
+                }
+                // Match rejected (or right oob) -> still record as a mono left feature.
+                kpts0_new.at(i).pt = pts0_new.at(i);
+                pts0.push_back(kpts0_new.at(i));
+                ids0.push_back(++currid);
+            }
+        } else {
+            // ZNCC matcher not bound to this cam pair -- unreachable in normal
+            // operation since enable_zncc_stereo_matcher is called at startup
+            // whenever use_stereo is true. As a defensive fallback, record the
+            // FAST corners as mono-left features so they're temporally tracked;
+            // the mono->stereo promote pass below will upgrade them once the
+            // matcher is bound.
+            for (size_t i = 0; i < pts0_new.size(); i++) {
+                bool oob_left = ((int)pts0_new.at(i).x < 0 || (int)pts0_new.at(i).x >= img_width0 ||
+                                 (int)pts0_new.at(i).y < 0 || (int)pts0_new.at(i).y >= img_height0);
+                if (oob_left) continue;
+                kpts0_new.at(i).pt = pts0_new.at(i);
+                pts0.push_back(kpts0_new.at(i));
+                ids0.push_back(++currid);
+            }
+        }
+    }
 
-                // Check to see if it there is already a feature in the right image at this location
-                //  1) If this is not already in the right image, then we should treat it as a stereo
-                //  2) Otherwise we will treat this as just a monocular track of the feature
-                // TODO: we should check to see if we can combine this new feature and the one in the right
-                // TODO: seems if reject features which overlay with right features already we have very poor tracking perf
-                if (!oob_left && !oob_right && mask[i] == 1) {
-                    // update the uv coordinates
-                    kpts0_new.at(i).pt = pts0_new.at(i);
-                    kpts1_new.at(i).pt = pts1_new.at(i);
-                    // append the new uv coordinate
-                    pts0.push_back(kpts0_new.at(i));
-                    pts1.push_back(kpts1_new.at(i));
-                    // move id forward and append this new point
-                    size_t temp = ++currid;
-                    ids0.push_back(temp);
-                    ids1.push_back(temp);
-                } else if (!oob_left) {
-                    // update the uv coordinates
-                    kpts0_new.at(i).pt = pts0_new.at(i);
-                    // append the new uv coordinate
-                    pts0.push_back(kpts0_new.at(i));
-                    // move id forward and append this new point
-                    size_t temp = ++currid;
-                    ids0.push_back(temp);
+    // Mono->stereo promote pass: re-run match_stereo on every existing mono-left
+    // track (ids0[i] not in ids1) and upgrade successful matches to full stereo
+    // pairs by appending the right point to pts1/ids1 with the same id. The
+    // right-image dedup loop below preserves features whose id is in ids0 via
+    // its is_stereo branch, so newly-promoted pairs survive cleanup.
+    if (cam_id_left  == stereo_cam_id_left_ &&
+        cam_id_right == stereo_cam_id_right_ &&
+        !pts0.empty())
+    {
+        std::unordered_set<size_t> right_ids(ids1.begin(), ids1.end());
+
+        modal_flow::StereoMatchInput in{};
+        in.left_cam_id   = (modal_flow::CameraId)cam_id_left;
+        in.right_cam_id  = (modal_flow::CameraId)cam_id_right;
+        // Use this function's buf_id parameters; see the longer comment on the
+        // top-off match call above for why img_buf_next_ would mis-align.
+        in.left_img_buf  = buf_id_left;
+        in.right_img_buf = buf_id_right;
+
+        // Map kept index in `in` -> index in pts0/ids0 so we can write back.
+        std::vector<size_t> src_idx;
+        src_idx.reserve(pts0.size());
+        in.left_points  .reserve(pts0.size());
+        in.left_bearings.reserve(pts0.size());
+        for (size_t i = 0; i < pts0.size(); i++) {
+            if (right_ids.count(ids0[i])) continue;            // already stereo
+            const cv::Point2f &p = pts0[i].pt;
+            // Skip features too close to the border for the matcher's 11x11 patch.
+            // BORDER=12 in the kernel; use a safe 15 here. Out-of-bounds and edge
+            // features cause the matcher to return the OOB sentinel anyway -- skipping
+            // them up-front saves a kernel slot and keeps the accept-rate print honest.
+            if (p.x < 15 || p.x >= img_width0 - 15 ||
+                p.y < 15 || p.y >= img_height0 - 15) continue;
+            Eigen::Vector2f n = camera_calib.at(cam_id_left)->undistort_f(Eigen::Vector2f(p.x, p.y));
+            in.left_points  .push_back({p.x, p.y, 0.f});
+            in.left_bearings.push_back({n(0), n(1), 0.f});
+            src_idx.push_back(i);
+        }
+
+        if (!in.left_points.empty()) {
+            modal_flow::StereoMatchResult res = mgr_.match_stereo(in);
+            // Accumulators are only consumed by the kEnableStereoZnccDiag print
+            // block below; tagged maybe_unused so off-builds don't warn.
+            [[maybe_unused]] int    n_promote = 0;
+            [[maybe_unused]] double sum_disp = 0, sum_peak = 0, sum_lr = 0;
+            for (size_t k = 0; k < in.left_points.size(); k++) {
+                if (!res.status[k]) continue;
+                cv::Point2f rpt(res.right_points[k].x, res.right_points[k].y);
+                if ((int)rpt.x < 0 || (int)rpt.x >= img_width1 ||
+                    (int)rpt.y < 0 || (int)rpt.y >= img_height1) continue;
+                size_t i = src_idx[k];
+                cv::KeyPoint rkpt = pts0[i]; // copy keypoint attributes (size, octave, etc.)
+                rkpt.pt = rpt;
+                pts1.push_back(rkpt);
+                ids1.push_back(ids0[i]);     // SAME id == becomes a stereo pair
+                stereo_confidence_[ids0[i]] = StereoConfidence{
+                    res.peak_zncc[k], res.margin[k], res.lr_err[k]};
+                float dx = rpt.x - pts0[i].pt.x;
+                float dy = rpt.y - pts0[i].pt.y;
+                sum_disp += std::sqrt(dx * dx + dy * dy);
+                sum_peak += res.peak_zncc[k];
+                sum_lr   += res.lr_err[k];
+                n_promote++;
+            }
+            if constexpr (kEnableStereoZnccDiag) {
+                if (n_promote > 0) {
+                    printf("[STEREO ZNCC] mono->stereo promote: %d/%zu (%.0f%%)  "
+                           "disp=%.1fpx  peakZNCC=%.2f  lrErr=%.2fpx  (cam %zu->%zu)\n",
+                           n_promote, in.left_points.size(),
+                           100.0 * n_promote / in.left_points.size(),
+                           sum_disp / n_promote, sum_peak / n_promote, sum_lr / n_promote,
+                           cam_id_left, cam_id_right);
+                } else {
+                    // Mirrors the per-gate breakdown on the new-features path; see the
+                    // comment there for why we report joint counts alongside marginals.
+                    const float zncc_min   = 0.60f;
+                    const float margin_min = 0.10f;
+                    const float lr_thresh  = 5.0f;
+                    int    n_oob = 0, n_peak_ok = 0, n_marg_ok = 0, n_lr_ok = 0;
+                    int    n_joint_pm = 0, n_full = 0;
+                    int    n_valid = 0;
+                    float  peak_min =  1e9f, peak_max = -1e9f, peak_sum = 0.f;
+                    float  marg_min =  1e9f, marg_max = -1e9f, marg_sum = 0.f;
+                    float  lr_min   =  1e9f, lr_max   = -1e9f, lr_sum   = 0.f;
+                    for (size_t k = 0; k < in.left_points.size(); k++) {
+                        const float p  = res.peak_zncc[k];
+                        const float m  = res.margin[k];
+                        const float lr = res.lr_err[k];
+                        if (p <= -1.5f) { n_oob++; continue; }
+                        n_valid++;
+                        if (p > peak_max) peak_max = p; if (p < peak_min) peak_min = p; peak_sum += p;
+                        if (m > marg_max) marg_max = m; if (m < marg_min) marg_min = m; marg_sum += m;
+                        if (lr > lr_max)  lr_max  = lr; if (lr < lr_min)  lr_min  = lr; lr_sum  += lr;
+                        const bool peak_ok = (p  >= zncc_min);
+                        const bool marg_ok = (m  >= margin_min);
+                        const bool lr_ok   = (lr <  lr_thresh);
+                        if (peak_ok) n_peak_ok++;
+                        if (marg_ok) n_marg_ok++;
+                        if (lr_ok)   n_lr_ok++;
+                        if (peak_ok && marg_ok)            n_joint_pm++;
+                        if (peak_ok && marg_ok && lr_ok)   n_full++;
+                    }
+                    printf("[STEREO ZNCC] mono->stereo promote: 0/%zu  oob=%d  "
+                           "peak>=%.2f:%d/%d  margin>=%.2f:%d/%d  lr<%.1fpx:%d/%d  "
+                           "JOINT pm:%d/%d  full:%d/%d\n",
+                           in.left_points.size(), n_oob,
+                           zncc_min, n_peak_ok, n_valid, margin_min, n_marg_ok, n_valid,
+                           lr_thresh, n_lr_ok, n_valid,
+                           n_joint_pm, n_valid, n_full, n_valid);
+                    if (n_valid > 0) {
+                        printf("[STEREO ZNCC]   promote stats  peak[%.2f/%.2f/%.2f]  "
+                               "margin[%.2f/%.2f/%.2f]  lr_px[%.1f/%.1f/%.1f]\n",
+                               peak_min, peak_sum / n_valid, peak_max,
+                               marg_min, marg_sum / n_valid, marg_max,
+                               lr_min,   lr_sum   / n_valid, lr_max);
+                    }
                 }
             }
         }

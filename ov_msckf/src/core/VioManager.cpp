@@ -1,5 +1,6 @@
 /*
  * OpenVINS: An Open Platform for Visual-Inertial Research
+ * Copyright (C) 2025-2026 Joao Leonardo Silva Cotta
  * Copyright (C) 2018-2023 Patrick Geneva
  * Copyright (C) 2018-2023 Guoquan Huang
  * Copyright (C) 2018-2023 OpenVINS Contributors
@@ -26,7 +27,9 @@
 #include "feat/FeatureInitializer.h"
 #include "track/TrackAruco.h"
 #include "track/TrackDescriptor.h"
+#if OV_HAVE_MODAL_FLOW
 #include "track/TrackOCL/TrackOCL.h"
+#endif
 #ifndef DISABLE_TRACK_KLT
 #include "track/TrackKLT.h"
 #endif
@@ -69,6 +72,35 @@ VioManager::VioManager(VioManagerOptions &params_) : thread_init_running(false),
   cv::setNumThreads(params.num_opencv_threads);
   cv::setRNGSeed(0);
 
+  // Forward manager-level knobs consumed inside the state/updaters
+  params.state_options.epoch_bridge_bias_cols = params.epoch_bridge_bias_cols;
+
+  // Shutter declarations decide which cameras carry an ESTIMATED readout state under
+  // calib_cam_readout (undeclared legacy rigs infer from a nonzero readout value)
+  for (int i = 0; i < params.state_options.num_cameras; i++) {
+    const bool rolling = params.camera_shutter_rolling.count((size_t)i)
+                             ? params.camera_shutter_rolling.at((size_t)i)
+                             : (params.camera_readout_time.count((size_t)i) && params.camera_readout_time.at((size_t)i) != 0.0);
+    params.state_options.camera_estimate_readout[(size_t)i] = rolling;
+  }
+
+  // Config-drift guard: an unsynced multi-camera rig running WITHOUT epoch-anchored cloning
+  // clones at every camera's frame time, so the shared window covers only window/N seconds per
+  // camera -- no track can reach max-track length (SLAM starves at zero features forever) and
+  // near-hover MSCKF triangulation collapses with the baseline. This is exactly what a STALE
+  // deployed estimator_config.yaml (missing the async block, epoch_mode defaulting to false)
+  // looks like, and it dead-reckons into a health auto-reset loop on hardware.
+  if (params.state_options.num_cameras >= 2 && !params.use_stereo && !params.epoch_mode) {
+    PRINT_WARNING(RED "=======================================================================\n" RESET);
+    PRINT_WARNING(RED "VioManager(): %d UNSYNCED cameras with epoch_mode DISABLED!\n" RESET, params.state_options.num_cameras);
+    PRINT_WARNING(RED "Per-frame cloning divides the clone window across cameras: SLAM features\n" RESET);
+    PRINT_WARNING(RED "cannot reach max-track length and MSCKF triangulation loses its baseline.\n" RESET);
+    PRINT_WARNING(RED "Set epoch_mode: true (async rigs) or use_stereo: true (synced pairs).\n" RESET);
+    PRINT_WARNING(RED "If you DID set it, the DEPLOYED estimator_config.yaml is an older file\n" RESET);
+    PRINT_WARNING(RED "that lacks the async block -- regenerate the on-target config.\n" RESET);
+    PRINT_WARNING(RED "=======================================================================\n" RESET);
+  }
+
   // Create the state!!
   state = std::make_shared<State>(params.state_options);
 
@@ -84,21 +116,75 @@ VioManager::VioManager(VioManagerOptions &params_) : thread_init_running(false),
   state->_calib_imu_ACCtoIMU->set_value(params.q_ACCtoIMU);
   state->_calib_imu_ACCtoIMU->set_fej(params.q_ACCtoIMU);
 
-  // Timeoffset from camera to IMU
-  Eigen::VectorXd temp_camimu_dt;
-  temp_camimu_dt.resize(1);
-  temp_camimu_dt(0) = params.calib_camimu_dt;
-  state->_calib_dt_CAMtoIMU->set_value(temp_camimu_dt);
-  state->_calib_dt_CAMtoIMU->set_fej(temp_camimu_dt);
-
   // Loop through and load each of the cameras
   state->_cam_intrinsics_cameras = params.camera_intrinsics;
   for (int i = 0; i < state->_options.num_cameras; i++) {
+
+    // Timeoffset from this camera to IMU (t_imu = t_cam_i + t_off_i); ref cam fills the legacy alias
+    Eigen::VectorXd dt_val(1);
+    dt_val(0) = params.camera_imu_dt.count(i) ? params.camera_imu_dt.at(i) : params.calib_camimu_dt;
+    state->cam_imu_dt_var((size_t)i)->set_value(dt_val);
+    state->cam_imu_dt_var((size_t)i)->set_fej(dt_val);
+
     state->_cam_intrinsics.at(i)->set_value(params.camera_intrinsics.at(i)->get_value());
     state->_cam_intrinsics.at(i)->set_fej(params.camera_intrinsics.at(i)->get_value());
     state->_calib_IMUtoCAM.at(i)->set_value(params.camera_extrinsics.at(i));
     state->_calib_IMUtoCAM.at(i)->set_fej(params.camera_extrinsics.at(i));
+
+    // Rolling shutter readout time (0 = global shutter)
+    Eigen::VectorXd readout_val(1);
+    readout_val(0) = params.camera_readout_time.count(i) ? params.camera_readout_time.at(i) : 0.0;
+    state->_calib_camera_readout.at(i)->set_value(readout_val);
+    state->_calib_camera_readout.at(i)->set_fej(readout_val);
   }
+
+  // The initializer runs in the reference camera's clock
+  params.init_options.calib_camimu_dt = state->cam_imu_dt_ref();
+
+  // Declared nominal frame rates seed the rate estimators that otherwise need frames to settle:
+  // the epoch binding horizon runs at design width from the FIRST reference frame (fresh start
+  // and every hard reset), instead of a 50ms bootstrap guess.
+  {
+    const int ref_id = params.state_options.cam_imu_dt_ref_camid;
+    if (params.camera_fps.count((size_t)ref_id) && params.camera_fps.at((size_t)ref_id) > 0.0) {
+      ref_period_ema = 1.0 / params.camera_fps.at((size_t)ref_id);
+    }
+
+    // Epoch-anchoring constraint: the reference must be the FASTEST declared camera. A slower
+    // reference makes a faster camera deliver >1 frame per epoch; the extras hit the
+    // one-frame-per-(camera,epoch) rule and fall back to their own clones, fragmenting the
+    // window into mixed epoch/fallback times -- the fast camera's tracks split across them,
+    // max-track/SLAM graduation starves, and the few surviving MSCKF features drag the
+    // calibration (observed on hardware with ref=30Hz vs 42Hz: calib random-walk, divergence).
+    if (params.epoch_mode) {
+      for (auto const &fps : params.camera_fps) {
+        if (params.camera_fps.count((size_t)ref_id) && fps.second > params.camera_fps.at((size_t)ref_id) + 1e-6) {
+          PRINT_WARNING(RED "VioManager(): epoch reference cam%d (%.1f fps) is SLOWER than cam%zu (%.1f fps)!\n" RESET, ref_id,
+                        params.camera_fps.at((size_t)ref_id), fps.first, fps.second);
+          PRINT_WARNING(RED "\tExpect epoch-fallback churn and starved updates; set cam_imu_dt_ref_camid to the fastest camera.\n" RESET);
+        }
+      }
+    }
+  }
+
+  // Lock-free async multi-camera ingest: one SPSC ring per stream, ordered release from the IMU
+  // feed. Dropped frames flow through the processed-callback with processed=false so the owner can
+  // release external image handles exactly once.
+  AsyncCameraBuffer::Options buf_opts;
+  buf_opts.ring_capacity = (size_t)std::max(2, params.async_ring_size);
+  buf_opts.guard = params.async_guard;
+  buf_opts.stale_factor = params.async_stale_factor;
+  buf_opts.initial_periods.resize((size_t)state->_options.num_cameras, 0.0);
+  for (int i = 0; i < state->_options.num_cameras; i++) {
+    if (params.camera_fps.count((size_t)i) && params.camera_fps.at((size_t)i) > 0.0) {
+      buf_opts.initial_periods[(size_t)i] = 1.0 / params.camera_fps.at((size_t)i);
+    }
+  }
+  camera_buffer = std::make_shared<AsyncCameraBuffer>(state->_options.num_cameras, buf_opts, [this](const ov_core::CameraData &msg) {
+    if (camera_processed_cb) {
+      camera_processed_cb(msg, false);
+    }
+  });
 
   //===================================================================================
   //===================================================================================
@@ -133,10 +219,33 @@ VioManager::VioManager(VioManagerOptions &params_) : thread_init_running(false),
   // NOTE: we will split the total number of features over all cameras uniformly
   int init_max_features = std::floor((double)params.init_options.init_max_features / (double)params.state_options.num_cameras);
   if (params.use_klt) {
+#if !OV_HAVE_MODAL_FLOW
+    // Host/test builds without the VOXL sysroot have no TrackOCL: fall back to the CPU tracker
     if (params.use_gpu) {
-      trackFEATS = std::shared_ptr<TrackBase>(new TrackOCL(state->_cam_intrinsics_cameras, init_max_features,
-                                                          state->_options.max_aruco_features,
-                                                          params.fast_threshold, params.grid_x, params.grid_y, params.min_px_dist));
+      fprintf(stderr, "[VioManager] use_gpu requested but modal_flow/OpenCL is unavailable in this build; using CPU tracker\n");
+    }
+    if (false) {
+#else
+    if (params.use_gpu) {
+      auto track_ocl = std::make_shared<TrackOCL>(state->_cam_intrinsics_cameras, init_max_features,
+                                                  state->_options.max_aruco_features, params.use_stereo,
+                                                  params.fast_threshold, params.grid_x, params.grid_y, params.min_px_dist);
+      // Bind the ZNCC epipolar-band stereo matcher whenever stereo is on and
+      // the calibration has been packed by VoxlConfigure. It is the only
+      // stereo-projection path in TrackOCL; without it, stereo features stay
+      // mono-only.
+      PRINT_DEBUG("[VioManager] stereo: use_stereo=%d  calib_valid=%d\n",
+                  (int)params.use_stereo, (int)params.stereo_calib_valid);
+      if (params.use_stereo && params.stereo_calib_valid) {
+        track_ocl->enable_zncc_stereo_matcher(params.stereo_calib,
+                                              params.stereo_z_min,
+                                              params.stereo_z_max);
+      } else if (params.use_stereo) {
+        fprintf(stderr, "[VioManager] stereo requested but stereo_calib not "
+                        "populated; stereo features will stay mono-only\n");
+      }
+      trackFEATS = std::static_pointer_cast<TrackBase>(track_ocl);
+#endif
     } else {
 #ifndef DISABLE_TRACK_KLT
       trackFEATS = std::shared_ptr<TrackBase>(new TrackKLT(state->_cam_intrinsics_cameras, init_max_features,
@@ -177,6 +286,93 @@ VioManager::VioManager(VioManagerOptions &params_) : thread_init_running(false),
   }
 }
 
+void VioManager::soft_reset(SoftResetCause cause) {
+
+  // SNAPSHOT the live bias state FIRST (before the EKF is torn down below): on a mid-ops reset the
+  // filter's converged bg/ba (+ their marginal sigmas from _Cov) are the best available bias
+  // knowledge, and the dynamic initializer consumes them as a GATED prior (CPI linearization
+  // points, MLE seed, tightened first-pose bias prior -- see init_dyn_reset_prior_*). The caller
+  // has already quiesced sensor callbacks, so reading the state here is race-free. An invalid
+  // snapshot (never-initialized filter) still arms the context, which clears any stale prior.
+  ov_init::ResetBiasPrior bias_prior;
+  if (is_initialized_vio && timelastupdate != -1 && state != nullptr) {
+    bias_prior.bg = state->_imu->bias_g();
+    bias_prior.ba = state->_imu->bias_a();
+    std::vector<std::shared_ptr<ov_type::Type>> bias_vars = {state->_imu->bg(), state->_imu->ba()};
+    Eigen::MatrixXd Pbb = StateHelper::get_marginal_covariance(state, bias_vars); // 6x6 [bg, ba]
+    bias_prior.sigma_bg = Pbb.block(0, 0, 3, 3).diagonal().cwiseMax(0.0).cwiseSqrt();
+    bias_prior.sigma_ba = Pbb.block(3, 3, 3, 3).diagonal().cwiseMax(0.0).cwiseSqrt();
+    bias_prior.t_snapshot = state->_timestamp;
+    bias_prior.cause = (int)cause;
+    bias_prior.valid = true;
+    PRINT_INFO("[soft-reset]: bias prior snapshot |bg|=%.4f |ba|=%.4f (max sig %.4f/%.4f, cause=%d)\n", bias_prior.bg.norm(),
+               bias_prior.ba.norm(), bias_prior.sigma_bg.maxCoeff(), bias_prior.sigma_ba.maxCoeff(), (int)cause);
+  }
+  if (initializer != nullptr)
+    initializer->set_reset_prior(bias_prior);
+
+  // Stop/clear the async initialization machinery (the caller has already quiesced sensor callbacks).
+  {
+    std::lock_guard<std::mutex> lck(camera_queue_init_mtx);
+    camera_queue_init.clear();
+  }
+  thread_init_running.store(false);
+  thread_init_success.store(false);
+  is_initialized_vio = false;
+  timelastupdate = -1;
+  startup_time = -1;
+
+  // This is a mid-ops re-init with a warm front-end (feature DB + IMU history preserved below), so the
+  // next successful initialization may warm-start. First boot / hard reset never set this -> cold-start.
+  warmstart_next_init.store(true);
+
+  // Fresh navigation EKF with the configured calibration (mirrors the constructor). The feature
+  // tracker, inertial initializer (IMU history) and propagator are VioManager members and are
+  // intentionally PRESERVED, so re-initialization reuses the already-buffered recent measurements.
+  state = std::make_shared<State>(params.state_options);
+  state->_calib_imu_dw->set_value(params.vec_dw);
+  state->_calib_imu_dw->set_fej(params.vec_dw);
+  state->_calib_imu_da->set_value(params.vec_da);
+  state->_calib_imu_da->set_fej(params.vec_da);
+  state->_calib_imu_tg->set_value(params.vec_tg);
+  state->_calib_imu_tg->set_fej(params.vec_tg);
+  state->_calib_imu_GYROtoIMU->set_value(params.q_GYROtoIMU);
+  state->_calib_imu_GYROtoIMU->set_fej(params.q_GYROtoIMU);
+  state->_calib_imu_ACCtoIMU->set_value(params.q_ACCtoIMU);
+  state->_calib_imu_ACCtoIMU->set_fej(params.q_ACCtoIMU);
+  state->_cam_intrinsics_cameras = params.camera_intrinsics;
+  for (int i = 0; i < state->_options.num_cameras; i++) {
+    Eigen::VectorXd dt_val(1);
+    dt_val(0) = params.camera_imu_dt.count(i) ? params.camera_imu_dt.at(i) : params.calib_camimu_dt;
+    state->cam_imu_dt_var((size_t)i)->set_value(dt_val);
+    state->cam_imu_dt_var((size_t)i)->set_fej(dt_val);
+    state->_cam_intrinsics.at(i)->set_value(params.camera_intrinsics.at(i)->get_value());
+    state->_cam_intrinsics.at(i)->set_fej(params.camera_intrinsics.at(i)->get_value());
+    state->_calib_IMUtoCAM.at(i)->set_value(params.camera_extrinsics.at(i));
+    state->_calib_IMUtoCAM.at(i)->set_fej(params.camera_extrinsics.at(i));
+    Eigen::VectorXd readout_val(1);
+    readout_val(0) = params.camera_readout_time.count(i) ? params.camera_readout_time.at(i) : 0.0;
+    state->_calib_camera_readout.at(i)->set_value(readout_val);
+    state->_calib_camera_readout.at(i)->set_fej(readout_val);
+  }
+
+  // A soft reset starts a NEW estimation episode on a continuous sensor clock: purge everything
+  // keyed by pre-reset update times or scoped to the old episode, or downstream consumers
+  // (quality metric, extended packet) would present stale pre-reset evidence as current. The
+  // margtimestep-based map cleanup cannot do this -- a warm-started clone window reaches ~2 s
+  // back past the reset instant, so pre-reset entries would sit inside the new window.
+  used_features_map.clear();
+  // ZUPT episode flags are only written while initialized, so they would otherwise stay frozen
+  // at their pre-reset values: a stale did_zupt_update=true lets the publisher report CEP
+  // quality (fresh covariance => ~100) with state OK throughout the whole re-init, and a stale
+  // has_moved_since_zupt=true disables ZUPT for the entire new episode when
+  // zupt_only_at_beginning is set.
+  did_zupt_update = false;
+  has_moved_since_zupt = false;
+
+  PRINT_INFO("[soft-reset]: EKF reset; feature DB + IMU history preserved for fast re-init\n");
+}
+
 void VioManager::feed_measurement_batch_imu(const std::vector<ov_core::ImuData>& messages, double target_freq_hz) {
     if (messages.empty()) return;
 
@@ -187,7 +383,7 @@ void VioManager::feed_measurement_batch_imu(const std::vector<ov_core::ImuData>&
     }
     if (!is_initialized_vio) {
         oldest_time = messages.back().timestamp - params.init_options.init_window_time +
-                     state->_calib_dt_CAMtoIMU->value()(0) - params.zupt_prop_window;
+                     state->cam_imu_dt_min() - params.zupt_prop_window;
     }
 
     // Downsample if requested
@@ -213,10 +409,85 @@ void VioManager::feed_measurement_batch_imu(const std::vector<ov_core::ImuData>&
         initializer->feed_imu_batch(processed_messages, oldest_time);
     }
 
-    if (is_initialized_vio && updaterZUPT != nullptr && 
+    if (is_initialized_vio && updaterZUPT != nullptr &&
         (!params.zupt_only_at_beginning || !has_moved_since_zupt)) {
         updaterZUPT->feed_imu_batch(processed_messages, oldest_time);
     }
+
+    // Release every buffered camera frame whose global ordering this batch has decided
+    newest_imu_time = std::max(newest_imu_time, messages.back().timestamp);
+    drain_camera_buffer();
+}
+
+void VioManager::feed_measurement_camera(const ov_core::CameraData &message) {
+  if (camera_buffer != nullptr) {
+    camera_buffer->push(message);
+  }
+}
+
+bool VioManager::apply_epoch_snap(double &timestamp, const std::vector<int> &sensor_ids) {
+  if (!params.epoch_mode || !is_initialized_vio) {
+    return false;
+  }
+  const int ref_id = state->cam_imu_dt_ref_camid();
+  const bool has_ref = std::find(sensor_ids.begin(), sensor_ids.end(), ref_id) != sensor_ids.end();
+  if (has_ref) {
+    if (last_ref_frame_time > 0 && timestamp > last_ref_frame_time) {
+      const double period = timestamp - last_ref_frame_time;
+      ref_period_ema = (ref_period_ema > 0) ? (0.9 * ref_period_ema + 0.1 * period) : period;
+    }
+    last_ref_frame_time = timestamp; // this frame IS the new epoch
+    return false;
+  }
+  const double t_raw = timestamp;
+  const double horizon = ((ref_period_ema > 0) ? ref_period_ema : 0.05) * params.epoch_bind_factor;
+  bool can_bind = last_ref_frame_time > 0 && t_raw >= last_ref_frame_time && (t_raw - last_ref_frame_time) <= horizon &&
+                  state->_clones_IMU.find(last_ref_frame_time) != state->_clones_IMU.end();
+  if (can_bind) {
+    // One frame per (camera, epoch): a rate-beat collision falls back to its own clone
+    auto res_it = state->_epoch_residuals.find(last_ref_frame_time);
+    for (int cid : sensor_ids) {
+      if (res_it != state->_epoch_residuals.end() && res_it->second.count((size_t)cid) > 0) {
+        can_bind = false;
+      }
+    }
+  }
+  if (!can_bind) {
+    epoch_fallbacks++;
+    return false;
+  }
+  auto &residuals = state->_epoch_residuals[last_ref_frame_time];
+  for (int cid : sensor_ids) {
+    residuals[(size_t)cid] = t_raw - last_ref_frame_time;
+  }
+
+  // Build the exact ACI2 bridge over the KNOWN residual, at the current bias estimates (IMU
+  // coverage is guaranteed by the ingest release gate). If it cannot be built the updaters
+  // degrade to the first-order model for this frame -- still snapped, still consistent.
+  Propagator::BridgeData bd;
+  const double t0_imu = last_ref_frame_time + state->cam_imu_dt_ref();
+  if (propagator->compute_bridge(state, t0_imu, t0_imu + (t_raw - last_ref_frame_time), bd)) {
+    auto &bmap = state->_epoch_bridges[last_ref_frame_time];
+    for (int cid : sensor_ids) {
+      bmap[(size_t)cid] = bd;
+    }
+  }
+
+  timestamp = last_ref_frame_time;
+  epoch_snapped++;
+  return true;
+}
+
+void VioManager::drain_camera_buffer() {
+  if (camera_buffer == nullptr) {
+    return;
+  }
+  camera_buffer->drain(
+      newest_imu_time, [this](const std::vector<int> &sensor_ids) { return state->cam_imu_dt_max_for_ids(sensor_ids); },
+      [this](ov_core::CameraData &&msg) {
+        track_image_and_update(msg);
+        return (camera_processed_cb == nullptr) || camera_processed_cb(msg, true);
+      });
 }
 
 void VioManager::feed_measurement_imu(const ov_core::ImuData &message) {
@@ -228,7 +499,7 @@ void VioManager::feed_measurement_imu(const ov_core::ImuData &message) {
     oldest_time = -1;
   }
   if (!is_initialized_vio) {
-    oldest_time = message.timestamp - params.init_options.init_window_time + state->_calib_dt_CAMtoIMU->value()(0) - params.zupt_prop_window;
+    oldest_time = message.timestamp - params.init_options.init_window_time + state->cam_imu_dt_min() - params.zupt_prop_window;
   }
   propagator->feed_imu(message, oldest_time);
 
@@ -242,6 +513,10 @@ void VioManager::feed_measurement_imu(const ov_core::ImuData &message) {
   if (is_initialized_vio && updaterZUPT != nullptr && (!params.zupt_only_at_beginning || !has_moved_since_zupt)) {
     updaterZUPT->feed_imu(message, oldest_time);
   }
+
+  // Release every buffered camera frame whose global ordering this sample has decided
+  newest_imu_time = std::max(newest_imu_time, message.timestamp);
+  drain_camera_buffer();
 }
 
 void VioManager::feed_measurement_simulation(double timestamp, const std::vector<int> &camids,
@@ -267,6 +542,9 @@ void VioManager::feed_measurement_simulation(double timestamp, const std::vector
     PRINT_WARNING(RED "[SIM]: casting our tracker to a TrackSIM object!\n" RESET);
   }
 
+  // Epoch-anchored cloning applies to the simulation path too (obs must land at clone times)
+  apply_epoch_snap(timestamp, camids);
+
   // Feed our simulation tracker
   trackSIM->feed_measurement_simulation(timestamp, camids, feats);
   rT2 = boost::posix_time::microsec_clock::local_time();
@@ -281,8 +559,10 @@ void VioManager::feed_measurement_simulation(double timestamp, const std::vector
     }
     if (did_zupt_update) {
       assert(state->_timestamp == timestamp);
-      propagator->clean_old_imu_measurements(timestamp + state->_calib_dt_CAMtoIMU->value()(0) - params.prop_window);
-      updaterZUPT->clean_old_imu_measurements(timestamp + state->_calib_dt_CAMtoIMU->value()(0) - params.prop_window);
+      // Clean against the SMALLEST per-cam offset: strictly conservative (keeps every sample any
+      // camera's pending frame could still need; the per-cam dt spread is << prop_window)
+      propagator->clean_old_imu_measurements(timestamp + state->cam_imu_dt_min() - params.prop_window);
+      updaterZUPT->clean_old_imu_measurements(timestamp + state->cam_imu_dt_min() - params.prop_window);
       propagator->invalidate_cache();
       // timelastupdate = timestamp;
       return;
@@ -334,6 +614,14 @@ void VioManager::track_image_and_update(const ov_core::CameraData &message_const
     message.masks.at(i) = mask_temp;
   }
 
+  // Epoch-anchored cloning: only REFERENCE-camera frames define clone times; a non-reference
+  // frame arriving within the binding horizon of the newest epoch is SNAPPED onto it -- its
+  // timestamp becomes the epoch time (bit-exact, so every obs time equals a clone time across
+  // the whole pipeline) and its KNOWN residual t_raw - t_epoch enters the measurement model's
+  // dt_total. This keeps the clone rate at the reference rate and the window baseline intact
+  // for unsynced rigs. Frames with no bindable epoch clone fall back to cloning (counted).
+  apply_epoch_snap(message.timestamp, message.sensor_ids);
+
   // Perform our feature tracking!
   trackFEATS->feed_new_camera(message);
 
@@ -355,8 +643,9 @@ void VioManager::track_image_and_update(const ov_core::CameraData &message_const
     }
     if (did_zupt_update) {
       assert(state->_timestamp == message.timestamp);
-      propagator->clean_old_imu_measurements(message.timestamp + state->_calib_dt_CAMtoIMU->value()(0) - params.prop_window);
-      updaterZUPT->clean_old_imu_measurements(message.timestamp + state->_calib_dt_CAMtoIMU->value()(0) - params.prop_window);
+      // Conservative clean horizon (see feed_measurement_simulation note)
+      propagator->clean_old_imu_measurements(message.timestamp + state->cam_imu_dt_min() - params.prop_window);
+      updaterZUPT->clean_old_imu_measurements(message.timestamp + state->cam_imu_dt_min() - params.prop_window);
       propagator->invalidate_cache();
       // timelastupdate = message.timestamp;
       return;
@@ -391,12 +680,23 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
     return;
   }
 
+  // Epoch mode defers the old-clone marginalization until the epoch is COMPLETE (a message with
+  // a NEW time arrives): every camera's own update call must still see the full window, otherwise
+  // non-reference tracks can never reach max-track length and never graduate to SLAM features
+  // (they would be consumed as short MSCKF scraps at the reference camera's call instead).
+  if (epoch_marg_pending && state->_timestamp != message.timestamp) {
+    StateHelper::marginalize_old_clone(state);
+    epoch_marg_pending = false;
+  }
+
   // Propagate the state forward to the current update time
   // Also augment it with a new clone!
   // NOTE: if the state is already at the given time (can happen in sim)
   // NOTE: then no need to prop since we already are at the desired timestep
   if (state->_timestamp != message.timestamp) {
-    propagator->propagate_and_clone(state, message.timestamp);
+    if (!propagator->propagate_and_clone(state, message.timestamp)) {
+      return; // no clone for this frame (duplicate/backward request): skip its update
+    }
   }
   rT3 = boost::posix_time::microsec_clock::local_time();
 
@@ -664,8 +964,9 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
       trackARUCO->get_feature_database()->cleanup_measurements(state->margtimestep());
     }
     
-    // Cleanup old entries from used_features_map
-    // change this for dynamic reset
+    // Cleanup old entries from used_features_map (steady-state pruning only; the dynamic-reset
+    // case is handled in soft_reset(), which purges the whole map -- margtimestep alone cannot,
+    // since a warm-started window reaches back past the reset instant)
     auto it = used_features_map.begin();
     while (it != used_features_map.end()) {
       if (it->first < state->margtimestep()) {
@@ -677,7 +978,14 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
   }
 
   // Finally marginalize the oldest clone if needed
-  StateHelper::marginalize_old_clone(state);
+  if (params.epoch_mode) {
+    // Defer: the epoch's remaining (snapped) camera calls must still see the full window so their
+    // tracks can reach max-track length and graduate to SLAM; executed when the next NEW-time
+    // message arrives (see the top of this function)
+    epoch_marg_pending = ((int)state->_clones_IMU.size() > state->_options.max_clone_size);
+  } else {
+    StateHelper::marginalize_old_clone(state);
+  }
   rT7 = boost::posix_time::microsec_clock::local_time();
 
   //===================================================================================
@@ -703,6 +1011,15 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
   }
   PRINT_DEBUG(BLUE "[TIME]: %.4f seconds for re-tri & marg (%d clones in state)\n" RESET, time_marg, (int)state->_clones_IMU.size());
 
+  // Epoch/ingest health: fallbacks should stay ~0 on a well-configured rig (fastest cam = ref).
+  // A climbing fallback count = fragmented clone window = starved updates (see the ctor guard).
+  if (params.epoch_mode && camera_buffer != nullptr) {
+    PRINT_DEBUG(BLUE "[EPOCH]: %llu snapped, %llu fallbacks | ingest: %llu late, %llu full, %llu bogus drops\n" RESET,
+                (unsigned long long)epoch_snapped, (unsigned long long)epoch_fallbacks,
+                (unsigned long long)camera_buffer->count_drop_late(), (unsigned long long)camera_buffer->count_drop_full(),
+                (unsigned long long)camera_buffer->count_drop_bogus());
+  }
+
   std::stringstream ss;
   ss << "[TIME]: " << std::setprecision(4) << time_total << " seconds for total (camera";
   for (const auto &id : message.sensor_ids) {
@@ -715,7 +1032,7 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
   if (params.record_timing_information && of_statistics.is_open()) {
     // We want to publish in the IMU clock frame
     // The timestamp in the state will be the last camera time
-    double t_ItoC = state->_calib_dt_CAMtoIMU->value()(0);
+    double t_ItoC = state->cam_imu_dt_ref();
     double timestamp_inI = state->_timestamp + t_ItoC;
     // Append to the file
     of_statistics << std::fixed << std::setprecision(15) << timestamp_inI << "," << std::fixed << std::setprecision(5) << time_track << ","
@@ -743,7 +1060,9 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
 
   // Debug for camera imu offset
   if (state->_options.do_calib_camera_timeoffset) {
-    PRINT_INFO("camera-imu timeoffset = %.5f\n", state->_calib_dt_CAMtoIMU->value()(0));
+    for (int i = 0; i < state->_options.num_cameras; i++) {
+      PRINT_INFO("cam%d-imu timeoffset = %.5f\n", i, state->cam_imu_dt((size_t)i));
+    }
   }
 
   // Debug for camera intrinsics

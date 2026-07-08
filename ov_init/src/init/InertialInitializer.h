@@ -1,5 +1,6 @@
 /*
  * OpenVINS: An Open Platform for Visual-Inertial Research
+ * Copyright (C) 2025-2026 Joao Leonardo Silva Cotta
  * Copyright (C) 2018-2023 Patrick Geneva
  * Copyright (C) 2018-2023 Guoquan Huang
  * Copyright (C) 2018-2023 OpenVINS Contributors
@@ -22,7 +23,11 @@
 #ifndef OV_INIT_INERTIALINITIALIZER_H
 #define OV_INIT_INERTIALINITIALIZER_H
 
+#include <map>
+#include <unordered_map>
+
 #include "init/InertialInitializerOptions.h"
+#include "init/ResetPrior.h"
 
 namespace ov_core {
 class FeatureDatabase;
@@ -31,6 +36,8 @@ struct ImuData;
 namespace ov_type {
 class Type;
 class IMU;
+class PoseJPL;
+class Landmark;
 } // namespace ov_type
 
 namespace ov_init {
@@ -98,15 +105,34 @@ public:
    * @param[out] covariance Calculated covariance of the returned state
    * @param[out] order Order of the covariance matrix
    * @param[out] t_imu Our imu type (need to have correct ids)
+   * @param[out] clones_IMU Window clone poses recovered by the dynamic init (empty for static init). When
+   *             warm-start injection is enabled these are seeded into the EKF; @p covariance / @p order
+   *             then span the full joint [IMU, clones...] state. Empty otherwise (legacy IMU-only seed).
+   * @param[out] features_SLAM SLAM features recovered by the dynamic init (currently informational; landmark
+   *             warm-start is deferred -- the filter re-brings them via delayed SLAM init).
    * @param wait_for_jerk If true we will wait for a "jerk"
    * @return True if we have successfully initialized our system
    */
   bool initialize(double &timestamp, Eigen::MatrixXd &covariance, std::vector<std::shared_ptr<ov_type::Type>> &order,
-                  std::shared_ptr<ov_type::IMU> t_imu, bool wait_for_jerk = true);
+                  std::shared_ptr<ov_type::IMU> t_imu, std::map<double, std::shared_ptr<ov_type::PoseJPL>> &clones_IMU,
+                  std::unordered_map<size_t, std::shared_ptr<ov_type::Landmark>> &features_SLAM, bool wait_for_jerk = true);
+
+  /**
+   * @brief Arm the reset context with the live filter's bias snapshot (called from soft reset).
+   * The next dynamic-init attempts consume it as CPI linearization points, MLE seed, and a
+   * tightened first-pose bias prior (see init_dyn_reset_prior_* options). Thread-safe.
+   */
+  void set_reset_prior(const ResetBiasPrior &prior);
+
+  /// Disarm the reset context (successful init or explicit teardown). Thread-safe.
+  void clear_reset_prior();
 
 protected:
   /// Initialization parameters
   InertialInitializerOptions params;
+
+  /// Soft-reset hand-off context (bias prior episode), shared with the dynamic initializer
+  std::shared_ptr<ResetContext> reset_ctx;
 
   /// Feature tracker database with all features in it
   std::shared_ptr<ov_core::FeatureDatabase> _db;

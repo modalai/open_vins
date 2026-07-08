@@ -22,10 +22,13 @@ include_directories(
 )
 
 # Set link libraries used by all binaries
+# Threads::Threads provides pthread for the lock-free worker pool in ceres_free.
+find_package(Threads REQUIRED)
 list(APPEND thirdparty_libraries
         ${Boost_LIBRARIES}
         ${CERES_LIBRARIES}
         ${OpenCV_LIBRARIES}
+        Threads::Threads
 )
 
 ##################################################
@@ -34,15 +37,33 @@ list(APPEND thirdparty_libraries
 
 list(APPEND LIBRARY_SOURCES
         src/dummy.cpp
-        src/ceres/Factor_GenericPrior.cpp
-        src/ceres/Factor_ImageReprojCalib.cpp
-        src/ceres/Factor_ImuCPIv1.cpp
-        src/ceres/State_JPLQuatLocal.cpp
         src/init/InertialInitializer.cpp
         src/dynamic/DynamicInitializer.cpp
         src/static/StaticInitializer.cpp
         src/sim/SimulatorInit.cpp
 )
+
+# Exactly one MLE backend is compiled, same gate as ROS1.cmake: the ceres-free
+# initializer (ov_init::zbft_sfm; see ceres_free/README.md) is the default, and
+# the original Ceres factors are the -DOV_INIT_CERES_FREE=OFF fallback (they
+# require a Ceres install, which the VOXL target no longer ships).
+if (OV_INIT_CERES_FREE)
+    list(APPEND LIBRARY_SOURCES
+        src/ceres_free/Parallel.cpp
+        src/ceres_free/Problem.cpp
+        src/ceres_free/State_JPLQuatLocal.cpp
+        src/ceres_free/Factor_GenericPrior.cpp
+        src/ceres_free/Factor_ImageReprojCalib.cpp
+        src/ceres_free/Factor_ImuCPIv1.cpp
+    )
+else()
+    list(APPEND LIBRARY_SOURCES
+        src/ceres/Factor_GenericPrior.cpp
+        src/ceres/Factor_ImageReprojCalib.cpp
+        src/ceres/Factor_ImuCPIv1.cpp
+        src/ceres/State_JPLQuatLocal.cpp
+    )
+endif()
 file(GLOB_RECURSE LIBRARY_HEADERS "src/*.h")
 add_library(ov_init_lib SHARED ${LIBRARY_SOURCES} ${LIBRARY_HEADERS})
 ament_target_dependencies(ov_init_lib rclcpp ov_core cv_bridge)
@@ -69,10 +90,14 @@ ament_target_dependencies(test_simulation ${ament_libraries})
 target_link_libraries(test_simulation ov_init_lib ${thirdparty_libraries})
 install(TARGETS test_simulation DESTINATION lib/${PROJECT_NAME})
 
-add_executable(test_dynamic_mle src/test_dynamic_mle.cpp)
-ament_target_dependencies(test_dynamic_mle ${ament_libraries})
-target_link_libraries(test_dynamic_mle ov_init_lib ${thirdparty_libraries})
-install(TARGETS test_dynamic_mle DESTINATION lib/${PROJECT_NAME})
+# test_dynamic_mle drives Ceres directly (#include <ceres/ceres.h>) -- only
+# buildable with the Ceres fallback backend selected.
+if (NOT OV_INIT_CERES_FREE)
+    add_executable(test_dynamic_mle src/test_dynamic_mle.cpp)
+    ament_target_dependencies(test_dynamic_mle ${ament_libraries})
+    target_link_libraries(test_dynamic_mle ov_init_lib ${thirdparty_libraries})
+    install(TARGETS test_dynamic_mle DESTINATION lib/${PROJECT_NAME})
+endif()
 
 add_executable(test_dynamic_init src/test_dynamic_init.cpp)
 ament_target_dependencies(test_dynamic_init ${ament_libraries})

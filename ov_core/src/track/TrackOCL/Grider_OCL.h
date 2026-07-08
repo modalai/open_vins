@@ -1,5 +1,6 @@
 /*
  * OpenVINS: An Open Platform for Visual-Inertial Research
+ * Copyright (C) 2025-2026 Joao Leonardo Silva Cotta
  * Copyright (C) 2018-2022 Patrick Geneva
  * Copyright (C) 2018-2022 Guoquan Huang
  * Copyright (C) 2018-2022 OpenVINS Contributors

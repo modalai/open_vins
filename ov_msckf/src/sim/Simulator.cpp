@@ -1,5 +1,6 @@
 /*
  * OpenVINS: An Open Platform for Visual-Inertial Research
+ * Copyright (C) 2025-2026 Joao Leonardo Silva Cotta
  * Copyright (C) 2018-2023 Patrick Geneva
  * Copyright (C) 2018-2023 Guoquan Huang
  * Copyright (C) 2018-2023 OpenVINS Contributors
@@ -20,6 +21,8 @@
  */
 
 #include "Simulator.h"
+
+#include <limits>
 
 #include "cam/CamBase.h"
 #include "cam/CamEqui.h"
@@ -66,7 +69,16 @@ Simulator::Simulator(VioManagerOptions &params_) {
   // Set all our timestamps as starting from the minimum spline time
   timestamp = spline->get_start_time();
   timestamp_last_imu = spline->get_start_time();
-  timestamp_last_cam = spline->get_start_time();
+
+  // Per-camera truth schedules (defensive defaults if the caller skipped print_and_load_simulation)
+  int num_cams_sim = std::max(1, params.state_options.num_cameras);
+  if ((int)params.sim_cam_phase_offsets.size() < num_cams_sim)
+    params.sim_cam_phase_offsets.resize(num_cams_sim, 0.0);
+  if ((int)params.sim_camimu_dts.size() < num_cams_sim)
+    params.sim_camimu_dts.resize(num_cams_sim, params.calib_camimu_dt);
+  if ((int)params.sim_cam_readouts.size() < num_cams_sim)
+    params.sim_cam_readouts.resize(num_cams_sim, 0.0);
+  timestamp_last_cams.assign(num_cams_sim, spline->get_start_time());
 
   // Get the pose at the current timestep
   Eigen::Matrix3d R_GtoI_init;
@@ -103,10 +115,16 @@ Simulator::Simulator(VioManagerOptions &params_) {
     } else {
       timestamp += 1.0 / params.sim_freq_cam;
       timestamp_last_imu += 1.0 / params.sim_freq_cam;
-      timestamp_last_cam += 1.0 / params.sim_freq_cam;
+      for (auto &timestamp_last_cam_i : timestamp_last_cams)
+        timestamp_last_cam_i += 1.0 / params.sim_freq_cam;
     }
   }
   PRINT_DEBUG("[SIM]: moved %.3f seconds into the dataset where it starts moving\n", timestamp - spline->get_start_time());
+
+  // Apply the per-camera phase offsets (zero offsets leave the legacy shared cadence untouched)
+  for (int i = 0; i < num_cams_sim; i++) {
+    timestamp_last_cams.at(i) += params.sim_cam_phase_offsets.at(i);
+  }
 
   // Append the current true bias to our history
   hist_true_bias_time.push_back(timestamp_last_imu - 1.0 / params.sim_freq_imu);
@@ -311,7 +329,7 @@ bool Simulator::get_state(double desired_time, Eigen::Matrix<double, 17, 1> &imu
 bool Simulator::get_next_imu(double &time_imu, Eigen::Vector3d &wm, Eigen::Vector3d &am) {
 
   // Return if the camera measurement should go before us
-  if (timestamp_last_cam + 1.0 / params.sim_freq_cam < timestamp_last_imu + 1.0 / params.sim_freq_imu)
+  if (next_cam_event_time() < timestamp_last_imu + 1.0 / params.sim_freq_imu)
     return false;
 
   // Else lets do a new measurement!!!
@@ -391,19 +409,17 @@ bool Simulator::get_next_imu(double &time_imu, Eigen::Vector3d &wm, Eigen::Vecto
 bool Simulator::get_next_cam(double &time_cam, std::vector<int> &camids,
                              std::vector<std::vector<std::pair<size_t, Eigen::VectorXf>>> &feats) {
 
+  // Earliest pending camera frame event across all cameras (IMU clock)
+  double time_event = next_cam_event_time();
+
   // Return if the imu measurement should go before us
-  if (timestamp_last_imu + 1.0 / params.sim_freq_imu < timestamp_last_cam + 1.0 / params.sim_freq_cam)
+  if (timestamp_last_imu + 1.0 / params.sim_freq_imu < time_event)
     return false;
 
-  // Else lets do a new measurement!!!
-  timestamp_last_cam += 1.0 / params.sim_freq_cam;
-  timestamp = timestamp_last_cam;
-  time_cam = timestamp_last_cam - params.calib_camimu_dt;
-
-  // Get the pose at the current timestep
+  // Get the pose at the event timestep
   Eigen::Matrix3d R_GtoI;
   Eigen::Vector3d p_IinG;
-  bool success_pose = spline->get_pose(timestamp, R_GtoI, p_IinG);
+  bool success_pose = spline->get_pose(time_event, R_GtoI, p_IinG);
 
   // We have finished generating measurements
   if (!success_pose) {
@@ -411,11 +427,39 @@ bool Simulator::get_next_cam(double &time_cam, std::vector<int> &camids,
     return false;
   }
 
-  // Loop through each camera
+  // Global simulation time moves to this event
+  timestamp = time_event;
+
+  // Emit every camera due at this event whose reported stamp matches the first due camera's stamp.
+  // Bit-equal stamps bundle into one CameraData-equivalent (the legacy synced path); cameras due at
+  // the same event but with a different true dt stay pending and are emitted by the next call.
+  bool time_set = false;
   for (int i = 0; i < params.state_options.num_cameras; i++) {
 
-    // Get the uv features for this frame
-    std::vector<std::pair<size_t, Eigen::VectorXf>> uvs = project_pointcloud(R_GtoI, p_IinG, i, featmap);
+    // Skip cameras which are not due at this event time
+    double time_event_i = timestamp_last_cams.at(i) + 1.0 / params.sim_freq_cam;
+    if (time_event_i != time_event)
+      continue;
+
+    // Reported (camera-clock) stamp for this camera; only bit-equal stamps bundle
+    double time_meas_i = time_event_i - params.sim_camimu_dts.at(i);
+    if (!time_set) {
+      time_cam = time_meas_i;
+      time_set = true;
+    } else if (time_meas_i != time_cam) {
+      continue;
+    }
+
+    // This camera fires now
+    timestamp_last_cams.at(i) = time_event_i;
+
+    // Get the uv features for this frame (rolling shutter samples each row at its own time)
+    std::vector<std::pair<size_t, Eigen::VectorXf>> uvs;
+    if (params.sim_cam_readouts.at(i) > 1e-12) {
+      uvs = project_pointcloud_rs(time_event, i, featmap, params.sim_cam_readouts.at(i));
+    } else {
+      uvs = project_pointcloud(R_GtoI, p_IinG, i, featmap);
+    }
 
     // If we do not have enough, generate more
     if ((int)uvs.size() < params.num_pts) {
@@ -446,8 +490,85 @@ bool Simulator::get_next_cam(double &time_cam, std::vector<int> &camids,
     camids.push_back(i);
   }
 
-  // Return success
-  return true;
+  // At least the first due camera always emits
+  return time_set;
+}
+
+double Simulator::next_cam_event_time() {
+  double time_min = std::numeric_limits<double>::infinity();
+  for (const double &timestamp_last_cam_i : timestamp_last_cams)
+    time_min = std::min(time_min, timestamp_last_cam_i + 1.0 / params.sim_freq_cam);
+  return time_min;
+}
+
+std::vector<std::pair<size_t, Eigen::VectorXf>> Simulator::project_pointcloud_rs(double time_event, int camid,
+                                                                                 const std::unordered_map<size_t, Eigen::Vector3d> &feats,
+                                                                                 double readout) {
+
+  // Assert we have good camera
+  assert(camid < params.state_options.num_cameras);
+  assert((int)params.camera_intrinsics.size() == params.state_options.num_cameras);
+  assert((int)params.camera_extrinsics.size() == params.state_options.num_cameras);
+
+  // Grab our extrinsic and intrinsic values
+  Eigen::Matrix<double, 3, 3> R_ItoC = quat_2_Rot(params.camera_extrinsics.at(camid).block(0, 0, 4, 1));
+  Eigen::Matrix<double, 3, 1> p_IinC = params.camera_extrinsics.at(camid).block(4, 0, 3, 1);
+  std::shared_ptr<ov_core::CamBase> camera = params.camera_intrinsics.at(camid);
+  double height = (double)camera->h();
+
+  // Our projected uv true measurements
+  std::vector<std::pair<size_t, Eigen::VectorXf>> uvs;
+
+  // Loop through our map
+  for (const auto &feat : feats) {
+
+    // Row v is sampled at time_event + (v/h)*readout: fixed point on the row, re-sampling the pose
+    double time_sample = time_event;
+    Eigen::Vector2f uv_dist;
+    bool in_view = false;
+    for (int iter = 0; iter < 3; iter++) {
+
+      // Pose at the current row-sample time
+      Eigen::Matrix3d R_GtoI_s;
+      Eigen::Vector3d p_IinG_s;
+      if (!spline->get_pose(time_sample, R_GtoI_s, p_IinG_s)) {
+        in_view = false;
+        break;
+      }
+
+      // Transform feature into the camera frame at that time
+      Eigen::Vector3d p_FinI = R_GtoI_s * (feat.second - p_IinG_s);
+      Eigen::Vector3d p_FinC = R_ItoC * p_FinI + p_IinC;
+      if (p_FinC(2) > params.sim_max_feature_gen_distance || p_FinC(2) < 0.1) {
+        in_view = false;
+        break;
+      }
+
+      // Project and distort
+      Eigen::Vector2f uv_norm;
+      uv_norm << (float)(p_FinC(0) / p_FinC(2)), (float)(p_FinC(1) / p_FinC(2));
+      uv_dist = camera->distort_f(uv_norm);
+      if (uv_dist(0) < 0 || uv_dist(0) > camera->w() || uv_dist(1) < 0 || uv_dist(1) > camera->h()) {
+        in_view = false;
+        break;
+      }
+      in_view = true;
+
+      // Row determines the next sample time; stop when converged
+      double time_next = time_event + ((double)uv_dist(1) / height) * readout;
+      if (std::abs(time_next - time_sample) < 1e-6)
+        break;
+      time_sample = time_next;
+    }
+
+    // Else we can add this as a good projection
+    if (in_view) {
+      uvs.push_back({feat.first, uv_dist});
+    }
+  }
+
+  // Return our projections
+  return uvs;
 }
 
 std::vector<std::pair<size_t, Eigen::VectorXf>> Simulator::project_pointcloud(const Eigen::Matrix3d &R_GtoI, const Eigen::Vector3d &p_IinG,

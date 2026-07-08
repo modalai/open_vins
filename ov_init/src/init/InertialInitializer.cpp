@@ -1,5 +1,6 @@
 /*
  * OpenVINS: An Open Platform for Visual-Inertial Research
+ * Copyright (C) 2025-2026 Joao Leonardo Silva Cotta
  * Copyright (C) 2018-2023 Patrick Geneva
  * Copyright (C) 2018-2023 Guoquan Huang
  * Copyright (C) 2018-2023 OpenVINS Contributors
@@ -41,10 +42,17 @@ InertialInitializer::InertialInitializer(InertialInitializerOptions &params_, st
   // Vector of our IMU data
   imu_data = std::make_shared<std::vector<ov_core::ImuData>>();
 
+  // Soft-reset hand-off context (bias prior episode; armed from VioManager::soft_reset)
+  reset_ctx = std::make_shared<ResetContext>();
+
   // Create initializers
   init_static = std::make_shared<StaticInitializer>(params, _db, imu_data);
-  init_dynamic = std::make_shared<DynamicInitializer>(params, _db, imu_data);
+  init_dynamic = std::make_shared<DynamicInitializer>(params, _db, imu_data, reset_ctx);
 }
+
+void InertialInitializer::set_reset_prior(const ResetBiasPrior &prior) { reset_ctx->arm(prior); }
+
+void InertialInitializer::clear_reset_prior() { reset_ctx->disarm(); }
 
 void InertialInitializer::feed_imu(const ov_core::ImuData &message, double oldest_time) {
 
@@ -94,7 +102,9 @@ void InertialInitializer::feed_imu_batch(const std::vector<ov_core::ImuData>& me
 }
 
 bool InertialInitializer::initialize(double &timestamp, Eigen::MatrixXd &covariance, std::vector<std::shared_ptr<ov_type::Type>> &order,
-                                     std::shared_ptr<ov_type::IMU> t_imu, bool wait_for_jerk) {
+                                     std::shared_ptr<ov_type::IMU> t_imu,
+                                     std::map<double, std::shared_ptr<ov_type::PoseJPL>> &clones_IMU,
+                                     std::unordered_map<size_t, std::shared_ptr<ov_type::Landmark>> &features_SLAM, bool wait_for_jerk) {
 
   // Get the newest and oldest timestamps we will try to initialize between!
   double newest_cam_time = -1;
@@ -154,12 +164,15 @@ bool InertialInitializer::initialize(double &timestamp, Eigen::MatrixXd &covaria
   bool is_still = (!disparity_detected_moving_1to0 && !disparity_detected_moving_2to1);
   if (((has_jerk && wait_for_jerk) || (is_still && !wait_for_jerk)) && params.init_imu_thresh > 0.0) {
     PRINT_DEBUG(GREEN "[init]: USING STATIC INITIALIZER METHOD!\n" RESET);
+    // Static init produces no clones/features -> caller cold-starts (warm-start applies to dynamic only).
+    clones_IMU.clear();
+    features_SLAM.clear();
     return init_static->initialize(timestamp, covariance, order, t_imu, wait_for_jerk);
   } else if (params.init_dyn_use && !is_still) {
     PRINT_DEBUG(GREEN "[init]: USING DYNAMIC INITIALIZER METHOD!\n" RESET);
-    std::map<double, std::shared_ptr<ov_type::PoseJPL>> _clones_IMU;
-    std::unordered_map<size_t, std::shared_ptr<ov_type::Landmark>> _features_SLAM;
-    return init_dynamic->initialize(timestamp, covariance, order, t_imu, _clones_IMU, _features_SLAM);
+    // Forward the caller's maps so the recovered window clones + the joint covariance survive (the
+    // dynamic init previously dropped these locals here -> the filter always cold-started).
+    return init_dynamic->initialize(timestamp, covariance, order, t_imu, clones_IMU, features_SLAM);
   } else {
     std::string msg = (has_jerk) ? "" : "no accel jerk detected";
     msg += (has_jerk || is_still) ? "" : ", ";

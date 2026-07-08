@@ -1,3 +1,24 @@
+/*
+ * OpenVINS: An Open Platform for Visual-Inertial Research
+ * Copyright (C) 2025-2026 Joao Leonardo Silva Cotta
+ * Copyright (C) 2018-2022 Patrick Geneva
+ * Copyright (C) 2018-2022 Guoquan Huang
+ * Copyright (C) 2018-2022 OpenVINS Contributors
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
 #ifndef OV_CORE_TRACK_OCL_H
 #define OV_CORE_TRACK_OCL_H
 
@@ -6,7 +27,9 @@
 #include <modal_flow_ocl_manager.h>
 #include <modal_flow/ocl/OclDevice.hpp>
 #include <modal_flow/ocl/ManagerCL.hpp>
+#include <modal_flow/StereoMatcher.hpp>
 #include <modal_flow/Types.hpp>
+#include <unordered_map>
 
 namespace ov_core
 {
@@ -30,9 +53,9 @@ namespace ov_core
      * @param gridy size of grid in the y-direction / v-direction
      * @param minpxdist features need to be at least this number pixels away from each other
      */
-    explicit TrackOCL(std::unordered_map<size_t, std::shared_ptr<CamBase>> cameras, int numfeats, int numaruco,
+    explicit TrackOCL(std::unordered_map<size_t, std::shared_ptr<CamBase>> cameras, int numfeats, int numaruco, bool stereo,
                       int fast_threshold, int gridx, int gridy, int minpxdist)
-        : TrackBase(cameras, numfeats, numaruco, false, NONE),
+        : TrackBase(cameras, numfeats, numaruco, stereo, NONE),
           threshold(fast_threshold),
           grid_x(gridx),
           grid_y(gridy),
@@ -76,6 +99,34 @@ namespace ov_core
      * @brief set pyramid levels
      */
     void set_pyramid_levels(int levels) { pyr_levels = levels; };
+
+    /**
+     * @brief Enable the stereo matcher used at perform_detection_stereo time. 
+     *        Must be called BEFORE the first feed_new_camera() invocation -- 
+     *        the calibration is uploaded to the GPU once at this point and 
+     *        reused for every frame thereafter.
+     *
+     *        z_min / z_max bound the depth-sweep for the epipolar search.
+     *        Defaults (0.10 m / 100 m) cover the disparity range of a 68 mm
+     *        baseline stereo rig from near-touch out to effectively infinity;
+     *        tighten z_min if you know the scene is farther.
+     */
+    void enable_zncc_stereo_matcher(const modal_flow::StereoCalib &calib,
+                                    float z_min = 0.10f, float z_max = 100.0f);
+
+    /**
+     * @brief Per-feature stereo-match confidence stashed when the ZNCC matcher
+     *        accepts a stereo pair. Populated only when the matcher is in use;
+     *        consumed by Phase-5 EKF measurement-noise weighting.
+     */
+    struct StereoConfidence {
+        float peak_zncc;   // forward peak ZNCC, in [-1, 1]
+        float margin;      // peak - runner_up; uniqueness signal
+        float lr_err;      // px residual of right->left round-trip
+    };
+    const std::unordered_map<size_t, StereoConfidence>& stereo_confidence_map() const {
+        return stereo_confidence_;
+    }
 
   protected:
     /**
@@ -145,6 +196,16 @@ namespace ov_core
 
     std::map<size_t, modal_flow::BufferId> img_buf_prev_;
     std::map<size_t, modal_flow::BufferId> img_buf_next_;
+
+    // Cam IDs the ZNCC stereo matcher is bound to. Filled in by
+    // enable_zncc_stereo_matcher; perform_detection_stereo gates on incoming
+    // cam_id_left/right matching these (a safety check, no-ops if the matcher
+    // was never enabled since both default to 0).
+    size_t                                     stereo_cam_id_left_  = 0;
+    size_t                                     stereo_cam_id_right_ = 0;
+    // Per-feature stereo-match confidence (peak_zncc, margin, lr_err) keyed by
+    // feature id, used by the EKF measurement-noise weighting in Phase 5.
+    std::unordered_map<size_t, StereoConfidence> stereo_confidence_;
   };
 
 } // namespace ov_core

@@ -23,14 +23,16 @@ else ()
     add_definitions(-DENABLE_ARUCO_TAGS=1)
 endif ()
 
-# Find OpenCL
-find_package(OpenCL REQUIRED)
+# Find OpenCL (optional for native builds)
+find_package(OpenCL QUIET)
 if (OpenCL_FOUND)
     message(STATUS "OpenCL found: ${OpenCL_VERSION}")
     include_directories(${OpenCL_INCLUDE_DIRS})
     list(APPEND thirdparty_libraries ${OpenCL_LIBRARIES})
+    add_definitions(-DHAVE_OPENCL=1)
 else()
-    message(FATAL_ERROR "OpenCL not found")
+    message(WARNING "OpenCL not found - building without GPU acceleration")
+    add_definitions(-DHAVE_OPENCL=0)
 endif()
 
 # check if we have our python libs files (will search for python3 then python2 installs)
@@ -58,7 +60,11 @@ if (NOT CMAKE_BUILD_TYPE)
 endif ()
 
 # Enable compile optimizations
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -march=armv8.2-a -O3 -ffast-math -fomit-frame-pointer -fno-signed-zeros -fno-math-errno -funroll-loops -ftree-vectorize")
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64" OR CMAKE_CROSSCOMPILING)
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -march=armv8.2-a -O3 -ffast-math -fomit-frame-pointer -fno-signed-zeros -fno-math-errno -funroll-loops -ftree-vectorize")
+else()
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -march=native -O3 -ffast-math -fomit-frame-pointer -fno-signed-zeros -fno-math-errno -funroll-loops -ftree-vectorize")
+endif()
 
 # Enable debug flags (use if you want to debug in gdb)
 # set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -g3 -Wall -Wuninitialized -Wmaybe-uninitialized -fno-omit-frame-pointer")

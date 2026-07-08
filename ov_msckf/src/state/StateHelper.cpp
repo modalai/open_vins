@@ -1,5 +1,6 @@
 /*
  * OpenVINS: An Open Platform for Visual-Inertial Research
+ * Copyright (C) 2025-2026 Joao Leonardo Silva Cotta
  * Copyright (C) 2018-2023 Patrick Geneva
  * Copyright (C) 2018-2023 Guoquan Huang
  * Copyright (C) 2018-2023 OpenVINS Contributors
@@ -26,6 +27,7 @@
 #include "types/Landmark.h"
 #include "utils/colors.h"
 #include "utils/print.h"
+#include "utils/quat_ops.h"
 
 #include <boost/math/distributions/chi_squared.hpp>
 
@@ -221,6 +223,126 @@ void StateHelper::set_initial_covariance(std::shared_ptr<State> state, const Eig
     i_index += order[i]->size();
   }
   state->_Cov = state->_Cov.selfadjointView<Eigen::Upper>();
+}
+
+bool StateHelper::set_initial_state_warmstart(std::shared_ptr<State> state, const Eigen::MatrixXd &covariance,
+                                              const std::map<double, std::shared_ptr<ov_type::PoseJPL>> &clones_IMU) {
+
+  // Contract: `covariance` is the joint, landmark-marginalized navigation covariance in LOCAL error
+  // coordinates, ordered [IMU(15) | clone_0(6) | clone_1(6) | ...] with clones ASCENDING in time, which
+  // is exactly clones_IMU's (std::map) iteration order. The IMU block is the active state->_imu, already
+  // valued by the initializer; the clones are fresh, valued PoseJPL objects not yet in the covariance.
+  const int K = (int)clones_IMU.size();
+  const int imu_sz = state->_imu->size(); // 15
+  const int expected = imu_sz + 6 * K;
+
+  // Defensive gate -- a wrong joint covariance is worse than a cold start, so verify the contract and
+  // let the caller fall back to the legacy IMU-only seed on any violation.
+  if (K == 0 || state->_imu->id() != 0 || covariance.rows() != expected || covariance.cols() != expected) {
+    PRINT_ERROR(RED "StateHelper::set_initial_state_warmstart() - contract violated (imu_id=%d, cov=%ldx%ld, expected %d, K=%d)\n" RESET,
+                state->_imu->id(), (long)covariance.rows(), (long)covariance.cols(), expected, K);
+    return false;
+  }
+  for (auto const &cp : clones_IMU) {
+    if (cp.second == nullptr || state->_clones_IMU.find(cp.first) != state->_clones_IMU.end()) {
+      PRINT_ERROR(RED "StateHelper::set_initial_state_warmstart() - clone @ %.6f null or already in state\n" RESET, cp.first);
+      return false;
+    }
+  }
+
+  // Value guard: a NON-FINITE or non-PSD joint covariance is worse than a cold start -- it would inject
+  // NaN/Inf or negative variance into the filter (e.g. a marginal/near-degenerate init, or a divergence-
+  // triggered soft reset whose recovered covariance is garbage). Reject BEFORE mutating any state so the
+  // caller cleanly falls back to the legacy IMU-only seed. Check all entries finite and every diagonal
+  // strictly positive (a necessary PD condition; cheap proxy vs. a full eigen-decomposition on the hot
+  // reset path).
+  if (!covariance.allFinite()) {
+    PRINT_ERROR(RED "StateHelper::set_initial_state_warmstart() - non-finite joint covariance; cold-starting\n" RESET);
+    return false;
+  }
+  for (int d = 0; d < covariance.rows(); ++d) {
+    if (covariance(d, d) <= 0.0) {
+      PRINT_ERROR(RED "StateHelper::set_initial_state_warmstart() - non-positive covariance diagonal at %d (%.3e); cold-starting\n" RESET,
+                  d, covariance(d, d));
+      return false;
+    }
+  }
+
+  // Grow the covariance ONCE for all K clones (single reallocation; the new rows/cols are zero-filled,
+  // i.e. clones start uncorrelated with the existing calibration blocks -- the same block-diagonal
+  // assumption set_initial_covariance() makes for the IMU). Register each clone (id / _variables /
+  // _clones_IMU) and build the [imu, clones-ascending] ordering used to place the joint covariance.
+  std::vector<std::shared_ptr<Type>> order;
+  order.reserve(1 + K);
+  order.push_back(state->_imu);
+  const int old_size = (int)state->_Cov.rows();
+  state->_Cov.conservativeResizeLike(Eigen::MatrixXd::Zero(old_size + 6 * K, old_size + 6 * K));
+  int loc = old_size;
+  for (auto const &cp : clones_IMU) { // ascending time -> matches the clone-block order in `covariance`
+    std::shared_ptr<PoseJPL> pose = cp.second;
+    pose->set_local_id(loc);
+    state->_variables.push_back(pose);
+    state->_clones_IMU[cp.first] = pose;
+    order.push_back(pose);
+    loc += pose->size(); // 6
+  }
+
+  // Per-clone kinematics for the restored window, recovered ON THE MANIFOLD from the injected
+  // trajectory (these are state-quantity estimates feeding linearization points -- the analytic-
+  // Jacobian policy governs H matrices, which stay closed-form; it does not forbid geodesic rates).
+  // JPL convention R_GtoI(t+dt) = exp_so3(-w dt) R_GtoI(t)  ==>  the right-trivialized geodesic rate
+  //   w_k = -log_so3(R_{k+1} R_k^T) / dt
+  // is EXACT under the piecewise-constant-omega assumption the whole integrator stack already makes.
+  // Velocity uses the interval mean (secant) on flat R^3 -- exact mean velocity by the MVT, second-
+  // order accurate at the midpoint; the NEWEST clone instead takes the injected IMU velocity, which
+  // is exact. FEJ twins equal the values: a (re)init is a fresh linearization point. (Optional later
+  // refinement: forward the initializer's per-node MAP velocities and gyro-from-history omegas.)
+  if (clones_IMU.size() >= 2) {
+    std::vector<double> ts;
+    ts.reserve(clones_IMU.size());
+    for (auto const &cp : clones_IMU)
+      ts.push_back(cp.first);
+    for (size_t k = 0; k < ts.size(); k++) {
+      const size_t kp = (k + 1 < ts.size()) ? k + 1 : k; // forward neighbor (self at end)
+      const size_t km = (k > 0) ? k - 1 : k;             // backward neighbor (self at start)
+      const size_t kw = (k + 1 < ts.size()) ? k : k - 1; // omega interval start (forward; one-sided at end)
+      State::CloneKinematics kin;
+      const double dt_v = ts.at(kp) - ts.at(km);
+      if (dt_v > 0) {
+        kin.vel = (clones_IMU.at(ts.at(kp))->pos() - clones_IMU.at(ts.at(km))->pos()) / dt_v;
+      }
+      const double dt_w = ts.at(kw + 1) - ts.at(kw);
+      if (dt_w > 0) {
+        kin.omega = -ov_core::log_so3(clones_IMU.at(ts.at(kw + 1))->Rot() * clones_IMU.at(ts.at(kw))->Rot().transpose()) / dt_w;
+      }
+      if (k + 1 == ts.size()) {
+        kin.vel = state->_imu->vel(); // newest clone == injected IMU state: exact velocity
+      }
+      kin.vel_fej = kin.vel;
+      kin.omega_fej = kin.omega;
+      state->_clones_kinematics[ts.at(k)] = kin;
+    }
+  } else if (clones_IMU.size() == 1) {
+    State::CloneKinematics kin;
+    kin.vel = state->_imu->vel();
+    kin.vel_fej = kin.vel;
+    state->_clones_kinematics[clones_IMU.begin()->first] = kin;
+  }
+
+  // Copy the joint covariance (diagonal blocks AND all cross-terms) into the state covariance, mapping
+  // contiguous source offsets to each variable's id. Identical block-copy to set_initial_covariance.
+  int i_index = 0;
+  for (size_t i = 0; i < order.size(); i++) {
+    int k_index = 0;
+    for (size_t k = 0; k < order.size(); k++) {
+      state->_Cov.block(order[i]->id(), order[k]->id(), order[i]->size(), order[k]->size()) =
+          covariance.block(i_index, k_index, order[i]->size(), order[k]->size());
+      k_index += order[k]->size();
+    }
+    i_index += order[i]->size();
+  }
+  state->_Cov = state->_Cov.selfadjointView<Eigen::Upper>();
+  return true;
 }
 
 Eigen::MatrixXd StateHelper::get_marginal_covariance(std::shared_ptr<State> state,
@@ -576,7 +698,8 @@ void StateHelper::initialize_invertible(std::shared_ptr<State> state, std::share
   // PRINT_DEBUG(ss.str().c_str());
 }
 
-void StateHelper::augment_clone(std::shared_ptr<State> state, Eigen::Matrix<double, 3, 1> last_w) {
+void StateHelper::augment_clone(std::shared_ptr<State> state, Eigen::Matrix<double, 3, 1> last_w,
+                                Eigen::Matrix<double, 3, 1> last_w_fej) {
 
   // We can't insert a clone that occured at the same timestamp!
   if (state->_clones_IMU.find(state->_timestamp) != state->_clones_IMU.end()) {
@@ -598,10 +721,20 @@ void StateHelper::augment_clone(std::shared_ptr<State> state, Eigen::Matrix<doub
   // Append the new clone to our clone vector
   state->_clones_IMU[state->_timestamp] = pose;
 
+  // Store velocity and angular rate at clone time (value + FEJ linearizations): consumed by the
+  // per-camera time-offset / rolling-shutter measurement models
+  State::CloneKinematics clone_kin;
+  clone_kin.vel = state->_imu->vel();
+  clone_kin.omega = last_w;
+  clone_kin.vel_fej = state->_imu->vel_fej();
+  clone_kin.omega_fej = last_w_fej;
+  state->_clones_kinematics[state->_timestamp] = clone_kin;
+
   // If we are doing time calibration, then our clones are a function of the time offset
   // Logic is based on Mingyang Li and Anastasios I. Mourikis paper:
   // http://journals.sagepub.com/doi/pdf/10.1177/0278364913515286
   if (state->_options.do_calib_camera_timeoffset) {
+    std::shared_ptr<Vec> dt_ref = state->cam_imu_dt_var((size_t)state->cam_imu_dt_ref_camid());
     // Jacobian to augment by
     Eigen::Matrix<double, 6, 1> dnc_dt = Eigen::MatrixXd::Zero(6, 1);
     dnc_dt.block(0, 0, 3, 1) = last_w;
@@ -609,9 +742,9 @@ void StateHelper::augment_clone(std::shared_ptr<State> state, Eigen::Matrix<doub
     // Augment covariance with time offset Jacobian
     // TODO: replace this with a call to the EKFPropagate function instead....
     state->_Cov.block(0, pose->id(), state->_Cov.rows(), 6) +=
-        state->_Cov.block(0, state->_calib_dt_CAMtoIMU->id(), state->_Cov.rows(), 1) * dnc_dt.transpose();
+        state->_Cov.block(0, dt_ref->id(), state->_Cov.rows(), 1) * dnc_dt.transpose();
     state->_Cov.block(pose->id(), 0, 6, state->_Cov.rows()) +=
-        dnc_dt * state->_Cov.block(state->_calib_dt_CAMtoIMU->id(), 0, 1, state->_Cov.rows());
+        dnc_dt * state->_Cov.block(dt_ref->id(), 0, 1, state->_Cov.rows());
   }
 }
 
@@ -625,6 +758,9 @@ void StateHelper::marginalize_old_clone(std::shared_ptr<State> state) {
     // Note that the marginalizer should have already deleted the clone
     // Thus we just need to remove the pointer to it from our state
     state->_clones_IMU.erase(marginal_time);
+    state->_clones_kinematics.erase(marginal_time);
+    state->_epoch_residuals.erase(marginal_time);
+    state->_epoch_bridges.erase(marginal_time);
   }
 }
 

@@ -1,5 +1,6 @@
 /*
  * OpenVINS: An Open Platform for Visual-Inertial Research
+ * Copyright (C) 2025-2026 Joao Leonardo Silva Cotta
  * Copyright (C) 2018-2023 Patrick Geneva
  * Copyright (C) 2018-2023 Guoquan Huang
  * Copyright (C) 2018-2023 OpenVINS Contributors
@@ -21,6 +22,8 @@
 
 #ifndef OV_MSCKF_STATE_OPTIONS_H
 #define OV_MSCKF_STATE_OPTIONS_H
+
+#include <map>
 
 #include "types/LandmarkRepresentation.h"
 #include "utils/opencv_yaml_parse.h"
@@ -51,6 +54,38 @@ struct StateOptions {
 
   /// Bool to determine whether or not to calibrate camera to IMU time offset
   bool do_calib_camera_timeoffset = false;
+
+  /// Reference camera id whose cam-IMU time offset drives propagation/cloning; other cameras'
+  /// offsets are estimated as deltas against this one at measurement time
+  int cam_imu_dt_ref_camid = 0;
+
+  /// Bool to determine whether or not to calibrate camera rolling shutter readout time
+  bool do_calib_camera_readout = false;
+
+  /// Which cameras carry an ESTIMATED readout state when do_calib_camera_readout is on.
+  /// Filled from the per-camera shutter declarations: only rolling-shutter cameras are
+  /// estimated; a global-shutter camera's readout stays pinned at zero (no spurious DOF).
+  /// Empty map = legacy behavior (every camera estimated).
+  std::map<size_t, bool> camera_estimate_readout;
+
+  /// Initial 1-sigma prior (seconds) on an estimated readout time. The legacy 1ms is right for
+  /// refining a CALIBRATED readout; recovering from a datasheet-grade seed needs a wider prior
+  /// (a 12ms-error seed under a 1ms prior is a 12-sigma fight the filter effectively never wins).
+  double calib_cam_readout_init_sigma = 0.001;
+
+  /// Analytic IMU-bias columns from the preintegration bridge (see VioManagerOptions)
+  bool epoch_bridge_bias_cols = true;
+
+  /// Freeze dt/readout Jacobian columns while the window motion is degenerate for temporal
+  /// calibration (MVIS degenerate motions: static / constant velocity / slow pure rotation).
+  /// Opt-in (default off): rigs enable it explicitly in their estimator config.
+  bool dt_calib_gate = false;
+
+  /// Gate threshold: window peak |omega| (rad/s) below which rotation provides no dt excitation
+  double dt_calib_gate_min_omega = 0.10;
+
+  /// Gate threshold: window velocity spread (m/s) below which translation provides no dt excitation
+  double dt_calib_gate_min_vel_spread = 0.10;
 
   /// Bool to determine whether or not to calibrate the IMU intrinsics
   bool do_calib_imu_intrinsics = false;
@@ -115,6 +150,16 @@ struct StateOptions {
       parser->parse_config("calib_cam_extrinsics", do_calib_camera_pose);
       parser->parse_config("calib_cam_intrinsics", do_calib_camera_intrinsics);
       parser->parse_config("calib_cam_timeoffset", do_calib_camera_timeoffset);
+      parser->parse_config("cam_imu_dt_ref_camid", cam_imu_dt_ref_camid, false);
+      parser->parse_config("calib_cam_readout", do_calib_camera_readout, false);
+      parser->parse_config("calib_cam_readout_init_sigma", calib_cam_readout_init_sigma, false);
+      if (calib_cam_readout_init_sigma <= 0.0) {
+        PRINT_ERROR(RED "calib_cam_readout_init_sigma must be positive (got %.6f)\n" RESET, calib_cam_readout_init_sigma);
+        std::exit(EXIT_FAILURE);
+      }
+      parser->parse_config("dt_calib_gate", dt_calib_gate, false);
+      parser->parse_config("dt_calib_gate_min_omega", dt_calib_gate_min_omega, false);
+      parser->parse_config("dt_calib_gate_min_vel_spread", dt_calib_gate_min_vel_spread, false);
       parser->parse_config("calib_imu_intrinsics", do_calib_imu_intrinsics);
       parser->parse_config("calib_imu_g_sensitivity", do_calib_imu_g_sensitivity);
 
@@ -160,6 +205,9 @@ struct StateOptions {
     PRINT_DEBUG("  - calib_cam_extrinsics: %d\n", do_calib_camera_pose);
     PRINT_DEBUG("  - calib_cam_intrinsics: %d\n", do_calib_camera_intrinsics);
     PRINT_DEBUG("  - calib_cam_timeoffset: %d\n", do_calib_camera_timeoffset);
+    PRINT_DEBUG("  - cam_imu_dt_ref_camid: %d\n", cam_imu_dt_ref_camid);
+    PRINT_DEBUG("  - calib_cam_readout: %d\n", do_calib_camera_readout);
+    PRINT_DEBUG("  - calib_cam_readout_init_sigma: %.4f\n", calib_cam_readout_init_sigma);
     PRINT_DEBUG("  - calib_imu_intrinsics: %d\n", do_calib_imu_intrinsics);
     PRINT_DEBUG("  - calib_imu_g_sensitivity: %d\n", do_calib_imu_g_sensitivity);
     PRINT_DEBUG("  - imu_model: %d\n", imu_model);

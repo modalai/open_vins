@@ -1,5 +1,6 @@
 /*
  * OpenVINS: An Open Platform for Visual-Inertial Research
+ * Copyright (C) 2025-2026 Joao Leonardo Silva Cotta
  * Copyright (C) 2018-2023 Patrick Geneva
  * Copyright (C) 2018-2023 Guoquan Huang
  * Copyright (C) 2018-2023 OpenVINS Contributors
@@ -23,10 +24,12 @@
 #define OV_MSCKF_STATE_HELPER_H
 
 #include <Eigen/Eigen>
+#include <map>
 #include <memory>
 
 namespace ov_type {
 class Type;
+class PoseJPL;
 } // namespace ov_type
 
 namespace ov_msckf {
@@ -97,6 +100,25 @@ public:
    */
   static void set_initial_covariance(std::shared_ptr<State> state, const Eigen::MatrixXd &covariance,
                                      const std::vector<std::shared_ptr<ov_type::Type>> &order);
+
+  /**
+   * @brief Warm-start seed: inject the active IMU state **and** the initializer's window clones with
+   * their full joint covariance, so the EKF can update immediately instead of cold-starting.
+   *
+   * The dynamic initializer recovers the landmark-marginalized navigation covariance over the IMU and
+   * every window clone. This grows the covariance once, registers each clone (id, _variables,
+   * _clones_IMU), and copies the joint covariance (diagonals **and** cross-terms) into place. Contract:
+   * @p covariance is in LOCAL error coordinates ordered `[IMU(15) | clone_0(6) | clone_1(6) | ...]`
+   * with clones in ASCENDING time -- exactly @p clones_IMU's iteration order. The IMU must be the first
+   * covariance block (id 0) and the clones must be valued but not yet present in the state.
+   *
+   * @param state Pointer to state (its _imu is assumed already valued by the initializer)
+   * @param covariance Joint covariance, ordered [IMU, clones-ascending]
+   * @param clones_IMU Window clone poses (valued), keyed by imaging time (ascending)
+   * @return True on success; false if the size/ordering contract is violated (caller should cold-start)
+   */
+  static bool set_initial_state_warmstart(std::shared_ptr<State> state, const Eigen::MatrixXd &covariance,
+                                          const std::map<double, std::shared_ptr<ov_type::PoseJPL>> &clones_IMU);
 
   /**
    * @brief For a given set of variables, this will this will calculate a smaller covariance.
@@ -208,9 +230,11 @@ public:
    * \f}
    *
    * @param state Pointer to state
-   * @param last_w The estimated angular velocity at cloning time (used to estimate imu-cam time offset)
+   * @param last_w The estimated angular velocity at cloning time (current linearization)
+   * @param last_w_fej The estimated angular velocity at cloning time (FEJ linearization)
    */
-  static void augment_clone(std::shared_ptr<State> state, Eigen::Matrix<double, 3, 1> last_w);
+  static void augment_clone(std::shared_ptr<State> state, Eigen::Matrix<double, 3, 1> last_w,
+                            Eigen::Matrix<double, 3, 1> last_w_fej);
 
   /**
    * @brief Remove the oldest clone, if we have more then the max clone count!!

@@ -1,5 +1,6 @@
 /*
  * OpenVINS: An Open Platform for Visual-Inertial Research
+ * Copyright (C) 2025-2026 Joao Leonardo Silva Cotta
  * Copyright (C) 2018-2023 Patrick Geneva
  * Copyright (C) 2018-2023 Guoquan Huang
  * Copyright (C) 2018-2023 OpenVINS Contributors
@@ -27,10 +28,17 @@
 #include <atomic>
 #include <boost/filesystem.hpp>
 #include <fstream>
+#include <functional>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <string>
 
+#if HAVE_OPENCL
+#include <CL/cl.h> // cl_context used by the HAVE_OPENCL-guarded get_ocl_context() below (matches TrackBase.h)
+#endif
+
+#include "AsyncCameraBuffer.h"
 #include "VioManagerOptions.h"
 
 namespace ov_core {
@@ -75,10 +83,34 @@ public:
   void feed_measurement_imu(const ov_core::ImuData &message);
 
   /**
-   * @brief Feed function for camera measurements
+   * @brief Feed function for camera measurements (thread-safe, non-blocking).
+   *
+   * Pushes into this camera stream's lock-free ring; the IMU feed on the VIO thread releases
+   * frames in global timestamp order, gated on IMU availability and cross-camera ordering
+   * (see AsyncCameraBuffer). One producer thread per camera stream.
    * @param message Contains our timestamp, images, and camera ids
    */
-  void feed_measurement_camera(const ov_core::CameraData &message) { track_image_and_update(message); }
+  void feed_measurement_camera(const ov_core::CameraData &message);
+
+  /**
+   * @brief Per-frame post-processing hook, run on the VIO thread after a frame is consumed.
+   * @param cb cb(msg, processed): processed=false for frames the ingest dropped (release any
+   * external image handles there); return false to pause draining this round (e.g. reset pending).
+   * NOTE: the processed=false path can also run on a producer thread (ring-full last resort).
+   */
+  void set_camera_processed_callback(std::function<bool(const ov_core::CameraData &msg, bool processed)> cb) {
+    camera_processed_cb = std::move(cb);
+  }
+
+  /// Dispose every buffered camera frame (VIO thread; use when resetting)
+  void clear_camera_buffers() {
+    if (camera_buffer != nullptr) {
+      camera_buffer->clear();
+    }
+  }
+
+  /// Ingest buffer telemetry access
+  std::shared_ptr<AsyncCameraBuffer> get_camera_buffer() { return camera_buffer; }
 
   /**
    * @brief Feed function for a synchronized simulated cameras
@@ -114,6 +146,26 @@ public:
   /// Accessor to get the current state
   std::shared_ptr<State> get_state() { return state; }
 
+  /**
+   * @brief Front-end-preserving SOFT reset (toward the reset-at-any-moment method).
+   *
+   * Resets ONLY the navigation EKF (a fresh State with the configured calibration) and the
+   * initialization flags/queue, while KEEPING the feature-tracker database, the inertial
+   * initializer's IMU history, and the propagator. Those hold raw measurements that stay valid
+   * across a reset, so the improved (any-attitude, S2-gravity) dynamic initializer can re-fire
+   * within a frame or two instead of re-collecting a full ~init_window_time window -- the dominant
+   * reset latency. Contrast the hard reset, which destroys + recreates the whole VioManager.
+   *
+   * The caller MUST have quiesced sensor callbacks (no concurrent feed_*) before calling this.
+   *
+   * The live filter's bias estimates (+ marginal sigmas) are SNAPSHOTTED here and handed to the
+   * initializer as a gated prior (see init_dyn_reset_prior_*) -- the dominant conditioner of the
+   * free-S2 gravity/accel-bias valley on re-init. A DIVERGENCE-suspected cause inflates the
+   * snapshot sigmas so a poisoned filter cannot seed the re-init with false confidence.
+   */
+  enum class SoftResetCause { CLIENT = 0, DIVERGENCE = 1 };
+  void soft_reset(SoftResetCause cause = SoftResetCause::CLIENT);
+
   /// Accessor to get the current propagator
   std::shared_ptr<Propagator> get_propagator() { return propagator; }
 
@@ -143,13 +195,20 @@ public:
     feat_tracks_uvd = active_tracks_uvd;
   }
 
-  // Returns the OpenCL context if we are using the GPU for feature tracking 
+  // Returns the OpenCL context if we are using the GPU for feature tracking
+#if HAVE_OPENCL
   cl_context get_ocl_context() const { return trackFEATS->get_ocl_context(); }
+#endif
 
   std::shared_ptr<ov_core::TrackBase> get_track_feats() { return trackFEATS; }
 
   /// Returns used features map organized by timestamp
   std::map<double, std::vector<std::shared_ptr<ov_core::Feature>>> get_used_features_map() { return used_features_map; }
+
+  /// Zero-copy view of the used-features map. VIO-thread-only: the camera-processed callback runs
+  /// synchronously on the update thread, so the reference stays valid for the duration of the
+  /// callback -- the caller must never re-enter feed/drain while holding it.
+  const std::map<double, std::vector<std::shared_ptr<ov_core::Feature>>> &get_used_features_map_ref() const { return used_features_map; }
 
   /// Returns used features for a specific timestamp
   std::vector<std::shared_ptr<ov_core::Feature>> get_used_features_at_timestamp(double timestamp) {
@@ -198,6 +257,50 @@ public:
   bool get_did_zupt_update() const { return did_zupt_update; }
 
 protected:
+  /**
+   * @brief Release every camera frame whose global ordering is decided into the estimator.
+   * VIO thread only; called at the end of the IMU feeds.
+   */
+  void drain_camera_buffer();
+
+  /**
+   * @brief Epoch-anchored cloning decision for one incoming frame (VIO thread).
+   *
+   * Reference-camera frames define epochs; a non-reference frame within the binding horizon of
+   * the newest epoch CLONE is snapped onto it: `timestamp` is rewritten to the epoch time
+   * (bit-exact) and the known residual t_raw - t_epoch is recorded per camera for the
+   * measurement models. Returns true if the frame was snapped.
+   */
+  bool apply_epoch_snap(double &timestamp, const std::vector<int> &sensor_ids);
+
+  /// Lock-free async multi-camera ingest (per-stream rings + ordered release)
+  std::shared_ptr<AsyncCameraBuffer> camera_buffer;
+
+  /// Per-frame post-processing hook (see set_camera_processed_callback)
+  std::function<bool(const ov_core::CameraData &msg, bool processed)> camera_processed_cb;
+
+  /// Newest IMU timestamp fed to the estimator (VIO thread only; gates frame release)
+  double newest_imu_time = -std::numeric_limits<double>::infinity();
+
+  /// @name Epoch-anchored cloning state (VIO thread only)
+  /// @{
+  /// Timestamp of the newest reference-camera frame (the current epoch)
+  double last_ref_frame_time = -1;
+  /// EMA of the reference camera's frame period (binding horizon scale)
+  double ref_period_ema = -1;
+
+public:
+  /// Frames snapped onto an epoch clone instead of spawning their own (telemetry)
+  uint64_t epoch_snapped = 0;
+  /// Non-reference frames that fell back to creating their own clone (telemetry)
+  uint64_t epoch_fallbacks = 0;
+
+protected:
+  /// Epoch mode: the oldest clone is marginalized when the epoch COMPLETES (next new-time message)
+  bool epoch_marg_pending = false;
+
+  /// @}
+
   /**
    * @brief Given a new set of camera images, this will track them.
    *
@@ -285,6 +388,12 @@ protected:
 
   // Threads and their atomics
   std::atomic<bool> thread_init_running, thread_init_success;
+
+  // Set by soft_reset() (mid-ops re-init): the NEXT successful initialization is allowed to warm-start
+  // (inject the window clones + joint covariance) instead of cold-starting. Cleared once we re-init.
+  // First boot and hard reset leave this false -> they always cold-start. Lock-free hand-off between
+  // the (health/main) thread that calls soft_reset() and the async init thread that consumes it.
+  std::atomic<bool> warmstart_next_init{false};
 
   // If we did a zero velocity update
   bool did_zupt_update = false;

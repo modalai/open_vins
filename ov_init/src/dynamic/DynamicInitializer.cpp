@@ -1,5 +1,6 @@
 /*
  * OpenVINS: An Open Platform for Visual-Inertial Research
+ * Copyright (C) 2025-2026 Joao Leonardo Silva Cotta
  * Copyright (C) 2018-2023 Patrick Geneva
  * Copyright (C) 2018-2023 Guoquan Huang
  * Copyright (C) 2018-2023 OpenVINS Contributors
@@ -21,10 +22,12 @@
 
 #include "DynamicInitializer.h"
 
+#ifndef USE_CERES_FREE_INIT
 #include "ceres/Factor_GenericPrior.h"
 #include "ceres/Factor_ImageReprojCalib.h"
 #include "ceres/Factor_ImuCPIv1.h"
 #include "ceres/State_JPLQuatLocal.h"
+#endif
 #include "utils/helper.h"
 
 #include "cpi/CpiV1.h"
@@ -40,6 +43,41 @@
 using namespace ov_core;
 using namespace ov_type;
 using namespace ov_init;
+
+// ===================================================================================
+// Backend selection for the dynamic-init MLE refinement + covariance recovery.
+// Default = the in-tree, lock-free, RT-friendly ov_init::zbft_sfm solver (the build defines
+// USE_CERES_FREE_INIT; CMake option OV_INIT_CERES_FREE, ON by default). Configuring with
+// -DOV_INIT_CERES_FREE=OFF falls back to the original Ceres factors -- A/B only; it needs a
+// Ceres install, which the VOXL target no longer ships. The shared graph assembly below is
+// written against these aliases; only the options / solve / Schur / covariance steps diverge
+// (guarded by #ifdef USE_CERES_FREE_INIT).
+// ===================================================================================
+#ifdef USE_CERES_FREE_INIT
+#include "ceres_free/Factor_GenericPrior.h"
+#include "ceres_free/Factor_ImageReprojCalib.h"
+#include "ceres_free/Factor_ImuCPIv1.h"
+#include "ceres_free/LocalParameterization.h"
+#include "ceres_free/LossFunction.h"
+#include "ceres_free/Problem.h"
+#include "ceres_free/State_JPLQuatLocal.h"
+using MleProblem = ov_init::zbft_sfm::Problem;
+using MleJplQuat = ov_init::zbft_sfm::State_JPLQuatLocal;
+using MlePrior = ov_init::zbft_sfm::Factor_GenericPrior;
+using MleImuFactor = ov_init::zbft_sfm::Factor_ImuCPIv1;
+using MleReprojFactor = ov_init::zbft_sfm::Factor_ImageReprojCalib;
+using MleLoss = ov_init::zbft_sfm::LossFunction;
+using MleCauchy = ov_init::zbft_sfm::CauchyLoss;
+using MleGravityS2 = ov_init::zbft_sfm::GravityS2Parameterization;
+#else
+using MleProblem = ceres::Problem;
+using MleJplQuat = ov_init::State_JPLQuatLocal;
+using MlePrior = ov_init::Factor_GenericPrior;
+using MleImuFactor = ov_init::Factor_ImuCPIv1;
+using MleReprojFactor = ov_init::Factor_ImageReprojCalib;
+using MleLoss = ceres::LossFunction;
+using MleCauchy = ceres::CauchyLoss;
+#endif
 
 bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covariance, std::vector<std::shared_ptr<ov_type::Type>> &order,
                                     std::shared_ptr<ov_type::IMU> &_imu, std::map<double, std::shared_ptr<ov_type::PoseJPL>> &_clones_IMU,
@@ -75,7 +113,7 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
     return false;
   }
   if (imu_data->size() < 2 || !have_old_imu_readings) {
-    // PRINT_WARNING(RED "[init-d]: waiting for window to reach full size (%zu imu readings)!!\n" RESET, imu_data->size());
+    PRINT_DEBUG("[init-d]: waiting for the IMU window (%zu readings, have_old=%d)\n", imu_data->size(), (int)have_old_imu_readings);
     return false;
   }
 
@@ -97,7 +135,9 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
   // ======================================================
 
   // Settings
-  const int min_num_meas_to_optimize = (int)params.init_window_time;
+  // Floored at 2: the legacy int truncation admitted single-observation features below 2 s
+  // windows, whose feature Gram blocks are structurally rank-deficient.
+  const int min_num_meas_to_optimize = std::max(2, (int)params.init_window_time);
   const int min_valid_features = 8;
 
   // Validation information for features we can use
@@ -156,6 +196,7 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
   // Return if we do not have our full window or not enough measurements
   // Also check that we have enough features to initialize with
   if ((int)map_camera_times.size() < params.init_dyn_num_pose) {
+    PRINT_DEBUG("[init-d]: only %zu of %d required poses selected\n", map_camera_times.size(), params.init_dyn_num_pose);
     return false;
   }
   if (count_valid_features < min_valid_features) {
@@ -163,11 +204,41 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
     return false;
   }
 
-  // Bias initial guesses specified by the launch file
-  // We don't go through the effort to recover the biases right now since they should be
-  // Semi-well known before launching or can be considered to be near zero...
-  Eigen::Vector3d gyroscope_bias = params.init_dyn_bias_g;
-  Eigen::Vector3d accelerometer_bias = params.init_dyn_bias_a;
+  // Bias initial guesses: config seeds by default; on a SOFT RESET the live filter's biases
+  // (threaded via ResetContext from VioManager::soft_reset) replace them. This is the single
+  // biggest conditioner of the free-S2 gravity<->accel-bias valley: with a trustworthy ba the
+  // MLE's tightened bias prior (below) collapses the near-null direction instead of letting
+  // gravity and ba trade off. The prior is gated -- validity, norm bounds, sigma caps after
+  // random-walk AGE inflation, divergence inflation -- so a corrupted filter degrades exactly
+  // to the legacy config-seed behavior.
+  ResetBiasPrior reset_prior = (reset_ctx != nullptr) ? reset_ctx->prior() : ResetBiasPrior();
+  bool use_reset_prior = params.init_dyn_reset_prior_use && reset_prior.valid;
+  Eigen::Vector3d reset_sig_bg = Eigen::Vector3d::Zero(), reset_sig_ba = Eigen::Vector3d::Zero();
+  if (use_reset_prior) {
+    const double age = std::max(0.0, newest_cam_time - reset_prior.t_snapshot);
+    reset_sig_bg = (reset_prior.sigma_bg.array().square() + params.sigma_wb * params.sigma_wb * age).sqrt().matrix();
+    reset_sig_ba = (reset_prior.sigma_ba.array().square() + params.sigma_ab * params.sigma_ab * age).sqrt().matrix();
+    if (reset_prior.cause == 1) { // divergence-triggered reset: distrust the snapshot
+      reset_sig_bg *= params.init_dyn_reset_prior_divergence_infl;
+      reset_sig_ba *= params.init_dyn_reset_prior_divergence_infl;
+    }
+    use_reset_prior = reset_prior.bg.norm() <= params.init_dyn_reset_prior_max_bg &&
+                      reset_prior.ba.norm() <= params.init_dyn_reset_prior_max_ba &&
+                      reset_sig_bg.maxCoeff() <= params.init_dyn_reset_prior_max_sigma_bg &&
+                      reset_sig_ba.maxCoeff() <= params.init_dyn_reset_prior_max_sigma_ba;
+    if (use_reset_prior) {
+      PRINT_INFO("[init-d]: reset bias prior ACTIVE (age %.2fs, max sig_bg %.4f, max sig_ba %.4f, cause %d)\n", age,
+                 reset_sig_bg.maxCoeff(), reset_sig_ba.maxCoeff(), reset_prior.cause);
+    } else {
+      PRINT_WARNING(YELLOW "[init-d]: reset bias prior REJECTED (|bg|=%.3f |ba|=%.3f max sig_bg=%.4f max sig_ba=%.4f cause=%d)\n" RESET,
+                    reset_prior.bg.norm(), reset_prior.ba.norm(), reset_sig_bg.maxCoeff(), reset_sig_ba.maxCoeff(), reset_prior.cause);
+    }
+  }
+  Eigen::Vector3d gyroscope_bias = use_reset_prior ? reset_prior.bg : params.init_dyn_bias_g;
+  Eigen::Vector3d accelerometer_bias = use_reset_prior ? reset_prior.ba : params.init_dyn_bias_a;
+  // Optional hard freeze of ba during a reset re-init ("biases known" mode);
+  // requires an ACCEPTED prior and the explicit knob (covariance is spliced from the prior below).
+  const bool freeze_ba = use_reset_prior && params.init_dyn_fix_ba_on_reset;
 
   // Check that we have some angular velocity / orientation change
   double accel_inI_norm = 0.0;
@@ -237,10 +308,22 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
     return false;
   }
 
-  // Now lets pre-integrate from the first time to the last
+  // Now lets pre-integrate each CONSECUTIVE camera interval in a single sweep over the IMU
+  // stream, then COMPOSE the I0->Ii preintegrations from the interval results. The CPI value
+  // recursion (R, alpha, beta, DT) is associative, so composing consecutive intervals is
+  // algebraically the direct I0->Ii integration -- and the interval CPIs are exactly what the
+  // MLE consumes, so stage-1 and stage-2 now share ONE discrete trajectory model. This halves
+  // the "linsys setup" preintegration cost (previously two full sweeps per pose: I0->Ii AND
+  // Ii->Ii+1). Values only: the linear system evaluates alpha/beta/R at the fixed bias
+  // linearization point, so the composed objects carry no bias Jacobians (the MLE's IMU
+  // factors take those from the interval CPIs, unchanged).
   assert(oldest_camera_time < newest_cam_time);
   double last_camera_timestamp = 0.0;
   std::map<double, std::shared_ptr<ov_core::CpiV1>> map_camera_cpi_I0toIi, map_camera_cpi_IitoIi1;
+  double comp_DT = 0.0;                                          // running I0->Ii composition
+  Eigen::Matrix3d comp_R_I0toIk = Eigen::Matrix3d::Identity();   // R_I0toIk
+  Eigen::Vector3d comp_alpha = Eigen::Vector3d::Zero();          // alpha_I0toIk (in I0)
+  Eigen::Vector3d comp_beta = Eigen::Vector3d::Zero();           // beta_I0toIk (in I0)
   for (auto const &timepair : map_camera_times) {
 
     // No preintegration at the first timestamp
@@ -252,31 +335,7 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
       continue;
     }
 
-    // Perform our preintegration from I0 to Ii (used in the linear system)
-    double cpiI0toIi1_time0_in_imu = oldest_camera_time + params.calib_camimu_dt;
-    double cpiI0toIi1_time1_in_imu = current_time + params.calib_camimu_dt;
-    auto cpiI0toIi1 = std::make_shared<ov_core::CpiV1>(params.sigma_w, params.sigma_wb, params.sigma_a, params.sigma_ab, true);
-    cpiI0toIi1->setLinearizationPoints(gyroscope_bias, accelerometer_bias);
-    std::vector<ov_core::ImuData> cpiI0toIi1_readings =
-        InitializerHelper::select_imu_readings(*imu_data, cpiI0toIi1_time0_in_imu, cpiI0toIi1_time1_in_imu);
-    if (cpiI0toIi1_readings.size() < 2) {
-      PRINT_DEBUG(YELLOW "[init-d]: camera %.2f in has %zu IMU readings!\n" RESET, (cpiI0toIi1_time1_in_imu - cpiI0toIi1_time0_in_imu),
-                  cpiI0toIi1_readings.size());
-      return false;
-    }
-    double cpiI0toIi1_dt_imu = cpiI0toIi1_readings.at(cpiI0toIi1_readings.size() - 1).timestamp - cpiI0toIi1_readings.at(0).timestamp;
-    if (std::abs(cpiI0toIi1_dt_imu - (cpiI0toIi1_time1_in_imu - cpiI0toIi1_time0_in_imu)) > 0.01) {
-      PRINT_DEBUG(YELLOW "[init-d]: camera IMU was only propagated %.3f of %.3f\n" RESET, cpiI0toIi1_dt_imu,
-                  (cpiI0toIi1_time1_in_imu - cpiI0toIi1_time0_in_imu));
-      return false;
-    }
-    for (size_t k = 0; k < cpiI0toIi1_readings.size() - 1; k++) {
-      auto imu0 = cpiI0toIi1_readings.at(k);
-      auto imu1 = cpiI0toIi1_readings.at(k + 1);
-      cpiI0toIi1->feed_IMU(imu0.timestamp, imu1.timestamp, imu0.wm, imu0.am, imu1.wm, imu1.am);
-    }
-
-    // Perform our preintegration from Ii to Ii1 (used in the mle optimization)
+    // Perform our preintegration from Ii to Ii1 (used in the mle optimization, composed below)
     double cpiIitoIi1_time0_in_imu = last_camera_timestamp + params.calib_camimu_dt;
     double cpiIitoIi1_time1_in_imu = current_time + params.calib_camimu_dt;
     auto cpiIitoIi1 = std::make_shared<ov_core::CpiV1>(params.sigma_w, params.sigma_wb, params.sigma_a, params.sigma_ab, true);
@@ -300,28 +359,64 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
       cpiIitoIi1->feed_IMU(imu0.timestamp, imu1.timestamp, imu0.wm, imu0.am, imu1.wm, imu1.am);
     }
 
+    // Compose the I0->Ii values from this interval's result:
+    //   alpha_I0toIk = alpha_I0toIk-1 + beta_I0toIk-1*dt_k + R_I0toIk-1^T * alpha_Ik-1toIk
+    //   beta_I0toIk  = beta_I0toIk-1 + R_I0toIk-1^T * beta_Ik-1toIk
+    //   R_I0toIk     = R_Ik-1toIk * R_I0toIk-1
+    comp_alpha += comp_beta * cpiIitoIi1->DT + comp_R_I0toIk.transpose() * cpiIitoIi1->alpha_tau;
+    comp_beta += comp_R_I0toIk.transpose() * cpiIitoIi1->beta_tau;
+    comp_R_I0toIk = cpiIitoIi1->R_k2tau * comp_R_I0toIk;
+    comp_DT += cpiIitoIi1->DT;
+    auto cpiI0toIi1 = std::make_shared<ov_core::CpiV1>(params.sigma_w, params.sigma_wb, params.sigma_a, params.sigma_ab, true);
+    cpiI0toIi1->setLinearizationPoints(gyroscope_bias, accelerometer_bias);
+    cpiI0toIi1->DT = comp_DT;
+    cpiI0toIi1->R_k2tau = comp_R_I0toIk;
+    cpiI0toIi1->q_k2tau = rot_2_quat(comp_R_I0toIk);
+    cpiI0toIi1->alpha_tau = comp_alpha;
+    cpiI0toIi1->beta_tau = comp_beta;
+
     // Finally push back our integrations!
     map_camera_cpi_I0toIi.insert({current_time, cpiI0toIi1});
     map_camera_cpi_IitoIi1.insert({current_time, cpiIitoIi1});
     last_camera_timestamp = current_time;
   }
 
-  // Loop through each feature observation and append it!
-  // State ordering is: [features, velocity, gravity]
-  Eigen::MatrixXd A = Eigen::MatrixXd::Zero(num_measurements, system_size);
-  Eigen::VectorXd b = Eigen::VectorXd::Zero(num_measurements);
+  // Loop through each feature observation and accumulate the NORMAL EQUATIONS directly --
+  // the dense (num_measurements x system_size) A matrix, its Gram matrix inverse, and the
+  // (num_measurements x num_measurements) projector of the old path are never materialized.
+  // State ordering is: [features, velocity, gravity]. Every observation's block row is
+  // [ Y | -DT*Y | 0.5*DT^2*Y ] with ONE shared 2x3 Y, so every Gram block is a scalar multiple
+  // of S = Y^T*Y and every rhs block of t = Y^T*b_i. The feature-feature Gram is BLOCK-DIAGONAL
+  // (each row touches exactly one feature), which the constrained solve below exploits.
   PRINT_DEBUG("[init-d]: system of %d measurement x %d states created (%d features, %s)\n", num_measurements, system_size, num_features,
               (have_stereo) ? "stereo" : "mono");
-  int index_meas = 0;
   int idx_feat = 0;
   std::map<size_t, int> A_index_features;
+  // Per-feature normal-equation blocks: F_j (feat-feat), C_j (feat-vel), G_j (feat-grav), y_fj
+  std::vector<Eigen::Matrix3d> NE_F, NE_C, NE_G;
+  std::vector<Eigen::Vector3d> NE_yf;
+  NE_F.reserve(num_features);
+  NE_C.reserve(num_features);
+  NE_G.reserve(num_features);
+  NE_yf.reserve(num_features);
+  // Velocity/gravity normal-equation blocks
+  Eigen::Matrix3d NE_V = Eigen::Matrix3d::Zero();  // vel-vel
+  Eigen::Matrix3d NE_W = Eigen::Matrix3d::Zero();  // vel-grav
+  Eigen::Matrix3d NE_GG = Eigen::Matrix3d::Zero(); // grav-grav
+  Eigen::Vector3d NE_yv = Eigen::Vector3d::Zero();
+  Eigen::Vector3d NE_yg = Eigen::Vector3d::Zero();
   for (auto const &feat : features) {
     if (map_features_num_meas[feat.first] < min_num_meas_to_optimize)
       continue;
     if (A_index_features.find(feat.first) == A_index_features.end()) {
       A_index_features.insert({feat.first, idx_feat});
       idx_feat += 1;
+      NE_F.emplace_back(Eigen::Matrix3d::Zero());
+      NE_C.emplace_back(Eigen::Matrix3d::Zero());
+      NE_G.emplace_back(Eigen::Matrix3d::Zero());
+      NE_yf.emplace_back(Eigen::Vector3d::Zero());
     }
+    const int fj = A_index_features.at(feat.first);
     for (auto const &camtime : feat.second->timestamps) {
 
       // This camera
@@ -344,40 +439,42 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
 
         // Preintegration values
         double DT = 0.0;
-        Eigen::MatrixXd R_I0toIk = Eigen::MatrixXd::Identity(3, 3);
-        Eigen::MatrixXd alpha_I0toIk = Eigen::MatrixXd::Zero(3, 1);
+        Eigen::Matrix3d R_I0toIk = Eigen::Matrix3d::Identity();
+        Eigen::Vector3d alpha_I0toIk = Eigen::Vector3d::Zero();
         if (map_camera_cpi_I0toIi.find(time) != map_camera_cpi_I0toIi.end() && map_camera_cpi_I0toIi.at(time) != nullptr) {
           DT = map_camera_cpi_I0toIi.at(time)->DT;
           R_I0toIk = map_camera_cpi_I0toIi.at(time)->R_k2tau;
           alpha_I0toIk = map_camera_cpi_I0toIi.at(time)->alpha_tau;
         }
 
-        // Create the linear system based on the feature reprojection
+        // Measurement model (identical to the old dense row):
         // [ 1 0 -u ] p_FinCi = [ 0 ]
         // [ 0 1 -v ]           [ 0 ]
         // where
         // p_FinCi = R_C0toCi * R_ItoC * (p_FinI0 - p_IiinI0) + p_IinC
         //         = R_C0toCi * R_ItoC * (p_FinI0 - v_I0inI0 * dt - 0.5 * grav_inI0 * dt^2 - alpha) + p_IinC
-        Eigen::MatrixXd H_proj = Eigen::MatrixXd::Zero(2, 3);
-        H_proj << 1, 0, -uv_norm(0), 0, 1, -uv_norm(1);
-        Eigen::MatrixXd Y = H_proj * R_ItoC * R_I0toIk;
-        Eigen::MatrixXd H_i = Eigen::MatrixXd::Zero(2, system_size);
-        Eigen::MatrixXd b_i = Y * alpha_I0toIk - H_proj * p_IinC;
         if (size_feature == 1) {
-          assert(false);
-          // Substitute in p_FinI0 = z*bearing_inC0_rotI0 - R_ItoC^T*p_IinC
-          // H_i.block(0, size_feature * A_index_features.at(feat.first), 2, 1) = Y * features_bearings.at(feat.first);
-          // b_i += Y * R_ItoC.transpose() * p_IinC;
-        } else {
-          H_i.block(0, size_feature * A_index_features.at(feat.first), 2, 3) = Y; // feat
+          assert(false); // single-depth parameterization not supported on this path
         }
-        H_i.block(0, size_feature * num_features + 0, 2, 3) = -DT * Y;            // vel
-        H_i.block(0, size_feature * num_features + 3, 2, 3) = 0.5 * DT * DT * Y;  // grav
+        Eigen::Matrix<double, 2, 3> H_proj;
+        H_proj << 1, 0, -uv_norm(0), 0, 1, -uv_norm(1);
+        const Eigen::Matrix<double, 2, 3> Y = H_proj * R_ItoC * R_I0toIk;
+        const Eigen::Vector2d b_i = Y * alpha_I0toIk - H_proj * p_IinC;
 
-        // Else lets append this to our system!
-        A.block(index_meas, 0, 2, A.cols()) = H_i;
-        b.block(index_meas, 0, 2, 1) = b_i;
-        index_meas += 2;
+        // Accumulate: S/t scaled by the DT monomials of [feat | vel | grav] = [1 | -DT | 0.5*DT^2]
+        const Eigen::Matrix3d S = Y.transpose() * Y;
+        const Eigen::Vector3d t = Y.transpose() * b_i;
+        const double c_v = -DT;
+        const double c_g = 0.5 * DT * DT;
+        NE_F[fj] += S;
+        NE_C[fj] += c_v * S;
+        NE_G[fj] += c_g * S;
+        NE_yf[fj] += t;
+        NE_V += (c_v * c_v) * S;
+        NE_W += (c_v * c_g) * S;
+        NE_GG += (c_g * c_g) * S;
+        NE_yv += c_v * t;
+        NE_yg += c_g * t;
       }
     }
   }
@@ -386,19 +483,43 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
   // ======================================================
   // ======================================================
 
-  // Solve the linear system without constraint
-  // Eigen::MatrixXd AtA = A.transpose() * A;
-  // Eigen::MatrixXd Atb = A.transpose() * b;
-  // Eigen::MatrixXd x_hat = AtA.colPivHouseholderQr().solve(Atb);
-
-  // Constrained solving |g| = 9.81 constraint
-  Eigen::MatrixXd A1 = A.block(0, 0, A.rows(), A.cols() - 3);
-  // Eigen::MatrixXd A1A1_inv = (A1.transpose() * A1).inverse();
-  Eigen::MatrixXd A1A1_inv = (A1.transpose() * A1).llt().solve(Eigen::MatrixXd::Identity(A1.cols(), A1.cols()));
-  Eigen::MatrixXd A2 = A.block(0, A.cols() - 3, A.rows(), 3);
-  Eigen::MatrixXd Temp = A2.transpose() * (Eigen::MatrixXd::Identity(A1.rows(), A1.rows()) - A1 * A1A1_inv * A1.transpose());
-  Eigen::MatrixXd D = Temp * A2;
-  Eigen::MatrixXd d = Temp * b;
+  // Constrained solving |g| = 9.81 constraint (Dong-Si), via the arrowhead-reduced normal
+  // equations. With N = A^T*A partitioned into x1 = [features, velocity] and x2 = gravity:
+  //   D = N_22 - N_12^T N_11^{-1} N_12,   d = y_2 - N_12^T N_11^{-1} y_1
+  // (algebraically identical to the old A2^T (I - A1 (A1^T A1)^{-1} A1^T) [A2 | b] projector,
+  // without ever forming the measurement-sized projector or the dense (3F+3) Gram inverse).
+  // N_11 = [blkdiag(F_j), C_j; C_j^T, V] is an arrowhead: eliminate each feature with its own
+  // 3x3 inverse, solve the 3x3 velocity Schur system once, and keep the partial solves -- they
+  // also give the closed-form recovery of [features, velocity] once gravity is known.
+  // (A rank-deficient no-parallax feature makes its F_j near-singular; the old dense LLT was
+  //  equally undefined there, so behavior under degeneracy is unchanged.)
+  Eigen::Matrix3d Vs = NE_V;   // velocity Schur complement after feature elimination
+  Eigen::Matrix3d Rvg = NE_W;  // velocity rows of the gravity coupling after elimination
+  Eigen::Vector3d rv = NE_yv;  // velocity rhs after elimination
+  std::vector<Eigen::Matrix3d> NE_Finv(num_features);
+  for (int jj = 0; jj < num_features; ++jj) {
+    NE_Finv[jj] = NE_F[jj].inverse();
+    const Eigen::Matrix3d CtFinv = NE_C[jj].transpose() * NE_Finv[jj];
+    Vs.noalias() -= CtFinv * NE_C[jj];
+    Rvg.noalias() -= CtFinv * NE_G[jj];
+    rv.noalias() -= CtFinv * NE_yf[jj];
+  }
+  const Eigen::LLT<Eigen::Matrix3d> Vs_llt(Vs);
+  const Eigen::Matrix3d Xvg = Vs_llt.solve(Rvg);  // velocity block of N_11^{-1} N_12
+  const Eigen::Vector3d xv = Vs_llt.solve(rv);    // velocity block of N_11^{-1} y_1
+  // Feature blocks of N_11^{-1} N_12 / N_11^{-1} y_1 (kept for the recovery below)
+  std::vector<Eigen::Matrix3d> Xfg(num_features);
+  std::vector<Eigen::Vector3d> xf(num_features);
+  Eigen::MatrixXd D = NE_GG;
+  Eigen::MatrixXd d = NE_yg;
+  D.noalias() -= NE_W.transpose() * Xvg;
+  d.noalias() -= NE_W.transpose() * xv;
+  for (int jj = 0; jj < num_features; ++jj) {
+    Xfg[jj] = NE_Finv[jj] * (NE_G[jj] - NE_C[jj] * Xvg);
+    xf[jj] = NE_Finv[jj] * (NE_yf[jj] - NE_C[jj] * xv);
+    D.noalias() -= NE_G[jj].transpose() * Xfg[jj];
+    d.noalias() -= NE_G[jj].transpose() * xf[jj];
+  }
   Eigen::Matrix<double, 7, 1> coeff = InitializerHelper::compute_dongsi_coeff(D, d, params.gravity_mag);
 
   // Create companion matrix of our polynomial
@@ -462,9 +583,15 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
   Eigen::VectorXd state_grav = D_lambdaI_inv * d;
 
   // Overwrite our state: [features, velocity, gravity]
-  Eigen::VectorXd state_feat_vel = -A1A1_inv * A1.transpose() * A2 * state_grav + A1A1_inv * A1.transpose() * b;
+  // Closed-form recovery from the kept partial solves: x_1 = N_11^{-1}(y_1 - N_12*g), i.e.
+  // per-feature p_FinI0 = xf_j - Xfg_j*g and velocity v = xv - Xvg*g (identical to the old
+  // dense back-substitution, no measurement-sized products).
+  const Eigen::Vector3d g_sol = state_grav;
   Eigen::MatrixXd x_hat = Eigen::MatrixXd::Zero(system_size, 1);
-  x_hat.block(0, 0, size_feature * num_features + 3, 1) = state_feat_vel;
+  for (int jj = 0; jj < num_features; ++jj) {
+    x_hat.block(size_feature * jj, 0, 3, 1) = xf[jj] - Xfg[jj] * g_sol;
+  }
+  x_hat.block(size_feature * num_features + 0, 0, 3, 1) = xv - Xvg * g_sol;
   x_hat.block(size_feature * num_features + 3, 0, 3, 1) = state_grav;
   Eigen::Vector3d v_I0inI0 = x_hat.block(size_feature * num_features + 0, 0, 3, 1);
   PRINT_INFO("[init-d]: velocity in I0 was %.3f,%.3f,%.3f and |v| = %.4f\n", v_I0inI0(0), v_I0inI0(1), v_I0inI0(2), v_I0inI0.norm());
@@ -581,9 +708,12 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
   // ======================================================
   // ======================================================
 
-  // Ceres problem stuff
-  // NOTE: By default the problem takes ownership of the memory
-  ceres::Problem problem;
+  // MLE problem (ov_init::zbft_sfm in the default build; Ceres when OV_INIT_CERES_FREE=OFF).
+  // NOTE: By default the problem takes ownership of the added factors/params.
+  MleProblem problem;
+#ifdef USE_CERES_FREE_INIT
+  problem.EnableOwnership(); // match Ceres: free the new'd factors/params on destruction
+#endif
 
   // Our system states (map from time to index)
   std::map<double, int> map_states;
@@ -606,6 +736,32 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
   std::map<size_t, int> map_calib_cam;
   std::vector<double *> ceres_vars_calib_cam_intrinsics;
 
+#ifdef USE_CERES_FREE_INIT
+  // S² gravity parameter: world is already aligned to gravity (gram_schmidt above),
+  // so the seed is the pole (0,0,+G). This block is shared by all IMU factors.
+  double *var_gravity = new double[3];
+  var_gravity[0] = 0.0;
+  var_gravity[1] = 0.0;
+  var_gravity[2] = params.gravity_mag;
+  auto *gravity_s2_param = new MleGravityS2(params.gravity_mag);
+  problem.AddParameterBlock(var_gravity, 3, gravity_s2_param);
+
+  // Weak prior pulling gravity toward its +Z seed (0,0,G). Fights the gravity<->accel-bias ambiguity
+  // and the flipped-gravity basin so the post-solve flip gate is robust (NEES gold standard,
+  // test_init_consistency: flip rejection 42/50 -> 49/50 at sigma=0.5, grav err unchanged). It does NOT
+  // fix the free-S2 NEES overconfidence (that is weak gravity/bias observability over the init window,
+  // mitigated by the init_dyn_inflation_* congruence). Disabled if init_dyn_grav_prior_sigma <= 0.
+  if (params.init_dyn_grav_prior_sigma > 0.0) {
+    Eigen::MatrixXd g_lin(3, 1);
+    g_lin << var_gravity[0], var_gravity[1], var_gravity[2];
+    Eigen::MatrixXd g_info = Eigen::MatrixXd::Identity(3, 3) / std::pow(params.init_dyn_grav_prior_sigma, 2);
+    std::vector<std::string> g_types = {"vec3"};
+    problem.AddResidualBlock(new MlePrior(g_lin, g_types, g_info, Eigen::MatrixXd::Zero(3, 1)), nullptr, {var_gravity});
+  }
+#else
+  double *var_gravity = nullptr; // unused in Ceres path
+#endif
+
   // Helper lambda that will free any memory we have allocated
   auto free_state_memory = [&]() {
     for (auto const &ptr : ceres_vars_ori)
@@ -626,11 +782,29 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
       delete[] ptr;
     for (auto const &ptr : ceres_vars_calib_cam_intrinsics)
       delete[] ptr;
+#ifdef USE_CERES_FREE_INIT
+    delete[] var_gravity;
+#endif
   };
 
   // Set the optimization settings
   // NOTE: We use dense schur since after eliminating features we have a dense problem
   // NOTE: http://ceres-solver.org/solving_faqs.html#solving
+#ifdef USE_CERES_FREE_INIT
+  ov_init::zbft_sfm::SolverOptions options;
+  // Feature blocks are eliminated via the Schur complement by tagging them with
+  // SetSchurLandmark() below (there is no separate enable flag).
+  // LM is used (use_dogleg defaults to false) - better results on actual hardware.
+  options.num_threads = params.init_dyn_mle_max_threads; // worker count comes straight from the YAML
+  options.max_solver_time_seconds = params.init_dyn_mle_max_time;
+  options.max_num_iterations = params.init_dyn_mle_max_iter;
+  options.function_tolerance = params.init_dyn_mle_ftol;
+  options.gradient_tolerance = 1e-9;
+  // LM lambda schedule (YAML; defaults are Ceres-exact -- see InertialInitializerOptions)
+  options.min_lambda = params.init_dyn_mle_lm_min_lambda;
+  options.lm_nu_growth = params.init_dyn_mle_lm_nu_growth;
+  options.initial_lambda = params.init_dyn_mle_lm_initial_lambda;
+#else
   ceres::Solver::Options options;
   options.linear_solver_type = ceres::DENSE_SCHUR;
   options.trust_region_strategy_type = ceres::DOGLEG;
@@ -643,8 +817,9 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
   options.max_num_iterations = params.init_dyn_mle_max_iter;
   // options.minimizer_progress_to_stdout = true;
   // options.linear_solver_ordering = ordering;
-  options.function_tolerance = 1e-5;
+  options.function_tolerance = params.init_dyn_mle_ftol;
   options.gradient_tolerance = 1e-4 * options.function_tolerance;
+#endif
 
   // Loop through each CPI integration and add its measurement to the problem
   double timestamp_k = -1;
@@ -681,20 +856,66 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
     }
 
     // Now actually create the parameter block in the ceres problem
-    auto ceres_jplquat = new State_JPLQuatLocal();
+    auto ceres_jplquat = new MleJplQuat();
     problem.AddParameterBlock(var_ori, 4, ceres_jplquat);
     problem.AddParameterBlock(var_pos, 3);
     problem.AddParameterBlock(var_vel, 3);
     problem.AddParameterBlock(var_bias_g, 3);
     problem.AddParameterBlock(var_bias_a, 3);
+    if (freeze_ba)
+      problem.SetParameterBlockConstant(var_bias_a); // reset-frozen ba (accepted prior + explicit knob)
 
     // Fix this first ever pose to constrain the problem
     // NOTE: If we don't do this, then the problem won't be full rank
     // NOTE: Since init is over a small window, we are likely to be degenerate
     // NOTE: Thus we need to fix these parameters
     if (map_states.empty()) {
+#ifdef USE_CERES_FREE_INIT
+      // S² gravity path: the 2 observable tilt DOF now live in gravity on S².
+      // Use a TIGHT SOFT PRIOR on first-pose orientation and position (not hard-fixed)
+      // to anchor the gauge while allowing small corrections on aggressive reset windows.
+      // Prior: full 3-DOF orientation (over-constrains yaw by 1, harmless since yaw unobservable),
+      //        full 3-DOF position, and biases.
+      Eigen::MatrixXd x_lin = Eigen::MatrixXd::Zero(13, 1);
+      for (int j = 0; j < 4; j++) {
+        x_lin(0 + j) = var_ori[j];
+      }
+      for (int j = 0; j < 3; j++) {
+        x_lin(4 + j) = var_pos[j];
+        x_lin(7 + j) = var_bias_g[j];
+        x_lin(10 + j) = var_bias_a[j];
+      }
+      Eigen::MatrixXd prior_grad = Eigen::MatrixXd::Zero(12, 1);
+      Eigen::MatrixXd prior_Info = Eigen::MatrixXd::Identity(12, 12);
+      prior_Info.block(0, 0, 3, 3) *= 1.0 / std::pow(0.001, 2);  // orientation: tight (~0.057 deg)
+      prior_Info.block(3, 3, 3, 3) *= 1.0 / std::pow(0.001, 2);  // position: tight (~1 mm)
+      // Bias priors: legacy literals by default (bit-for-bit); per-axis tightened from the reset
+      // prior's floored marginal sigmas when a soft-reset episode is active (this is the main
+      // conditioner of the gravity <-> accel-bias ambiguity on re-init).
+      for (int j = 0; j < 3; j++) {
+        const double sbg = use_reset_prior ? std::max(params.init_dyn_reset_prior_sigma_floor_bg, reset_sig_bg(j)) : 0.05;
+        const double sba = use_reset_prior ? std::max(params.init_dyn_reset_prior_sigma_floor_ba, reset_sig_ba(j)) : 0.10;
+        prior_Info(6 + j, 6 + j) = 1.0 / std::pow(sbg, 2); // bias_g prior
+        prior_Info(9 + j, 9 + j) = 1.0 / std::pow(sba, 2); // bias_a prior
+      }
 
-      // Construct state and prior
+      // Construct state type and ceres parameter pointers
+      std::vector<std::string> x_types;
+      std::vector<double *> factor_params;
+      factor_params.push_back(var_ori);
+      x_types.emplace_back("quat"); // full 3-DOF orientation (not quat_yaw)
+      factor_params.push_back(var_pos);
+      x_types.emplace_back("vec3");
+      factor_params.push_back(var_bias_g);
+      x_types.emplace_back("vec3");
+      factor_params.push_back(var_bias_a);
+      x_types.emplace_back("vec3");
+
+      // Append it to the problem
+      auto *factor_prior = new MlePrior(x_lin, x_types, prior_Info, prior_grad);
+      problem.AddResidualBlock(factor_prior, nullptr, factor_params);
+#else
+      // Ceres path: original gauge anchoring (quat_yaw + position fixed)
       Eigen::MatrixXd x_lin = Eigen::MatrixXd::Zero(13, 1);
       for (int j = 0; j < 4; j++) {
         x_lin(0 + j) = var_ori[j];
@@ -707,8 +928,13 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
       Eigen::MatrixXd prior_grad = Eigen::MatrixXd::Zero(10, 1);
       Eigen::MatrixXd prior_Info = Eigen::MatrixXd::Identity(10, 10);
       prior_Info.block(0, 0, 4, 4) *= 1.0 / std::pow(1e-5, 2); // 4dof unobservable yaw and position
-      prior_Info.block(4, 4, 3, 3) *= 1.0 / std::pow(0.05, 2); // bias_g prior
-      prior_Info.block(7, 7, 3, 3) *= 1.0 / std::pow(0.10, 2); // bias_a prior
+      // Bias priors: legacy literals by default; per-axis reset-prior tightening (see S2 block)
+      for (int j = 0; j < 3; j++) {
+        const double sbg = use_reset_prior ? std::max(params.init_dyn_reset_prior_sigma_floor_bg, reset_sig_bg(j)) : 0.05;
+        const double sba = use_reset_prior ? std::max(params.init_dyn_reset_prior_sigma_floor_ba, reset_sig_ba(j)) : 0.10;
+        prior_Info(4 + j, 4 + j) = 1.0 / std::pow(sbg, 2); // bias_g prior
+        prior_Info(7 + j, 7 + j) = 1.0 / std::pow(sba, 2); // bias_a prior
+      }
 
       // Construct state type and ceres parameter pointers
       std::vector<std::string> x_types;
@@ -723,8 +949,9 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
       x_types.emplace_back("vec3");
 
       // Append it to the problem
-      auto *factor_prior = new Factor_GenericPrior(x_lin, x_types, prior_Info, prior_grad);
+      auto *factor_prior = new MlePrior(x_lin, x_types, prior_Info, prior_grad);
       problem.AddResidualBlock(factor_prior, nullptr, factor_params);
+#endif
     }
 
     // Append to our historical vector of states
@@ -753,8 +980,12 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
       factor_params.push_back(ceres_vars_vel.at(map_states.at(timestamp_k1)));
       factor_params.push_back(ceres_vars_bias_a.at(map_states.at(timestamp_k1)));
       factor_params.push_back(ceres_vars_pos.at(map_states.at(timestamp_k1)));
-      auto *factor_imu = new Factor_ImuCPIv1(cpi->DT, gravity, cpi->alpha_tau, cpi->beta_tau, cpi->q_k2tau, cpi->b_a_lin, cpi->b_w_lin,
-                                             cpi->J_q, cpi->J_b, cpi->J_a, cpi->H_b, cpi->H_a, cpi->P_meas);
+#ifdef USE_CERES_FREE_INIT
+      // 11th block: shared S² gravity parameter (the solver applies the manifold Jacobian)
+      factor_params.push_back(var_gravity);
+#endif
+      auto *factor_imu = new MleImuFactor(cpi->DT, gravity, cpi->alpha_tau, cpi->beta_tau, cpi->q_k2tau, cpi->b_a_lin, cpi->b_w_lin,
+                                          cpi->J_q, cpi->J_b, cpi->J_a, cpi->H_b, cpi->H_a, cpi->P_meas);
       problem.AddResidualBlock(factor_imu, nullptr, factor_params);
     }
 
@@ -774,7 +1005,7 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
       for (int j = 0; j < 3; j++) {
         var_calib_pos[j] = params.camera_extrinsics.at(cam_id)(4 + j, 0);
       }
-      auto ceres_calib_jplquat = new State_JPLQuatLocal();
+      auto ceres_calib_jplquat = new MleJplQuat();
       problem.AddParameterBlock(var_calib_ori, 4, ceres_calib_jplquat);
       problem.AddParameterBlock(var_calib_pos, 3);
       map_calib_cam2imu.insert({cam_id, (int)ceres_vars_calib_cam2imu_ori.size()});
@@ -801,7 +1032,7 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
       x_types.emplace_back("quat");
       factor_params.push_back(var_calib_pos);
       x_types.emplace_back("vec3");
-      auto *factor_prior = new Factor_GenericPrior(x_lin, x_types, prior_Info, prior_grad);
+      auto *factor_prior = new MlePrior(x_lin, x_types, prior_Info, prior_grad);
       problem.AddResidualBlock(factor_prior, nullptr, factor_params);
       if (!params.init_dyn_mle_opt_calib) {
         problem.SetParameterBlockConstant(var_calib_ori);
@@ -832,7 +1063,7 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
       std::vector<double *> factor_params;
       factor_params.push_back(var_calib_cam);
       x_types.emplace_back("vec8");
-      auto *factor_prior = new Factor_GenericPrior(x_lin, x_types, prior_Info, prior_grad);
+      auto *factor_prior = new MlePrior(x_lin, x_types, prior_Info, prior_grad);
       problem.AddResidualBlock(factor_prior, nullptr, factor_params);
       if (!params.init_dyn_mle_opt_calib) {
         problem.SetParameterBlockConstant(var_calib_cam);
@@ -876,6 +1107,9 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
             var_feat[j] = features_inG.at(feat_id)(j);
           }
           problem.AddParameterBlock(var_feat, 3);
+#ifdef USE_CERES_FREE_INIT
+          problem.SetSchurLandmark(var_feat); // eliminate features via the Schur arrowhead
+#endif
           map_features.insert({feat_id, (int)ceres_vars_feat.size()});
           ceres_vars_feat.push_back(var_feat);
         }
@@ -888,9 +1122,8 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
         factor_params.push_back(ceres_vars_calib_cam2imu_ori.at(map_calib_cam2imu.at(cam_id)));
         factor_params.push_back(ceres_vars_calib_cam2imu_pos.at(map_calib_cam2imu.at(cam_id)));
         factor_params.push_back(ceres_vars_calib_cam_intrinsics.at(map_calib_cam.at(cam_id)));
-        auto *factor_pinhole = new Factor_ImageReprojCalib(uv_raw, params.sigma_pix, is_fisheye);
-        // ceres::LossFunction *loss_function = nullptr;
-        ceres::LossFunction *loss_function = new ceres::CauchyLoss(1.0);
+        auto *factor_pinhole = new MleReprojFactor(uv_raw, params.sigma_pix, is_fisheye);
+        MleLoss *loss_function = new MleCauchy(1.0);
         problem.AddResidualBlock(factor_pinhole, loss_function, factor_params);
       }
     }
@@ -901,6 +1134,184 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
   assert(ceres_vars_ori.size() == ceres_vars_pos.size());
   auto rT5 = boost::posix_time::microsec_clock::local_time();
 
+  // Optimize the graph
+#ifdef USE_CERES_FREE_INIT
+  ov_init::zbft_sfm::SolverSummary summary = problem.Solve(options);
+  PRINT_INFO("[init-d]: %d iterations | %zu states, %zu feats (%zu valid) | cost %.4e => %.4e\n", summary.iterations,
+             map_states.size(), map_features.size(), count_valid_features, summary.initial_cost, summary.final_cost);
+  auto rT6 = boost::posix_time::microsec_clock::local_time();
+  timestamp = newest_cam_time;
+  if (params.init_dyn_mle_max_iter != 0 && !summary.converged) {
+    PRINT_WARNING(YELLOW "[init-d]: opt failed: %s!\n" RESET, summary.message.c_str());
+    free_state_memory();
+    return false;
+  }
+  PRINT_DEBUG("[init-d]: %s\n", summary.message.c_str());
+
+  // Recover the marginal covariance AT THE OPTIMUM, BEFORE any re-align rotates the states.
+  // Re-aligning and then recomputing would re-linearize the IMU factors against rotated states with
+  // an un-rotated gravity block -> an off-optimum, internally inconsistent covariance (exactly in the
+  // 0.1-30 deg tilt band where it matters). We recover it here and carry it through the re-align via a
+  // closed-form similarity transform (below). [theta, p, v, bg, ba], local error coordinates.
+  // When warm-starting we recover the FULL joint covariance over [IMU(15), clones(6 each, ascending
+  // time)] in a single shot. ComputeCovariance already inverts the entire landmark-marginalized
+  // reduced navigation Hessian and merely slices the requested blocks, so asking for every clone costs
+  // no extra factorization -- only a larger slice. The IMU 15x15 stays the top-left block, identical
+  // to the legacy seed, so the cold path is bit-for-bit unchanged. [theta,p,v,bg,ba | theta_i,p_i ...]
+  const bool warmstart = params.init_warmstart_inject;
+  const int n_clones = (int)map_states.size();
+  Eigen::MatrixXd cov_inject; // 15x15 (legacy) or (15 + 6*n_clones) (warm). ComputeCovariance sizes it.
+  bool cov_ok = false;
+  {
+    int sidx = map_states[newest_cam_time];
+    // When ba is reset-frozen it is a CONSTANT block: ComputeCovariance rejects constant blocks,
+    // so it is omitted from the request and its prior variance is spliced back in below.
+    std::vector<double *> cb = {ceres_vars_ori[sidx], ceres_vars_pos[sidx], ceres_vars_vel[sidx], ceres_vars_bias_g[sidx]};
+    if (!freeze_ba)
+      cb.push_back(ceres_vars_bias_a[sidx]);
+    if (warmstart) {
+      // Clones in ascending-time order -> matches _clones_IMU (std::map) iteration, the inflation/
+      // T-transform block layout, and the injection contract in StateHelper::set_initial_state_warmstart.
+      for (auto const &sp : map_states) {
+        cb.push_back(ceres_vars_ori[sp.second]);
+        cb.push_back(ceres_vars_pos[sp.second]);
+      }
+    }
+    cov_ok = problem.ComputeCovariance(cb, cov_inject, options);
+    if (!cov_ok) {
+      PRINT_WARNING(YELLOW "[init-d]: covariance recovery failed...\n" RESET);
+      free_state_memory();
+      return false;
+    }
+    if (freeze_ba) {
+      // Re-insert the frozen ba block at rows/cols 12-14 with its (floored, age-inflated) prior
+      // variance and ZERO cross-covariance -- BEFORE the realign similarity and the congruence
+      // inflation, which both index the [theta,p,v,bg,ba | clones...] layout. A zero ba variance
+      // here would freeze ba in the EKF forever; the prior variance keeps it honest.
+      const int n_in = (int)cov_inject.rows(); // 12 (+ 6*n_clones when warm)
+      Eigen::MatrixXd cov_full = Eigen::MatrixXd::Zero(n_in + 3, n_in + 3);
+      cov_full.topLeftCorner(12, 12) = cov_inject.topLeftCorner(12, 12);
+      for (int j = 0; j < 3; j++)
+        cov_full(12 + j, 12 + j) = std::pow(std::max(params.init_dyn_reset_prior_sigma_floor_ba, reset_sig_ba(j)), 2);
+      const int n_rest = n_in - 12;
+      if (n_rest > 0) {
+        cov_full.block(15, 15, n_rest, n_rest) = cov_inject.block(12, 12, n_rest, n_rest);
+        cov_full.block(0, 15, 12, n_rest) = cov_inject.block(0, 12, 12, n_rest);
+        cov_full.block(15, 0, n_rest, 12) = cov_inject.block(12, 0, n_rest, 12);
+      }
+      cov_inject = cov_full;
+    }
+  }
+
+  // GRAVITY DIRECTION GATE + CONDITIONAL RE-ALIGN
+  // Reject if the optimized gravity is too far from +Z (the expected pole).
+  // A flipped or badly tilted gravity will corrupt downstream attitude (especially PX4 NED).
+  // If tilt is moderate, re-align all states so gravity returns to +Z before injection.
+  {
+    Eigen::Vector3d g_opt(var_gravity[0], var_gravity[1], var_gravity[2]);
+    Eigen::Vector3d g_expected(0.0, 0.0, params.gravity_mag);
+    double cos_angle = g_opt.dot(g_expected) / (g_opt.norm() * g_expected.norm());
+    double angle_rad = std::acos(std::min(1.0, std::max(-1.0, cos_angle)));
+    double angle_deg = angle_rad * 180.0 / M_PI;
+
+    // Hard reject if gravity is more than the configured gate off — catches flipped/corrupted gravity
+    const double kMaxGravityTiltDeg = params.init_dyn_grav_gate_deg;
+    if (angle_deg > kMaxGravityTiltDeg) {
+      PRINT_ERROR(RED "[init-d]: GRAVITY DIRECTION INVALID! Optimized g=(%.3f,%.3f,%.3f) is %.1f° from expected +Z. "
+                      "Rejecting init to prevent NED corruption.\n" RESET,
+                  g_opt(0), g_opt(1), g_opt(2), angle_deg);
+      free_state_memory();
+      return false;
+    }
+
+    // Conditional re-align: if tilt > 0.1°, rotate all states so gravity returns to +Z.
+    // This ensures downstream (propagator, PX4) sees a gravity-aligned world frame.
+    const double kRealignThresholdDeg = 0.1;
+    if (angle_deg > kRealignThresholdDeg) {
+      // Compute rotation from g_opt to g_expected using Rodrigues
+      Eigen::Vector3d g_opt_norm = g_opt.normalized();
+      Eigen::Vector3d g_exp_norm = g_expected.normalized();
+      Eigen::Vector3d axis = g_opt_norm.cross(g_exp_norm);
+      double axis_norm = axis.norm();
+      if (axis_norm > 1e-9) {
+        axis /= axis_norm;
+        // R_realign rotates g_opt to g_expected
+        Eigen::Matrix3d R_realign = Eigen::AngleAxisd(angle_rad, axis).toRotationMatrix();
+
+        // Carry the recovered-at-optimum covariance through this world-frame re-align via the
+        // closed-form similarity T = blkdiag(I, R_realign, R_realign, I, I): delta-theta is the
+        // body-frame (left-JPL) error, invariant under the right-multiply world rotation
+        // (R_new = R_old * R_realign^T); delta-p and delta-v are world vectors (-> R_realign); the
+        // biases are body-frame (-> I). O(1) and provably consistent with the rotated state.
+        if (cov_ok) {
+          // Closed-form similarity over [IMU(15) | clones(6 each)]. IMU: blkdiag(I,R,R,I,I) over
+          // [theta,p,v,bg,ba]. Each clone: blkdiag(I,R) over [theta,p] -- the orientation error is the
+          // body-frame (left-JPL) error, invariant under the right-multiply world rotation
+          // (R_new = R_old * R_realign^T); the clone position is a world vector -> R_realign. T_theta=I
+          // is validated by the realign-consistency NEES case. O(1) and consistent with the rotated state.
+          Eigen::MatrixXd Tre = Eigen::MatrixXd::Identity(cov_inject.rows(), cov_inject.cols());
+          Tre.block(3, 3, 3, 3) = R_realign; // IMU p
+          Tre.block(6, 6, 3, 3) = R_realign; // IMU v
+          if (warmstart) {
+            for (int c = 0; c < n_clones; ++c)
+              Tre.block(15 + 6 * c + 3, 15 + 6 * c + 3, 3, 3) = R_realign; // clone p
+          }
+          cov_inject = (Tre * cov_inject * Tre.transpose()).eval();
+        }
+
+        // Rotate all clone poses and velocities
+        for (auto &var_q : ceres_vars_ori) {
+          Eigen::Matrix3d R_old = ov_core::quat_2_Rot(Eigen::Map<Eigen::Vector4d>(var_q));
+          Eigen::Matrix3d R_new = R_old * R_realign.transpose(); // world frame rotation
+          Eigen::Vector4d q_new = ov_core::rot_2_quat(R_new);
+          for (int j = 0; j < 4; j++) var_q[j] = q_new(j);
+        }
+        for (auto &var_p : ceres_vars_pos) {
+          Eigen::Vector3d p_old = Eigen::Map<Eigen::Vector3d>(var_p);
+          Eigen::Vector3d p_new = R_realign * p_old;
+          for (int j = 0; j < 3; j++) var_p[j] = p_new(j);
+        }
+        for (auto &var_v : ceres_vars_vel) {
+          Eigen::Vector3d v_old = Eigen::Map<Eigen::Vector3d>(var_v);
+          Eigen::Vector3d v_new = R_realign * v_old;
+          for (int j = 0; j < 3; j++) var_v[j] = v_new(j);
+        }
+        for (auto &var_f : ceres_vars_feat) {
+          Eigen::Vector3d f_old = Eigen::Map<Eigen::Vector3d>(var_f);
+          Eigen::Vector3d f_new = R_realign * f_old;
+          for (int j = 0; j < 3; j++) var_f[j] = f_new(j);
+        }
+
+        PRINT_INFO("[init-d]: Re-aligned states by %.2f° to restore gravity to +Z\n", angle_deg);
+      }
+    }
+
+    if (angle_deg > 5.0) {
+      PRINT_WARNING(YELLOW "[init-d]: Gravity tilt was %.2f° from expected +Z (g=%.3f,%.3f,%.3f). "
+                           "Linear init may have been marginal.\n" RESET,
+                    angle_deg, g_opt(0), g_opt(1), g_opt(2));
+    } else {
+      PRINT_DEBUG("[init-d]: Gravity tilt %.3f° from +Z (nominal)\n", angle_deg);
+    }
+  }
+
+  // WARM-START WORLD GAUGE: translate the world so the newest IMU sits at the origin (matching the
+  // legacy single-state seed, which zeroes the injected position below). Applied here -- after the
+  // gravity re-align rotated the raw solver arrays, before the clone/feature objects are built -- as
+  // ONE rigid world translation over every clone position and feature, so the injected geometry stays
+  // self-consistent (the newest clone keeps coinciding with the zeroed IMU pose). Covariance is
+  // translation-invariant (it is the first-pose-anchored relative error), so cov_inject is untouched.
+  if (warmstart) {
+    const int sN = map_states.at(newest_cam_time);
+    const Eigen::Vector3d p_newest(ceres_vars_pos[sN][0], ceres_vars_pos[sN][1], ceres_vars_pos[sN][2]);
+    for (auto const &sp : map_states)
+      for (int j = 0; j < 3; j++)
+        ceres_vars_pos[sp.second][j] -= p_newest(j);
+    for (auto &var_f : ceres_vars_feat)
+      for (int j = 0; j < 3; j++)
+        var_f[j] -= p_newest(j);
+  }
+#else
   // Optimize the ceres graph
   ceres::Solver::Summary summary;
   ceres::Solve(options, &problem, &summary);
@@ -917,6 +1328,7 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
     return false;
   }
   PRINT_DEBUG("[init-d]: %s\n", summary.message.c_str());
+#endif
 
   //======================================================
   //======================================================
@@ -987,7 +1399,23 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
     // TODO: std::unordered_map<size_t, std::shared_ptr<ov_type::Vec>> &_cam_intrinsics
   }
 
-  // Recover the covariance here of the optimized states
+  // Recover the covariance of the optimized IMU state.
+#ifdef USE_CERES_FREE_INIT
+  // The marginal covariance was recovered AT THE OPTIMUM above (before the gravity re-align, by
+  // inverting the gauge-anchored landmark-marginalized reduced Hessian) and carried through the
+  // re-align by a closed-form similarity transform, so it is consistent with the injected (possibly
+  // re-aligned) state. OpenVINS order [theta, p, v, bg, ba].
+  order.clear();
+  order.push_back(_imu);
+  if (warmstart) {
+    // Append clones in ascending-time order so `order` matches cov_inject's clone-block layout
+    // exactly (both derived from map_states / _clones_IMU, which are ascending std::maps). Keeps the
+    // returned (covariance, order) pair dimensionally consistent for downstream injection.
+    for (auto const &cp : _clones_IMU)
+      order.push_back(cp.second);
+  }
+  covariance = cov_inject;
+#else
   // NOTE: for now just the IMU state is recovered, but we should be able to do everything
   // NOTE: maybe having features / clones will make it more stable?
   std::vector<std::pair<const double *, const double *>> covariance_blocks;
@@ -1084,11 +1512,41 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
   covariance.block(9, 12, 3, 3) = covtmp.eval();
   covariance.block(12, 9, 3, 3) = covtmp.transpose().eval();
 
-  // inflate as needed
-  covariance.block(0, 0, 3, 3) *= params.init_dyn_inflation_orientation;
-  covariance.block(6, 6, 3, 3) *= params.init_dyn_inflation_velocity;
-  covariance.block(9, 9, 3, 3) *= params.init_dyn_inflation_bias_gyro;
-  covariance.block(12, 12, 3, 3) *= params.init_dyn_inflation_bias_accel;
+  // Reset-frozen ba: Ceres returns ZERO covariance for constant blocks -- overwrite the ba
+  // diagonal with the (floored, age-inflated) prior variance so the EKF can keep estimating it.
+  if (freeze_ba) {
+    covariance.block(12, 12, 3, 3).setZero();
+    covariance.block(0, 12, 12, 3).setZero();
+    covariance.block(12, 0, 3, 12).setZero();
+    for (int j = 0; j < 3; j++)
+      covariance(12 + j, 12 + j) = std::pow(std::max(params.init_dyn_reset_prior_sigma_floor_ba, reset_sig_ba(j)), 2);
+  }
+
+#endif // USE_CERES_FREE_INIT
+
+  // Inflate as a proper congruence S*Cov*S^T (scales cross-covariances consistently, not just the
+  // diagonal blocks -- required once the full joint covariance over clones is injected). S scales
+  // each error sub-block's sigma by sqrt(variance-inflation). NEES gold-standard guidance
+  // (test_init_consistency, free-S2 path): velocity/accel-bias dominate the raw Laplace overconfidence
+  // (ba ~ x100 variance); orientation/gyro-bias need far less; position is unscaled today but is
+  // itself mildly overconfident (a future knob). [theta, p, v, bg, ba]
+  {
+    Eigen::VectorXd sd = Eigen::VectorXd::Ones(covariance.rows());
+    sd.segment<3>(0).setConstant(std::sqrt(params.init_dyn_inflation_orientation));
+    sd.segment<3>(3).setConstant(std::sqrt(params.init_dyn_inflation_position));
+    sd.segment<3>(6).setConstant(std::sqrt(params.init_dyn_inflation_velocity));
+    sd.segment<3>(9).setConstant(std::sqrt(params.init_dyn_inflation_bias_gyro));
+    // Reset-frozen ba carries its PRIOR variance (spliced above) -- already honest, do not inflate.
+    sd.segment<3>(12).setConstant(freeze_ba ? 1.0 : std::sqrt(params.init_dyn_inflation_bias_accel));
+    // Warm-start clone poses inflate with the SAME orientation/position factors as the IMU pose block,
+    // so the newest clone (which shares the IMU pose) stays bit-identical to the IMU's (theta,p)
+    // sub-block and every cross-covariance scales as a proper congruence. Loop is a no-op when 15x15.
+    for (int o = 15; o + 6 <= (int)covariance.rows(); o += 6) {
+      sd.segment<3>(o).setConstant(std::sqrt(params.init_dyn_inflation_orientation));
+      sd.segment<3>(o + 3).setConstant(std::sqrt(params.init_dyn_inflation_position));
+    }
+    covariance = (sd.asDiagonal() * covariance * sd.asDiagonal()).eval();
+  }
 
   // we are done >:D
   covariance = 0.5 * (covariance + covariance.transpose());
@@ -1110,9 +1568,9 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
   PRINT_DEBUG("[TIME]: %.4f sec for prelim tests\n", (rT2 - rT1).total_microseconds() * 1e-6);
   PRINT_DEBUG("[TIME]: %.4f sec for linsys setup\n", (rT3 - rT2).total_microseconds() * 1e-6);
   PRINT_DEBUG("[TIME]: %.4f sec for linsys\n", (rT4 - rT3).total_microseconds() * 1e-6);
-  PRINT_DEBUG("[TIME]: %.4f sec for ceres opt setup\n", (rT5 - rT4).total_microseconds() * 1e-6);
-  PRINT_DEBUG("[TIME]: %.4f sec for ceres opt\n", (rT6 - rT5).total_microseconds() * 1e-6);
-  PRINT_DEBUG("[TIME]: %.4f sec for ceres covariance\n", (rT7 - rT6).total_microseconds() * 1e-6);
+  PRINT_DEBUG("[TIME]: %.4f sec for ceres-free opt setup\n", (rT5 - rT4).total_microseconds() * 1e-6);
+  PRINT_DEBUG("[TIME]: %.4f sec for ceres-free opt\n", (rT6 - rT5).total_microseconds() * 1e-6);
+  PRINT_DEBUG("[TIME]: %.4f sec for ceres-free covariance\n", (rT7 - rT6).total_microseconds() * 1e-6);
   PRINT_DEBUG("[TIME]: %.4f sec total for initialization\n", (rT7 - rT1).total_microseconds() * 1e-6);
   free_state_memory();
   return true;

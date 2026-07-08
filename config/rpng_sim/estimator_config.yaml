@@ -6,6 +6,11 @@ use_fej: true # if first-estimate Jacobians should be used (enable for good cons
 integration: "rk4" # discrete, rk4, analytical (if rk4 or analytical used then analytical covariance propagation is used)
 use_stereo: true # if we have more than 1 camera, if we should try to track stereo constraints
 max_cameras: 2 # how many cameras we have 1 = mono, 2 = stereo, >2 = binocular (all mono tracking)
+use_gpu: false # modalai fork TrackOCL GPU tracker (VOXL only; simulation always uses TrackSIM)
+
+# modalai fork: IMU history windows kept behind the newest clone / ZUPT clean horizon (code defaults)
+prop_window: 0.10
+zupt_prop_window: 0.10
 
 calib_cam_extrinsics: true # if the transform between camera and IMU should be optimized R_ItoC, p_CinI
 calib_cam_intrinsics: true # if camera intrinsics should be optimized (focal, center, distortion)
@@ -41,6 +46,7 @@ init_window_time: 2.0
 init_imu_thresh: 1.0
 init_max_disparity: 1.5
 init_max_features: 15
+init_gravity_max_angle: 45.0 # modalai fork - max tilt accepted by the dynamic-init gravity gate (code default)
 
 init_dyn_use: true # if dynamic initialization should be used
 init_dyn_mle_opt_calib: false # if we should optimize calibration during intialization (not recommended)

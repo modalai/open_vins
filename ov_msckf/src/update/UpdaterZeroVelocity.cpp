@@ -1,5 +1,6 @@
 /*
  * OpenVINS: An Open Platform for Visual-Inertial Research
+ * Copyright (C) 2025-2026 Joao Leonardo Silva Cotta
  * Copyright (C) 2018-2023 Patrick Geneva
  * Copyright (C) 2018-2023 Guoquan Huang
  * Copyright (C) 2018-2023 OpenVINS Contributors
@@ -78,7 +79,7 @@ bool UpdaterZeroVelocity::try_update(std::shared_ptr<State> state, double timest
 
   // Set the last time offset value if we have just started the system up
   if (!have_last_prop_time_offset) {
-    last_prop_time_offset = state->_calib_dt_CAMtoIMU->value()(0);
+    last_prop_time_offset = state->cam_imu_dt_ref();
     have_last_prop_time_offset = true;
   }
 
@@ -86,7 +87,7 @@ bool UpdaterZeroVelocity::try_update(std::shared_ptr<State> state, double timest
   // assert(timestamp > state->_timestamp);
 
   // Get what our IMU-camera offset should be (t_imu = t_cam + calib_dt)
-  double t_off_new = state->_calib_dt_CAMtoIMU->value()(0);
+  double t_off_new = state->cam_imu_dt_ref();
 
   // First lets construct an IMU vector of measurements we need
   // double time0 = state->_timestamp+t_off_new;

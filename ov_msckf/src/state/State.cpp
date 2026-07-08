@@ -1,5 +1,6 @@
 /*
  * OpenVINS: An Open Platform for Visual-Inertial Research
+ * Copyright (C) 2025-2026 Joao Leonardo Silva Cotta
  * Copyright (C) 2018-2023 Patrick Geneva
  * Copyright (C) 2018-2023 Guoquan Huang
  * Copyright (C) 2018-2023 OpenVINS Contributors
@@ -29,6 +30,9 @@ State::State(StateOptions &options) {
 
   // Save our options
   _options = options;
+  if (_options.cam_imu_dt_ref_camid < 0 || _options.cam_imu_dt_ref_camid >= _options.num_cameras) {
+    _options.cam_imu_dt_ref_camid = 0;
+  }
 
   // Append the imu to the state and covariance
   int current_id = 0;
@@ -94,16 +98,21 @@ State::State(StateOptions &options) {
     }
   }
 
-  // Camera to IMU time offset
-  _calib_dt_CAMtoIMU = std::make_shared<Vec>(1);
-  if (_options.do_calib_camera_timeoffset) {
-    _calib_dt_CAMtoIMU->set_local_id(current_id);
-    _variables.push_back(_calib_dt_CAMtoIMU);
-    current_id += _calib_dt_CAMtoIMU->size();
-  }
-
-  // Loop through each camera and create extrinsic and intrinsics
+  // Loop through each camera and create its time offset, extrinsic, intrinsics, and readout
   for (int i = 0; i < _options.num_cameras; i++) {
+
+    // Allocate camera-imu time offset (1 DOF per camera); the reference camera's variable is
+    // aliased into _calib_dt_CAMtoIMU so single-offset call sites keep working unchanged
+    auto dt_camimu = std::make_shared<Vec>(1);
+    _calib_dt_CAMtoIMU_map.insert({i, dt_camimu});
+    if (_options.do_calib_camera_timeoffset) {
+      dt_camimu->set_local_id(current_id);
+      _variables.push_back(dt_camimu);
+      current_id += dt_camimu->size();
+    }
+    if (i == _options.cam_imu_dt_ref_camid) {
+      _calib_dt_CAMtoIMU = dt_camimu;
+    }
 
     // Allocate extrinsic transform
     auto pose = std::make_shared<PoseJPL>();
@@ -128,6 +137,25 @@ State::State(StateOptions &options) {
       _variables.push_back(intrin);
       current_id += intrin->size();
     }
+
+    // Allocate rolling shutter readout time (1 DOF per camera; 0 = global shutter).
+    // Only cameras declared rolling get an ESTIMATED readout (id >= 0): a global-shutter
+    // camera's readout is physically zero, and estimating it anyway hands the filter a
+    // spurious DOF that absorbs residual junk on that stream. Empty map = legacy (all cams).
+    auto readout = std::make_shared<Vec>(1);
+    _calib_camera_readout.insert({i, readout});
+    bool estimate_readout = _options.do_calib_camera_readout &&
+                            (_options.camera_estimate_readout.empty() ||
+                             (_options.camera_estimate_readout.count((size_t)i) > 0 && _options.camera_estimate_readout.at((size_t)i)));
+    if (estimate_readout) {
+      readout->set_local_id(current_id);
+      _variables.push_back(readout);
+      current_id += readout->size();
+    }
+  }
+  if (_calib_dt_CAMtoIMU == nullptr) {
+    // No cameras configured: keep a detached variable so legacy call sites stay valid
+    _calib_dt_CAMtoIMU = std::make_shared<Vec>(1);
   }
 
   // Finally initialize our covariance to small value
@@ -147,7 +175,9 @@ State::State(StateOptions &options) {
     }
   }
   if (_options.do_calib_camera_timeoffset) {
-    _Cov(_calib_dt_CAMtoIMU->id(), _calib_dt_CAMtoIMU->id()) = std::pow(0.01, 2);
+    for (int i = 0; i < _options.num_cameras; i++) {
+      _Cov(_calib_dt_CAMtoIMU_map.at(i)->id(), _calib_dt_CAMtoIMU_map.at(i)->id()) = std::pow(0.01, 2);
+    }
   }
   if (_options.do_calib_camera_pose) {
     for (int i = 0; i < _options.num_cameras; i++) {
@@ -161,6 +191,15 @@ State::State(StateOptions &options) {
       _Cov.block(_cam_intrinsics.at(i)->id(), _cam_intrinsics.at(i)->id(), 4, 4) = std::pow(1.0, 2) * Eigen::MatrixXd::Identity(4, 4);
       _Cov.block(_cam_intrinsics.at(i)->id() + 4, _cam_intrinsics.at(i)->id() + 4, 4, 4) =
           std::pow(0.005, 2) * Eigen::MatrixXd::Identity(4, 4);
+    }
+  }
+  if (_options.do_calib_camera_readout) {
+    for (int i = 0; i < _options.num_cameras; i++) {
+      // Prior applies only to REGISTERED readout states (declared-rolling cameras)
+      if (_calib_camera_readout.at(i)->id() >= 0) {
+        _Cov(_calib_camera_readout.at(i)->id(), _calib_camera_readout.at(i)->id()) =
+            std::pow(_options.calib_cam_readout_init_sigma, 2);
+      }
     }
   }
 }

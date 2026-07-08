@@ -1,5 +1,6 @@
 /*
  * OpenVINS: An Open Platform for Visual-Inertial Research
+ * Copyright (C) 2025-2026 Joao Leonardo Silva Cotta
  * Copyright (C) 2018-2023 Patrick Geneva
  * Copyright (C) 2018-2023 Guoquan Huang
  * Copyright (C) 2018-2023 OpenVINS Contributors
@@ -28,6 +29,22 @@
 #include <sstream>
 #include <string>
 #include <vector>
+
+// libmodal-flow is a VOXL sysroot dependency (installed by install_build_deps.sh). Host x86 test
+// builds do not have it: gate on header presence, mirroring ov_core's optional-OpenCL handling
+// (TrackOCL is only compiled when OpenCL/modal_flow exist). All TUs in a given environment agree
+// on this macro, so the struct layout stays consistent within every build.
+#if defined(__has_include)
+#if __has_include(<modal_flow/StereoMatcher.hpp>)
+#define OV_HAVE_MODAL_FLOW 1
+#endif
+#endif
+#ifndef OV_HAVE_MODAL_FLOW
+#define OV_HAVE_MODAL_FLOW 0
+#endif
+#if OV_HAVE_MODAL_FLOW
+#include <modal_flow/StereoMatcher.hpp>
+#endif
 
 #include "state/StateOptions.h"
 #include "update/UpdaterOptions.h"
@@ -119,6 +136,12 @@ struct VioManagerOptions {
     if (parser != nullptr) {
       parser->parse_config("dt_slam_delay", dt_slam_delay);
       parser->parse_config("try_zupt", try_zupt);
+      parser->parse_config("epoch_mode", epoch_mode, false);
+      parser->parse_config("epoch_bind_factor", epoch_bind_factor, false);
+      parser->parse_config("epoch_bridge_bias_cols", epoch_bridge_bias_cols, false);
+      parser->parse_config("async_ring_size", async_ring_size, false);
+      parser->parse_config("async_guard", async_guard, false);
+      parser->parse_config("async_stale_factor", async_stale_factor, false);
       parser->parse_config("zupt_max_velocity", zupt_max_velocity);
       parser->parse_config("zupt_noise_multiplier", zupt_noise_multiplier);
       parser->parse_config("zupt_max_disparity", zupt_max_disparity);
@@ -129,6 +152,12 @@ struct VioManagerOptions {
       parser->parse_config("record_timing_filepath", record_timing_filepath);
     }
     PRINT_DEBUG("  - dt_slam_delay: %.1f\n", dt_slam_delay);
+    PRINT_DEBUG("  - epoch_mode: %d\n", epoch_mode);
+    PRINT_DEBUG("  - epoch_bind_factor: %.2f\n", epoch_bind_factor);
+    PRINT_DEBUG("  - epoch_bridge_bias_cols: %d\n", epoch_bridge_bias_cols);
+    PRINT_DEBUG("  - async_ring_size: %d\n", async_ring_size);
+    PRINT_DEBUG("  - async_guard: %.4f\n", async_guard);
+    PRINT_DEBUG("  - async_stale_factor: %.2f\n", async_stale_factor);
     PRINT_DEBUG("  - zero_velocity_update: %d\n", try_zupt);
     PRINT_DEBUG("  - zupt_max_velocity: %.2f\n", zupt_max_velocity);
     PRINT_DEBUG("  - zupt_noise_multiplier: %.2f\n", zupt_noise_multiplier);
@@ -214,8 +243,45 @@ struct VioManagerOptions {
   /// Rotation from accelerometer to the "IMU" gyroscope frame frame
   Eigen::Matrix<double, 4, 1> q_GYROtoIMU;
 
-  /// Time offset between camera and IMU.
+  /// Epoch-anchored cloning: clones are created only at REFERENCE-camera frame times; other
+  /// cameras' frames snap onto the previous epoch clone (known residual enters the measurement
+  /// model) instead of spawning their own clones. Restores the full clone-window baseline for
+  /// unsynced multi-camera rigs (defect B1). Frames with no bindable epoch fall back to cloning.
+  bool epoch_mode = false;
+
+  /// Epoch binding horizon as a multiple of the reference camera's frame period
+  double epoch_bind_factor = 1.2;
+
+  /// Analytic IMU-bias columns from the preintegration bridge (escape hatch: set false if
+  /// vibration/mismodeling lets camera residuals over-drive the biases)
+  bool epoch_bridge_bias_cols = true;
+
+  /// Async camera ingest: per-camera ring capacity (frames)
+  int async_ring_size = 16;
+
+  /// Async camera ingest: IMU margin (s) beyond the per-camera offset before a frame releases
+  double async_guard = 0.002;
+
+  /// Async camera ingest: a camera is stale after this many EMA frame periods of silence
+  double async_stale_factor = 1.5;
+
+  /// Time offset between camera and IMU (the REFERENCE camera's offset).
   double calib_camimu_dt = 0.0;
+
+  /// Per-camera time offset between camera and IMU.
+  std::map<size_t, double> camera_imu_dt;
+
+  /// Map between camid and rolling shutter readout time (seconds). 0.0 = global shutter.
+  std::map<size_t, double> camera_readout_time;
+
+  /// Per-camera shutter declaration from the estimator config: camN_shutter "global"/"rolling".
+  /// Missing entry = legacy behavior (shutter inferred from the readout time alone).
+  std::map<size_t, bool> camera_shutter_rolling;
+
+  /// Per-camera NOMINAL frame rate (Hz) from the estimator config (camN_fps). Used to seed the
+  /// epoch-period/staleness EMAs before they converge and to sanity-check the readout time.
+  /// 0 = undeclared.
+  std::map<size_t, double> camera_fps;
 
   /// Map between camid and camera intrinsics (fx, fy, cx, cy, d1...d4, cam_w, cam_h)
   std::unordered_map<size_t, std::shared_ptr<ov_core::CamBase>> camera_intrinsics;
@@ -238,12 +304,18 @@ struct VioManagerOptions {
   void print_and_load_state(const std::shared_ptr<ov_core::YamlParser> &parser = nullptr) {
     if (parser != nullptr) {
       parser->parse_config("gravity_mag", gravity_mag);
+      if (state_options.cam_imu_dt_ref_camid < 0 || state_options.cam_imu_dt_ref_camid >= state_options.num_cameras) {
+        PRINT_WARNING(YELLOW "cam_imu_dt_ref_camid (%d) is out of range, falling back to cam0\n" RESET, state_options.cam_imu_dt_ref_camid);
+        state_options.cam_imu_dt_ref_camid = 0;
+      }
       for (int i = 0; i < state_options.num_cameras; i++) {
 
-        // Time offset (use the first one)
-        // TODO: support multiple time offsets between cameras
-        if (i == 0) {
-          parser->parse_external("relative_config_imucam", "cam" + std::to_string(i), "timeshift_cam_imu", calib_camimu_dt, false);
+        // Time offset (per camera; the reference camera's value also fills the legacy scalar)
+        double dt_camimu = calib_camimu_dt;
+        parser->parse_external("relative_config_imucam", "cam" + std::to_string(i), "timeshift_cam_imu", dt_camimu, false);
+        camera_imu_dt[(size_t)i] = dt_camimu;
+        if (i == state_options.cam_imu_dt_ref_camid) {
+          calib_camimu_dt = dt_camimu;
         }
 
         // Distortion model
@@ -287,6 +359,66 @@ struct VioManagerOptions {
           camera_intrinsics.at(i)->set_value(cam_calib);
         }
         camera_extrinsics.insert({i, cam_eigen});
+
+        // Rolling shutter readout time. Two sources, main config wins over the kalibr chain:
+        //   camN_readout_time_s (estimator config, survives recalibration)  >  t_readout (kalibr chain)
+        // The explicit camN_shutter declaration ("global"/"rolling") validates the pair: a rolling
+        // camera MUST declare a positive readout (silent 0 = unmodeled RS distortion on every row),
+        // a global camera has any stale readout zeroed. Missing declaration = legacy inference.
+        double t_readout = 0.0;
+        parser->parse_external("relative_config_imucam", "cam" + std::to_string(i), "t_readout", t_readout, false);
+        double readout_cfg = -1.0;
+        parser->parse_config("cam" + std::to_string(i) + "_readout_time_s", readout_cfg, false);
+        if (readout_cfg >= 0.0) {
+          t_readout = readout_cfg;
+        }
+        std::string shutter = "";
+        parser->parse_config("cam" + std::to_string(i) + "_shutter", shutter, false);
+        double fps = 0.0;
+        parser->parse_config("cam" + std::to_string(i) + "_fps", fps, false);
+        if (fps < 0.0 || !std::isfinite(fps)) {
+          PRINT_ERROR(RED "VioManager(): cam%d_fps (%.3f) must be a finite rate in Hz (or omitted)\n" RESET, i, fps);
+          std::exit(EXIT_FAILURE);
+        }
+        camera_fps[(size_t)i] = fps;
+        if (shutter == "rolling") {
+          camera_shutter_rolling[(size_t)i] = true;
+          if (t_readout <= 0.0 && state_options.do_calib_camera_readout) {
+            // Refining readout ONLINE from a zero seed is the documented trap (FEJ linearizes the
+            // RS terms at 0 and the prior fights every step): calibration demands a real seed.
+            PRINT_ERROR(RED "VioManager(): cam%d declared ROLLING with calib_cam_readout ON but no positive readout seed!\n" RESET, i);
+            PRINT_ERROR(RED "\t- set cam%d_readout_time_s (seconds for the full frame, rows x line_time),\n" RESET, i);
+            PRINT_ERROR(RED "\t- or add t_readout to cam%d in the kalibr chain,\n" RESET, i);
+            PRINT_ERROR(RED "\t- or set calib_cam_readout: false to run RS deliberately unmodeled (bring-up only).\n" RESET);
+            std::exit(EXIT_FAILURE);
+          }
+          if (t_readout <= 0.0) {
+            // Deliberate bring-up state: RS declared but unmodeled. A WRONG readout is worse than
+            // none (its mean aliases into the camera's dt, its row-dependent part poisons the
+            // calibration), so zero is allowed -- loudly.
+            PRINT_WARNING(YELLOW "VioManager(): cam%d is ROLLING shutter with readout 0 -- RS is UNMODELED (bring-up only).\n" RESET, i);
+            PRINT_WARNING(YELLOW "\tRows carry up to f*|omega|*readout px of systematic error; measure and set the readout.\n" RESET);
+          }
+        } else if (shutter == "global") {
+          camera_shutter_rolling[(size_t)i] = false;
+          if (t_readout != 0.0) {
+            PRINT_WARNING(YELLOW "VioManager(): cam%d declared GLOBAL shutter; ignoring configured readout %.4fs\n" RESET, i, t_readout);
+            t_readout = 0.0;
+          }
+        } else if (!shutter.empty()) {
+          PRINT_ERROR(RED "VioManager(): cam%d_shutter must be \"global\" or \"rolling\", got \"%s\"\n" RESET, i, shutter.c_str());
+          std::exit(EXIT_FAILURE);
+        } else if (state_options.num_cameras > 1) {
+          // Undeclared on a multi-camera rig: infer, but say so (this is how a stale config hides)
+          PRINT_WARNING(YELLOW "VioManager(): cam%d has no camN_shutter declaration; inferring %s from readout %.4fs\n" RESET, i,
+                        (t_readout != 0.0) ? "ROLLING" : "GLOBAL", t_readout);
+        }
+        if (fps > 0.0 && std::abs(t_readout) > 1.0 / fps) {
+          PRINT_ERROR(RED "VioManager(): cam%d readout time %.4fs exceeds the frame period %.4fs (fps %.1f) -- impossible\n" RESET, i,
+                      t_readout, 1.0 / fps, fps);
+          std::exit(EXIT_FAILURE);
+        }
+        camera_readout_time.insert({i, t_readout});
       }
       parser->parse_config("use_mask", use_mask);
       if (use_mask) {
@@ -372,7 +504,7 @@ struct VioManagerOptions {
                   state_options.num_cameras);
       std::exit(EXIT_FAILURE);
     }
-    PRINT_DEBUG("  - calib_camimu_dt: %.4f\n", calib_camimu_dt);
+    PRINT_DEBUG("  - calib_camimu_dt_ref(cam%d): %.4f\n", state_options.cam_imu_dt_ref_camid, calib_camimu_dt);
     PRINT_DEBUG("CAMERA PARAMETERS:\n");
     for (int n = 0; n < state_options.num_cameras; n++) {
       std::stringstream ss;
@@ -388,6 +520,15 @@ struct VioManagerOptions {
       T_CtoI.block(0, 0, 3, 3) = ov_core::quat_2_Rot(camera_extrinsics.at(n).block(0, 0, 4, 1)).transpose();
       T_CtoI.block(0, 3, 3, 1) = -T_CtoI.block(0, 0, 3, 3) * camera_extrinsics.at(n).block(4, 0, 3, 1);
       ss << "T_C" << n << "toI:" << std::endl << T_CtoI << std::endl << std::endl;
+      ss << "cam_" << n << "_dt_camimu:" << (camera_imu_dt.count(n) ? camera_imu_dt.at(n) : calib_camimu_dt) << std::endl;
+      ss << "cam_" << n << "_t_readout:" << (camera_readout_time.count(n) ? camera_readout_time.at(n) : 0.0) << std::endl;
+      ss << "cam_" << n << "_shutter:"
+         << (camera_shutter_rolling.count(n) ? (camera_shutter_rolling.at(n) ? "rolling" : "global")
+                                             : ((camera_readout_time.count(n) && camera_readout_time.at(n) != 0.0) ? "rolling(inferred)"
+                                                                                                                   : "global(inferred)"))
+         << std::endl;
+      ss << "cam_" << n << "_fps:" << ((camera_fps.count(n) && camera_fps.at(n) > 0.0) ? std::to_string(camera_fps.at(n)) : "undeclared")
+         << std::endl;
       PRINT_DEBUG(ss.str().c_str());
     }
     PRINT_DEBUG("IMU PARAMETERS:\n");
@@ -410,7 +551,22 @@ struct VioManagerOptions {
   bool use_klt = true;
 
   // If we should use GPU to run tracking functions
-  bool use_gpu = false; 
+  bool use_gpu = false;
+
+  // Session-static stereo calibration packed for libmodal-flow. Populated by
+  // VoxlConfigure (intrinsics + composed extrinsic) and marked valid once the
+  // full pack is filled in. VioManager passes it into TrackOCL via
+  // enable_zncc_stereo_matcher at startup.
+#if OV_HAVE_MODAL_FLOW
+  modal_flow::StereoCalib stereo_calib{};
+#endif
+  bool                    stereo_calib_valid = false;
+
+  // Depth-sweep bounds for the epipolar search. Defaults cover near-touch
+  // (0.10 m) out to effectively infinity (100 m) for a small-baseline rig.
+  // Operator-settable in voxl-open-vins-server.conf if desired.
+  float                   stereo_z_min = 0.10f;
+  float                   stereo_z_max = 100.0f;
 
   /// If should extract aruco tags and estimate them
   bool use_aruco = true;
@@ -551,6 +707,18 @@ struct VioManagerOptions {
   /// Feature distance we generate features from (maximum)
   double sim_max_feature_gen_distance = 10;
 
+  /// Per-camera frame phase offsets in seconds (frame k of camera i fires at start + offset_i + k/sim_freq_cam).
+  /// All-zero (default) reproduces the legacy fully-synced simulation bit-exactly. Keys: sim_phase_offset_camN.
+  std::vector<double> sim_cam_phase_offsets;
+
+  /// Per-camera TRUE cam-IMU time offsets in seconds (reported frame stamp = event time - dt_i).
+  /// Defaults to calib_camimu_dt for every camera (legacy single-offset behavior). Keys: sim_camimu_dt_camN.
+  std::vector<double> sim_camimu_dts;
+
+  /// Per-camera TRUE rolling-shutter readout times in seconds (row v sampled at event time + (v/h)*readout).
+  /// Zero (default) = global shutter, which short-circuits to the legacy projection path. Keys: sim_readout_camN.
+  std::vector<double> sim_cam_readouts;
+
   /**
    * @brief This function will load print out all simulated parameters.
    * This allows for visual checking that everything was loaded properly from ROS/CMD parsers.
@@ -570,6 +738,18 @@ struct VioManagerOptions {
       parser->parse_config("sim_min_feature_gen_dist", sim_min_feature_gen_distance);
       parser->parse_config("sim_max_feature_gen_dist", sim_max_feature_gen_distance);
     }
+    // Per-camera truth schedules: sized to the camera count, scalar key per camera so plain YAML parses them
+    int num_cams_sim = std::max(1, state_options.num_cameras);
+    sim_cam_phase_offsets.assign(num_cams_sim, 0.0);
+    sim_camimu_dts.assign(num_cams_sim, calib_camimu_dt);
+    sim_cam_readouts.assign(num_cams_sim, 0.0);
+    if (parser != nullptr) {
+      for (int i = 0; i < num_cams_sim; i++) {
+        parser->parse_config("sim_phase_offset_cam" + std::to_string(i), sim_cam_phase_offsets.at(i), false);
+        parser->parse_config("sim_camimu_dt_cam" + std::to_string(i), sim_camimu_dts.at(i), false);
+        parser->parse_config("sim_readout_cam" + std::to_string(i), sim_cam_readouts.at(i), false);
+      }
+    }
     PRINT_DEBUG("SIMULATION PARAMETERS:\n");
     PRINT_WARNING(BOLDRED "  - state init seed: %d \n" RESET, sim_seed_state_init);
     PRINT_WARNING(BOLDRED "  - perturb seed: %d \n" RESET, sim_seed_preturb);
@@ -581,6 +761,10 @@ struct VioManagerOptions {
     PRINT_DEBUG("  - imu feq: %.2f\n", sim_freq_imu);
     PRINT_DEBUG("  - min feat dist: %.2f\n", sim_min_feature_gen_distance);
     PRINT_DEBUG("  - max feat dist: %.2f\n", sim_max_feature_gen_distance);
+    for (int i = 0; i < num_cams_sim; i++) {
+      PRINT_DEBUG("  - cam%d truth: phase %.6f s | camimu dt %.6f s | readout %.6f s\n", i, sim_cam_phase_offsets.at(i),
+                  sim_camimu_dts.at(i), sim_cam_readouts.at(i));
+    }
   }
 };
 
