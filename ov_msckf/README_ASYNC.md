@@ -15,8 +15,9 @@ It covers the lock-free ingest, the per-camera temporal states, the epoch-anchor
 with its ACI² preintegration bridge, the rolling-shutter measurement model, the deferred
 marginalization rule, the reset semantics, the deliberate omission of the bridge transport noise
 (the `Q_tp` question), and every configuration key added by this work. The synchronized code path
-is preserved bit-identical (FNV-1a state-hash parity `6d38d0ae8d4fc3ae` against the pre-branch
-baseline).
+is preserved bit-identical: FNV-1a hash parity `6d38d0ae8d4fc3ae` of the simulated estimator
+stream against the pre-branch baseline, measured with the out-of-tree jig driven by
+`scripts/sim_ab.sh parity` (the jig itself is not committed; see §11).
 
 ---
 
@@ -50,7 +51,7 @@ camera independently.
 
 ## 2. The unsynchronized multi-camera problem
 
-Stock multi-camera MSCKF assumes camera frames share timestamps, so one clone serves every
+Stock multi-camera MSCKF [1,3] assumes camera frames share timestamps, so one clone serves every
 camera's measurements at that instant. Without hardware sync the frame times $\{t_{f,i}\}$ never
 coincide, and the two naive treatments both fail:
 
@@ -79,8 +80,9 @@ threads, the single consumer is the IMU feed thread — the estimator therefore 
 single-threaded with respect to state. Frames are *released* to the estimator by a $k$-way merge
 that maintains three invariants:
 
-- **I1 (per-stream FIFO):** each ring preserves arrival order; a frame older than the newest
-  released time of its own stream is dropped as `late`.
+- **I1 (release-order FIFO):** each ring preserves arrival order; a frame not newer than the
+  merge's last released timestamp (a single cursor across all streams — release order is global)
+  is dropped as `late`.
 - **I2 (IMU coverage):** the merge head at time $t_h$ is released only once IMU data covers
   $t_h + g$, with guard $g =$ `async_guard`. Propagation and bridging (§6) therefore never
   extrapolate inertial data.
@@ -103,9 +105,9 @@ telemetry line. On a well-configured rig all three counters stay pinned at zero.
 
 ## 4. Per-camera temporal calibration states
 
-The single scalar $t_d$ of stock OpenVINS becomes a map: each camera owns
+The single scalar $t_d$ of stock OpenVINS [4] becomes a map: each camera owns
 $t_{d,i}$ (`State::_calib_dt_CAMtoIMU_map`, accessors `cam_imu_dt(i)`, `cam_imu_dt_delta(i)`), all
-read from the kalibr chain (`timeshift_cam_imu` **per camera**). One camera
+read from the kalibr chain [9] (`timeshift_cam_imu` **per camera**). One camera
 (`cam_imu_dt_ref_camid`, $r$) is the **clock reference**: clones are stamped in camera-$r$-aligned
 IMU time, so the quantity that shifts camera $i$'s measurements relative to the clones is the
 *delta* $\Delta t_{d,i} = t_{d,i} - t_{d,r}$. Consequently the measurement Jacobian carries
@@ -123,9 +125,11 @@ filter effectively never wins under FEJ.
 
 **Degenerate-motion gating.** Temporal states are observable only when the window's kinematics
 vary: under constant ${}^{I}\omega$ and constant ${}^{G}v$ (hover, straight cruise) the dt/readout
-columns become collinear with clone and feature errors and the states drift on noise [7]. When the
-window-wide spread tests fall below `dt_calib_gate_min_omega` / `dt_calib_gate_min_vel_spread`,
-the **columns are skipped while the current values remain applied** (`dt_calib_gate`) — the model
+columns become collinear with clone and feature errors and the states drift on noise [7]. The gate
+tests the clone window's excitation: its **peak** $\|{}^{I}\omega\|$ against
+`dt_calib_gate_min_omega` and its velocity **spread** (max deviation from the window mean, an
+acceleration proxy) against `dt_calib_gate_min_vel_spread`; when both fall below threshold the
+**columns are skipped while the current values remain applied** (`dt_calib_gate`) — the model
 stays correct, only its refinement pauses.
 
 ---
@@ -133,18 +137,24 @@ stays correct, only its refinement pauses.
 ## 5. Epoch-anchored cloning (`epoch_mode`)
 
 Clones are created **only at reference-camera frame times** $t_e$ (the *epochs*). A non-reference
-frame from camera $i$, stamped $t_{f,i}$, defines the **epoch residual**
+frame from camera $i$, stamped $t_{f,i}$ (same camera clock convention as $t_e$), defines the
+**epoch residual**
 
 ```math
-\delta_i \;=\; \big(t_{f,i} + t_{d,i}\big) - t_e ,
+\delta_i \;=\; \underbrace{\big(t_{f,i} - t_e\big)}_{\text{raw, stored}} \;+\; \Delta t_{d,i} ,
 ```
 
-stored per (clone, camera) in `State::_epoch_residuals`. The frame **binds** to the epoch clone if
-$|\delta_i| \le \beta\, T_r$, with $T_r$ the reference frame period and $\beta =$
+whose raw part is stored per (clone, camera) in `State::_epoch_residuals` while the calibration
+part $\Delta t_{d,i} = t_{d,i} - t_{d,r}$ is added at update time via `cam_imu_dt_delta(i)` — so
+the transport interval stays differentiable in the live dt states, and $\delta_i$ equals the true
+IMU-clock separation $(t_{f,i} + t_{d,i}) - (t_e + t_{d,r})$. The frame **binds** to the epoch
+clone if $0 \le t_{f,i} - t_e \le \beta\, T_r$ (the ordered release of §3 makes the raw residual
+non-negative), with $T_r$ the EMA-tracked reference frame period and $\beta =$
 `epoch_bind_factor`; otherwise it falls back to its own clone (`epoch_fallbacks` counts these; the
 one-frame-per-(camera, epoch) rule prevents double binding). Binding is *exact*, not
-interpolated: the measurement model transports the state across $\delta_i$ with a preintegration
-bridge (§6).
+interpolated: the measurement model transports the state across the raw residual with a
+preintegration bridge (§6), while the $\Delta t_{d,i}$ remainder — an estimated state, so it must
+stay differentiable — rides the first-order dt transport of §7.
 
 **The reference must be the fastest camera.** If some camera has rate $f_i \gt f_r$, pigeonholing
 forces at least $f_i - f_r$ extra frames per second into already-occupied epochs; each one falls
@@ -170,8 +180,8 @@ identical data go from $5.3\,\mathrm{m}$ to $0.44\,\mathrm{m}$ ATE, independent 
 
 The bridge relates the IMU pose at the true imaging time $t_f = t_e + \delta$ to the epoch clone,
 using the **actual IMU samples** over $[t_e,\, t_e + \delta]$ with the analytic closed forms of
-ACI² [2] (`compute_Xi_sum`, small-$\omega$ safe). Define the relative terms, all expressed in the
-epoch frame $\{I_e\}$:
+ACI² [2,10] (implemented in this module's `Propagator::compute_Xi_sum`, small-$\omega$ safe).
+Define the relative terms, all expressed in the epoch frame $\{I_e\}$:
 
 ```math
 \Delta R = {}^{I_f}_{I_e}R, \qquad
@@ -189,7 +199,7 @@ so that
 
 Per IMU step of length $\Delta t$ (bias/intrinsics-corrected midpoint signals $\hat\omega, \hat a$;
 $R_{step} = \mathrm{Exp}(-\hat\omega \Delta t)$; $A = \Delta R^\top$; $\Xi_1 \ldots \Xi_4$ the
-analytic integrals of [2]):
+analytic integrals of [10]):
 
 ```math
 \alpha \leftarrow \alpha + \beta\,\Delta t + A\,\Xi_2\,\hat a, \qquad
@@ -198,7 +208,7 @@ analytic integrals of [2]):
 ```
 
 **Bias Jacobians.** The bridge is built once at bias linearization $\bar b = (\bar b_g, \bar b_a)$
-(the ACI² partial-fixed convention) and corrected to first order at update time, never
+(the ACI² partial-fixed convention [10]) and corrected to first order at update time, never
 re-integrated:
 
 ```math
@@ -218,15 +228,27 @@ J_{\alpha a} \leftarrow J_{\alpha a} + J_{\beta a} \Delta t - A\,\Xi_2,
 ```math
 J_{\beta g} \leftarrow J_{\beta g} + A\big(\Xi_3 + \lfloor \Xi_1 \hat a \rfloor J_{\theta g}\big), \qquad
 J_{\beta a} \leftarrow J_{\beta a} - A\,\Xi_1, \qquad
-J_{\theta g} \leftarrow R_{step}\, J_{\theta g} + J_r(-\hat\omega \Delta t)\, \Delta t .
+J_{\theta g} \leftarrow R_{step}\, J_{\theta g} + J_r(+\hat\omega \Delta t)\, \Delta t .
 ```
+
+Note the **positive** argument of the right Jacobian in the $J_{\theta g}$ increment: from
+$\mathrm{Exp}(-\hat\omega\Delta t + \delta b_g\,\Delta t) = R_{step}\,\mathrm{Exp}\big(J_r(-\hat\omega\Delta t)\,\delta b_g\,\Delta t\big)$,
+transporting the new increment through $R_{step}$ gives
+$R_{step}\, J_r(-\hat\omega\Delta t) = J_l(-\hat\omega\Delta t) = J_r(+\hat\omega\Delta t)$.
+Writing $J_r(-\hat\omega\Delta t)$ here (the flavor stored by `compute_Xi_sum` for the stock
+propagator's noise Jacobian) is wrong by $O(\|\hat\omega\|\Delta t)$ per step — measured
+$1.0\times10^{-3}$ relative at 800 Hz, *below* the original $2\times10^{-3}$ oracle tolerance,
+which is how it initially slipped through.
 
 These give **analytic bias columns** in the measurement Jacobian of every epoch-snapped
 observation (`epoch_bridge_bias_cols`): camera residuals correct $b_g, b_a$ *through the bridge*,
 which is what makes the bound measurement a first-class EKF update rather than a fixed-lag hack.
 All coupling signs are pinned by a finite-difference oracle (`test_preint_bridge`), not by
 convention arguments — two sign errors in the literature-derived forms were caught exactly this
-way. Caveat that earns its own knob: if timing or RS is grossly mismodeled, these same columns
+way, and the $J_r$-flavor subtlety above was later caught by review and is now pinned too: the
+oracle runs at two IMU rates (800 and 200 Hz) under a $10^{-6}$ relative tolerance — three orders
+below the wrong flavor's error, and comfortably above the exact form's measured residual
+($\approx 4\times10^{-9}$). Caveat that earns its own knob: if timing or RS is grossly mismodeled, these same columns
 are the conduit by which systematic image error drives the IMU biases (a hardware bring-up run
 walked $b_a$ to $0.45\,\mathrm{m/s^2}$ this way); `epoch_bridge_bias_cols: false` is the
 bring-up escape hatch.
@@ -328,15 +350,24 @@ Q \leftarrow \Phi\, Q\, \Phi^\top + G\, Q_d\, G^\top,
 \qquad
 \Phi = \begin{bmatrix} R_{step} & 0 & 0 \\ A\lfloor \Xi_2 \hat a \rfloor & I & \Delta t I \\ A\lfloor \Xi_1 \hat a \rfloor & 0 & I \end{bmatrix},
 \qquad
-G = \begin{bmatrix} -J_r \Delta t & 0 \\ A\,\Xi_4 & -A\,\Xi_2 \\ A\,\Xi_3 & -A\,\Xi_1 \end{bmatrix}.
+G = \begin{bmatrix} J_r(\hat\omega\Delta t)\, \Delta t & 0 \\ A\,\Xi_4 & -A\,\Xi_2 \\ A\,\Xi_3 & -A\,\Xi_1 \end{bmatrix},
 ```
 
-This recursion was implemented, measured, and then **deliberately removed** from
-`compute_bridge` (it survives in git history, submodule commit `15634ce`, should it ever be
-needed). The engineering argument, in decreasing order of importance:
+with the noise columns of $G$ matching the bias columns of §6 entry for entry — as they must,
+since $n_g, n_a$ enter $\hat\omega = \omega_m - b_g - n_g$, $\hat a = a_m - b_a - n_a$ exactly
+like the biases (the $\theta$-row therefore carries the same $J_r(+\hat\omega\Delta t)$ increment
+as $J_{\theta g}$, and the same sign).
 
-1. **Magnitude.** The bridge never exceeds the binding horizon $\delta_{max} = \beta\, T_r$
-   ($= 1.5/60 = 25\,\mathrm{ms}$ on the reference rig). Worst-case 1-σ pixel impact, using the
+This recursion was implemented, measured, and then **deliberately removed** from
+`compute_bridge`; it is preserved in full above, should it ever be needed. The engineering
+argument, in decreasing order of importance:
+
+1. **Magnitude.** The bridge never exceeds the binding horizon $\delta_{max} = \beta\, T_r$.
+   The deployed reference rig (60 Hz reference camera, `epoch_bind_factor: 1.5` in its hardware
+   config — not the in-repo defaults) gives $\delta_{max} = 1.5/60 = 25\,\mathrm{ms}$; at the in-repo
+   defaults ($\beta = 1.2$, 30 Hz `voxl_sim`) it is $40\,\mathrm{ms}$, which scales $e_\theta$ below by
+   $1.26\times$ and $e_p$ by $2\times$ without changing the conclusion. Worst-case 1-σ pixel
+   impact at $\delta_{max} = 25\,\mathrm{ms}$, using the
    *kalibr-inflated* sheet noises ($\sigma_g = 9.7\!\times\!10^{-4}\,\mathrm{rad/s/\sqrt{Hz}}$,
    $\sigma_a = 2.3\!\times\!10^{-2}\,\mathrm{m/s^2/\sqrt{Hz}}$, $f = 450\,\mathrm{px}$, depth $d$):
 
@@ -367,10 +398,12 @@ needed). The engineering argument, in decreasing order of importance:
    GS+RS async $0.352\,\mathrm{m}$ / NEES $7.7$ with $94\%$ readout recovery. No optimism signature.
 
 **Revisit criterion.** Re-land the recursion (as a per-epoch error state, not R-inflation) when
-$f\,\sigma_g\sqrt{\delta_{max}} \gtrsim \sigma_{px}/3$ — reachable with a slow reference camera
-($\delta_{max} \gtrsim 100\,\mathrm{ms}$), a narrow-FOV lens ($f \gtrsim 2000\,\mathrm{px}$), sub-$0.5\,\mathrm{px}$ front
-ends, or MEMS-grade-noise regressions; or if a soak shows epoch-snapped residuals running
-systematically hotter $\chi^2$ than same-camera unsnapped ones.
+$f\,\sigma_g\sqrt{\delta_{max}} \gtrsim \sigma_{px}/3$. No single factor crosses that line at the
+reference values — a slow reference camera ($\delta_{max} \gtrsim 100\,\mathrm{ms}$) alone reaches
+$0.14\,\mathrm{px}$ against the $0.4\,\mathrm{px}$ threshold — but pairings do: a narrow-FOV lens
+($f \gtrsim 2000\,\mathrm{px}$) with a sub-$0.5\,\mathrm{px}$ front end, a slow reference with a narrow-FOV
+lens, or any of these compounded by MEMS-grade-noise regressions. Also revisit if a soak shows
+epoch-snapped residuals running systematically hotter $\chi^2$ than same-camera unsnapped ones.
 
 ---
 
@@ -385,8 +418,10 @@ resets the EKF while preserving the expensive front-end state: feature database,
 and IMU history survive, so re-initialization is warm rather than a cold $\sim 2\,\mathrm{s}$ window
 rebuild. Specifically it:
 
-- rebuilds state and covariance, re-pins the FEJ of every $t_{d,i}$ and $t_{r,i}$ at the current
-  values (calibration knowledge survives the reset; its transient history does not);
+- rebuilds state and covariance, re-pins the value and FEJ of every $t_{d,i}$ and $t_{r,i}$ at
+  the **configured** calibration (the config's calibration knowledge survives the reset; online
+  refinements and their transient history are deliberately discarded — a reset returns to the
+  trusted prior, not to estimates the divergence may have poisoned);
 - snapshots the live $b_g, b_a$ and their (random-walk age-inflated) sigmas as a **reset bias
   prior** for the initializer, gated by `init_dyn_reset_prior_max_{bg,ba}` /
   `..._max_sigma_{bg,ba}` with sigma floors and a `DIVERGENCE`-cause inflation — the main
@@ -421,7 +456,7 @@ rest of the configuration at boot and fails fast on contradictions.
 |---|---|---|
 | `camN_shutter` | `"global"` / `"rolling"` | Authoritative shutter declaration. `global`: readout pinned to 0 forever, **never** estimated (no spurious DOF); any configured nonzero readout is zeroed with a warning. `rolling`: RS model of §7 active whenever the readout value is nonzero. Missing on a multi-camera rig: legacy inference from the readout value, with a warning (that is what a stale deployed config looks like). Invalid string: fatal. |
 | `camN_readout_time_s` | float ≥ 0 | Readout (first→last row, seconds). Priority: this key **wins over** kalibr-chain `t_readout` (survives recalibration); absent both → 0. `rolling` + 0 is allowed as the declared bring-up state "RS deliberately unmodeled" (loud warning; see §7 for why a wrong value is worse than none). `rolling` + 0 + `calib_cam_readout: true` is **fatal**: estimating from a zero seed is the documented FEJ trap. Must satisfy $t_r \le 1/\text{fps}$ (fatal otherwise). |
-| `camN_fps` | float > 0 | Nominal rate of the **streamed sensor mode**. Seeds the ingest staleness EMA and the epoch binding horizon from the first frame (cold start and every hard reset), and sanity-bounds the readout. Must be finite and non-negative (fatal otherwise). Warns if any camera is declared faster than the epoch reference (§5). |
+| `camN_fps` | float ≥ 0, finite | Nominal rate of the **streamed sensor mode**; `0` (or absent) means *undeclared* — no EMA seeding, no readout bound. When positive: seeds the ingest staleness EMA and the epoch binding horizon from the first frame (cold start and every hard reset), and sanity-bounds the readout. Negative or non-finite is fatal. Warns if any camera is declared faster than the epoch reference (§5). |
 
 ### Asynchronous multi-camera (estimator config)
 
@@ -429,7 +464,7 @@ rest of the configuration at boot and fails fast on contradictions.
 |---|---|---|
 | `epoch_mode` | `false` | Master switch for epoch-anchored cloning (§5). `false` preserves the stock synced behavior bit-identically. A rig with ≥2 cameras, `use_stereo: false`, and `epoch_mode: false` triggers the **config-drift guard** — a loud boot warning that this exact combination is what a stale deployed config looks like, and that it dead-reckons into an auto-reset loop on hardware. |
 | `cam_imu_dt_ref_camid` | `0` | Clock-reference camera $r$ (§4). **Must be the fastest camera** (§5). |
-| `epoch_bind_factor` | `1.2` | Binding horizon in reference periods: bind iff $\lvert\delta_i\rvert \le \beta\, T_r$. Larger admits slower cameras' phase excursions; it also bounds $\delta_{max}$ in the $Q_{tp}$ analysis (§8). |
+| `epoch_bind_factor` | `1.2` | Binding horizon in reference periods: bind iff $0 \le t_{f,i} - t_e \le \beta\, T_r$ (§5). Larger admits slower cameras' phase excursions; it also bounds $\delta_{max}$ in the $Q_{tp}$ analysis (§8). |
 | `epoch_bridge_bias_cols` | `true` | Analytic $J_b$ bias columns on bridged measurements (§6). Disable only as a bring-up escape hatch when gross timing/RS mismodeling is suspected of driving the biases. |
 | `async_ring_size` | `16` | Per-camera SPSC ring capacity (frames). |
 | `async_guard` | `0.002` | IMU coverage guard $g$ (s) — invariant **I2** of §3. |
@@ -442,7 +477,7 @@ rest of the configuration at boot and fails fast on contradictions.
 | `calib_cam_readout` | `false` | Online refinement of $t_{r,i}$ — **only** for declared-`rolling` cameras; the readout *value* is applied regardless (value/column separation, §7). |
 | `calib_cam_readout_init_sigma` | `0.001` | Initial 1-σ prior on estimated readouts (s). $1\,\mathrm{ms}$ suits a measured seed; $\approx 5\,\mathrm{ms}$ a datasheet guess (§4). Must be positive (fatal otherwise). |
 | `dt_calib_gate` | `false` | Opt-in: freeze dt/readout **columns** under degenerate window motion (§4); values stay applied. |
-| `dt_calib_gate_min_omega`, `dt_calib_gate_min_vel_spread` | `0.10` | Window-wide motion-spread thresholds ($\mathrm{rad/s}$, $\mathrm{m/s}$) below which the gate engages. |
+| `dt_calib_gate_min_omega`, `dt_calib_gate_min_vel_spread` | `0.10` | Window excitation thresholds — peak $\|\omega\|$ ($\mathrm{rad/s}$) and velocity spread ($\mathrm{m/s}$); the gate engages when **both** fall below threshold (§4). |
 
 ### Kalibr chain (per camera)
 
@@ -457,11 +492,16 @@ fallback readout source, overridden by `camN_readout_time_s`.
   error): $0.385\,\mathrm{m}$ / $0.60^\circ$ / NEES $11.2$ vs synced baseline $0.436\,\mathrm{m}$ / $0.40^\circ$ / NEES $32$;
   pre-fix $41.9\,\mathrm{m}$ / NEES $5041$. Mixed GS+RS: $0.352\,\mathrm{m}$ / NEES $7.7$, readout recovered to
   $94\%$ of truth.
-- **Synced-path parity**: FNV-1a state hash `6d38d0ae8d4fc3ae` identical to the pre-branch
-  baseline with `epoch_mode: false` — the legacy path is untouched by construction, not by hope.
-- **Finite-difference oracles**: `test_preint_bridge` pins every $J_b$ coupling sign in §6;
-  `test_async_buffer` exercises the ordering/liveness/disposal invariants of §3;
-  `test_async_dual` runs the full async dual-mono estimator against truth.
+- **Synced-path parity**: FNV-1a hash `6d38d0ae8d4fc3ae` of the simulated estimator stream,
+  identical to the pre-branch baseline with `epoch_mode: false` — the legacy path is untouched by
+  construction, not by hope. Measured by `scripts/sim_ab.sh parity`, which compiles an
+  out-of-tree hash jig against both trees; the jig source is a development artifact and is not
+  committed, so reproducing the check requires rebuilding it per the S0 stage notes.
+- **Finite-difference oracles**: `test_preint_bridge` pins every $J_b$ coupling sign *and*
+  Jacobian flavor in §6 (FD at two IMU rates, $10^{-6}$ relative tolerance), plus mean exactness
+  against dense integration and the bias-correction convention; `test_async_buffer` exercises the
+  ordering/liveness/disposal invariants of §3; `test_async_dual` runs the full async dual-mono
+  estimator against truth.
 - **Runtime telemetry**: per-update `[EPOCH]` line (snapped/fallback counts, late/full/bogus
   drops) — a healthy rig holds fallbacks and all drop counters at zero (§3, §5).
 
@@ -473,7 +513,7 @@ fallback readout source, overridden by `camN_readout_time_s`.
 Visual-Inertial Estimation," ICRA 2020.
 
 [2] K. Eckenhoff, P. Geneva, G. Huang, "Closed-form Preintegration Methods for Graph-based
-Visual-Inertial Navigation," IJRR 2019; and the ACI² formulation of its ICRA revision.
+Visual-Inertial Navigation," IJRR 2019.
 
 [3] A. I. Mourikis, S. I. Roumeliotis, "A Multi-State Constraint Kalman Filter for Vision-aided
 Inertial Navigation," ICRA 2007.
@@ -495,3 +535,6 @@ Improvement of Vision-aided Inertial Navigation," IEEE T-RO 2014.
 
 [9] P. Furgale, J. Rehder, R. Siegwart, "Unified Temporal and Spatial Calibration for Multi-Sensor
 Systems," IROS 2013.
+
+[10] Y. Yang, B. P. W. Babu, C. Chen, G. Huang, L. Ren, "Analytic Combined IMU Integration (ACI²)
+for Visual-Inertial Navigation," ICRA 2020.
