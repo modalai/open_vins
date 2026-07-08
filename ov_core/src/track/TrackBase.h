@@ -28,6 +28,7 @@
 #include <thread>
 #include <unordered_map>
 
+#include <Eigen/Eigen>
 #include <boost/date_time/posix_time/posix_time.hpp>
 #include <opencv2/core/core.hpp>
 #include <opencv2/highgui/highgui.hpp>
@@ -154,6 +155,28 @@ public:
   void set_num_features(int _num_features) { num_features = _num_features; }
 
   virtual cl_context get_ocl_context() const { return nullptr; }
+
+  // --- optional capabilities implemented by GPU-backed trackers (default no-ops), analogous to
+  //     get_ocl_context() above. They let VioManager / the server use these features through the
+  //     TrackBase interface WITHOUT depending on the concrete tracker type (e.g. TrackOCL). ---
+
+  /// IMU-aided KLT seeding: forward gyro samples / bias / per-camera IMU->camera rotation so the
+  /// tracker can seed nextPts with the IMU-predicted inter-frame rotation. No-op unless supported.
+  virtual void feed_imu(double t, double gx, double gy, double gz) { (void)t; (void)gx; (void)gy; (void)gz; }
+  virtual void set_gyro_bias(double bx, double by, double bz) { (void)bx; (void)by; (void)bz; }
+  virtual void set_cam_imu_rotation(size_t cam_id, const Eigen::Matrix3d &R_ItoC) { (void)cam_id; (void)R_ItoC; }
+
+  /// Per-feature stereo-match confidence (for reinit diagnostics). Empty on trackers that don't
+  /// produce stereo matches; a matching tracker overrides stereo_confidence_map().
+  struct StereoConfidence {
+    float peak_zncc;  // forward peak ZNCC, in [-1, 1]
+    float margin;     // peak - runner_up; uniqueness signal
+    float lr_err;     // px residual of right->left round-trip
+  };
+  virtual const std::unordered_map<size_t, StereoConfidence> &stereo_confidence_map() const {
+    static const std::unordered_map<size_t, StereoConfidence> empty;
+    return empty;
+  }
 
 protected:
   /// Camera object which has all calibration in it

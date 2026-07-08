@@ -36,6 +36,8 @@
 
 #include <boost/date_time/posix_time/posix_time.hpp>
 #include <boost/math/distributions/chi_squared.hpp>
+#include <iterator>
+#include <set>
 
 using namespace ov_core;
 using namespace ov_type;
@@ -59,7 +61,8 @@ UpdaterSLAM::UpdaterSLAM(UpdaterOptions &options_slam, UpdaterOptions &options_a
   }
 }
 
-void UpdaterSLAM::delayed_init(std::shared_ptr<State> state, std::vector<std::shared_ptr<Feature>> &feature_vec) {
+void UpdaterSLAM::delayed_init(std::shared_ptr<State> state, std::vector<std::shared_ptr<Feature>> &feature_vec,
+                               const std::unordered_map<size_t, StereoMatchConfidence> *stereo_confidence) {
 
   // Return if no features
   if (feature_vec.empty())
@@ -256,6 +259,62 @@ void UpdaterSLAM::delayed_init(std::shared_ptr<State> state, std::vector<std::sh
     double chi2_multipler = is_aruco ? _options_aruco.chi2_multipler : _options_slam.chi2_multipler;
     if (StateHelper::initialize(state, landmark, Hx_order, H_x, H_f, R, res, chi2_multipler)) {
       state->_features_SLAM.insert({f.featid, landmark});
+
+      // DIAGNOSTIC: confirm/refute whether "landmarked too close" flicker traces to a
+      // feature being marginalized then re-triangulated from a thin/short-baseline
+      // observation set. See RejectStats.h ReinitEvent for details.
+      if (kEnableReinitDiag) {
+        std::set<double> distinct_ts;
+        int n_obs = 0;
+        for (auto const &pair : f.timestamps) {
+          n_obs += (int)pair.second.size();
+          for (double t : pair.second)
+            distinct_ts.insert(t);
+        }
+        ReinitEvent ev;
+        ev.meas_ts = state->_timestamp;
+        ev.featid = f.featid;
+        ev.is_stereo = is_stereo;
+        ev.is_reinit = reinit_mark_and_check(f.featid);
+        ev.n_cams = (int)f.timestamps.size();
+        ev.n_obs = n_obs;
+        ev.n_distinct_ts = (int)distinct_ts.size();
+        ev.time_span_s = distinct_ts.empty() ? 0.0 : (*distinct_ts.rbegin() - *distinct_ts.begin());
+        ev.depth_anchor = f.p_FinA(2);
+
+        // For the single-instant 2-cam stereo case: recompute the SAME baseline vector
+        // FeatureInitializer used (anchor pose vs. the other camera's pose, both read
+        // straight from clones_cam) to check whether the triangulation actually saw the
+        // true known extrinsic separation, or something anomalous (a pose/lookup bug).
+        if (ev.n_cams == 2 && ev.n_distinct_ts == 1) {
+          try {
+            double t0 = *distinct_ts.begin();
+            size_t other_cam = ((int)f.timestamps.begin()->first == f.anchor_cam_id) ? std::next(f.timestamps.begin())->first
+                                                                                      : f.timestamps.begin()->first;
+            FeatureInitializer::ClonePose anchor_pose = clones_cam.at(f.anchor_cam_id).at(f.anchor_clone_timestamp);
+            FeatureInitializer::ClonePose other_pose = clones_cam.at(other_cam).at(t0);
+            Eigen::Vector3d p_CiinA = anchor_pose.Rot() * (other_pose.pos() - anchor_pose.pos());
+            ev.baseline_norm = p_CiinA.norm();
+          } catch (const std::exception &e) {
+            ev.baseline_norm = -1.0;
+          }
+        }
+
+        // Matcher's own confidence for this feature's L/R correspondence, if VioManager
+        // supplied one (see UpdaterSLAM.h delayed_init doc). Left at ReinitEvent's "no
+        // data" sentinel defaults if unavailable.
+        if (stereo_confidence != nullptr) {
+          auto it_conf = stereo_confidence->find(f.featid);
+          if (it_conf != stereo_confidence->end()) {
+            ev.peak_zncc = it_conf->second.peak_zncc;
+            ev.margin = it_conf->second.margin;
+            ev.lr_err = it_conf->second.lr_err;
+          }
+        }
+
+        log_reinit_event(ev);
+      }
+
       return true;
     }
     return false;

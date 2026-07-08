@@ -24,6 +24,7 @@
 
 #include <Eigen/Eigen>
 #include <memory>
+#include <unordered_map>
 
 #include "feat/FeatureInitializerOptions.h"
 
@@ -40,6 +41,7 @@ class Landmark;
 namespace ov_msckf {
 
 class State;
+struct StereoMatchConfidence; // see RejectStats.h; only used here as a pointer-to-map param
 
 /**
  * @brief Will compute the system for our sparse SLAM features and update the filter.
@@ -73,8 +75,13 @@ public:
    * @brief Given max track features, this will try to use them to initialize them in the state.
    * @param state State of the filter
    * @param feature_vec Features that can be used for update
+   * @param stereo_confidence DIAGNOSTIC ONLY: optional featid -> matcher-confidence lookup
+   *        (from TrackOCL::stereo_confidence_map(), copied by VioManager since UpdaterSLAM
+   *        doesn't otherwise see the tracker) attached to reinit diagnostic log lines. Null
+   *        if not available; does not affect estimation, only ReinitEvent logging.
    */
-  void delayed_init(std::shared_ptr<State> state, std::vector<std::shared_ptr<ov_core::Feature>> &feature_vec);
+  void delayed_init(std::shared_ptr<State> state, std::vector<std::shared_ptr<ov_core::Feature>> &feature_vec,
+                     const std::unordered_map<size_t, StereoMatchConfidence> *stereo_confidence = nullptr);
 
   /**
    * @brief Will change SLAM feature anchors if it will be marginalized
