@@ -238,7 +238,10 @@ $R_{step}\, J_r(-\hat\omega\Delta t) = J_l(-\hat\omega\Delta t) = J_r(+\hat\omeg
 Writing $J_r(-\hat\omega\Delta t)$ here (the flavor stored by `compute_Xi_sum` for the stock
 propagator's noise Jacobian) is wrong by $O(\|\hat\omega\|\Delta t)$ per step — measured
 $1.0\times10^{-3}$ relative at 800 Hz, *below* the original $2\times10^{-3}$ oracle tolerance,
-which is how it initially slipped through.
+which is how it initially slipped through. The implementation evaluates the increment as the
+factored product $R_{step}\big(J_{\theta g} + J_r(-\hat\omega\Delta t)\,\Delta t\big)$,
+reusing the $J_r(-\hat\omega\Delta t)$ block `compute_Xi_sum` already produces — the exact
+$J_r(+\hat\omega\Delta t)$ correction at zero additional per-step transcendental cost.
 
 These give **analytic bias columns** in the measurement Jacobian of every epoch-snapped
 observation (`epoch_bridge_bias_cols`): camera residuals correct $b_g, b_a$ *through the bridge*,
