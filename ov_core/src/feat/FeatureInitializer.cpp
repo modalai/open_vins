@@ -30,7 +30,10 @@
 using namespace ov_core;
 
 bool FeatureInitializer::single_triangulation(std::shared_ptr<Feature> feat,
-                                              std::unordered_map<size_t, std::unordered_map<double, ClonePose>> &clonesCAM) {
+                                              std::unordered_map<size_t, std::unordered_map<double, ClonePose>> &clonesCAM,
+                                              FailReason *reason) {
+  if (reason)
+    *reason = FailReason::NONE;
 
   // Total number of measurements
   // Also set the first measurement to be the anchor frame
@@ -104,6 +107,14 @@ bool FeatureInitializer::single_triangulation(std::shared_ptr<Feature> feat,
   // Then set the flag for bad (i.e. set z-axis to nan)
   if (std::abs(condA) > _options.max_cond_number || p_f(2, 0) < _options.min_dist || p_f(2, 0) > _options.max_dist ||
       std::isnan(p_f.norm())) {
+    if (reason) {
+      if (std::isnan(p_f.norm()))
+        *reason = FailReason::TRI_NAN;
+      else if (std::abs(condA) > _options.max_cond_number)
+        *reason = FailReason::TRI_COND;
+      else
+        *reason = FailReason::TRI_DEPTH;
+    }
     return false;
   }
 
@@ -247,7 +258,10 @@ bool FeatureInitializer::single_triangulation_1d(std::shared_ptr<Feature> feat,
 }
 
 bool FeatureInitializer::single_gaussnewton(std::shared_ptr<Feature> feat,
-                                            std::unordered_map<size_t, std::unordered_map<double, ClonePose>> &clonesCAM) {
+                                            std::unordered_map<size_t, std::unordered_map<double, ClonePose>> &clonesCAM,
+                                            FailReason *reason) {
+  if (reason)
+    *reason = FailReason::NONE;
 
   // Get into inverse depth
   double rho = 1 / feat->p_FinA(2);
@@ -418,6 +432,14 @@ bool FeatureInitializer::single_gaussnewton(std::shared_ptr<Feature> feat,
   // 3. If the baseline ratio is large
   if (feat->p_FinA(2) < _options.min_dist || feat->p_FinA(2) > _options.max_dist ||
       (feat->p_FinA.norm() / base_line_max) > _options.max_baseline || std::isnan(feat->p_FinA.norm())) {
+    if (reason) {
+      if (std::isnan(feat->p_FinA.norm()))
+        *reason = FailReason::GN_NAN;
+      else if (feat->p_FinA(2) < _options.min_dist || feat->p_FinA(2) > _options.max_dist)
+        *reason = FailReason::GN_DEPTH;
+      else
+        *reason = FailReason::GN_BASELINE;
+    }
     return false;
   }
 
