@@ -130,11 +130,14 @@ static void test_mean_exactness() {
               (bd.beta - be_ref).norm());
 }
 
-static void test_bias_jacobians_fd() {
+// The J_th_g increment must be Jr(+w dt), not Jr(-w dt): the two differ by O(|w| dt) relative,
+// so the oracle runs a low-rate case (200 Hz -> ~6e-3 with the wrong flavor) under a tolerance
+// (1e-6) far below that gap but far above the exact form's residual (~4e-9 measured).
+static void test_bias_jacobians_fd(double rate_hz, double tol) {
   const double t0 = 20.000, t1 = 20.030; // 30 ms
   const Eigen::Vector3d bg(0.004, -0.01, 0.02), ba(0.03, -0.05, 0.01);
   NoiseManager noises;
-  auto imu = make_imu(t0, t1, 800.0);
+  auto imu = make_imu(t0, t1, rate_hz);
 
   auto build = [&](const Eigen::Vector3d &bgi, const Eigen::Vector3d &bai, Propagator::BridgeData &out) {
     auto state = make_state(bgi, bai);
@@ -170,9 +173,9 @@ static void test_bias_jacobians_fd() {
     const double scale = std::max(1e-6, fd.norm());
     const double rel = (fd - an).norm() / scale;
     max_rel = std::max(max_rel, rel);
-    CHECK(rel < 2e-3, "J_b col %d: rel err %.3e (fd norm %.3e)", j, rel, fd.norm());
+    CHECK(rel < tol, "J_b col %d @ %.0f Hz: rel err %.3e (fd norm %.3e)", j, rate_hz, rel, fd.norm());
   }
-  std::printf("[ok] bias_jacobians_fd: max relative error %.3e over 6 columns\n", max_rel);
+  std::printf("[ok] bias_jacobians_fd @ %.0f Hz: max relative error %.3e over 6 columns\n", rate_hz, max_rel);
 }
 
 static void test_correction_convention() {
@@ -210,7 +213,8 @@ static void test_correction_convention() {
 int main() {
   ov_core::Printer::setPrintLevel("WARNING");
   test_mean_exactness();
-  test_bias_jacobians_fd();
+  test_bias_jacobians_fd(800.0, 1e-6);
+  test_bias_jacobians_fd(200.0, 1e-6);
   test_correction_convention();
   if (failures == 0) {
     std::printf("[PASS] PreintegrationBridge: mean exact, analytic J_b == FD oracle, correction convention verified\n");
