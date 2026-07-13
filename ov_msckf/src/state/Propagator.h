@@ -107,6 +107,39 @@ public:
   void invalidate_cache() { cache_imu_valid = false; }
 
   /**
+   * @brief Snapshot of the propagator's restorable mutable state (state snapshotting).
+   *
+   * Captures the IMU history and the last-propagation time offset -- everything that mutates and
+   * matters for continuation. The fast-prop cache is deliberately NOT captured: restore()
+   * invalidates it so it is rebuilt lazily.
+   */
+  struct Snapshot {
+    std::vector<ov_core::ImuData> imu_data;
+    double last_prop_time_offset = 0.0;
+    bool have_last_prop_time_offset = false;
+  };
+
+  /// Capture the propagator's mutable state
+  Snapshot capture() {
+    std::lock_guard<std::mutex> lck(imu_data_mtx);
+    Snapshot s;
+    s.imu_data = imu_data;
+    s.last_prop_time_offset = last_prop_time_offset;
+    s.have_last_prop_time_offset = have_last_prop_time_offset;
+    return s;
+  }
+
+  /// Restore the propagator's mutable state in place (object identity preserved -- callers such
+  /// as UpdaterZeroVelocity cache this Propagator pointer). Invalidates the fast-prop cache.
+  void restore(const Snapshot &s) {
+    std::lock_guard<std::mutex> lck(imu_data_mtx);
+    imu_data = s.imu_data;
+    last_prop_time_offset = s.last_prop_time_offset;
+    have_last_prop_time_offset = s.have_last_prop_time_offset;
+    cache_imu_valid = false;
+  }
+
+  /**
    * @brief Propagate state up to given timestamp and then clone
    *
    * This will first collect all imu readings that occured between the

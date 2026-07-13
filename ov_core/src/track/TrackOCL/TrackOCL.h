@@ -154,6 +154,39 @@ namespace ov_core
         return stereo_confidence_;
     }
 
+    // --- Frontend snapshot/restore (replay harness rewind/branch) ---
+    // Extends the base CPU frontend capture with TrackOCL's per-camera IMU-seeding state and the
+    // per-feature stereo priors. NOT captured (small first-frame transients, self-heal via re-fed
+    // IMU / re-matched stereo, and within the GPU run-to-run noise floor): the imu_rot_ gyro ring
+    // (windowed integration re-selects fresh samples) and the GPU pyramid buffers (rebuilt by the
+    // harness re-feeding the snapshot frame before restore). last_cam_time_ IS captured -- a stale
+    // value would make the first post-restore delta_q integrate over the wrong window.
+    struct OCLFrontendState : public FrontendState {
+        std::unordered_map<size_t, Eigen::Matrix3d> R_ItoC;
+        std::unordered_map<size_t, double> last_cam_time;
+        std::unordered_map<size_t, float> stereo_inv_depth_prior;
+    };
+
+    std::shared_ptr<FrontendState> capture_frontend() override {
+        auto s = std::make_shared<OCLFrontendState>();
+        capture_frontend_base(*s);
+        s->R_ItoC = R_ItoC_;
+        s->last_cam_time = last_cam_time_;
+        s->stereo_inv_depth_prior = stereo_inv_depth_prior_;
+        return s;
+    }
+
+    void restore_frontend(const std::shared_ptr<FrontendState> &s) override {
+        if (!s)
+            return;
+        restore_frontend_base(*s);
+        if (auto o = std::dynamic_pointer_cast<OCLFrontendState>(s)) {
+            R_ItoC_ = o->R_ItoC;
+            last_cam_time_ = o->last_cam_time;
+            stereo_inv_depth_prior_ = o->stereo_inv_depth_prior;
+        }
+    }
+
   protected:
     /**
      * @brief Process a new monocular image

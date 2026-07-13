@@ -428,6 +428,91 @@ void VioManager::feed_measurement_camera(const ov_core::CameraData &message) {
   }
 }
 
+std::shared_ptr<VioManager::Snapshot> VioManager::snapshot() {
+  auto snap = std::make_shared<Snapshot>();
+
+  // EKF state: full independent deep clone (values + fej + covariance + clone/SLAM/calib maps +
+  // epoch metadata). This is the non-reproducible core -- GPU tracking feeds updates
+  // non-deterministically, so a past state cannot be re-derived by replaying, only captured.
+  snap->state = StateHelper::clone_state(state);
+
+  // Propagator IMU history + prop-time offset (fast-prop cache excluded; rebuilt on restore)
+  if (propagator != nullptr)
+    snap->prop = propagator->capture();
+
+  // Tracker CPU frontend (pts_last / ids_last / currid / per-cam IMU-seed state) + feature DB
+  if (trackFEATS != nullptr) {
+    snap->track_front = trackFEATS->capture_frontend();
+    if (auto db = trackFEATS->get_feature_database())
+      snap->feature_db = db->clone_features();
+  }
+
+  // Manager scalars
+  snap->is_initialized_vio = is_initialized_vio;
+  snap->timelastupdate = timelastupdate;
+  snap->startup_time = startup_time;
+  snap->distance = distance;
+  snap->newest_imu_time = newest_imu_time;
+  snap->last_ref_frame_time = last_ref_frame_time;
+  snap->ref_period_ema = ref_period_ema;
+  snap->epoch_marg_pending = epoch_marg_pending;
+  snap->used_features_map = used_features_map;
+
+  return snap;
+}
+
+void VioManager::restore(const std::shared_ptr<Snapshot> &snap, const std::vector<ov_core::CameraData> &prime_frames) {
+  if (snap == nullptr)
+    return;
+
+  // 1) Install a FRESH clone of the snapshot state, so the snapshot node stays pristine and can
+  //    be restored again to spawn a second branch. Swapping the shared_ptr is safe: no sub-object
+  //    (updater/propagator/initializer) caches the State -- all take it as a per-call argument.
+  state = StateHelper::clone_state(snap->state);
+
+  // 2) Propagator + scalars restored in place (Propagator object identity preserved -- ZUPT
+  //    caches this exact pointer).
+  if (propagator != nullptr)
+    propagator->restore(snap->prop);
+
+  is_initialized_vio = snap->is_initialized_vio;
+  timelastupdate = snap->timelastupdate;
+  startup_time = snap->startup_time;
+  distance = snap->distance;
+  newest_imu_time = snap->newest_imu_time;
+  last_ref_frame_time = snap->last_ref_frame_time;
+  ref_period_ema = snap->ref_period_ema;
+  epoch_marg_pending = snap->epoch_marg_pending;
+  used_features_map = snap->used_features_map;
+
+  // Discard whatever the live ring holds now. The in-flight (pushed-but-not-drained) frames that
+  // were pending at snapshot time are NOT re-injected here -- instead the caller rewinds its feed
+  // cursor to the last PROCESSED frame, so those frames re-push from the log and re-drain
+  // naturally as feeding resumes. (Restoring an old snapshot after the filter ran forward also
+  // makes clearing correct: the live ring holds unrelated future frames.)
+  clear_camera_buffers();
+
+  // 3) Rebuild the GPU previous-frame pyramid. It is not host-visible, so we re-feed the snapshot
+  //    frame's image(s) through the tracker: feed_new_camera uploads the frame into img_buf_next_
+  //    (the next real feed then swaps it into img_buf_prev_, exactly as if we had never rewound).
+  //    We first clear the CPU frontend so this priming feed DETECTS (it must not try to KLT-track
+  //    from the stale post-snapshot pyramid); its detection output is overwritten in step 4.
+  if (trackFEATS != nullptr && !prime_frames.empty()) {
+    trackFEATS->restore_frontend(std::make_shared<ov_core::TrackBase::FrontendState>());
+    for (const auto &f : prime_frames)
+      trackFEATS->feed_new_camera(f);
+  }
+
+  // 4) Force-restore the tracker CPU frontend and feature database to the snapshot. This overwrites
+  //    whatever the priming feed produced, so the NEXT real feed KLT-tracks the snapshot's features
+  //    (in pts_last) from the just-rebuilt pyramid -- continuation is faithful to the snapshot.
+  if (trackFEATS != nullptr) {
+    trackFEATS->restore_frontend(snap->track_front);
+    if (auto db = trackFEATS->get_feature_database())
+      db->restore_features(snap->feature_db);
+  }
+}
+
 bool VioManager::apply_epoch_snap(double &timestamp, const std::vector<int> &sensor_ids) {
   if (!params.epoch_mode || !is_initialized_vio) {
     return false;
