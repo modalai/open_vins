@@ -24,6 +24,7 @@
 #define OV_CORE_CAM_BASE_H
 
 #include <Eigen/Eigen>
+#include <memory>
 #include <unordered_map>
 
 #include <opencv2/opencv.hpp>
@@ -48,6 +49,16 @@ public:
   CamBase(int width, int height) : _width(width), _height(height) {}
 
   virtual ~CamBase() {}
+
+  /**
+   * @brief Deep-copy this camera model (concrete type + intrinsic values).
+   *
+   * Used by state snapshotting: online intrinsic calibration mutates camera_values, so a
+   * captured filter state must own an independent camera object rather than aliasing the live
+   * one. Derived clones copy the full 8-vector via set_value(), which rebuilds every cached
+   * OpenCV matrix, so the clone is fully self-contained.
+   */
+  virtual std::shared_ptr<CamBase> clone() = 0;
 
   /**
    * @brief This will set and update the camera calibration values.

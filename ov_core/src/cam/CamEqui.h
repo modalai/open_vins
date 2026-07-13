@@ -101,6 +101,13 @@ public:
 
   ~CamEqui() {}
 
+  std::shared_ptr<CamBase> clone() override {
+    auto c = std::make_shared<CamEqui>(_width, _height);
+    if (camera_values.rows() == 8)
+      c->set_value(camera_values);
+    return c;
+  }
+
   /**
    * @brief Given a raw uv point, this will undistort it based on the camera matrices into normalized camera coords.
    * @param uv_dist Raw uv coordinate we wish to undistort

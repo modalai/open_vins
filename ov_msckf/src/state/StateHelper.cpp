@@ -24,16 +24,115 @@
 
 #include "state/State.h"
 
+#include "cam/CamBase.h"
+#include "types/IMU.h"
+#include "types/JPLQuat.h"
 #include "types/Landmark.h"
+#include "types/PoseJPL.h"
+#include "types/Vec.h"
 #include "utils/colors.h"
 #include "utils/print.h"
 #include "utils/quat_ops.h"
 
 #include <boost/math/distributions/chi_squared.hpp>
+#include <map>
 
 using namespace ov_core;
 using namespace ov_type;
 using namespace ov_msckf;
+
+std::shared_ptr<State> StateHelper::clone_state(std::shared_ptr<State> state) {
+
+  std::lock_guard<std::mutex> lock(state->_mutex_state);
+
+  // A fresh State builds default IMU/calib objects + a _Cov sized to the active calib set; we
+  // overwrite _variables, _Cov and every map below, so those defaults are simply released.
+  auto out = std::make_shared<State>(state->_options);
+
+  // 1) Clone every covariance variable, preserving its local id (== its block offset in _Cov).
+  //    Type::clone() copies value + fej but NOT the id (its contract), so we re-stamp the id.
+  //    Landmark/IMU/PoseJPL/JPLQuat/Vec all override clone() to preserve their dynamic type.
+  //    Build an old-pointer -> new-clone map so every state map can be rewired to the clones.
+  std::map<ov_type::Type *, std::shared_ptr<ov_type::Type>> ptr_map;
+  std::vector<std::shared_ptr<ov_type::Type>> new_vars;
+  new_vars.reserve(state->_variables.size());
+  for (const auto &var : state->_variables) {
+    std::shared_ptr<ov_type::Type> nv = var->clone();
+    nv->set_local_id(var->id());
+    ptr_map[var.get()] = nv;
+    new_vars.push_back(nv);
+  }
+
+  // Resolve an old pointer to its clone. Variables in _variables resolve to the exact object now
+  // in out->_variables (so the maps and the covariance layout share identity). Pointers NOT in
+  // _variables are inactive/fixed calibration (id == -1, not in _Cov): clone once and cache, so
+  // any aliasing (e.g. _calib_dt_CAMtoIMU into _calib_dt_CAMtoIMU_map) still shares one object.
+  auto resolve = [&](const std::shared_ptr<ov_type::Type> &old) -> std::shared_ptr<ov_type::Type> {
+    if (old == nullptr)
+      return nullptr;
+    auto it = ptr_map.find(old.get());
+    if (it != ptr_map.end())
+      return it->second;
+    std::shared_ptr<ov_type::Type> nv = old->clone();
+    nv->set_local_id(old->id());
+    ptr_map[old.get()] = nv;
+    return nv;
+  };
+
+  out->_variables = new_vars;
+  out->_Cov = state->_Cov; // ids preserved above, so the block layout is identical -- verbatim copy
+
+  // 2) Scalars + non-covariance metadata (all value types, deep-copy by assignment)
+  out->_timestamp = state->_timestamp;
+  out->_options = state->_options;
+  out->_kin_miss_count = state->_kin_miss_count;
+  out->_clones_kinematics = state->_clones_kinematics;
+  out->_epoch_residuals = state->_epoch_residuals;
+  out->_epoch_bridges = state->_epoch_bridges;
+
+  // 3) Rewire every Type-holding map/pointer to the clones
+  out->_imu = std::dynamic_pointer_cast<IMU>(resolve(state->_imu));
+
+  out->_clones_IMU.clear();
+  for (const auto &kv : state->_clones_IMU)
+    out->_clones_IMU[kv.first] = std::dynamic_pointer_cast<PoseJPL>(resolve(kv.second));
+
+  out->_features_SLAM.clear();
+  for (const auto &kv : state->_features_SLAM)
+    out->_features_SLAM[kv.first] = std::dynamic_pointer_cast<Landmark>(resolve(kv.second));
+
+  out->_calib_dt_CAMtoIMU_map.clear();
+  for (const auto &kv : state->_calib_dt_CAMtoIMU_map)
+    out->_calib_dt_CAMtoIMU_map[kv.first] = std::dynamic_pointer_cast<Vec>(resolve(kv.second));
+  // alias into the map: resolves to the same clone as the ref camera's map entry (cached above)
+  out->_calib_dt_CAMtoIMU = std::dynamic_pointer_cast<Vec>(resolve(state->_calib_dt_CAMtoIMU));
+
+  out->_calib_camera_readout.clear();
+  for (const auto &kv : state->_calib_camera_readout)
+    out->_calib_camera_readout[kv.first] = std::dynamic_pointer_cast<Vec>(resolve(kv.second));
+
+  out->_calib_IMUtoCAM.clear();
+  for (const auto &kv : state->_calib_IMUtoCAM)
+    out->_calib_IMUtoCAM[kv.first] = std::dynamic_pointer_cast<PoseJPL>(resolve(kv.second));
+
+  out->_cam_intrinsics.clear();
+  for (const auto &kv : state->_cam_intrinsics)
+    out->_cam_intrinsics[kv.first] = std::dynamic_pointer_cast<Vec>(resolve(kv.second));
+
+  // Camera intrinsic objects are NOT Types / not in covariance: deep-copy via CamBase::clone()
+  // (online intrinsic calib mutates them, so the snapshot must own independent copies)
+  out->_cam_intrinsics_cameras.clear();
+  for (const auto &kv : state->_cam_intrinsics_cameras)
+    out->_cam_intrinsics_cameras[kv.first] = kv.second ? kv.second->clone() : nullptr;
+
+  out->_calib_imu_dw = std::dynamic_pointer_cast<Vec>(resolve(state->_calib_imu_dw));
+  out->_calib_imu_da = std::dynamic_pointer_cast<Vec>(resolve(state->_calib_imu_da));
+  out->_calib_imu_tg = std::dynamic_pointer_cast<Vec>(resolve(state->_calib_imu_tg));
+  out->_calib_imu_GYROtoIMU = std::dynamic_pointer_cast<JPLQuat>(resolve(state->_calib_imu_GYROtoIMU));
+  out->_calib_imu_ACCtoIMU = std::dynamic_pointer_cast<JPLQuat>(resolve(state->_calib_imu_ACCtoIMU));
+
+  return out;
+}
 
 void StateHelper::EKFPropagation(std::shared_ptr<State> state, const std::vector<std::shared_ptr<Type>> &order_NEW,
                                  const std::vector<std::shared_ptr<Type>> &order_OLD, const Eigen::MatrixXd &Phi,
