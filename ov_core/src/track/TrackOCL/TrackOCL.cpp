@@ -58,6 +58,21 @@ int test_feed_all = 0;
 // ============================================================================
 static constexpr bool kImuAidedSeeding = true;
 
+// ============================================================================
+// A/B TOGGLE: stereo front-end scheme. Flip + rebuild to compare empirically.
+//   false (Approach A, current): independent temporal KLT in BOTH cameras; the
+//     right partner rides its own KLT and a narrow ZNCC only SNAPS it when a
+//     confident match disagrees by >kCorrectSnapPx. A lost right-KLT permanently
+//     degrades the pair to mono-left ("fails-silent" drift/decay).
+//   true (Approach B, re-derivation): KLT the LEFT as the temporal anchor; the
+//     right partner is the fresh ZNCC epipolar re-derivation EVERY frame (right-
+//     KLT ignored for paired features). On reject the pair yields mono-left this
+//     frame (fails-safe) and can RE-ACQUIRE the partner on a later frame even
+//     after a right-KLT loss, since the partner never depended on right-KLT.
+// Both builds emit the same STEREO EPI / track-stats diagnostics for comparison.
+// ============================================================================
+static constexpr bool kStereoRederive = false;
+
 namespace {
 // DIAGNOSTIC: per-frame feature-track breakdown handed to the feature DB (what the
 // VIO sees). Lets us see stereo-vs-mono counts, when tracking thins out / goes
@@ -168,12 +183,18 @@ void TrackOCL::enable_zncc_stereo_matcher(const modal_flow::StereoCalib &calib_i
     // 0.20->0.30 to reject that population; re-measure both the degenerate-reinit rate
     // and overall stereo yield after this change (stereo has previously been found
     // starved -- this trades some yield for fewer false near-field promotions).
-    stereo_zncc_min_   = 0.70f;
-    stereo_margin_min_ = 0.30f;
-    stereo_lr_thresh_  = 3.0f;
+    // Mirror the host-validated ZNCC params (stereo_exploration): high peak floor + LOOSE
+    // uniqueness margin + 2px L-R. The prior 0.70/0.30 over-rejected good-but-ambiguous matches
+    // (per-feature [STEREO DUMP] showed peak~0.99 killed by margin<0.30 on repetitive texture).
+    // A high peak floor (0.80) still rejects the bad near-field promotions (those sat at 0.60-0.70),
+    // while a loose margin (0.10) admits the correct-but-non-unique matches the host accepted.
+    stereo_zncc_min_   = 0.80f;
+    stereo_margin_min_ = 0.10f;
+    stereo_lr_thresh_  = 2.0f;
     stm->set_zncc_min(stereo_zncc_min_);
     stm->set_margin_min(stereo_margin_min_);
     stm->set_lr_thresh(stereo_lr_thresh_);
+    stm->set_band(stereo_band_px_);   // widen perpendicular search to tolerate residual R_lr tilt
     mgr_.set_stereo_matcher(std::move(stm));
 
     if (stereo_diag_on_)
@@ -423,6 +444,20 @@ void TrackOCL::feed_new_camera(const CameraData &message)
         return;
     }
 
+    // Guard the "map::at" throw: a bundle carrying a cam_id not in our configured maps
+    // (mtx_feeds/camera_calib) throws std::out_of_range downstream. Skip+log instead of throwing,
+    // and surface the offending id so the pairing bug is traceable rather than a bare "map::at".
+    for (size_t k = 0; k < message.sensor_ids.size(); k++) {
+        size_t sid = message.sensor_ids[k];
+        if (sid >= mtx_feeds.size() || camera_calib.find(sid) == camera_calib.end()) {
+            static int s_badid = 0;
+            if (s_badid++ < 50)
+                fprintf(stderr, "[TrackOCL] SKIP malformed frame: sensor_id=%zu not configured "
+                        "(n_img=%zu, n_cams=%zu)\n", sid, num_images, mtx_feeds.size());
+            return;
+        }
+    }
+
     for (size_t msg_id = 0; msg_id < num_images; msg_id++)
     {
         // Lock this data feed for this camera
@@ -625,6 +660,23 @@ void TrackOCL::feed_stereo(const CameraData &message, size_t msg_id_left, size_t
     int cam_width_right  = std::get<0>(dims_right);
     int cam_height_right = std::get<1>(dims_right);
 
+    // ---- ONE-SHOT DIAGNOSTIC: log the L/R ORDER the matcher receives (first few frames) ----
+    // The pipeline assumes images[0]=LEFT, images[1]=RIGHT (feed_new_camera dispatches (0,1)); a
+    // swapped bundle silently inverts the epipolar geometry -> uniform weak ZNCC. Order confirmed
+    // correct during bring-up; kept as a cheap startup assertion.
+    {
+        static int s_pairdump = 0;
+        if (s_pairdump < 4) {
+            printf("[STEREO PAIRDUMP] #%d ts=%.6f  sensor_ids=[%zu,%zu]  idx0->cam_left=%zu  idx1->cam_right=%zu\n",
+                   s_pairdump, message.timestamp,
+                   message.sensor_ids.size() > 0 ? message.sensor_ids[0] : (size_t)999,
+                   message.sensor_ids.size() > 1 ? message.sensor_ids[1] : (size_t)999,
+                   cam_id_left, cam_id_right);
+            fflush(stdout);
+            s_pairdump++;
+        }
+    }
+
     // NOTE: do NOT re-upload frames here. feed_new_camera() already swapped prev<-next
     // and uploaded the CURRENT frame for BOTH cameras before dispatching to feed_stereo().
     // Re-uploading collapses prev==next (both = current frame), so temporal KLT matches a
@@ -757,7 +809,9 @@ void TrackOCL::feed_stereo(const CameraData &message, size_t msg_id_left, size_t
     // was lost fall through to mono-left in the assembly below (as before).
     const bool stereo_bound = (cam_id_left  == stereo_cam_id_left_ &&
                                cam_id_right == stereo_cam_id_right_);
-    if (stereo_bound) {
+    // Approach B only: id -> right pixel re-derived from the left this frame (empty in Approach A).
+    std::unordered_map<size_t, cv::Point2f> rederive_right;
+    if (stereo_bound && !kStereoRederive) {
         std::unordered_map<size_t, int> right_idx;   // id -> index of KLT-surviving right track
         for (size_t n = 0; n < ids_right_old.size(); n++)
             if (n < mask_rr.size() && mask_rr[n]) right_idx[ids_right_old[n]] = (int)n;
@@ -794,6 +848,17 @@ void TrackOCL::feed_stereo(const CameraData &message, size_t msg_id_left, size_t
                 if ((int)mpt.x < 0 || (int)mpt.x >= cam_width_right ||
                     (int)mpt.y < 0 || (int)mpt.y >= cam_height_right) continue;
                 corr_acc_++;
+                // Phase-0 R_lr observable: accumulate the perp-residual tilt fit over accepted,
+                // in-bounds matches. Weight by margin (confident, unique matches vote harder).
+                // Gated on the diag flag so the running sums reset with the print block below.
+                if (stereo_diag_on_) {
+                    const double xc = (double)cin.source_points[k].x - 0.5 * (double)cam_width_left;
+                    const double r  = (double)c.perp_resid[k];
+                    const double w  = (double)std::max(c.margin[k], 0.f);
+                    epi_sw_ += w; epi_swx_ += w * xc; epi_swxx_ += w * xc * xc;
+                    epi_swr_ += w * r; epi_swrx_ += w * r * xc; epi_swrr_ += w * r * r;
+                    epi_n_++;
+                }
                 cv::Point2f &kpt = pts_right_new.at(corr_ri[k]).pt;
                 float dpx = std::hypot(mpt.x - kpt.x, mpt.y - kpt.y);
                 if (dpx > kCorrectSnapPx) {                        // snap out drift
@@ -803,6 +868,65 @@ void TrackOCL::feed_stereo(const CameraData &message, size_t msg_id_left, size_t
                     corr_snap_max_ = std::max(corr_snap_max_, dpx);
                 }
                 const size_t id = ids_left_old.at(corr_li[k]);
+                stereo_inv_depth_prior_[id] = c.inv_depth[k];      // refresh depth prior
+                stereo_confidence_[id] = StereoConfidence{c.peak_zncc[k], c.margin[k], c.lr_err[k]};
+            }
+        }
+    } else if (stereo_bound && kStereoRederive) {
+        // ===== Approach B: re-derive the right partner from the left EVERY frame =====
+        // Submit ALL left-KLT survivors that carry a stereo depth prior -- independent of
+        // right-KLT state, so a pair can re-acquire its partner after a right-KLT loss. The
+        // ZNCC match (narrow window around the per-frame refreshed inverse-depth prior) becomes
+        // the right observation outright; reject => no right this frame (mono-left, fails-safe).
+        std::unordered_map<size_t, int> right_klt;   // id -> surviving right-KLT idx (snap-px stat only)
+        for (size_t n = 0; n < ids_right_old.size(); n++)
+            if (n < mask_rr.size() && mask_rr[n]) right_klt[ids_right_old[n]] = (int)n;
+
+        modal_flow::StereoMatchInput cin{};
+        cin.source_cam_id  = (modal_flow::CameraId)cam_id_left;
+        cin.target_cam_id  = (modal_flow::CameraId)cam_id_right;
+        cin.source_img_buf = img_buf_next_[cam_id_left];    // CURRENT frame, both cameras
+        cin.target_img_buf = img_buf_next_[cam_id_right];
+        cin.rho_half_width = stereo_rho_half_width_;
+        std::vector<size_t> cand_id;
+        for (size_t i = 0; i < pts_left_new.size(); i++) {
+            if (!mask_ll[i]) continue;
+            auto pit = stereo_inv_depth_prior_.find(ids_left_old.at(i));
+            if (pit == stereo_inv_depth_prior_.end()) continue;   // not a stereo pair
+            const cv::Point2f &p = pts_left_new.at(i).pt;
+            if (p.x < 0 || p.y < 0 || (int)p.x > cam_width_left || (int)p.y > cam_height_left) continue;
+            Eigen::Vector2f nb = stereo_static_cam_left_->undistort_f(Eigen::Vector2f(p.x, p.y));
+            cin.source_points  .push_back({p.x, p.y, 0.f});
+            cin.source_bearings.push_back({nb(0), nb(1), 0.f});
+            cin.inv_depth_prior.push_back(pit->second);
+            cand_id.push_back(ids_left_old.at(i));
+        }
+        if (!cin.source_points.empty()) {
+            modal_flow::StereoMatchResult c = mgr_.match_stereo(cin);
+            corr_sub_ += (long)cin.source_points.size();
+            for (size_t k = 0; k < cin.source_points.size(); k++) {
+                if (!(c.status[k] && stereo_runner_ok(c.peak_zncc[k], c.margin[k]))) continue;  // reject -> mono-left
+                cv::Point2f mpt(c.target_points[k].x, c.target_points[k].y);
+                if ((int)mpt.x < 0 || (int)mpt.x >= cam_width_right ||
+                    (int)mpt.y < 0 || (int)mpt.y >= cam_height_right) continue;
+                corr_acc_++;
+                const size_t id = cand_id[k];
+                // stat: how far the re-derivation sits from the drift-prone right-KLT, when present.
+                auto rk = right_klt.find(id);
+                if (rk != right_klt.end()) {
+                    float dpx = std::hypot(mpt.x - pts_right_new.at(rk->second).pt.x,
+                                           mpt.y - pts_right_new.at(rk->second).pt.y);
+                    corr_snap_++; corr_snap_sum_ += dpx; corr_snap_max_ = std::max(corr_snap_max_, dpx);
+                }
+                if (stereo_diag_on_) {
+                    const double xc = (double)cin.source_points[k].x - 0.5 * (double)cam_width_left;
+                    const double r  = (double)c.perp_resid[k];
+                    const double w  = (double)std::max(c.margin[k], 0.f);
+                    epi_sw_ += w; epi_swx_ += w * xc; epi_swxx_ += w * xc * xc;
+                    epi_swr_ += w * r; epi_swrx_ += w * r * xc; epi_swrr_ += w * r * r;
+                    epi_n_++;
+                }
+                rederive_right[id] = mpt;                          // this frame's right observation
                 stereo_inv_depth_prior_[id] = c.inv_depth[k];      // refresh depth prior
                 stereo_confidence_[id] = StereoConfidence{c.peak_zncc[k], c.margin[k], c.lr_err[k]};
             }
@@ -817,9 +941,26 @@ void TrackOCL::feed_stereo(const CameraData &message, size_t msg_id_left, size_t
             fprintf(fp, "[STEREO CORRECTION] over %d frames: submitted=%ld accepted=%ld snapped=%ld (%.0f%% of acc)  snap px mean/max=%.2f/%.2f\n",
                     stereo_diag_period_, corr_sub_, corr_acc_, corr_snap_,
                     corr_acc_ ? 100.0 * (double)corr_snap_ / (double)corr_acc_ : 0.0, mean, (double)corr_snap_max_);
+            // R_lr observable: solve the weighted fit perp = a + b*x_center and report the tilt.
+            const double det = epi_sw_ * epi_swxx_ - epi_swx_ * epi_swx_;
+            if (epi_n_ > 20 && std::fabs(det) > 1e-9) {
+                const double a  = (epi_swr_ * epi_swxx_ - epi_swx_ * epi_swrx_) / det;   // centre residual (~pitch)
+                const double b  = (epi_sw_  * epi_swrx_ - epi_swx_ * epi_swr_) / det;    // slope (px per px)
+                const double e2e  = b * (double)cam_width_left;                          // edge-to-edge tilt (~roll)
+                const double mean_r = epi_swr_ / epi_sw_;
+                const double rms  = std::sqrt(std::max(0.0, epi_swrr_ / epi_sw_));        // raw perp RMS (band-clipped)
+                char epi_line[256];
+                snprintf(epi_line, sizeof(epi_line),
+                         "[STEREO EPI] over %d frames n=%ld  perp mean=%.2f rms=%.2f px  fit: centre a=%.2f  edge-to-edge b*w=%.2f px  (band=%d clip)\n",
+                         stereo_diag_period_, epi_n_, mean_r, rms, a, e2e, stereo_band_px_);
+                fputs(epi_line, fp);        // /run diag file (full stereo diagnostics)
+                fputs(epi_line, stdout);    // ALSO echo to terminal for Phase-0 bring-up watch
+                fflush(stdout);
+            }
             fflush(fp);
         }
         corr_sub_ = corr_acc_ = corr_snap_ = 0; corr_snap_sum_ = 0.0; corr_snap_max_ = 0.f;
+        epi_sw_ = epi_swx_ = epi_swxx_ = epi_swr_ = epi_swrx_ = epi_swrr_ = 0.0; epi_n_ = 0;
     }
     rT5 = boost::posix_time::microsec_clock::local_time();
 
@@ -827,6 +968,7 @@ void TrackOCL::feed_stereo(const CameraData &message, size_t msg_id_left, size_t
     std::vector<cv::KeyPoint> good_left, good_right;
     std::vector<size_t> good_ids_left, good_ids_right;
 
+    if (!(kStereoRederive && stereo_bound)) {
     // Loop through all left points
     for (size_t i = 0; i < pts_left_new.size(); i++) {
         if (pts_left_new.at(i).pt.x < 0 || pts_left_new.at(i).pt.y < 0 || (int)pts_left_new.at(i).pt.x > cam_width_left ||
@@ -861,6 +1003,34 @@ void TrackOCL::feed_stereo(const CameraData &message, size_t msg_id_left, size_t
         good_right.push_back(pts_right_new.at(i));
         good_ids_right.push_back(ids_right_old.at(i));
         }
+    }
+    } else {
+    // ===== Approach B assembly: the right stereo obs is the re-derivation ONLY =====
+    // left survivors -> good_left; right partner attached iff re-derived this frame. Paired
+    // rights are NEVER taken from right-KLT (that is the drift we are avoiding); a paired right
+    // that failed re-derivation is intentionally dropped (mono-left). Unpaired right-KLT tracks
+    // still flow through as mono-right.
+    std::unordered_set<size_t> left_ids(ids_left_old.begin(), ids_left_old.end());
+    for (size_t i = 0; i < pts_left_new.size(); i++) {
+        if (!mask_ll[i]) continue;
+        const cv::Point2f &lp = pts_left_new.at(i).pt;
+        if (lp.x < 0 || lp.y < 0 || (int)lp.x > cam_width_left || (int)lp.y > cam_height_left) continue;
+        good_left.push_back(pts_left_new.at(i));
+        good_ids_left.push_back(ids_left_old.at(i));
+        auto rd = rederive_right.find(ids_left_old.at(i));
+        if (rd != rederive_right.end()) {
+            good_right.push_back(cv::KeyPoint(rd->second, pts_left_new.at(i).size));
+            good_ids_right.push_back(ids_left_old.at(i));
+        }
+    }
+    for (size_t i = 0; i < pts_right_new.size(); i++) {
+        if (!mask_rr[i]) continue;
+        const cv::Point2f &rp = pts_right_new.at(i).pt;
+        if (rp.x < 0 || rp.y < 0 || (int)rp.x >= cam_width_right || (int)rp.y >= cam_height_right) continue;
+        if (left_ids.count(ids_right_old.at(i))) continue;   // paired -> re-derivation-only
+        good_right.push_back(pts_right_new.at(i));
+        good_ids_right.push_back(ids_right_old.at(i));
+    }
     }
 
     // Update our feature database, with theses new observations

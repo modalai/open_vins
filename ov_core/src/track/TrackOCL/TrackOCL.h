@@ -335,7 +335,9 @@ namespace ov_core
       float marg_min[3]{1e9f, 1e9f, 1e9f},  marg_max[3]{-1e9f, -1e9f, -1e9f};
       float lr_min[3]{1e9f, 1e9f, 1e9f},    lr_max[3]{-1e9f, -1e9f, -1e9f};
     };
-    bool  stereo_diag_on_     = false; // OFF by default for now; set true to write the /run diag logs
+    bool  stereo_diag_on_     = false; // OFF by default. Set true to emit [STEREO EPI]/[STEREO DIAG]
+                                       // to /run/voxl-open-vins-stereo-diag.log (EPI also echoes to
+                                       // stdout) during R_lr bring-up / tilt validation.
     int   stereo_diag_period_ = 30;   // print every N perform_detection_stereo calls (~1/s @30Hz)
     int   stereo_diag_calls_  = 0;
     StereoRejectStats stereo_reject_stats_{};
@@ -345,6 +347,11 @@ namespace ov_core
     float stereo_zncc_min_   = 0.70f;
     float stereo_margin_min_ = 0.30f;
     float stereo_lr_thresh_  = 3.0f;
+    // Perpendicular search half-width (px). Back to the host-validated 2: the per-feature dump
+    // showed matches land ON the projected curve (geometry good, peaks ~0.99), so the band=3
+    // widening was not needed and only lowered the uniqueness margin (wider search -> more
+    // near-duplicate peaks). Widen again only if a genuine R_lr tilt is confirmed off-curve.
+    int   stereo_band_px_    = 2;
 
     void accumulate_stereo_reject_(int pass, float peak, float margin, float lr,
                                    bool matcher_status, bool right_oob);
@@ -358,6 +365,16 @@ namespace ov_core
     float  corr_snap_max_ = 0.f;
     int    corr_diag_frames_ = 0;
 
+    // R_lr epipolar-residual observable (Phase 0, read-only). Accumulates a weighted least-squares
+    // fit  perp_resid ~ a + b*x_center  over the corrector's accepted matches, printed each
+    // stereo_diag_period_ as [STEREO EPI]. x_center = src_x - img_w/2, so `a` is the image-centre
+    // residual (~ relative pitch) and b*img_w the edge-to-edge tilt (~ relative roll) -- the -5.36px
+    // signature under a mis-set R_lr. NOTE: perp_resid is clipped to +/-BAND (2px) by the kernel
+    // search, so this measures residual tilt WITHIN the band -- a drift watchdog around a good calib,
+    // attenuated for gross miscalibration (edge features beyond the band saturate or fail to match).
+    double epi_sw_ = 0, epi_swx_ = 0, epi_swxx_ = 0, epi_swr_ = 0, epi_swrx_ = 0, epi_swrr_ = 0;
+    long   epi_n_  = 0;
+
     // IMU-aided seeding diagnostic (feed_stereo). Every stereo_diag_period_ frames prints, for the
     // left camera: gyro-buffer liveness, the predicted rotation magnitude, and how much of the
     // inter-frame feature motion the IMU seed removed (reduction% ~ 0 => not helping/identity;
@@ -368,7 +385,8 @@ namespace ov_core
     // point, the right projection at z_max (far) and z_min (near), in/out-of-bounds
     // flags, and the matcher's best match + peak/margin/lr. Distinguishes FOV/
     // calibration OOB (off-image even at z_max) from z-range OOB (off only near).
-    bool stereo_dump_on_         = false;   // per-feature [STEREO DUMP] epipolar log (noisy; off)
+    bool stereo_dump_on_         = false;   // per-feature [STEREO DUMP] epipolar log (noisy; off).
+                                            // Confirmed geometry good (matches on-curve, peak ~0.99).
     int  stereo_dump_per_window_ = 8;   // features sampled per dump
     void dump_stereo_epipolar_(const modal_flow::StereoMatchInput &in,
                                const modal_flow::StereoMatchResult &res,
