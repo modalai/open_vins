@@ -93,6 +93,32 @@ public:
   }
 
   /**
+   * @brief Deep-copy this landmark.
+   *
+   * Vec::clone() constructs a plain Vec and would SLICE away every Landmark field
+   * (_featid, anchor, representation, ...). This override preserves the full landmark so state
+   * snapshots and any other clone() caller get a faithful copy. Local id is not copied (clone()
+   * contract: the caller assigns covariance placement via set_local_id()).
+   */
+  std::shared_ptr<Type> clone() override {
+    auto Clone = std::shared_ptr<Landmark>(new Landmark((int)_size));
+    Clone->set_value(value());
+    Clone->set_fej(fej());
+    Clone->_featid = _featid;
+    Clone->_unique_camera_id = _unique_camera_id;
+    Clone->_anchor_cam_id = _anchor_cam_id;
+    Clone->_anchor_clone_timestamp = _anchor_clone_timestamp;
+    Clone->_quality = _quality;
+    Clone->has_had_anchor_change = has_had_anchor_change;
+    Clone->should_marg = should_marg;
+    Clone->update_fail_count = update_fail_count;
+    Clone->uv_norm_zero = uv_norm_zero;
+    Clone->uv_norm_zero_fej = uv_norm_zero_fej;
+    Clone->_feat_representation = _feat_representation;
+    return Clone;
+  }
+
+  /**
    * @brief Will return the position of the feature in the global frame of reference.
    * @param getfej Set to true to get the landmark FEJ value
    * @return Position of feature either in global or anchor frame

@@ -38,13 +38,20 @@
 #include <CL/cl.h> // cl_context used by the HAVE_OPENCL-guarded get_ocl_context() below (matches TrackBase.h)
 #endif
 
+#include <map>
+#include <unordered_map>
+#include <vector>
+
 #include "AsyncCameraBuffer.h"
 #include "VioManagerOptions.h"
+#include "state/Propagator.h"     // Propagator::Snapshot nested type (VioManager::Snapshot)
+#include "track/TrackBase.h"      // TrackBase::FrontendState nested type (VioManager::Snapshot)
 
 namespace ov_core {
 struct ImuData;
 struct CameraData;
 class TrackBase;
+class Feature;
 class FeatureInitializer;
 } // namespace ov_core
 namespace ov_init {
@@ -133,6 +140,59 @@ public:
    * @param imustate State in the MSCKF ordering: [time(sec),q_GtoI,p_IinG,v_IinG,b_gyro,b_accel]
    */
   void initialize_with_gt(Eigen::Matrix<double, 17, 1> imustate);
+
+  // ============================================================================================
+  // Snapshot / restore / branch (offline replay harness -- "jump around the log")
+  //
+  // Captures the full mutable filter state so the harness can rewind to a past frame and continue
+  // (or branch a divergent continuation). Designed for SINGLE-THREADED use: the harness calls
+  // these on its feed thread between measurements, so there is no concurrent sensor callback to
+  // quiesce (unlike the live server's reset path). Not safe to call concurrently with feeding.
+  //
+  // What is captured (only the non-reproducible filter internals): the EKF State (deep clone),
+  // the propagator IMU history, the feature database, the tracker CPU frontend state, and the
+  // manager scalars. NOTHING image-shaped is stored -- images come back off disk by frame id:
+  //   - the GPU-resident previous-frame pyramid (not host-visible) is rebuilt by restore()
+  //     re-feeding the snapshot frame's image, which the caller reloads from the log and supplies;
+  //   - the in-flight (pushed-but-not-drained) camera frames are NOT captured here -- restore()
+  //     just clears the ring, and the caller rewinds its feed cursor to the last PROCESSED frame
+  //     so those frames re-push from the log and re-drain naturally.
+  // ============================================================================================
+  struct Snapshot {
+    std::shared_ptr<State> state;                                   // deep clone (StateHelper::clone_state)
+    Propagator::Snapshot prop;                                      // IMU history + prop time offset
+    std::shared_ptr<ov_core::TrackBase::FrontendState> track_front; // tracker CPU last-frame state
+    std::unordered_map<size_t, std::shared_ptr<ov_core::Feature>> feature_db; // deep-copied features
+    // manager scalars
+    bool is_initialized_vio = false;
+    double timelastupdate = -1;
+    double startup_time = -1;
+    double distance = 0;
+    double newest_imu_time = -std::numeric_limits<double>::infinity();
+    double last_ref_frame_time = -1;
+    double ref_period_ema = -1;
+    bool epoch_marg_pending = false;
+    std::map<double, std::vector<std::shared_ptr<ov_core::Feature>>> used_features_map;
+  };
+
+  /// Capture the full mutable filter state (deep copies; the returned snapshot is independent of
+  /// the live filter and may be restored any number of times to branch repeatedly).
+  std::shared_ptr<Snapshot> snapshot();
+
+  /**
+   * @brief Restore a snapshot and continue from it.
+   *
+   * Installs a fresh deep clone of the snapshot state (so the snapshot stays reusable), restores
+   * the propagator / feature database / tracker CPU state / scalars in place (object identities
+   * preserved -- ZUPT/initializer alias them), and rebuilds the GPU previous-frame pyramid by
+   * feeding @p prime_frames (the camera frame(s) at the snapshot cursor, re-read from the log by
+   * the caller). Pass the same frame(s) whose processing produced the snapshot.
+   *
+   * @param snap         Snapshot to restore
+   * @param prime_frames Camera frame(s) at the snapshot cursor, in feed order (empty = skip GPU
+   *                     prime; only valid if you will re-detect on the next feed)
+   */
+  void restore(const std::shared_ptr<Snapshot> &snap, const std::vector<ov_core::CameraData> &prime_frames);
 
   /// If we are initialized or not
   bool initialized() { return is_initialized_vio && timelastupdate != -1; }

@@ -49,6 +49,26 @@ class StateHelper {
 
 public:
   /**
+   * @brief Deep-copy an entire State into an independent new State.
+   *
+   * Produces a fully decoupled snapshot: the returned state shares no mutable object with the
+   * source, so the source can keep evolving (or the copy can be fed forward on a branch) without
+   * cross-contamination. Preserves the exact covariance (_Cov verbatim) and variable ordering
+   * (each cloned variable keeps its local id), rebuilds every state map (_imu, _clones_IMU,
+   * _features_SLAM, calib, intrinsics) to point at the cloned variables, preserves the
+   * _calib_dt_CAMtoIMU alias into _calib_dt_CAMtoIMU_map, deep-copies the camera intrinsic
+   * objects, and copies all non-covariance metadata (_clones_kinematics, _epoch_residuals,
+   * _epoch_bridges, _timestamp, _options, _kin_miss_count).
+   *
+   * This is the core primitive behind the replay harness's snapshot / rewind / branch. It has
+   * private access to _Cov and _variables, which is why it lives on StateHelper.
+   *
+   * @param state Source state to copy
+   * @return A newly allocated, independent deep copy
+   */
+  static std::shared_ptr<State> clone_state(std::shared_ptr<State> state);
+
+  /**
    * @brief Performs EKF propagation of the state covariance.
    *
    * The mean of the state should already have been propagated, thus just moves the covariance forward in time.
