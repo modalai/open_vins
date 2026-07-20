@@ -159,6 +159,41 @@ public:
    */
   void append_new_measurements(const std::shared_ptr<FeatureDatabase> &database);
 
+  /**
+   * @brief Deep-copy every feature into a new id->Feature map (state snapshotting).
+   *
+   * get_internal_data() shares the Feature objects (shallow); this clones each Feature so the
+   * returned map is fully independent of the live database. Feature has only value-type members,
+   * so `make_shared<Feature>(*f)` is a complete deep copy.
+   */
+  std::unordered_map<size_t, std::shared_ptr<Feature>> clone_features() {
+    std::lock_guard<std::mutex> lck(mtx);
+    std::unordered_map<size_t, std::shared_ptr<Feature>> out;
+    out.reserve(features_idlookup.size());
+    for (const auto &kv : features_idlookup) {
+      if (kv.second)
+        out[kv.first] = std::make_shared<Feature>(*kv.second);
+    }
+    return out;
+  }
+
+  /**
+   * @brief Replace this database's contents in place with a deep copy of the given map.
+   *
+   * Restores a snapshot WITHOUT swapping the FeatureDatabase object itself -- callers such as
+   * UpdaterZeroVelocity and InertialInitializer cache this exact database pointer at
+   * construction, so the object identity must be preserved; only its contents are replaced.
+   */
+  void restore_features(const std::unordered_map<size_t, std::shared_ptr<Feature>> &snapshot) {
+    std::lock_guard<std::mutex> lck(mtx);
+    features_idlookup.clear();
+    features_idlookup.reserve(snapshot.size());
+    for (const auto &kv : snapshot) {
+      if (kv.second)
+        features_idlookup[kv.first] = std::make_shared<Feature>(*kv.second);
+    }
+  }
+
 protected:
   /// Mutex lock for our map
   std::mutex mtx;
