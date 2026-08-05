@@ -249,7 +249,7 @@ struct InertialInitializerOptions {
     PRINT_DEBUG("  - init_window_time: %.2f\n", init_window_time);
     PRINT_DEBUG("  - init_imu_thresh: %.2f\n", init_imu_thresh);
     PRINT_DEBUG("  - init_max_disparity: %.2f\n", init_max_disparity);
-    PRINT_DEBUG("  - init_max_features: %.2f\n", init_max_features);
+    PRINT_DEBUG("  - init_max_features: %d\n", init_max_features);
     if (init_max_features < 15) {
       PRINT_ERROR(RED "number of requested feature tracks to init not enough!!\n" RESET);
       PRINT_ERROR(RED "  init_max_features = %d\n" RESET, init_max_features);
