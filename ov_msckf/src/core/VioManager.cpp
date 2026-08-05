@@ -22,6 +22,9 @@
 
 #include "VioManager.h"
 
+#include <chrono>
+#include <thread>
+
 #include "feat/Feature.h"
 #include "feat/FeatureDatabase.h"
 #include "feat/FeatureInitializer.h"
@@ -444,6 +447,17 @@ std::shared_ptr<VioManager::Snapshot> VioManager::snapshot() {
       snap->feature_db = db->clone_features();
   }
 
+  // Aruco state is neither captured nor reset: its database would replay duplicated
+  // observations at the same clone times on a branch. Say so once instead of corrupting quietly.
+  if (trackARUCO != nullptr) {
+    static bool warned_aruco = false;
+    if (!warned_aruco) {
+      PRINT_WARNING(YELLOW "[snapshot]: trackARUCO is active but its state is NOT captured -- a restored branch "
+                           "will replay duplicated aruco observations. Disable use_aruco for replay work.\n" RESET);
+      warned_aruco = true;
+    }
+  }
+
   // Manager scalars
   snap->is_initialized_vio = is_initialized_vio;
   snap->timelastupdate = timelastupdate;
@@ -453,7 +467,19 @@ std::shared_ptr<VioManager::Snapshot> VioManager::snapshot() {
   snap->last_ref_frame_time = last_ref_frame_time;
   snap->ref_period_ema = ref_period_ema;
   snap->epoch_marg_pending = epoch_marg_pending;
-  snap->used_features_map = used_features_map;
+  snap->did_zupt_update = did_zupt_update;
+  snap->has_moved_since_zupt = has_moved_since_zupt;
+
+  // used_features_map DEEP-copied: the live vectors hold shared_ptr<Feature> aliasing database
+  // objects that keep mutating after capture (new obs appended, to_delete flags) -- a shallow
+  // copy would hand the restored branch evidence rewritten by the abandoned future.
+  snap->used_features_map.clear();
+  for (const auto &kv : used_features_map) {
+    auto &dst = snap->used_features_map[kv.first];
+    dst.reserve(kv.second.size());
+    for (const auto &f : kv.second)
+      dst.push_back(f ? std::make_shared<ov_core::Feature>(*f) : nullptr);
+  }
 
   return snap;
 }
@@ -462,10 +488,39 @@ void VioManager::restore(const std::shared_ptr<Snapshot> &snap, const std::vecto
   if (snap == nullptr)
     return;
 
+  // 0) Quiesce + reset the async-init machinery FIRST. A detached init thread still running
+  //    would race the state swap below, and a latched thread_init_success from the abandoned
+  //    future would make try_to_initialize() return true on a restored PRE-init snapshot with
+  //    no initialization ever performed (boot-default covariance) -- the worst possible
+  //    silent-corruption path. Mirrors soft_reset()'s handling.
+  while (thread_init_running.load()) {
+    PRINT_WARNING(YELLOW "[restore]: waiting for the async init thread to finish before rewinding...\n" RESET);
+    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+  }
+  thread_init_success.store(false);
+  {
+    std::lock_guard<std::mutex> lck(camera_queue_init_mtx);
+    camera_queue_init.clear();
+  }
+
   // 1) Install a FRESH clone of the snapshot state, so the snapshot node stays pristine and can
   //    be restored again to spawn a second branch. Swapping the shared_ptr is safe: no sub-object
   //    (updater/propagator/initializer) caches the State -- all take it as a per-call argument.
+  //    The ONE aliasing that must survive the swap is the camera intrinsic OBJECTS: the trackers
+  //    hold the pre-swap CamBase pointers (undistortion), and EKFUpdate syncs the estimated Vec
+  //    into whatever objects the STATE map names -- so keep the tracker's objects, write the
+  //    snapshot's values into them, and point the restored state at them. Without this, online
+  //    camera-intrinsic calibration updates objects the tracker never sees again.
+  auto prev_cam_objs = (state != nullptr) ? state->_cam_intrinsics_cameras
+                                          : std::unordered_map<size_t, std::shared_ptr<ov_core::CamBase>>();
   state = StateHelper::clone_state(snap->state);
+  for (auto &kv : state->_cam_intrinsics_cameras) {
+    auto it = prev_cam_objs.find(kv.first);
+    if (it != prev_cam_objs.end() && it->second != nullptr && kv.second != nullptr) {
+      it->second->set_value(kv.second->get_value());
+      kv.second = it->second;
+    }
+  }
 
   // 2) Propagator + scalars restored in place (Propagator object identity preserved -- ZUPT
   //    caches this exact pointer).
@@ -480,7 +535,45 @@ void VioManager::restore(const std::shared_ptr<Snapshot> &snap, const std::vecto
   last_ref_frame_time = snap->last_ref_frame_time;
   ref_period_ema = snap->ref_period_ema;
   epoch_marg_pending = snap->epoch_marg_pending;
-  used_features_map = snap->used_features_map;
+  did_zupt_update = snap->did_zupt_update;
+  has_moved_since_zupt = snap->has_moved_since_zupt;
+
+  // Deep-copy on the way back in too, so the snapshot node stays pristine for a second branch.
+  used_features_map.clear();
+  for (const auto &kv : snap->used_features_map) {
+    auto &dst = used_features_map[kv.first];
+    dst.reserve(kv.second.size());
+    for (const auto &f : kv.second)
+      dst.push_back(f ? std::make_shared<ov_core::Feature>(*f) : nullptr);
+  }
+
+  // Retriangulation accumulators + viz outputs: same feature ids reappear after the rewind by
+  // design, so accumulators from the abandoned future would MERGE with branch observations.
+  // Clear them (the viz outputs self-heal on the next base-cam frame).
+  active_feat_linsys_A.clear();
+  active_feat_linsys_b.clear();
+  active_feat_linsys_count.clear();
+  active_tracks_posinG.clear();
+  active_tracks_uvd.clear();
+  active_tracks_time = -1;
+  good_features_MSCKF.clear();
+
+  // ZUPT updater: its private IMU window and hold counters belong to the abandoned timeline (a
+  // stale last_zupt_state_timestamp can even delete measurements from the restored database).
+  // Recreate it clean -- ZUPT simply re-accumulates after a rewind (same recipe as construction).
+  if (updaterZUPT != nullptr && trackFEATS != nullptr) {
+    updaterZUPT = std::make_shared<UpdaterZeroVelocity>(params.zupt_options, params.imu_noises,
+                                                        trackFEATS->get_feature_database(), propagator, params.gravity_mag,
+                                                        params.zupt_max_velocity, params.zupt_noise_multiplier,
+                                                        params.zupt_max_disparity, params.zupt_prop_window);
+  }
+
+  // Pre-init restore: the initializer's own IMU buffer holds the abandoned future (it is only
+  // fed while un-initialized, so a rewind would append duplicates of the overlap). Recreate it
+  // against the same feature database, exactly like construction.
+  if (!snap->is_initialized_vio && trackFEATS != nullptr) {
+    initializer = std::make_shared<ov_init::InertialInitializer>(params.init_options, trackFEATS->get_feature_database());
+  }
 
   // Discard whatever the live ring holds now. The in-flight (pushed-but-not-drained) frames that
   // were pending at snapshot time are NOT re-injected here -- instead the caller rewinds its feed
@@ -494,7 +587,9 @@ void VioManager::restore(const std::shared_ptr<Snapshot> &snap, const std::vecto
   //    (the next real feed then swaps it into img_buf_prev_, exactly as if we had never rewound).
   //    We first clear the CPU frontend so this priming feed DETECTS (it must not try to KLT-track
   //    from the stale post-snapshot pyramid); its detection output is overwritten in step 4.
-  if (trackFEATS != nullptr && !prime_frames.empty()) {
+  //    TrackSIM has no pyramid and hard-exits on an image feed -- the obs-replay tier passes
+  //    empty primes, but guard it structurally.
+  if (trackFEATS != nullptr && !prime_frames.empty() && std::dynamic_pointer_cast<TrackSIM>(trackFEATS) == nullptr) {
     trackFEATS->restore_frontend(std::make_shared<ov_core::TrackBase::FrontendState>());
     for (const auto &f : prime_frames)
       trackFEATS->feed_new_camera(f);
@@ -614,6 +709,14 @@ void VioManager::feed_measurement_simulation(double timestamp, const std::vector
   // If not, recreate and re-cast the tracker to our simulation tracker
   std::shared_ptr<TrackSIM> trackSIM = std::dynamic_pointer_cast<TrackSIM>(trackFEATS);
   if (trackSIM == nullptr) {
+    // The swap below re-creates the initializer against the new tracker's database. If a
+    // detached async init thread from earlier IMAGE feeds is still running, dropping the old
+    // initializer here would free it mid-initialize() -- wait it out first (pure-sim runs never
+    // enter this loop: the swap happens before any try_to_initialize can have spawned one).
+    while (thread_init_running.load()) {
+      PRINT_WARNING(YELLOW "[SIM]: waiting for the async init thread before swapping to TrackSIM...\n" RESET);
+      std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
     // Replace with the simulated tracker
     trackSIM = std::make_shared<TrackSIM>(state->_cam_intrinsics_cameras, state->_options.max_aruco_features);
     trackFEATS = trackSIM;
