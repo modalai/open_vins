@@ -245,6 +245,21 @@ bool JointCalib::solve(const std::vector<WindowData> &windows, SharedCalib &cali
     w.seed_bg = in.bg;
     w.seed_ba = in.ba;
   };
+  // EXACT seed restore (export-on-accept): unlike apply_seeds — which is a
+  // carry consumer and correctly no-ops on an empty snapshot — this puts the
+  // window's seed fields back bit-for-bit INCLUDING has_seeds=false, so a
+  // kept-A export re-entry sees precisely the anchors its evaluation solved
+  // under, and the post-export state is precisely what legacy leaves behind.
+  auto force_seeds = [](const SeedSnap &in, WindowData &w) {
+    w.has_seeds = in.has;
+    w.seed_q = in.q;
+    w.seed_v = in.v;
+    w.seed_p = in.p;
+    w.seed_feats = in.feats;
+    w.seed_grav = in.grav;
+    w.seed_bg = in.bg;
+    w.seed_ba = in.ba;
+  };
   // ---- carry consume (stage-entry warm start across staged calls) ----
   const bool carry_on = (carry != nullptr) && cfg.use_carry;
   if (carry_on && carry->valid && carry->warm.size() == work.size()) {
@@ -379,6 +394,25 @@ bool JointCalib::solve(const std::vector<WindowData> &windows, SharedCalib &cali
     cfg_eff.duel_on_accept = false;
   }
   const bool duel_defer = cfg_eff.duel_on_accept;
+  // Export-on-accept (see JointConfig::export_on_accept): evaluations run
+  // cost-only — except cert-stage path A, which exports inline because the
+  // certificate consumes its q_n pre-accept and q_n must be the export's
+  // exact bits — and the accepted candidate's (Lambda, g, qn) are produced
+  // by ONE deferred pass inside the accept branch (stored where inline,
+  // entry-faithful re-entry elsewhere). eoa=false is the legacy inline-
+  // export path, byte-identical to the pre-t7 binary.
+  //
+  // duel_on_accept DISARMS eoa: the deferred-duel fold is INCREMENTAL
+  // (Lsum += d_L - s.L on a winner), so legacy's accepted linearization
+  // carries the loser's export in its rounding — sum_orig + (win - orig)
+  // and a rebuilt direct sum differ in the last ulp. Reproducing those bits
+  // would require exporting the duel LOSER too, which is the very work eoa
+  // exists to elide; the experimental mode keeps legacy exports instead
+  // (same one-flag-one-behavior doctrine as the fused disarm above).
+  const bool eoa = cfg.export_on_accept && !duel_defer;
+  if (cfg.export_on_accept && duel_defer && cfg.verbose)
+    std::printf("[joint] export_on_accept disarmed under duel_on_accept: the deferred-duel fold is incremental "
+                "(exact-bits parity needs the loser's export)\n");
   const bool estop_on = cfg.early_stop && cert_on;
   int stable_run = 0;
   int conv_run = 0; // conv-stop consecutive below-tolerance accepted steps
@@ -434,8 +468,19 @@ bool JointCalib::solve(const std::vector<WindowData> &windows, SharedCalib &cali
           const bool cap_now = cfg.fused_schur && pass >= cfg.fused_warmup_passes &&
                                accepted_steps < cfg.outer_iterations - cfg.fused_polish_accepts;
           const int itA = cap_now ? cfg.fused_iters : cfg.window_max_iters;
-          okA = WindowBA::solve_and_export(work[wi], calib, true, wrA, itA, false, &wA, pslot[wi]) &&
-                (int)wrA.Lambda.rows() == np;
+          // eoa: cost-only eval — EXCEPT on cert-on stages, where the P1
+          // certificate consumes wrA.qn BEFORE the accept decision. q_n must
+          // be the full export's bits: a calib-column-free "qn-only" stats
+          // path was measured 1-ulp off (the smaller H's leading dimension
+          // changes SIMD peeling under -ffast-math; see the note at
+          // Problem::ExportReducedInformation), and q_n feeds thresholded
+          // duel arbitration. So cert stages keep path A's inline export
+          // (its Lambda is then REUSED at accept — not re-computed), and the
+          // eoa savings there are the path-B/duel-loser exports. Dimension
+          // consistency reads the layout dim, not the (absent) Lambda —
+          // equal to Lambda.rows() whenever an export ran.
+          okA = WindowBA::solve_and_export(work[wi], calib, !eoa || cert_on, wrA, itA, false, &wA, pslot[wi]) &&
+                wrA.free_dim == np;
           s.t_preint += wrA.t_preint;
           s.t_inner += wrA.t_inner;
           s.t_export += wrA.t_export;
@@ -490,8 +535,12 @@ bool JointCalib::solve(const std::vector<WindowData> &windows, SharedCalib &cali
           const bool seeded = LinearSeed::seed_window(work[wi], calib, work[wi].seed_bg, sr, cfg.seed);
           s.t_seed += std::chrono::duration<double>(std::chrono::steady_clock::now() - t_s0).count();
           if (seeded || work[wi].has_seeds) {
-            okB = WindowBA::solve_and_export(work[wi], calib, true, wrB, cfg.window_max_iters, false, &wB, pslot[wi]) &&
-                  (int)wrB.Lambda.rows() == np;
+            // eoa: cost-only duel — the loser's export was ALWAYS dead state,
+            // and the winner's is deferred to the accept pass. q_n is not
+            // consumed from path B pre-accept (the cert reads wrA.qn only;
+            // the accepted point's q_n comes from the export pass).
+            okB = WindowBA::solve_and_export(work[wi], calib, !eoa, wrB, cfg.window_max_iters, false, &wB, pslot[wi]) &&
+                  wrB.free_dim == np;
             s.t_preint += wrB.t_preint;
             s.t_inner += wrB.t_inner;
             s.t_export += wrB.t_export;
@@ -582,8 +631,10 @@ bool JointCalib::solve(const std::vector<WindowData> &windows, SharedCalib &cali
         veto = true; // candidate failure: reject this candidate (re-seeded again next pass)
         continue;
       }
-      Lsum += s.L;
-      gsum += s.g;
+      if (!eoa) { // eoa: evals carry no (L, g); the accept branch's export pass fills Lsum/gsum
+        Lsum += s.L;
+        gsum += s.g;
+      }
       cost_total += s.cost;
       rep.windows_used++;
     }
@@ -619,8 +670,8 @@ bool JointCalib::solve(const std::vector<WindowData> &windows, SharedCalib &cali
               return;
             WindowSolveReport wrB;
             WindowWarmState wB;
-            s.d_ok = WindowBA::solve_and_export(work[wi], calib, true, wrB, cfg.window_max_iters, false, &wB, pslot[wi]) &&
-                     (int)wrB.Lambda.rows() == np;
+            s.d_ok = WindowBA::solve_and_export(work[wi], calib, !eoa, wrB, cfg.window_max_iters, false, &wB, pslot[wi]) &&
+                     wrB.free_dim == np;
             s.d_preint = wrB.t_preint;
             s.d_inner = wrB.t_inner;
             s.d_export = wrB.t_export;
@@ -674,11 +725,13 @@ bool JointCalib::solve(const std::vector<WindowData> &windows, SharedCalib &cali
             rep.cold_gain_relsum += (s.cost - s.d_cost) / std::max(s.cost, 1e-300);
             if (s.deferred_cause == 'p' || s.deferred_cause == 'a' || s.deferred_cause == 'c')
               rep.cold_won_guard++;
-            Lsum += s.d_L - s.L;
-            gsum += s.d_g - s.g;
+            if (!eoa) { // eoa: no (L, g) anywhere pre-accept; the export pass re-enters the FINAL kept state
+              Lsum += s.d_L - s.L;
+              gsum += s.d_g - s.g;
+              s.L = std::move(s.d_L);
+              s.g = std::move(s.d_g);
+            }
             cost_total += s.d_cost - s.cost;
-            s.L = std::move(s.d_L);
-            s.g = std::move(s.d_g);
             s.cost = s.d_cost;
             s.qn = s.d_qn;
             s.cold_cause = s.deferred_cause;
@@ -718,11 +771,142 @@ bool JointCalib::solve(const std::vector<WindowData> &windows, SharedCalib &cali
       // ---- accept the current point; fold the seed priors; store linearization ----
       const double merit_before = prev_merit; // for the early-stop stability test
       rejects_in_a_row = 0;
+      // ---- export-on-accept: the evaluations above ran cost-only (except
+      // cert-stage path A, whose inline export carried q_n — its Lambda is
+      // REUSED here, never re-derived); produce the accepted candidate's
+      // (Lambda_w, g_w, qn_w) NOW, once, at the UNCHANGED kept optima. A
+      // re-entry is entry-faithful so its bytes equal the export legacy
+      // computed inline during the evaluation:
+      //   * kept-A: enter from the PRE-promotion warm baseline (the state A's
+      //     eval entered from) — a LOCAL copy, so the warm write-back inside
+      //     the call never touches warm_acc (promotion below owns that);
+      //     if a duel re-seeded this window this pass, A's anchors of record
+      //     are the PRE-re-seed seeds (seeds_pre) — swap them in, restore
+      //     after (work[wi] must keep the post-re-seed seeds, as legacy does).
+      //   * kept-B: enter cold from the window's current (post-re-seed) seeds
+      //     — exactly B's evaluation entry.
+      // Then state_at overrides to the kept optimum (warm_cand, still un-
+      // moved) and max_iters=0 exports there. Calib holds the accepted p
+      // (apply_dp runs only at the bottom of the loop).
+      if (eoa) {
+        struct ExpSlot {
+          bool ran = false, ok = false, stored = false;
+          Eigen::MatrixXd L;
+          Eigen::VectorXd g;
+          double qn = 0.0;
+          double t_pre = 0.0, t_fac = 0.0, t_exp = 0.0;
+          int phit = 0, pmiss = 0;
+        };
+        std::vector<ExpSlot> ex(work.size());
+        pool.parallel_dynamic((int)work.size(), [&](int /*worker*/, int k) {
+          {
+            const int wi = order[k];
+            EvalSlot &s = slots[wi];
+            if (dead[wi] || !s.attempted || !s.ok)
+              return;
+            ExpSlot &e = ex[wi];
+            e.ran = true;
+            // cert-stage kept-A: the evaluation already exported (inline, for
+            // q_n) — s.L/s.g/s.qn are the exact legacy bytes; reuse, never
+            // re-derive (the -ffast-math emitted-loop rule)
+            if (s.kept_path == 'A' && (int)s.L.rows() == np) {
+              e.ok = e.stored = true;
+              return;
+            }
+            WindowWarmState entry; // kept-A entry context (local copy — see block comment)
+            WindowWarmState *w0 = nullptr;
+            if (s.kept_path == 'A') {
+              entry = warm_acc[wi];
+              w0 = &entry;
+            }
+            SeedSnap live;
+            const bool swap_seeds = (s.kept_path == 'A' && s.cold_cause != 0);
+            if (swap_seeds) {
+              snap_seeds(work[wi], live);
+              force_seeds(s.seeds_pre, work[wi]);
+            }
+            WindowSolveReport wre;
+            e.ok = WindowBA::solve_and_export(work[wi], calib, true, wre, /*max_iters=*/0, false, w0, pslot[wi],
+                                              /*state_at=*/&warm_cand[wi]) &&
+                   (int)wre.Lambda.rows() == np;
+            if (swap_seeds)
+              force_seeds(live, work[wi]);
+            e.t_pre = wre.t_preint;
+            e.t_fac = wre.t_factor;
+            e.t_exp = wre.t_export;
+            (wre.preint_hit ? e.phit : e.pmiss)++;
+            if (e.ok) {
+              e.L = std::move(wre.Lambda);
+              e.g = std::move(wre.gred);
+              e.qn = wre.qn;
+            }
+          }
+        });
+        // fixed-order fold (Lsum/gsum are untouched by the cost-only reduction)
+        bool any_export_fail = false;
+        for (size_t wi = 0; wi < work.size(); ++wi) {
+          ExpSlot &e = ex[wi];
+          if (!e.ran)
+            continue;
+          rep.t_preint_sum += e.t_pre;
+          rep.t_factor_sum += e.t_fac;
+          rep.t_export_sum += e.t_exp;
+          rep.preint_hits += e.phit;
+          rep.preint_misses += e.pmiss;
+          if (!e.ok) {
+            // Failure at an ACCEPTED point (the eval's cost was fine but the
+            // undamped export system is not): legacy discovered this class at
+            // the eval's own export and never admitted the window into the
+            // pass — the accounting below reproduces that. Loud by design: on
+            // a healthy record this must never fire (the replay parity gate
+            // proves it).
+            dead[wi] = 1;
+            any_export_fail = true;
+            std::printf("[joint] WARNING pass %d: window %zu export FAILED at the accepted point -> dead "
+                        "(legacy caught this class at eval time; investigate before trusting this run)\n",
+                        pass, wi);
+            continue;
+          }
+          if (e.stored) {
+            Lsum += slots[wi].L;
+            gsum += slots[wi].g;
+            // slots[wi].qn already carries the inline export's q_n (legacy bits)
+          } else {
+            Lsum += e.L;
+            gsum += e.g;
+            // the accepted point's q_n — the value the eval's inline export
+            // would have carried; promoted to qn_acc/qn_ref below
+            slots[wi].qn = e.qn;
+          }
+        }
+        if (any_export_fail) {
+          // Re-derive the accepted merit over the SURVIVING window set in the
+          // legacy accumulation order (window-ordered sum, then the prior): a
+          // subtraction of the dead windows' costs would differ in the last
+          // ulp from never having added them, and prev_merit feeds accept
+          // thresholds and ships as final_merit.
+          cost_total = 0.0;
+          rep.windows_used = 0;
+          for (size_t wi = 0; wi < work.size(); ++wi)
+            if (slots[wi].attempted && slots[wi].ok && !dead[wi]) {
+              cost_total += slots[wi].cost;
+              rep.windows_used++;
+            }
+          if (rep.windows_used == 0) {
+            // every window died at the accepted point (legacy: dead at the
+            // entry reduction). Leave calib at the last ACCEPTED point, not
+            // the un-vetted candidate the failed exports just disowned.
+            restore(accepted_p);
+            return false;
+          }
+          merit = cost_total + prior_cost_now();
+        }
+      }
       prev_merit = merit;
       accepted_p = snapshot();
       // promote the accepted evaluation's nuisance optima to the warm baseline
       for (size_t wi = 0; wi < work.size(); ++wi)
-        if (slots[wi].attempted && slots[wi].ok) {
+        if (slots[wi].attempted && slots[wi].ok && !dead[wi]) {
           warm_acc[wi] = std::move(warm_cand[wi]);
           cost_acc[wi] = slots[wi].cost;
           qn_acc[wi] = slots[wi].qn;

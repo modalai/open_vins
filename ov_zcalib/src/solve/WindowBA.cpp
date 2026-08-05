@@ -65,7 +65,7 @@ struct WindowGraph {
 
 
 bool WindowBA::solve_and_export(const WindowData &win, SharedCalib &calib, bool export_info, WindowSolveReport &rep, int max_iters,
-                                bool verbose, WindowWarmState *warm, WindowPreint *pc) {
+                                bool verbose, WindowWarmState *warm, WindowPreint *pc, const WindowWarmState *state_at) {
 
   const int N = (int)win.clone_times.size();
   if (N < 3 || win.num_feats == 0)
@@ -459,6 +459,26 @@ bool WindowBA::solve_and_export(const WindowData &win, SharedCalib &calib, bool 
     G.pba->x0 = ba_anchor;
   }
 
+  // ---- export-only state override (export-on-accept re-entry) ----
+  // Everything ABOVE ran from the ENTRY state (warm strand or cold seeds),
+  // exactly as the evaluation that produced this optimum did: the reprojection
+  // transport linearization (w_clone/v_clone) and the gauge anchors are now
+  // pinned at the evaluation's values. Only NOW load the kept optimum itself,
+  // so the (zero-iteration) export below linearizes at it. Overriding any
+  // earlier would move the transport linearization off the evaluation's and
+  // break the deferred-export == inline-export byte contract.
+  if (state_at) {
+    if (!state_at->valid || (int)state_at->q.size() != N || state_at->feats.size() != win.num_feats)
+      return false; // a mis-shaped override would silently export a wrong point: fail loudly
+    q = state_at->q;
+    bg = state_at->bg;
+    v = state_at->v;
+    ba = state_at->ba;
+    p = state_at->p;
+    feats = state_at->feats;
+    grav = state_at->grav;
+  }
+
   // ---- inner (nuisance) solve ----
   SolverOptions opts;
   opts.max_num_iterations = max_iters;
@@ -489,12 +509,24 @@ bool WindowBA::solve_and_export(const WindowData &win, SharedCalib &calib, bool 
   opts.min_lambda = 1e-7;
   opts.lm_nu_growth = 4.0;
   const auto t_in0 = std::chrono::steady_clock::now();
-  SolverSummary sum = problem.Solve(opts);
+  if (max_iters > 0) {
+    SolverSummary sum = problem.Solve(opts);
+    rep.cost_final = sum.final_cost;
+    rep.iterations = sum.iterations;
+    rep.inner_converged = sum.converged;
+    rep.time_stopped = sum.time_stopped;
+  } else {
+    // export-only re-entry (max_iters=0, export-on-accept): the state was
+    // placed at the kept optimum above; a Solve(0) would only pay one wasted
+    // nuisance linearization (the export re-linearizes with the calib columns
+    // freed anyway). No cost/convergence claim is made — the consumers of
+    // this call read only the export products.
+    rep.cost_final = 0.0;
+    rep.iterations = 0;
+    rep.inner_converged = false;
+    rep.time_stopped = false;
+  }
   rep.t_inner = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_in0).count();
-  rep.cost_final = sum.final_cost;
-  rep.iterations = sum.iterations;
-  rep.inner_converged = sum.converged;
-  rep.time_stopped = sum.time_stopped;
   if (warm) {
     warm->q = q;
     warm->bg = bg;
@@ -509,6 +541,7 @@ bool WindowBA::solve_and_export(const WindowData &win, SharedCalib &calib, bool 
   // ---- export reduced information on the free calibration blocks ----
   // The keep set and the flag flips act on the GRAPH's calib copy (the
   // registered pointers); the caller's calib is never touched here.
+  rep.free_dim = G.calib.local_dim(); // layout dim of THIS solve (eval-only reports carry no Lambda)
   rep.ok = true;
   if (export_info) {
     const auto t_ex0 = std::chrono::steady_clock::now();
@@ -525,5 +558,10 @@ bool WindowBA::solve_and_export(const WindowData &win, SharedCalib &calib, bool 
       problem.SetParameterBlockConstant(b.ptr); // leave calib untouched by this window
     rep.t_export = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_ex0).count();
   }
+  // (A qn-only stats path without the calib columns was built and measured NOT
+  // byte-equal to the full export's q_n — the smaller H's leading dimension
+  // changes SIMD head-peeling under -ffast-math and H_zz drifts 1 ulp. See the
+  // note at Problem::ExportReducedInformation. Cert-consuming evaluations must
+  // therefore export fully; JointCalib owns that policy.)
   return rep.ok;
 }

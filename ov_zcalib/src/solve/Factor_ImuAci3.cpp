@@ -242,14 +242,13 @@ bool Factor_ImuAci3::evaluate_tg_(double const *const *parameters, double *resid
   dpi.segment<6>(6) = da_now - da_lin;
   dpi.segment<3>(12) = 2.0 * ov_core::quat_multiply(qA_now, ov_core::Inv(qA_lin)).head<3>();
   {
-    // PI ORDER RECONCILIATION. The preint tg columns follow mixing()'s ROW-major element
-    // enumeration (Ek(k/3, k%3) — kept at its legacy shape for -ffast-math parity), while the
-    // parameter block is Tg.data() = Matrix3d COLUMN-major storage. The permutation lives HERE,
-    // at the factor boundary, and nowhere else: dpi is built in PI order from the storage view,
-    // and jacobians[14] maps pi columns back to storage-element columns below.
-    const Eigen::Map<const Eigen::Matrix3d> Tg_now(parameters[14]);
-    for (int k = 0; k < 9; ++k)
-      dpi(15 + k) = Tg_now(k / 3, k % 3) - tg_lin(k / 3, k % 3);
+    // One pi convention end-to-end: mixing() enumerates the tg columns in Matrix3d
+    // STORAGE (column-major) order — the very order of the Tg.data() parameter block —
+    // so the delta is a straight 9-vector subtraction and the Jacobian block below is a
+    // straight column copy. No boundary permutation exists to get wrong.
+    const Eigen::Map<const Eigen::Matrix<double, 9, 1>> tg_now(parameters[14]);
+    const Eigen::Map<const Eigen::Matrix<double, 9, 1>> tg_l(tg_lin.data());
+    dpi.segment<9>(15) = tg_now - tg_l;
   }
 
   Eigen::Vector3d dbw = b_w1 - bg_lin;
@@ -349,9 +348,7 @@ bool Factor_ImuAci3::evaluate_tg_(double const *const *parameters, double *resid
   }
   if (jacobians[14]) {
     Eigen::Map<Eigen::Matrix<double, 15, 9, Eigen::RowMajor>> J(jacobians[14], 15, 9);
-    // storage element j sits at (row j%3, col j/3) = pi row-major index 3*(j%3) + j/3
-    for (int j = 0; j < 9; ++j)
-      J.col(j) = Jpi.col(15 + 3 * (j % 3) + j / 3);
+    J = Jpi.middleCols(15, 9); // pi tg columns are storage-order by construction
   }
   return true;
 }

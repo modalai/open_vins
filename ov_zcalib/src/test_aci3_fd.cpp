@@ -425,7 +425,7 @@ static void test_sweep_tg(double hz, double tol_mean, double tol_col) {
       dq(3) = 1.0;
       mm.q_AtoI = ov_core::quat_multiply(dq / dq.norm(), model.q_AtoI);
     } else if (col < 24)
-      mm.Tg((col - 15) / 3, (col - 15) % 3) += eps; // pi order = mixing's ROW-major enumeration
+      mm.Tg.data()[col - 15] += eps; // pi order == Matrix3d storage order, end-to-end
     else if (col < 27)
       bgp(col - 24) += eps;
     else

@@ -96,7 +96,10 @@ struct Trajectory {
   }
 };
 
-/// Raw IMU sample at time t (intrinsic model inverted, biases added)
+/// Raw IMU sample at time t (intrinsic model inverted, biases added).
+/// g-sensitivity: the imu2 forward map is w_hat = Dw*(wm - bg - Tg*a_hat) with
+/// a_hat = R_AtoI*Da*(am - ba), so the INVERSE injects wm += Tg*a_hat_true. Guarded
+/// on a nonzero truth Tg so Tg=0 worlds stay byte-identical to the validated gates.
 inline RawImu raw_imu_at(const Truth &tr, const Trajectory &tj, double t, std::mt19937 &rng, double w_noise = 0.0, double a_noise = 0.0,
                          double temp_c = 30.0) {
   std::normal_distribution<double> nrm(0.0, 1.0);
@@ -106,6 +109,8 @@ inline RawImu raw_imu_at(const Truth &tr, const Trajectory &tj, double t, std::m
   RawImu s;
   s.timestamp = t;
   s.wm = Dw_i * tj.omega_I(t) + tr.bg + w_noise * Eigen::Vector3d(nrm(rng), nrm(rng), nrm(rng));
+  if (!tr.imu.Tg.isZero())
+    s.wm += tr.imu.Tg * tj.accel_I(t, tr.g_W);
   s.am = Da_i * (R_A_t * tj.accel_I(t, tr.g_W)) + tr.ba + a_noise * Eigen::Vector3d(nrm(rng), nrm(rng), nrm(rng));
   s.temp_c = temp_c;
   return s;

@@ -16,9 +16,12 @@
 #include "Parallel.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <set>
 
 using namespace ov_init::zbft_sfm;
@@ -43,6 +46,39 @@ namespace {
 inline double seconds_since(const std::chrono::steady_clock::time_point &t0) {
   return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
 }
+
+// ---- R5 measure-first probe (env OV_ZCALIB_ORDER_PROBE=1) -------------------------------
+// t_order = accumulated wall of assign_ordering()+analyze_band(), reported against the wall
+// of the entry points that recompute it (Solve / ComputeCovariance / ExportReducedInformation;
+// 2 recomputes per warm eval, 4 per duel). The symbolic/ordering pass is a pure function of
+// (graph structure, constancy signature) and so is a CACHE candidate — but the WindowGraph
+// session's "rebuild was never the cost" verdict says MEASURE before caching. One stderr line
+// at process exit; atomic counters because window solves run concurrently under the session
+// scheduler; two clock reads per call when armed, zero work when the env is unset.
+struct OrderProbe {
+  std::atomic<long long> order_ns{0}, entry_ns{0}, calls{0};
+  const bool on;
+  OrderProbe() : on(std::getenv("OV_ZCALIB_ORDER_PROBE") != nullptr) {}
+  ~OrderProbe() {
+    if (!on)
+      return;
+    const double to = 1e-9 * (double)order_ns.load(), te = 1e-9 * (double)entry_ns.load();
+    std::fprintf(stderr, "[zbft/order-probe] assign_ordering+analyze_band: calls=%lld t_order=%.6f s solver-entry wall=%.3f s share=%.4f%%\n",
+                 calls.load(), to, te, (te > 0.0) ? 100.0 * to / te : 0.0);
+  }
+};
+OrderProbe g_order_probe;
+struct OrderEntryScope { // RAII denominator: covers every return path of the enclosing entry point
+  std::chrono::steady_clock::time_point t0;
+  OrderEntryScope() {
+    if (g_order_probe.on)
+      t0 = std::chrono::steady_clock::now();
+  }
+  ~OrderEntryScope() {
+    if (g_order_probe.on)
+      g_order_probe.entry_ns.fetch_add((long long)std::llround(1e9 * seconds_since(t0)), std::memory_order_relaxed);
+  }
+};
 
 } // namespace
 
@@ -107,6 +143,7 @@ void Problem::AddResidualBlock(const CostFunction *cost, const LossFunction *los
 }
 
 void Problem::assign_ordering() {
+  const auto t_order0 = g_order_probe.on ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
   n_nav_ = 0;
   n_land_ = 0;
   land_diag_.clear();
@@ -182,6 +219,10 @@ void Problem::assign_ordering() {
   }
 
   analyze_band();
+  if (g_order_probe.on) {
+    g_order_probe.order_ns.fetch_add((long long)std::llround(1e9 * seconds_since(t_order0)), std::memory_order_relaxed);
+    g_order_probe.calls.fetch_add(1, std::memory_order_relaxed);
+  }
 }
 
 void Problem::analyze_band() {
@@ -761,8 +802,22 @@ void Problem::apply_delta(const Eigen::VectorXd &delta) {
 }
 
 SolverSummary Problem::Solve(const SolverOptions &options) {
+  OrderEntryScope order_probe_scope; // R5 probe denominator (no-op unless armed)
   SolverSummary summary;
   const auto t0 = std::chrono::steady_clock::now();
+
+  // R2 [BIT-EXACT dead-state]: an accepted step's re-linearization is consumed only by the
+  // NEXT iteration (its gradient check, damping diagonal and step solve). When the accepted
+  // step is the LAST permitted iteration (iter + 1 == max_num_iterations) there is no next
+  // iteration: H/grad are function-locals, the re-linearization's cost lands in a discarded
+  // dummy, and ExportReducedInformation/ComputeCovariance re-linearize independently. Under
+  // fused_iters=1 warm evals this fires on EVERY capped eval — one of the eval's two inner
+  // linearizations is pure dead state. Skipping it changes ONLY SolverSummary::jacobian_evals
+  // and the time_* splits (consumed by ov_init bench tools alone, grep-verified 2026-07-13);
+  // every parameter byte, cost, iterate and message is untouched by construction.
+  // OV_ZCALIB_TERMLIN_LEGACY=1 restores the unconditional re-linearize (replay byte-parity
+  // kill-switch: same binary, rungs on vs off, YAML must be byte-identical).
+  static const bool termlin_legacy = (std::getenv("OV_ZCALIB_TERMLIN_LEGACY") != nullptr);
 
   if (options.pin_eigen_single_thread)
     Eigen::setNbThreads(1); // our ParallelExecutor owns the parallelism; keep Eigen serial
@@ -932,8 +987,9 @@ SolverSummary Problem::Solve(const SolverOptions &options) {
             std::fprintf(stderr, "[zbft/dl] it=%2d cost=%.8e rel=%.3e gnorm=%.3e radius=%.2e rho=%.3f\n", iter, cost, rel,
                          grad.lpNorm<Eigen::Infinity>(), radius, rho);
           // Re-linearize at the accepted iterate (the candidate checks above already handled
-          // the terminal case, so an accepted step here always continues).
-          {
+          // the terminal case, so an accepted step here always continues). R2: skipped when
+          // this was the last permitted iteration — nothing consumes it (see Solve() head).
+          if (termlin_legacy || iter + 1 < options.max_num_iterations) {
             const auto tt = std::chrono::steady_clock::now();
             double cc = 0.0;
             linearize(H, grad, cc, exec);
@@ -1056,8 +1112,9 @@ SolverSummary Problem::Solve(const SolverOptions &options) {
           std::fprintf(stderr, "[zbft/lm] it=%2d cost=%.8e rel=%.3e gnorm=%.3e lambda=%.2e rho=%.3f\n", iter, cost, rel,
                        grad.lpNorm<Eigen::Infinity>(), lambda, rho);
         // Re-linearize at the accepted iterate (the candidate checks above already handled the
-        // terminal case, so an accepted step here always continues to the next iteration).
-        {
+        // terminal case, so an accepted step here always continues to the next iteration). R2:
+        // skipped when this was the last permitted iteration — nothing consumes it (Solve() head).
+        if (termlin_legacy || iter + 1 < options.max_num_iterations) {
           const auto tt = std::chrono::steady_clock::now();
           double relin_cost = 0.0;
           linearize(H, grad, relin_cost, exec);
@@ -1100,6 +1157,7 @@ SolverSummary Problem::Solve(const SolverOptions &options) {
 }
 
 bool Problem::ComputeCovariance(const std::vector<double *> &blocks, Eigen::MatrixXd &covariance, const SolverOptions &options) {
+  OrderEntryScope order_probe_scope; // R5 probe denominator (no-op unless armed)
   assign_ordering();
   if (n_total_ == 0)
     return false;
@@ -1174,6 +1232,7 @@ bool Problem::ComputeCovariance(const std::vector<double *> &blocks, Eigen::Matr
 
 bool Problem::ExportReducedInformation(const std::vector<double *> &blocks, Eigen::MatrixXd &Lambda, Eigen::VectorXd &gred,
                                        const SolverOptions &options, ExportStats *stats) {
+  OrderEntryScope order_probe_scope; // R5 probe denominator (no-op unless armed)
   assign_ordering();
   if (n_total_ == 0)
     return false;
@@ -1189,51 +1248,9 @@ bool Problem::ExportReducedInformation(const std::vector<double *> &blocks, Eige
     out_dim += blocks_[i].lsize;
   }
 
-  ParallelExecutor exec(options.num_threads, options.worker_init_fn);
-  Eigen::MatrixXd H;
-  Eigen::VectorXd grad;
-  double cost = 0.0;
-  linearize(H, grad, cost, exec); // at the current iterate, undamped
-
-  // Landmark-marginalized nav system, VISIBILITY-AWARE like solve_step: the
-  // dense (n_nav x n_land) x (n_land x n_nav) product multiplied through the
-  // structural zeros of every landmark's non-observing poses (measured ~9% of
-  // window-solve thread-CPU). Per landmark, only its adjacent nav blocks are
-  // touched — identical algebra to the old dense BD*Bt fold, including the
-  // 1e-10 diagonal damping and the gradient fold g_nav' = g_nav - (B D^-1) g_l.
-  Eigen::MatrixXd Hnav = H.topLeftCorner(n_nav_, n_nav_).selfadjointView<Eigen::Lower>();
-  Eigen::VectorXd gnav = grad.head(n_nav_);
-  for (size_t li = 0; li < land_diag_.size(); ++li) {
-    const int g0 = n_nav_ + land_diag_[li].first;
-    Eigen::Matrix3d V = Eigen::Matrix3d(H.block(g0, g0, 3, 3).selfadjointView<Eigen::Lower>());
-    V.diagonal().array() += 1e-10;
-    const Eigen::Matrix3d Vinv = V.inverse();
-    const Eigen::Vector3d gl = grad.segment(g0, 3);
-    if (stats)
-      stats->land_decrement += gl.dot(Vinv * gl);
-    const std::vector<int> &adj = land_adj_[li];
-    const int P = (int)adj.size();
-    if ((int)schur_off_.size() < P) {
-      schur_off_.resize(P);
-      schur_W_.resize(P);
-      schur_Ma_.resize(P);
-    }
-    for (int ia = 0; ia < P; ++ia) {
-      const Block &ba = blocks_[adj[ia]];
-      schur_off_[ia] = ba.offset;
-      schur_W_[ia] = H.block(g0, ba.offset, 3, ba.lsize);
-      schur_Ma_[ia].noalias() = schur_W_[ia].transpose() * Vinv;
-      gnav.segment(ba.offset, ba.lsize).noalias() -= schur_Ma_[ia] * gl;
-    }
-    // FULL (both-triangle) fill-in: the kept/nuisance partition below indexes
-    // Hnav at arbitrary (row, col), unlike solve_step's lower-only Hred.
-    for (int ia = 0; ia < P; ++ia)
-      for (int ib = 0; ib < P; ++ib)
-        Hnav.block(schur_off_[ia], schur_off_[ib], schur_Ma_[ia].rows(), schur_W_[ib].cols()).noalias() -=
-            schur_Ma_[ia] * schur_W_[ib];
-  }
-
-  // Partition nav into kept vs nuisance indices (kept in requested order).
+  // Partition nav into kept vs nuisance indices (kept in requested order). Hoisted above the
+  // linearization (pure integer bookkeeping, identical values) so the marginalization below
+  // can pick its path from the layout.
   std::vector<int> kidx, nidx;
   kidx.reserve(out_dim);
   std::vector<char> is_kept(n_nav_, 0);
@@ -1245,45 +1262,245 @@ bool Problem::ExportReducedInformation(const std::vector<double *> &blocks, Eige
   for (int i = 0; i < n_nav_; ++i)
     if (!is_kept[i])
       nidx.push_back(i);
-
   const int nk = (int)kidx.size(), nn = (int)nidx.size();
-  Eigen::MatrixXd Hkk(nk, nk), Hkn(nk, nn), Hnn(nn, nn);
-  Eigen::VectorXd gk(nk), gn(nn);
-  for (int a = 0; a < nk; ++a) {
-    gk(a) = gnav(kidx[a]);
-    for (int b = 0; b < nk; ++b)
-      Hkk(a, b) = Hnav(kidx[a], kidx[b]);
-    for (int b = 0; b < nn; ++b)
-      Hkn(a, b) = Hnav(kidx[a], nidx[b]);
-  }
-  for (int a = 0; a < nn; ++a) {
-    gn(a) = gnav(nidx[a]);
-    for (int b = 0; b < nn; ++b)
-      Hnn(a, b) = Hnav(nidx[a], nidx[b]);
-  }
 
-  if (nn == 0) {
-    Lambda = Hkk;
-    gred = gk;
+  // R1-T1 layout probe: the calibrator's export keeps a CONTIGUOUS TRAILING offset range —
+  // WindowBA registers clones + gravity before the calib blocks and assign_ordering assigns
+  // nav offsets in registration order, so nuisance = [0, nn) and kept = [nn, n_nav) always
+  // (the kept range may be internally permuted vs the request order, e.g. cam vs td). kidx
+  // holds nk distinct in-range offsets, so min(kidx) >= nn is equivalent to set equality
+  // with the trailing range. A caller that violates it (none in-tree) stays on the legacy
+  // path unchanged.
+  bool tail_contig = true;
+  for (int i : kidx)
+    if (i < nn) {
+      tail_contig = false;
+      break;
+    }
+
+  // R1-T1 [BIT-EXACT] rung switches: OV_ZCALIB_EXPORT_LEGACY forces the historical full-fill
+  // path (replay byte-parity kill-switch); OV_ZCALIB_EXPORT_AUDIT computes BOTH paths per
+  // export and memcmps every consumed output byte (Lambda, gred, stats, ok) — the P3-c1
+  // dual-path in-binary proof method.
+  static const bool export_legacy = (std::getenv("OV_ZCALIB_EXPORT_LEGACY") != nullptr);
+  static const bool export_audit = (std::getenv("OV_ZCALIB_EXPORT_AUDIT") != nullptr);
+
+  ParallelExecutor exec(options.num_threads, options.worker_init_fn);
+  Eigen::MatrixXd H;
+  Eigen::VectorXd grad;
+  double cost = 0.0;
+  linearize(H, grad, cost, exec); // at the current iterate, undamped
+
+  // ---- LEGACY marginalization (pre-R1 code, verbatim): the kill-switch path, the audit
+  // reference, and the general path for non-trailing kept layouts. ----
+  const auto run_legacy = [&](Eigen::MatrixXd &L_out, Eigen::VectorXd &g_out, ExportStats *st) -> bool {
+    // Landmark-marginalized nav system, VISIBILITY-AWARE like solve_step: the
+    // dense (n_nav x n_land) x (n_land x n_nav) product multiplied through the
+    // structural zeros of every landmark's non-observing poses (measured ~9% of
+    // window-solve thread-CPU). Per landmark, only its adjacent nav blocks are
+    // touched — identical algebra to the old dense BD*Bt fold, including the
+    // 1e-10 diagonal damping and the gradient fold g_nav' = g_nav - (B D^-1) g_l.
+    Eigen::MatrixXd Hnav = H.topLeftCorner(n_nav_, n_nav_).selfadjointView<Eigen::Lower>();
+    Eigen::VectorXd gnav = grad.head(n_nav_);
+    for (size_t li = 0; li < land_diag_.size(); ++li) {
+      const int g0 = n_nav_ + land_diag_[li].first;
+      Eigen::Matrix3d V = Eigen::Matrix3d(H.block(g0, g0, 3, 3).selfadjointView<Eigen::Lower>());
+      V.diagonal().array() += 1e-10;
+      const Eigen::Matrix3d Vinv = V.inverse();
+      const Eigen::Vector3d gl = grad.segment(g0, 3);
+      if (st)
+        st->land_decrement += gl.dot(Vinv * gl);
+      const std::vector<int> &adj = land_adj_[li];
+      const int P = (int)adj.size();
+      if ((int)schur_off_.size() < P) {
+        schur_off_.resize(P);
+        schur_W_.resize(P);
+        schur_Ma_.resize(P);
+      }
+      for (int ia = 0; ia < P; ++ia) {
+        const Block &ba = blocks_[adj[ia]];
+        schur_off_[ia] = ba.offset;
+        schur_W_[ia] = H.block(g0, ba.offset, 3, ba.lsize);
+        schur_Ma_[ia].noalias() = schur_W_[ia].transpose() * Vinv;
+        gnav.segment(ba.offset, ba.lsize).noalias() -= schur_Ma_[ia] * gl;
+      }
+      // FULL (both-triangle) fill-in: the kept/nuisance partition below indexes
+      // Hnav at arbitrary (row, col), unlike solve_step's lower-only Hred.
+      for (int ia = 0; ia < P; ++ia)
+        for (int ib = 0; ib < P; ++ib)
+          Hnav.block(schur_off_[ia], schur_off_[ib], schur_Ma_[ia].rows(), schur_W_[ib].cols()).noalias() -=
+              schur_Ma_[ia] * schur_W_[ib];
+    }
+
+    Eigen::MatrixXd Hkk(nk, nk), Hkn(nk, nn), Hnn(nn, nn);
+    Eigen::VectorXd gk(nk), gn(nn);
+    for (int a = 0; a < nk; ++a) {
+      gk(a) = gnav(kidx[a]);
+      for (int b = 0; b < nk; ++b)
+        Hkk(a, b) = Hnav(kidx[a], kidx[b]);
+      for (int b = 0; b < nn; ++b)
+        Hkn(a, b) = Hnav(kidx[a], nidx[b]);
+    }
+    for (int a = 0; a < nn; ++a) {
+      gn(a) = gnav(nidx[a]);
+      for (int b = 0; b < nn; ++b)
+        Hnn(a, b) = Hnav(nidx[a], nidx[b]);
+    }
+
+    if (nn == 0) {
+      L_out = Hkk;
+      g_out = gk;
+      if (st)
+        st->nuis_decrement = st->land_decrement;
+      return true;
+    }
+    Eigen::LDLT<Eigen::MatrixXd> ldlt(Hnn);
+    if (ldlt.info() != Eigen::Success || (ldlt.vectorD().array() <= 0.0).any())
+      return false;
+    const Eigen::MatrixXd HnnInvHnk = ldlt.solve(Hkn.transpose());
+    L_out = Hkk - Hkn * HnnInvHnk;
+    g_out = gk - HnnInvHnk.transpose() * gn;
+    if (st) {
+      // nuisance Newton decrement q_n = g_z' H_zz^{-1} g_z = sum_l gl'V^{-1}gl
+      // + gn'Hnn^{-1}gn (exact block-elimination identity; one extra O(nn^2)
+      // solve on the factorization formed above). q_n/2 = the cost decrease a
+      // further inner solve could still achieve at this linearization — the P1
+      // stationarity certificate's statistic.
+      st->nuis_decrement = st->land_decrement + gn.dot(ldlt.solve(gn));
+      st->nuis_grad_inf = gn.lpNorm<Eigen::Infinity>();
+    }
+    L_out = 0.5 * (L_out + L_out.transpose()).eval(); // symmetrize
+    return L_out.allFinite() && g_out.allFinite();
+  };
+
+  // ---- R1-T1 fast marginalization [BIT-EXACT]: dead-write elimination + contiguous
+  // gathers, valid only under the trailing-kept layout probed above.
+  //
+  // Consumed-region catalogue of the legacy Hnav (every read between the fold and the LDLT):
+  //   (1) Hnn gather -> nuisance x nuisance; only the LOWER triangle ever reaches arithmetic
+  //       (Eigen's LDLT<Lower> factors from the lower triangle — the upper copy was dead the
+  //       moment it was made);
+  //   (2) Hkn gather -> kept rows x nuisance cols; kept offsets >= nn > nuisance offsets,
+  //       i.e. STRICTLY BELOW the diagonal — lower triangle again;
+  //   (3) Hkk gather -> kept x kept, BOTH triangles (the request order permutes inside the
+  //       trailing range).
+  // Therefore the nuisance-ROW upper strip (rows < nn, cols > row) is dead state: its
+  // selfadjointView materialization and its landmark fill-in writes are skipped. Every
+  // surviving write keeps the legacy expression, operand layout and accumulation order, so
+  // every consumed byte is byte-identical (proved in-binary by OV_ZCALIB_EXPORT_AUDIT and
+  // end-to-end by the OV_ZCALIB_EXPORT_LEGACY replay harness).
+  const auto run_fast = [&](Eigen::MatrixXd &L_out, Eigen::VectorXd &g_out, ExportStats *st) -> bool {
+    Eigen::MatrixXd Hnav(n_nav_, n_nav_); // deliberately uninitialized: the dead strip is never read
+    for (int j = 0; j < n_nav_; ++j)      // lower triangle incl. diagonal: the bytes selfadjointView copied
+      Hnav.col(j).segment(j, n_nav_ - j) = H.col(j).segment(j, n_nav_ - j);
+    for (int j = nn + 1; j < n_nav_; ++j) // kept x kept upper mirror: bytes = H's lower mirrored, as before
+      for (int i = nn; i < j; ++i)
+        Hnav(i, j) = H(j, i);
+    Eigen::VectorXd gnav = grad.head(n_nav_);
+    for (size_t li = 0; li < land_diag_.size(); ++li) {
+      const int g0 = n_nav_ + land_diag_[li].first;
+      Eigen::Matrix3d V = Eigen::Matrix3d(H.block(g0, g0, 3, 3).selfadjointView<Eigen::Lower>());
+      V.diagonal().array() += 1e-10;
+      const Eigen::Matrix3d Vinv = V.inverse();
+      const Eigen::Vector3d gl = grad.segment(g0, 3);
+      if (st)
+        st->land_decrement += gl.dot(Vinv * gl);
+      const std::vector<int> &adj = land_adj_[li];
+      const int P = (int)adj.size();
+      if ((int)schur_off_.size() < P) {
+        schur_off_.resize(P);
+        schur_W_.resize(P);
+        schur_Ma_.resize(P);
+      }
+      for (int ia = 0; ia < P; ++ia) {
+        const Block &ba = blocks_[adj[ia]];
+        schur_off_[ia] = ba.offset;
+        schur_W_[ia] = H.block(g0, ba.offset, 3, ba.lsize);
+        schur_Ma_[ia].noalias() = schur_W_[ia].transpose() * Vinv;
+        gnav.segment(ba.offset, ba.lsize).noalias() -= schur_Ma_[ia] * gl;
+      }
+      // Fill-in with the dead nuisance-row upper-strip writes SKIPPED: a block lands there
+      // iff its row block starts above the diagonal (ra < cb; distinct blocks never straddle
+      // it) AND its row block is nuisance (ra < nn). Kept-row upper blocks (ra >= nn — the
+      // Hkk gather consumes them) keep their OWN gemm, not a transpose-mirror of the lower
+      // slot: Vinv = V.inverse() is not bitwise-symmetric and byte identity is the contract.
+      for (int ia = 0; ia < P; ++ia) {
+        const int ra = schur_off_[ia];
+        for (int ib = 0; ib < P; ++ib) {
+          const int cb = schur_off_[ib];
+          if (ra < cb && ra < nn)
+            continue; // dead write: nuisance-row upper strip
+          Hnav.block(ra, cb, schur_Ma_[ia].rows(), schur_W_[ib].cols()).noalias() -= schur_Ma_[ia] * schur_W_[ib];
+        }
+      }
+    }
+
+    // Contiguous partition gathers (nidx == [0, nn) here, so nidx[b] == b):
+    Eigen::MatrixXd Hkk(nk, nk), Hkn(nk, nn), Hnn(nn, nn);
+    Eigen::VectorXd gk(nk), gn(nn);
+    for (int a = 0; a < nk; ++a) {
+      gk(a) = gnav(kidx[a]);
+      for (int b = 0; b < nk; ++b)
+        Hkk(a, b) = Hnav(kidx[a], kidx[b]);
+      Hkn.row(a) = Hnav.row(kidx[a]).head(nn); // kept row >= nn: lower-triangle reads only
+    }
+    gn = gnav.head(nn);
+    for (int j = 0; j < nn; ++j) // lower-only column tails: exactly the triangle LDLT consumes
+      Hnn.col(j).tail(nn - j) = Hnav.col(j).segment(j, nn - j);
+
+    if (nn == 0) {
+      L_out = Hkk;
+      g_out = gk;
+      if (st)
+        st->nuis_decrement = st->land_decrement;
+      return true;
+    }
+    Eigen::LDLT<Eigen::MatrixXd> ldlt(Hnn); // consumes the lower triangle; Hnn's upper is never read into arithmetic
+    if (ldlt.info() != Eigen::Success || (ldlt.vectorD().array() <= 0.0).any())
+      return false;
+    const Eigen::MatrixXd HnnInvHnk = ldlt.solve(Hkn.transpose());
+    L_out = Hkk - Hkn * HnnInvHnk;
+    g_out = gk - HnnInvHnk.transpose() * gn;
+    if (st) {
+      st->nuis_decrement = st->land_decrement + gn.dot(ldlt.solve(gn));
+      st->nuis_grad_inf = gn.lpNorm<Eigen::Infinity>();
+    }
+    L_out = 0.5 * (L_out + L_out.transpose()).eval(); // symmetrize
+    return L_out.allFinite() && g_out.allFinite();
+  };
+
+  if (export_audit && tail_contig && !export_legacy) {
+    // Dual-path audit: run BOTH marginalizations from the same (H, grad) and memcmp every
+    // consumed output byte. Aborts loudly on the first divergence (the PREINT_AUDIT pattern).
+    ExportStats s_ref, s_new;
+    if (stats) {
+      s_ref = *stats; // legacy += semantics accumulate from the caller's entry values
+      s_new = *stats;
+    }
+    Eigen::MatrixXd L_ref;
+    Eigen::VectorXd g_ref;
+    const bool ok_ref = run_legacy(L_ref, g_ref, stats ? &s_ref : nullptr);
+    const bool ok_new = run_fast(Lambda, gred, stats ? &s_new : nullptr);
+    bool same = (ok_ref == ok_new);
+    if (same && ok_new) {
+      same = L_ref.rows() == Lambda.rows() && L_ref.cols() == Lambda.cols() && g_ref.size() == gred.size() &&
+             (L_ref.size() == 0 || std::memcmp(L_ref.data(), Lambda.data(), sizeof(double) * (size_t)L_ref.size()) == 0) &&
+             (g_ref.size() == 0 || std::memcmp(g_ref.data(), gred.data(), sizeof(double) * (size_t)g_ref.size()) == 0);
+      if (stats)
+        same = same && std::memcmp(&s_ref.nuis_decrement, &s_new.nuis_decrement, sizeof(double)) == 0 &&
+               std::memcmp(&s_ref.land_decrement, &s_new.land_decrement, sizeof(double)) == 0 &&
+               std::memcmp(&s_ref.nuis_grad_inf, &s_new.nuis_grad_inf, sizeof(double)) == 0;
+    }
+    if (!same) {
+      std::fprintf(stderr, "EXPORT AUDIT FAILURE: fast-path bytes != legacy path (n_nav %d nk %d nn %d ok %d/%d)\n", n_nav_, nk, nn,
+                   (int)ok_ref, (int)ok_new);
+      std::abort();
+    }
     if (stats)
-      stats->nuis_decrement = stats->land_decrement;
-    return true;
+      *stats = s_new;
+    return ok_new;
   }
-  Eigen::LDLT<Eigen::MatrixXd> ldlt(Hnn);
-  if (ldlt.info() != Eigen::Success || (ldlt.vectorD().array() <= 0.0).any())
-    return false;
-  const Eigen::MatrixXd HnnInvHnk = ldlt.solve(Hkn.transpose());
-  Lambda = Hkk - Hkn * HnnInvHnk;
-  gred = gk - HnnInvHnk.transpose() * gn;
-  if (stats) {
-    // nuisance Newton decrement q_n = g_z' H_zz^{-1} g_z = sum_l gl'V^{-1}gl
-    // + gn'Hnn^{-1}gn (exact block-elimination identity; one extra O(nn^2)
-    // solve on the factorization formed above). q_n/2 = the cost decrease a
-    // further inner solve could still achieve at this linearization — the P1
-    // stationarity certificate's statistic.
-    stats->nuis_decrement = stats->land_decrement + gn.dot(ldlt.solve(gn));
-    stats->nuis_grad_inf = gn.lpNorm<Eigen::Infinity>();
-  }
-  Lambda = 0.5 * (Lambda + Lambda.transpose()).eval(); // symmetrize
-  return Lambda.allFinite() && gred.allFinite();
+  if (tail_contig && !export_legacy)
+    return run_fast(Lambda, gred, stats);
+  return run_legacy(Lambda, gred, stats);
 }

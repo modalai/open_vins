@@ -23,6 +23,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 
 #include "../init/RelRotProcrustes.h"
 #include "utils/quat_ops.h"
@@ -149,13 +151,61 @@ bool LinearSeed::seed_window(WindowData &win, const SharedCalib &calib, const Ei
   std::vector<Eigen::Matrix3d> JS(N, Eigen::Matrix3d::Zero()), JV(N, Eigen::Matrix3d::Zero()); // d(S,V)/d(ba)
   std::vector<double> T(N, 0.0);
   {
+    // R3 [BIT-EXACT]: one two-pointer chain sweep with the covariance propagation skipped.
+    // This seeder consumes ONLY {q_KtoK1, alpha, beta, dt, H_a, H_b} — never P15 — and the
+    // chain's mean/Jacobian recursions are P-independent (the documented skip_cov contract),
+    // while the legacy per-interval integrate() rescanned the window's whole IMU array AND
+    // propagated the full 15x15 covariance (~6.7k flops/sample, the dominant per-sample term)
+    // into an output nothing here reads. Chain-vs-integrate() bit-parity is pinned by
+    // test_preint_chain (incl. the skip_cov mean-field pin); OV_ZCALIB_SEED_AUDIT re-proves
+    // both properties on every live window (dual-compute + bitwise memcmp of the mean fields);
+    // OV_ZCALIB_SEED_LEGACY forces the per-interval integrate() loop (replay byte-parity
+    // kill-switch). The kinematic recursion below is untouched: integration of interval k
+    // depends only on (imu, clone_times, model, bg_eff), not on the recursion state, so
+    // hoisting the integrations above the recursion cannot change a byte.
+    static const bool seed_legacy = (std::getenv("OV_ZCALIB_SEED_LEGACY") != nullptr);
+    static const bool seed_audit = (std::getenv("OV_ZCALIB_SEED_AUDIT") != nullptr);
+    std::vector<AciPreintResult> chain;
+    if (!seed_legacy) {
+      const bool chain_ok = AciCalibPreint::integrate_chain(win.imu, win.clone_times, model_all, bg_eff, Eigen::Vector3d::Zero(),
+                                                            calib.noise, chain, nullptr, /*skip_cov=*/true);
+      if (seed_audit) {
+        // Dual-path audit: the legacy loop's per-interval scan vs the skip_cov chain, bitwise
+        // on the mean/Jacobian fields (P15 neutralized: skip_cov leaves it at the default by
+        // contract). Failure-parity is audited too: the chain must fail exactly when some
+        // interval's integrate() fails.
+        bool ref_ok = true;
+        for (int k = 0; k + 1 < N && ref_ok; ++k) {
+          AciPreintResult ref;
+          ref_ok = AciCalibPreint::integrate(win.imu, win.clone_times[k], win.clone_times[k + 1], model_all, bg_eff,
+                                             Eigen::Vector3d::Zero(), calib.noise, ref);
+          if (ref_ok && chain_ok) {
+            AciPreintResult a = ref, b = chain[k];
+            a.P15.setIdentity();
+            b.P15.setIdentity();
+            if (!preint_bitwise_equal(a, b)) {
+              std::fprintf(stderr, "SEED CHAIN AUDIT FAILURE: interval %d [%.9f, %.9f] mean fields != integrate()\n", k,
+                           win.clone_times[k], win.clone_times[k + 1]);
+              std::abort();
+            }
+          }
+        }
+        if (ref_ok != chain_ok) {
+          std::fprintf(stderr, "SEED CHAIN AUDIT FAILURE: ok mismatch (integrate %d chain %d)\n", (int)ref_ok, (int)chain_ok);
+          std::abort();
+        }
+      }
+      if (!chain_ok)
+        return false;
+    }
     Eigen::Vector3d Sk = Eigen::Vector3d::Zero(), Vk = Eigen::Vector3d::Zero();
     Eigen::Matrix3d JSk = Eigen::Matrix3d::Zero(), JVk = Eigen::Matrix3d::Zero();
     for (int k = 0; k + 1 < N; ++k) {
-      AciPreintResult pre;
-      if (!AciCalibPreint::integrate(win.imu, win.clone_times[k], win.clone_times[k + 1], model_all, bg_eff, Eigen::Vector3d::Zero(),
-                                     calib.noise, pre))
+      AciPreintResult pre_legacy;
+      if (seed_legacy && !AciCalibPreint::integrate(win.imu, win.clone_times[k], win.clone_times[k + 1], model_all, bg_eff,
+                                                    Eigen::Vector3d::Zero(), calib.noise, pre_legacy))
         return false;
+      const AciPreintResult &pre = seed_legacy ? pre_legacy : chain[k];
       const Eigen::Matrix3d Rk_T = ov_core::quat_2_Rot(q[k]).transpose();
       Sk += Vk * pre.dt + Rk_T * pre.alpha;
       JSk += JVk * pre.dt + Rk_T * pre.H_a; // alpha(ba) = alpha + H_a * ba (ba_lin = 0)

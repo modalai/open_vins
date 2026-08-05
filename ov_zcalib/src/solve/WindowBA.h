@@ -119,10 +119,11 @@ struct SharedCalib {
       v.push_back({imu.da.data(), 6, 6, false, "da", -1});
     if (imu.calib_RAtoI)
       v.push_back({imu.q_AtoI.data(), 4, 3, true, "q_AtoI", -1});
-    // Matrix3d STORAGE order (column-major). mixing() enumerates pi in ROW-major order (its
-    // legacy shape is parity-frozen); the factor reconciles the two at its boundary — see
-    // Factor_ImuAci3::evaluate_tg_. Everything outside the factor (priors, caps, split bands,
-    // record, writeback) is per-element symmetric, so storage order is safe here.
+    // Matrix3d STORAGE order (column-major) — ONE pi convention end-to-end since the
+    // factor-boundary permutation was removed: mixing() enumerates the tg columns in the very
+    // order of this Tg.data() block (see ImuIntrinsicModel::mixing / Factor_ImuAci3::evaluate_tg_).
+    // Everything outside the factor (priors, caps, split bands, record, writeback) is
+    // per-element symmetric, so storage order is safe here.
     if (imu.calib_tg)
       v.push_back({imu.Tg.data(), 9, 9, false, "tg", -1});
     for (int c = 0; c < (int)cams.size(); ++c) {
@@ -227,6 +228,13 @@ struct WindowSolveReport {
   bool time_stopped = false;
   double qn = 0.0;
   double gn_inf = 0.0;
+  /// Local dim of the calibration free-block layout THIS call solved under
+  /// (set on every successful call, export or eval-only). The fusion's
+  /// dimension-consistency checks read this instead of Lambda.rows():
+  /// eval-only reports carry no Lambda (export-on-accept), and for exporting
+  /// calls the two are equal by construction (Lambda is built over the same
+  /// free_blocks() layout).
+  int free_dim = 0;
   // P3 preint cache evidence: whether this call reused the window's cached
   // preintegration, and the IMU-factor construction time (whitener build /
   // fetch) — a cost that previously fell UNTIMED between t_preint and t_inner.
@@ -257,10 +265,18 @@ public:
    *        value-keyed on the exact (pi, noise-pi) bytes — a hit reuses the stored
    *        preintegration + whitener (bit-identical to recomputation), a miss
    *        refills the entry. nullptr = legacy per-call recomputation.
+   * @param state_at export-on-accept re-entry: AFTER the entry state (warm/seeds)
+   *        has pinned the reprojection transport linearization (w_clone/v_clone)
+   *        and the gauge anchors — exactly as the evaluation that produced this
+   *        optimum did — override the solve state to *state_at and (with
+   *        max_iters=0) export there. This is what makes the deferred accept-time
+   *        export byte-equal to the legacy inline eval export. Pass max_iters=0
+   *        with it: no inner iterations run (a Solve(0) would only pay a wasted
+   *        linearization), and cost_final is NOT claimed (stays 0).
    */
   static bool solve_and_export(const WindowData &win, SharedCalib &calib, bool export_info, WindowSolveReport &rep,
                                int max_iters = 30, bool verbose = false, WindowWarmState *warm = nullptr,
-                               WindowPreint *pc = nullptr);
+                               WindowPreint *pc = nullptr, const WindowWarmState *state_at = nullptr);
 };
 
 } // namespace ov_zcalib

@@ -43,7 +43,8 @@ static int failures = 0;
 // Session stream: quiet head (SETTLE + bootstrap-fail guard), one long excited
 // span for bootstrap + collection. Truth td/extrinsics/IMU-intrinsics inside.
 static void write_session_record(const synth::Truth &tr, const std::string &path, double dur, double ex0, double ex1, unsigned rng,
-                                 bool single_axis = false, const Eigen::Matrix<double, 8, 1> *seed_cam = nullptr) {
+                                 bool single_axis = false, const Eigen::Matrix<double, 8, 1> *seed_cam = nullptr,
+                                 double pump_amp = 0.0) {
   synth::Trajectory tj;
   tj.excite_t0 = ex0;
   tj.excite_t1 = ex1;
@@ -52,7 +53,68 @@ static void write_session_record(const synth::Truth &tr, const std::string &path
   so.excite = {{ex0, ex1}};
   std::vector<RawImu> imu;
   std::vector<FrameObs> frames;
-  if (!single_axis) {
+  if (!single_axis && pump_amp > 0.0) {
+    // g-aligned "pumping" at the real Sting handheld dynamics class (std|a_m| 2.8-3.2
+    // m/s^2; the shared shape's 0.37 starves the split-half chain judge of per-half
+    // q_AtoI conditioning — the tg-arbiter ladder measured the halves' own basin at
+    // 0.6-1.0 deg vs 0.3 deg bands there, and the honest judge refuses). 3.1 rad/s:
+    // the ladder's da-CLEAN frequency (best chain conditioning, z 0.77; da col-3 stays
+    // ~3.1e-3 where 3.7 parks it ~9e-3-1e-2 at short durations). Its one weakness —
+    // Tg(2,2) shrinkage against the 3.1-2.9 beat — is a TG-RECOVERY concern; this
+    // suite's worlds carry Tg=0 and tg correctly refuses (tg_e2e T1 owns recovery at
+    // 3.7 / 240 s). Generated HERE like the single-axis branch, NOT via a
+    // synth::Trajectory knob: the -ffast-math SLP seam repacks p_of's sin group if the
+    // shared expression grows a guarded term (see test_tg_e2e / parity probe evidence).
+    std::mt19937 g(rng);
+    std::normal_distribution<double> nrm(0.0, 1.0);
+    const double w_z = 3.1;
+    auto p1 = [&](double t) {
+      Eigen::Vector3d p = tj.p_of(t);
+      p(2) += tj.env(t) * pump_amp * std::sin(w_z * t + 0.7);
+      return p;
+    };
+    const Eigen::Matrix3d Dw_i = ImuIntrinsicModel::ut(tr.imu.dw).inverse();
+    const Eigen::Matrix3d Da_i = ImuIntrinsicModel::ut(tr.imu.da).inverse();
+    const Eigen::Matrix3d R_A_t = ov_core::quat_2_Rot(tr.imu.q_AtoI).transpose();
+    for (double t = 0.0; t <= dur; t += 1.0 / so.imu_hz) {
+      const double h = 1e-4;
+      const Eigen::Vector3d pdd = (p1(t + h) - 2 * p1(t) + p1(t - h)) / (h * h);
+      const Eigen::Vector3d a_hat = tj.R_of(t) * (pdd + tr.g_W);
+      RawImu s;
+      s.timestamp = t;
+      s.wm = Dw_i * tj.omega_I(t) + tr.bg + so.w_noise * Eigen::Vector3d(nrm(g), nrm(g), nrm(g));
+      if (!tr.imu.Tg.isZero())
+        s.wm += tr.imu.Tg * a_hat;
+      s.am = Da_i * (R_A_t * a_hat) + tr.ba + so.a_noise * Eigen::Vector3d(nrm(g), nrm(g), nrm(g));
+      s.temp_c = 28.0;
+      imu.push_back(s);
+    }
+    auto pf = synth::make_cloud(90, rng ^ 0x51ed270bu);
+    uint32_t seq = 0;
+    const Eigen::Matrix3d R_ItoC = ov_core::quat_2_Rot(tr.q_ItoC);
+    for (double tc = 0.2; tc + tr.td <= dur - 0.01; tc += 1.0 / so.fps, ++seq) {
+      FrameObs fo;
+      fo.timestamp = tc - 0.5 * so.exposure_s;
+      fo.exposure_s = (float)so.exposure_s;
+      fo.temp_c = 28.f;
+      fo.seq = seq;
+      for (int f = 0; f < 90; ++f) {
+        const double ti = tc + tr.td;
+        const Eigen::Vector3d pc = R_ItoC * (tj.R_of(ti) * (pf[f] - p1(ti))) + tr.p_IinC;
+        if (pc(2) < 0.4)
+          continue;
+        Eigen::Vector2d uv(tr.cam(0) * pc(0) / pc(2) + tr.cam(2), tr.cam(1) * pc(1) / pc(2) + tr.cam(3));
+        if (uv(0) < 10 || uv(0) > tr.img_w - 10 || uv(1) < 10 || uv(1) > tr.img_h - 10)
+          continue;
+        FrameObsPoint p;
+        p.id = (uint32_t)f;
+        p.u = (float)(uv(0) + so.pix_noise * nrm(g));
+        p.v = (float)(uv(1) + so.pix_noise * nrm(g));
+        fo.pts.push_back(p);
+      }
+      frames.push_back(fo);
+    }
+  } else if (!single_axis) {
     synth::make_streams(tr, tj, so, rng, imu, frames);
   } else {
     // single-axis rotation, no gravity re-orientation: the degenerate case
@@ -147,7 +209,12 @@ int main() {
   const std::string rec_deg = "/tmp/ov_zcalib_session_deg.bin";
 
   // 6 s quiet head (settle), excitation [6, 120]; bootstrap ~[6, 20+], collection after
-  write_session_record(tr, rec, 120.0, 6.0, 118.0, 4242);
+  // S1 = the DESIGNED rich-excitation case: real-log dynamics (pump 0.35 m @ 3.1 rad/s,
+  // std|a_m| ~2.4 m/s^2) so the accel-chain unlock question is really asked. The legacy
+  // 0.37 m/s^2 shape now honestly REFUSES under the arbiter's split-half judge (its
+  // per-half qA basin is wider than the agreement band there) — that refusal world is
+  // tg_e2e's T2/T3 territory; S1 must be the certify world.
+  write_session_record(tr, rec, 120.0, 6.0, 118.0, 4242, false, nullptr, 0.35);
 
   SessionConfig cfg;
   cfg.harvester.pix_sigma = 0.5;
