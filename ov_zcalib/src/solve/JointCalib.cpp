@@ -784,6 +784,9 @@ bool JointCalib::solve(const std::vector<WindowData> &windows, SharedCalib &cali
         double qn = 0.0;
         double t_pre = 0.0, t_fac = 0.0, t_exp = 0.0;
         int phit = 0, pmiss = 0;
+        double min_pivot = 0.0; // veto dossier: failing export's Hnn min pivot
+        int nn = 0;
+        int clamped = 0; // R6 spectral elimination: rank-clamped landmark dirs
       };
       std::vector<ExpSlot> ex(work.size());
       pool.parallel_dynamic((int)work.size(), [&](int /*worker*/, int k) {
@@ -817,6 +820,9 @@ bool JointCalib::solve(const std::vector<WindowData> &windows, SharedCalib &cali
           e.ok = WindowBA::solve_and_export(work[wi], calib, true, wre, /*max_iters=*/0, false, w0, pslot[wi],
                                             /*state_at=*/&warm_cand[wi]) &&
                  (int)wre.Lambda.rows() == np;
+          e.min_pivot = wre.export_min_pivot;
+          e.nn = wre.export_nuis_dim;
+          e.clamped = wre.export_clamped;
           if (swap_seeds)
             force_seeds(live, work[wi]);
           e.t_pre = wre.t_preint;
@@ -866,15 +872,15 @@ bool JointCalib::solve(const std::vector<WindowData> &windows, SharedCalib &cali
             export_suspect[wi] = 1;
             veto = true;
             std::printf("[joint] WARNING pass %d: window %zu (uid %u) export FAILED at the accepted candidate -> "
-                        "candidate VETOED, window kept (inline evals armed for it)\n",
-                        pass, wi, work[wi].uid);
+                        "candidate VETOED, window kept (inline evals armed for it) [Hnn min pivot %.3e, dim %d, clamped %d]\n",
+                        pass, wi, work[wi].uid, e.min_pivot, e.nn, e.clamped);
             continue;
           }
           dead[wi] = 1;
           any_export_fail = true;
           std::printf("[joint] WARNING pass %d: window %zu (uid %u) export FAILED at the entry point -> dead "
-                      "(legacy-identical accounting; the window never joins this solve's fused set)\n",
-                      pass, wi, work[wi].uid);
+                      "(the window never joins this solve's fused set) [Hnn min pivot %.3e, dim %d, clamped %d]\n",
+                      pass, wi, work[wi].uid, e.min_pivot, e.nn, e.clamped);
           continue;
         }
         if (e.stored) {

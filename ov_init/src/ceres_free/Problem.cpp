@@ -19,6 +19,7 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <limits>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -1156,6 +1157,42 @@ SolverSummary Problem::Solve(const SolverOptions &options) {
   return summary;
 }
 
+// R6 spectral landmark elimination: eliminate each landmark's 3x3 information block by
+// EIGENDECOMPOSITION with a relative rank cutoff — THE method, not a fallback. A landmark
+// direction carrying (near-)zero information (the shallow-depth / short-track degeneracy
+// class) contributes ZERO fill-in to the reduced system: that is the flat-prior marginal
+// limit, the statistically honest reduction. The historical absolute +1e-10 floor + inverse
+// instead injected 1/(0+1e-10) = 1e10-scale rank-deficient fill-in whose cancellation drove
+// the reduced nuisance Hessian indefinite at converged points (measured on-device, Stinger
+// hires close-depth class: Hnn min pivots -5.5e9 / -1.7e8 / -8.8e2 at dim 467 — the
+// export-veto class, and the last-ulp load-race suspect). The cutoff is RELATIVE
+// (tol = 1e-8 * lambda_max): it caps the elimination's condition number at 1e8 — Schur
+// complement PSD to fp64 roundoff — while a direction 8 orders below the landmark's
+// strongest carries >= 1e4 x the whitened sigma, i.e. no usable signal. The 1e-12 absolute
+// floor retires all-dust landmarks (no real landmark information sits below it) whole.
+// computeDirect() is the closed-form 3x3 path: allocation-free, iteration-free,
+// deterministic — real-time-safe inside the worker pool (no locks, fixed work).
+static Eigen::Matrix3d eliminate_landmark_pinv(const Eigen::Matrix3d &V, Problem::ExportStats *st) {
+  Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> es;
+  es.computeDirect(V);
+  const Eigen::Vector3d lam = es.eigenvalues(); // ascending
+  const double lmax = lam(2);
+  if (!(lmax > 1e-12)) { // all-dust (or non-finite) landmark: contributes nothing
+    if (st)
+      st->clamped_dirs += 3;
+    return Eigen::Matrix3d::Zero();
+  }
+  const double tol = 1e-8 * lmax;
+  Eigen::Matrix3d Vinv = Eigen::Matrix3d::Zero();
+  for (int k = 0; k < 3; ++k) {
+    if (lam(k) > tol)
+      Vinv.noalias() += (es.eigenvectors().col(k) / lam(k)) * es.eigenvectors().col(k).transpose();
+    else if (st)
+      ++st->clamped_dirs;
+  }
+  return Vinv;
+}
+
 bool Problem::ComputeCovariance(const std::vector<double *> &blocks, Eigen::MatrixXd &covariance, const SolverOptions &options) {
   OrderEntryScope order_probe_scope; // R5 probe denominator (no-op unless armed)
   assign_ordering();
@@ -1191,17 +1228,35 @@ bool Problem::ComputeCovariance(const std::vector<double *> &blocks, Eigen::Matr
     // the small (lsize x lsize) inverses directly -- never materialize the dense
     // n_land x n_land D^-1 (that costs an O(n_land^2) zero-fill plus an O(n_nav*n_land^2)
     // gemm for what is O(n_nav*n_land*lsize) work).
-    // Small ridge keeps weakly-observed (near-singular) landmark blocks invertible;
-    // it perturbs the marginal only at the ~1e-8 level for well-observed landmarks.
+    // Landmark blocks eliminate via the R6 spectral pinv (rank-clamped): a degenerate
+    // landmark contributes zero along its unobserved directions instead of absolute-floor
+    // poison — this covariance feeds the COMMIT certification sigmas, where 1e10-scale
+    // fill-in error is a silent cert corruption. Blocks here are 3-dof landmarks (the
+    // only landmark class in this problem); the generic-lsize fallback keeps the old
+    // shape-agnostic contract for any future non-3 block.
     const auto Bt = H.block(n_nav_, 0, n_land_, n_nav_); // = B^T (landmark row-strip, always written)
     Eigen::MatrixXd BD(n_nav_, n_land_);
     for (const auto &od : land_diag_) {
       const int off = od.first;
       const int ls = od.second;
-      Eigen::MatrixXd Dblk =
-          Eigen::MatrixXd(H.block(n_nav_ + off, n_nav_ + off, ls, ls).selfadjointView<Eigen::Lower>());
-      Dblk.diagonal().array() += 1e-10;
-      BD.middleCols(off, ls).noalias() = Bt.middleRows(off, ls).transpose() * Dblk.inverse();
+      Eigen::MatrixXd Dinv;
+      if (ls == 3) {
+        Dinv = eliminate_landmark_pinv(
+            Eigen::Matrix3d(H.block(n_nav_ + off, n_nav_ + off, 3, 3).selfadjointView<Eigen::Lower>()), nullptr);
+      } else {
+        const Eigen::MatrixXd Dblk =
+            Eigen::MatrixXd(H.block(n_nav_ + off, n_nav_ + off, ls, ls).selfadjointView<Eigen::Lower>());
+        Eigen::SelfAdjointEigenSolver<Eigen::MatrixXd> es(Dblk);
+        const double lmax = (ls > 0) ? es.eigenvalues()(ls - 1) : 0.0;
+        Dinv = Eigen::MatrixXd::Zero(ls, ls);
+        if (lmax > 1e-12) {
+          const double tol = 1e-8 * lmax;
+          for (int k = 0; k < ls; ++k)
+            if (es.eigenvalues()(k) > tol)
+              Dinv.noalias() += (es.eigenvectors().col(k) / es.eigenvalues()(k)) * es.eigenvectors().col(k).transpose();
+        }
+      }
+      BD.middleCols(off, ls).noalias() = Bt.middleRows(off, ls).transpose() * Dinv;
     }
     Hred = Eigen::MatrixXd(H.topLeftCorner(n_nav_, n_nav_).selfadjointView<Eigen::Lower>()) - BD * Bt;
   }
@@ -1298,15 +1353,14 @@ bool Problem::ExportReducedInformation(const std::vector<double *> &blocks, Eige
     // dense (n_nav x n_land) x (n_land x n_nav) product multiplied through the
     // structural zeros of every landmark's non-observing poses (measured ~9% of
     // window-solve thread-CPU). Per landmark, only its adjacent nav blocks are
-    // touched — identical algebra to the old dense BD*Bt fold, including the
-    // 1e-10 diagonal damping and the gradient fold g_nav' = g_nav - (B D^-1) g_l.
+    // touched; the landmark block eliminates via the R6 spectral pinv (rank-
+    // clamped) and the gradient fold g_nav' = g_nav - (B V^+) g_l.
     Eigen::MatrixXd Hnav = H.topLeftCorner(n_nav_, n_nav_).selfadjointView<Eigen::Lower>();
     Eigen::VectorXd gnav = grad.head(n_nav_);
     for (size_t li = 0; li < land_diag_.size(); ++li) {
       const int g0 = n_nav_ + land_diag_[li].first;
-      Eigen::Matrix3d V = Eigen::Matrix3d(H.block(g0, g0, 3, 3).selfadjointView<Eigen::Lower>());
-      V.diagonal().array() += 1e-10;
-      const Eigen::Matrix3d Vinv = V.inverse();
+      const Eigen::Matrix3d V = Eigen::Matrix3d(H.block(g0, g0, 3, 3).selfadjointView<Eigen::Lower>());
+      const Eigen::Matrix3d Vinv = eliminate_landmark_pinv(V, st);
       const Eigen::Vector3d gl = grad.segment(g0, 3);
       if (st)
         st->land_decrement += gl.dot(Vinv * gl);
@@ -1355,6 +1409,11 @@ bool Problem::ExportReducedInformation(const std::vector<double *> &blocks, Eige
       return true;
     }
     Eigen::LDLT<Eigen::MatrixXd> ldlt(Hnn);
+    if (st) {
+      st->nuis_dim = nn;
+      st->nuis_min_pivot =
+          (ldlt.info() == Eigen::Success) ? ldlt.vectorD().minCoeff() : std::numeric_limits<double>::quiet_NaN();
+    }
     if (ldlt.info() != Eigen::Success || (ldlt.vectorD().array() <= 0.0).any())
       return false;
     const Eigen::MatrixXd HnnInvHnk = ldlt.solve(Hkn.transpose());
@@ -1399,9 +1458,8 @@ bool Problem::ExportReducedInformation(const std::vector<double *> &blocks, Eige
     Eigen::VectorXd gnav = grad.head(n_nav_);
     for (size_t li = 0; li < land_diag_.size(); ++li) {
       const int g0 = n_nav_ + land_diag_[li].first;
-      Eigen::Matrix3d V = Eigen::Matrix3d(H.block(g0, g0, 3, 3).selfadjointView<Eigen::Lower>());
-      V.diagonal().array() += 1e-10;
-      const Eigen::Matrix3d Vinv = V.inverse();
+      const Eigen::Matrix3d V = Eigen::Matrix3d(H.block(g0, g0, 3, 3).selfadjointView<Eigen::Lower>());
+      const Eigen::Matrix3d Vinv = eliminate_landmark_pinv(V, st);
       const Eigen::Vector3d gl = grad.segment(g0, 3);
       if (st)
         st->land_decrement += gl.dot(Vinv * gl);
@@ -1456,6 +1514,11 @@ bool Problem::ExportReducedInformation(const std::vector<double *> &blocks, Eige
       return true;
     }
     Eigen::LDLT<Eigen::MatrixXd> ldlt(Hnn); // consumes the lower triangle; Hnn's upper is never read into arithmetic
+    if (st) {
+      st->nuis_dim = nn;
+      st->nuis_min_pivot =
+          (ldlt.info() == Eigen::Success) ? ldlt.vectorD().minCoeff() : std::numeric_limits<double>::quiet_NaN();
+    }
     if (ldlt.info() != Eigen::Success || (ldlt.vectorD().array() <= 0.0).any())
       return false;
     const Eigen::MatrixXd HnnInvHnk = ldlt.solve(Hkn.transpose());

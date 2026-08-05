@@ -554,6 +554,9 @@ bool WindowBA::solve_and_export(const WindowData &win, SharedCalib &calib, bool 
     rep.ok = problem.ExportReducedInformation(keep, rep.Lambda, rep.gred, opts, &est);
     rep.qn = est.nuis_decrement;
     rep.gn_inf = est.nuis_grad_inf;
+    rep.export_min_pivot = est.nuis_min_pivot;
+    rep.export_nuis_dim = est.nuis_dim;
+    rep.export_clamped = est.clamped_dirs;
     for (auto &b : G.calib.free_blocks())
       problem.SetParameterBlockConstant(b.ptr); // leave calib untouched by this window
     rep.t_export = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_ex0).count();
