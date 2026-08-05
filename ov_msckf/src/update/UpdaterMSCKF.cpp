@@ -184,10 +184,22 @@ void UpdaterMSCKF::update(std::shared_ptr<State> state, std::vector<std::shared_
           Eigen::Vector3d p_CiinG = clones_cam_rs.at(cam_id).at(clone_time).pos();
           Eigen::Matrix3d R_GtoIi = R_ItoC.transpose() * R_GtoCi;
           Eigen::Vector3d p_IiinG = p_CiinG + R_GtoCi.transpose() * p_IinC;
-          // Apply RS correction in IMU frame
+          // Apply RS correction in IMU frame -- at the SAME kinematics the residual path
+          // transports this row time with: bridge ENDPOINT (w_end, v_end) when the frame was
+          // epoch-snapped, else the clone-time cache. Triangulating the row warp at clone-time
+          // kinematics while the update linearizes it at the endpoint left the landmark init
+          // inconsistent with the measurement model at O((w_end - w_clone) * dt_rs).
           const State::CloneKinematics &kin = state->_clones_kinematics.at(clone_time);
-          R_GtoIi = exp_so3(-kin.omega * dt_rs) * R_GtoIi;
-          p_IiinG = p_IiinG + kin.vel * dt_rs;
+          Eigen::Vector3d w_rs = kin.omega;
+          Eigen::Vector3d v_rs = kin.vel;
+          const PreintBridgeData *br_rs = state->epoch_bridge(cam_id, clone_time);
+          if (br_rs != nullptr && state->_clones_IMU.find(clone_time) != state->_clones_IMU.end()) {
+            const Eigen::Matrix3d R_clone = state->_clones_IMU.at(clone_time)->Rot();
+            w_rs = br_rs->w_end;
+            v_rs = kin.vel + br_rs->v_grav + R_clone.transpose() * br_rs->beta;
+          }
+          R_GtoIi = exp_so3(-w_rs * dt_rs) * R_GtoIi;
+          p_IiinG = p_IiinG + v_rs * dt_rs;
           // Recompute camera pose
           R_GtoCi = R_ItoC * R_GtoIi;
           p_CiinG = p_IiinG - R_GtoCi.transpose() * p_IinC;
