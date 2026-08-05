@@ -100,6 +100,11 @@ struct CalibProfile {
   double collect_budget_s = 40.0;    ///< live cutover ceiling (a live stream has no EOF)
   double collect_min_eig = 5.0;      ///< early cutover once the WEAKEST direction is this well determined
   bool cpu_performance_mode = true;  ///< measured 3.1x on the solve; restored on exit
+  /// Write the session record mirror (<out>.session.bin). ON by default: the record is the
+  /// replay/forensics contract (a session replays bit-identically on the same binary).
+  /// Disable only where storage forbids it -- an unrecorded session cannot be replayed,
+  /// cross-checked across platforms, or examined after the fact.
+  bool record_session = true;
 };
 
 /// Load a calibrator profile. A MISSING FILE IS NOT AN ERROR: the built-in defaults are the
@@ -159,6 +164,9 @@ inline bool load_calib_profile(const std::string &path, CalibProfile &out) {
   parser->parse_config("solve_budget_s", out.session.solve_budget_s, false);
   parser->parse_config("num_threads", out.session.joint.num_threads, false);
   parser->parse_config("cpu_performance_mode", out.cpu_performance_mode, false);
+  parser->parse_config("record_session", out.record_session, false);
+  if (!out.record_session)
+    PRINT_WARNING("[ov_zcalib] record_session=false -- the session record mirror is DISABLED (session will not be replayable)\n");
 
   // ---- window shape (advanced; the profile above already sets a measured-good pair) ----
   parser->parse_config("max_clones", out.session.harvester.max_clones, false);
