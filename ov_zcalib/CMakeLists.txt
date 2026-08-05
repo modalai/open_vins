@@ -96,8 +96,8 @@ if (OV_ZCALIB_BUILD_TESTS AND NOT DISABLE_TRACK_KLT)
     add_test(NAME zcalib_test_export_parity COMMAND zcalib_test_export_parity)
 endif ()
 
-# The host CLI (upstream run_*.cpp entrypoint pattern).
-if (NOT DISABLE_TRACK_KLT)
-    add_executable(ov_zcalibrate src/run_calibrate.cpp)
-    target_link_libraries(ov_zcalibrate ov_zcalib_lib)
-endif ()
+# The CLI (upstream run_*.cpp entrypoint pattern). Builds on device too: --replay
+# consumes the tracker-free session record, so DISABLE_TRACK_KLT does not
+# constrain it — on-target replay is how solve-time work gets measured.
+add_executable(ov_zcalibrate src/run_calibrate.cpp)
+target_link_libraries(ov_zcalibrate ov_zcalib_lib)

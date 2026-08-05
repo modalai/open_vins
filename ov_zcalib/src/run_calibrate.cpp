@@ -373,6 +373,13 @@ int main(int argc, char **argv) {
 
 
   if (!voxl_dir.empty()) {
+#ifdef DISABLE_TRACK_KLT
+    // Device build: the raw-log ingest front-end (VoxlLogFeeder/TrackKLT) is
+    // host-only. On target the server records sessions in-process; this CLI
+    // exists there for --replay of those records.
+    std::printf("--voxl log ingest is host-only (device build strips TrackKLT); use --replay <session.bin>\n");
+    return 1;
+#else
     // voxl-logger MPA log (log000N/): the log is self-describing — per-unit
     // fisheye intrinsics ship inside it; the mechanical extrinsic seed comes
     // from --ext-rpy/--ext-t in the vcc convention, composed exactly as
@@ -529,6 +536,7 @@ int main(int argc, char **argv) {
       }
     }
     return rep.final_state == RunnerState::DONE ? 0 : 2;
+#endif // DISABLE_TRACK_KLT
   }
 
   if (!replay_path.empty()) {
