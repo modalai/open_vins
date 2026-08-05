@@ -43,6 +43,7 @@ namespace {
 inline double seconds_since(const std::chrono::steady_clock::time_point &t0) {
   return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
 }
+
 } // namespace
 
 int Problem::block_index(double *values) const {
@@ -168,7 +169,144 @@ void Problem::assign_ordering() {
       }
     }
   }
+
+  // Fixed-size Schur eligibility (see Problem.h): a landmark whose every adjacency is a
+  // 3-dof block takes the unrolled Matrix3d path. Structure-only, so it is decided once
+  // per ordering rather than per trial.
+  land_all3_.assign(land_diag_.size(), 0);
+  for (size_t li = 0; li < land_adj_.size(); ++li) {
+    bool all3 = !land_adj_[li].empty();
+    for (int nb : land_adj_[li])
+      all3 = all3 && (blocks_[nb].lsize == 3);
+    land_all3_[li] = all3 ? 1 : 0;
+  }
+
+  analyze_band();
 }
+
+void Problem::analyze_band() {
+  use_banded_ = false;
+  band_half_ = band_nb_ = band_border_ = 0;
+  if (n_nav_ <= 0)
+    return;
+
+  // Column reach of the reduced nav system's LOWER triangle. Every nonzero in it comes from
+  // exactly two places, and BOTH make a CLIQUE of the blocks involved:
+  //   (a) a residual couples all of its variable non-landmark blocks;
+  //   (b) a landmark's Schur fill-in couples all of its adjacent (observing) blocks.
+  // So reach[j] = the largest row that column j can occupy is an EXACT upper bound, which is
+  // what a band extraction needs -- underestimating it would silently drop entries.
+  // Half-bandwidth of the leading nb dofs when the TRAILING (n_nav_ - nb) dofs are pulled out
+  // as a dense border. The border dofs must be EXCLUDED from the cliques, not merely clamped:
+  // every IMU factor ties its two clones to the gravity block, so if gravity stays in the band
+  // then every column "reaches" the end of the window and the band is the whole matrix. Pulling
+  // it into the border is exactly what makes the rest banded.
+  const auto half_band = [&](int nb) {
+    std::vector<int> reach(nb);
+    for (int j = 0; j < nb; ++j)
+      reach[j] = j;
+    const auto clique = [&](const std::vector<int> &blks) {
+      int lo = nb, hi = -1;
+      for (int bidx : blks) {
+        const Block &b = blocks_[bidx];
+        if (b.constant || b.landmark || b.offset >= nb)
+          continue; // constants/landmarks are not in the nav band; offset >= nb IS the border
+        lo = std::min(lo, b.offset);
+        hi = std::max(hi, b.offset + b.lsize - 1);
+      }
+      if (hi >= lo)
+        for (int j = lo; j <= hi; ++j)
+          reach[j] = std::max(reach[j], hi);
+    };
+    for (const Residual &res : residuals_)
+      clique(res.blocks);
+    for (const auto &adj : land_adj_)
+      clique(adj);
+    int b = 0;
+    for (int j = 0; j < nb; ++j)
+      b = std::max(b, reach[j] - j);
+    return b;
+  };
+
+  // Border candidates: nothing, or the LAST nav block (the S2 gravity, which is registered
+  // after every clone -- see WindowBA -- and couples to all of them).
+  int last_off = -1, last_lsize = 0;
+  for (const Block &b : blocks_) {
+    if (b.constant || b.landmark)
+      continue;
+    if (b.offset > last_off) {
+      last_off = b.offset;
+      last_lsize = b.lsize;
+    }
+  }
+  const double dense_cost = (double)n_nav_ * n_nav_ * n_nav_ / 3.0;
+  double best_cost = dense_cost;
+  for (int nbord : {0, last_lsize}) {
+    const int nb = n_nav_ - nbord;
+    if (nb <= 1)
+      continue;
+    const int b = half_band(nb);
+    // banded Cholesky ~ nb*b^2 ; plus (1 + nbord) band solves ~ 2*nb*b each ; plus the
+    // nbord x nbord Schur complement.
+    const double cost = (double)nb * b * b + 2.0 * nb * b * (nbord + 1) + (double)nbord * nbord * nb;
+    if (cost < best_cost * 0.5) { // demand a real win, not a wash: the dense LLT is blocked+fast
+      best_cost = cost;
+      band_half_ = b;
+      band_nb_ = nb;
+      band_border_ = nbord;
+      use_banded_ = true;
+    }
+  }
+  if (use_banded_) {
+    band_AB_.resize(band_half_ + 1, band_nb_);
+    band_C_.resize(band_nb_, std::max(1, band_border_));
+    band_Y_.resize(band_nb_, std::max(1, band_border_));
+    band_S_.resize(std::max(1, band_border_), std::max(1, band_border_));
+    band_z_.resize(band_nb_);
+  }
+}
+
+namespace {
+// Right-looking banded Cholesky, lower band storage AB(k,j) = B(j+k, j), k = 0..b.
+// O(n*b^2) instead of O(n^3/3), and the whole factor lives in (b+1)*n doubles.
+inline bool band_chol(Eigen::MatrixXd &AB, int n, int b) {
+  for (int j = 0; j < n; ++j) {
+    double d = AB(0, j);
+    if (!(d > 0.0))
+      return false; // not positive definite (caller falls back / rejects the step)
+    d = std::sqrt(d);
+    AB(0, j) = d;
+    const int m = std::min(b, n - 1 - j);
+    for (int i = 1; i <= m; ++i)
+      AB(i, j) /= d;
+    for (int k = 1; k <= m; ++k) {
+      const double ajk = AB(k, j);
+      if (ajk == 0.0)
+        continue;
+      for (int i = k; i <= m; ++i)
+        AB(i - k, j + k) -= AB(i, j) * ajk;
+    }
+  }
+  return true;
+}
+// Solve B x = rhs in place, given the band factor from band_chol.
+inline void band_solve(const Eigen::MatrixXd &AB, int n, int b, Eigen::Ref<Eigen::VectorXd> x) {
+  for (int j = 0; j < n; ++j) { // forward: L y = x
+    x(j) /= AB(0, j);
+    const int m = std::min(b, n - 1 - j);
+    const double xj = x(j);
+    for (int i = 1; i <= m; ++i)
+      x(j + i) -= AB(i, j) * xj;
+  }
+  for (int j = n - 1; j >= 0; --j) { // backward: L^T x = y
+    const int m = std::min(b, n - 1 - j);
+    double s = x(j);
+    for (int i = 1; i <= m; ++i)
+      s -= AB(i, j) * x(j + i);
+    x(j) = s / AB(0, j);
+  }
+}
+} // namespace
 
 double Problem::evaluate_cost(ParallelExecutor &exec) const {
   // Residual-only trial scoring. This runs once per LM/dogleg TRIAL (accepted or rejected),
@@ -425,12 +563,15 @@ bool Problem::solve_step(const Eigen::MatrixXd &H, const Eigen::VectorXd &grad, 
     Hred_(i, i) += lambda * std::min(std::max(H(i, i), 1e-6), 1e32);
   rhs_.noalias() = -grad.head(n_nav_);
 
+  if (schur_Vinv_.size() < land_diag_.size())
+    schur_Vinv_.resize(land_diag_.size());
   for (size_t li = 0; li < land_diag_.size(); ++li) {
     const int g0 = n_nav_ + land_diag_[li].first;
     Eigen::Matrix3d V = Eigen::Matrix3d(H.block(g0, g0, 3, 3).selfadjointView<Eigen::Lower>());
     for (int d = 0; d < 3; ++d)
       V(d, d) += lambda * std::min(std::max(H(g0 + d, g0 + d), 1e-6), 1e32);
     const Eigen::Matrix3d Vinv = V.inverse();
+    schur_Vinv_[li] = Vinv; // reused by the back-substitution below (same damped V)
     const Eigen::Vector3d gl = grad.segment(g0, 3);
     const std::vector<int> &adj = land_adj_[li];
     const int P = (int)adj.size();
@@ -439,55 +580,139 @@ bool Problem::solve_step(const Eigen::MatrixXd &H, const Eigen::VectorXd &grad, 
       schur_W_.resize(P);
       schur_Ma_.resize(P);
     }
-    // Precompute, per observing pose block: its nav offset, W_a = H[off_a, landmark] (stored
-    // transposed in the landmark row-strip of the lower triangle), and M_a = W_a * V^-1.
+    // FAST PATH: every adjacency is a 3-dof clone pose (the inner solve's only case), so the
+    // whole reduction is 3x3 and can be compiled as such -- no Dynamic dispatch. See Problem.h.
+    if (land_all3_[li]) {
+      if ((int)schur_W3_.size() < P) {
+        schur_W3_.resize(P);
+        schur_Ma3_.resize(P);
+      }
+      for (int ia = 0; ia < P; ++ia) {
+        const int off = blocks_[adj[ia]].offset;
+        schur_off_[ia] = off;
+        schur_W3_[ia] = H.block<3, 3>(g0, off);
+        schur_Ma3_[ia].noalias() = schur_W3_[ia].transpose() * Vinv;
+        rhs_.segment<3>(off).noalias() += schur_Ma3_[ia] * gl;
+      }
+      for (int ia = 0; ia < P; ++ia) {
+        const int offa = schur_off_[ia];
+        const Eigen::Matrix3d &Ma = schur_Ma3_[ia];
+        for (int ib = 0; ib < P; ++ib) {
+          const int offb = schur_off_[ib];
+          if (offa < offb)
+            continue; // lower triangle (incl. diagonal blocks) only
+          Hred_.block<3, 3>(offa, offb).noalias() -= Ma * schur_W3_[ib];
+        }
+      }
+      continue;
+    }
+
+    // GENERAL PATH (the export: calibration blocks are variable, so an adjacency may be
+    // 1-dof td, 3-dof quat/pos or 8-dof camera wide).
+    // Precompute, per adjacent nav block: its nav offset, W_a = H[landmark, off_a] read
+    // directly from the landmark row-strip (3 x lsize_a), and M_a = W_a^T * V^-1.
     // Also fold the rhs update -ga += M_a * g_l here (one pass over P).
     for (int ia = 0; ia < P; ++ia) {
-      const int off = blocks_[adj[ia]].offset;
+      const Block &ba = blocks_[adj[ia]];
+      const int off = ba.offset;
       schur_off_[ia] = off;
-      schur_W_[ia] = H.block(g0, off, 3, 3).transpose();
-      schur_Ma_[ia].noalias() = schur_W_[ia] * Vinv;
-      rhs_.segment(off, 3).noalias() += schur_Ma_[ia] * gl;
+      schur_W_[ia] = H.block(g0, off, 3, ba.lsize);
+      schur_Ma_[ia].noalias() = schur_W_[ia].transpose() * Vinv;
+      rhs_.segment(off, ba.lsize).noalias() += schur_Ma_[ia] * gl;
     }
-    // Symmetric rank-3 fill-in Hred -= W V^-1 W^T. Only the LOWER triangle is written
-    // (Eigen's LLT reads a single triangle) -- halves the O(P^2) 3x3 block updates -- and
-    // W_b is reused from the precompute instead of re-fetched/transposed in the inner loop.
+    // Symmetric fill-in Hred -= W^T V^-1 W. Only the LOWER triangle is written
+    // (Eigen's LLT reads a single triangle) -- halves the O(P^2) block updates -- and
+    // W_b is reused from the precompute instead of re-fetched in the inner loop.
     for (int ia = 0; ia < P; ++ia) {
       const int offa = schur_off_[ia];
-      const Eigen::Matrix3d &Ma = schur_Ma_[ia];
+      const int lsa = (int)schur_Ma_[ia].rows();
+      const Eigen::Matrix<double, Eigen::Dynamic, 3> &Ma = schur_Ma_[ia];
       for (int ib = 0; ib < P; ++ib) {
         const int offb = schur_off_[ib];
         if (offa < offb)
           continue; // lower triangle (incl. diagonal blocks) only
-        Hred_.block(offa, offb, 3, 3).noalias() -= Ma * schur_W_[ib].transpose();
+        Hred_.block(offa, offb, lsa, (int)schur_W_[ib].cols()).noalias() -= Ma * schur_W_[ib];
       }
     }
   }
 
-  // In-place Cholesky on Hred_ (rebuilt every call) -- no factor-storage copy per trial.
-  Eigen::LLT<Eigen::Ref<Eigen::MatrixXd>> llt(Hred_);
-  if (llt.info() != Eigen::Success)
-    return false;
-  da_ = rhs_;
-  llt.matrixL().solveInPlace(da_);
-  llt.matrixU().solveInPlace(da_);
+  bool banded_ok = false;
+  if (use_banded_) {
+    // BORDERED-BANDED SOLVE (see Problem.h / analyze_band).  [ B  C ] [x1]   [r1]
+    // B is banded (half-bandwidth b), C/D are the low-rank      [ C' D ] [x2] = [r2]
+    // gravity border. Same solution as the dense Cholesky, at n*b^2 instead of n^3/3 flops
+    // and with the factor resident in L2. Hred_ holds only the LOWER triangle.
+    const int nb = band_nb_, b = band_half_, nc = band_border_;
+    band_AB_.setZero();
+    for (int j = 0; j < nb; ++j) {
+      const int m = std::min(b, nb - 1 - j);
+      for (int i = 0; i <= m; ++i)
+        band_AB_(i, j) = Hred_(j + i, j);
+    }
+    banded_ok = band_chol(band_AB_, nb, b);
+    if (banded_ok) {
+      da_.resize(n_nav_);
+      band_z_ = rhs_.head(nb);
+      band_solve(band_AB_, nb, b, band_z_); // z = B^-1 r1
+      if (nc > 0) {
+        for (int k = 0; k < nc; ++k) // C(:,k) = Hred_(nb+k, 0:nb) (it lives in the lower triangle)
+          for (int i = 0; i < nb; ++i)
+            band_C_(i, k) = Hred_(nb + k, i);
+        band_Y_ = band_C_;
+        for (int k = 0; k < nc; ++k) {
+          Eigen::VectorXd col = band_Y_.col(k);
+          band_solve(band_AB_, nb, b, col); // Y = B^-1 C
+          band_Y_.col(k) = col;
+        }
+        for (int k = 0; k < nc; ++k) // S = D - C' Y   (D from the lower triangle, symmetrized)
+          for (int l = 0; l < nc; ++l)
+            band_S_(k, l) = (k >= l) ? Hred_(nb + k, nb + l) : Hred_(nb + l, nb + k);
+        band_S_.noalias() -= band_C_.transpose() * band_Y_;
+        const Eigen::VectorXd rhs2 = rhs_.segment(nb, nc) - band_C_.transpose() * band_z_;
+        const Eigen::LDLT<Eigen::MatrixXd> ldlt_s(band_S_);
+        if (ldlt_s.info() != Eigen::Success) {
+          banded_ok = false;
+        } else {
+          const Eigen::VectorXd x2 = ldlt_s.solve(rhs2);
+          da_.head(nb) = band_z_ - band_Y_ * x2; // x1 = z - Y x2
+          da_.segment(nb, nc) = x2;
+        }
+      } else {
+        da_.head(nb) = band_z_;
+      }
+    }
+  }
+  if (!banded_ok) {
+    // Dense fallback: a non-PD band (or a shape the gate refused) lands here unchanged.
+    Eigen::LLT<Eigen::Ref<Eigen::MatrixXd>> llt(Hred_);
+    if (llt.info() != Eigen::Success)
+      return false;
+    da_ = rhs_;
+    llt.matrixL().solveInPlace(da_);
+    llt.matrixU().solveInPlace(da_);
+  }
   if (!da_.allFinite())
     return false;
   delta.head(n_nav_) = da_;
 
   // Back-substitute landmarks: d_l = -V^-1 (g_l + sum_a W_a^T d_a), with W_a^T read directly
-  // from the landmark row-strip of the lower triangle.
+  // from the landmark row-strip of the lower triangle and the damped V^-1 reused from the
+  // Schur pass above (identical damping; rebuilding + re-inverting it was pure waste).
   for (size_t li = 0; li < land_diag_.size(); ++li) {
     const int g0 = n_nav_ + land_diag_[li].first;
-    Eigen::Matrix3d V = Eigen::Matrix3d(H.block(g0, g0, 3, 3).selfadjointView<Eigen::Lower>());
-    for (int d = 0; d < 3; ++d)
-      V(d, d) += lambda * std::min(std::max(H(g0 + d, g0 + d), 1e-6), 1e32);
     Eigen::Vector3d acc = grad.segment(g0, 3);
-    for (int nb : land_adj_[li]) {
-      const Block &b = blocks_[nb];
-      acc.noalias() += H.block(g0, b.offset, 3, 3) * delta.segment(b.offset, 3);
+    if (land_all3_[li]) { // fixed-size: same arithmetic, unrolled (see Problem.h)
+      for (int nb : land_adj_[li]) {
+        const int off = blocks_[nb].offset;
+        acc.noalias() += H.block<3, 3>(g0, off) * delta.segment<3>(off);
+      }
+    } else {
+      for (int nb : land_adj_[li]) {
+        const Block &b = blocks_[nb];
+        acc.noalias() += H.block(g0, b.offset, 3, b.lsize) * delta.segment(b.offset, b.lsize);
+      }
     }
-    delta.segment(g0, 3).noalias() = V.inverse() * (-acc);
+    delta.segment(g0, 3).noalias() = schur_Vinv_[li] * (-acc);
   }
   return delta.allFinite();
 }
@@ -582,6 +807,7 @@ SolverSummary Problem::Solve(const SolverOptions &options) {
     for (int iter = 0; iter < options.max_num_iterations; ++iter) {
       if (seconds_since(t0) > options.max_solver_time_seconds) {
         summary.message = "time budget reached";
+        summary.time_stopped = true;
         break;
       }
       if (grad.lpNorm<Eigen::Infinity>() < options.gradient_tolerance) {
@@ -609,7 +835,10 @@ SolverSummary Problem::Solve(const SolverOptions &options) {
           summary.message = "GN solve failed";
           break;
         }
-        mu = std::max(kMinMu, 2.0 * mu / kMuFactor); // relax on success
+        // relax from the mu that actually FACTORIZED (m), not the entry value:
+        // relaxing from the entry value re-runs the same failed factorizations
+        // every iteration once the problem needs m > kMinMu
+        mu = std::max(kMinMu, m / kMuFactor);
       }
 
       // Cauchy point: alpha = ||g||^2 / (g^T H g). (H holds the used lower triangle only.)
@@ -624,6 +853,7 @@ SolverSummary Problem::Solve(const SolverOptions &options) {
       while (true) {
         if (seconds_since(t0) > options.max_solver_time_seconds) {
           summary.message = "time budget reached";
+          summary.time_stopped = true;
           break;
         }
 
@@ -734,6 +964,7 @@ SolverSummary Problem::Solve(const SolverOptions &options) {
   for (int iter = 0; iter < options.max_num_iterations; ++iter) {
     if (seconds_since(t0) > options.max_solver_time_seconds) {
       summary.message = "time budget reached";
+      summary.time_stopped = true;
       break;
     }
     if (grad.lpNorm<Eigen::Infinity>() < options.gradient_tolerance) {
@@ -749,6 +980,7 @@ SolverSummary Problem::Solve(const SolverOptions &options) {
     while (true) {
       if (seconds_since(t0) > options.max_solver_time_seconds) {
         summary.message = "time budget reached";
+        summary.time_stopped = true;
         break;
       }
       bool solved;
@@ -938,4 +1170,120 @@ bool Problem::ComputeCovariance(const std::vector<double *> &blocks, Eigen::Matr
   }
   covariance = 0.5 * (covariance + covariance.transpose()).eval(); // symmetrize
   return true;
+}
+
+bool Problem::ExportReducedInformation(const std::vector<double *> &blocks, Eigen::MatrixXd &Lambda, Eigen::VectorXd &gred,
+                                       const SolverOptions &options, ExportStats *stats) {
+  assign_ordering();
+  if (n_total_ == 0)
+    return false;
+
+  // Requested (kept) blocks must be variable & non-landmark; everything else is marginalized.
+  std::vector<std::pair<int, int>> req; // (nav-offset, lsize)
+  int out_dim = 0;
+  for (double *ptr : blocks) {
+    int i = block_index(ptr);
+    if (i < 0 || blocks_[i].constant || blocks_[i].landmark || blocks_[i].offset < 0 || blocks_[i].offset >= n_nav_)
+      return false;
+    req.emplace_back(blocks_[i].offset, blocks_[i].lsize);
+    out_dim += blocks_[i].lsize;
+  }
+
+  ParallelExecutor exec(options.num_threads, options.worker_init_fn);
+  Eigen::MatrixXd H;
+  Eigen::VectorXd grad;
+  double cost = 0.0;
+  linearize(H, grad, cost, exec); // at the current iterate, undamped
+
+  // Landmark-marginalized nav system, VISIBILITY-AWARE like solve_step: the
+  // dense (n_nav x n_land) x (n_land x n_nav) product multiplied through the
+  // structural zeros of every landmark's non-observing poses (measured ~9% of
+  // window-solve thread-CPU). Per landmark, only its adjacent nav blocks are
+  // touched — identical algebra to the old dense BD*Bt fold, including the
+  // 1e-10 diagonal damping and the gradient fold g_nav' = g_nav - (B D^-1) g_l.
+  Eigen::MatrixXd Hnav = H.topLeftCorner(n_nav_, n_nav_).selfadjointView<Eigen::Lower>();
+  Eigen::VectorXd gnav = grad.head(n_nav_);
+  for (size_t li = 0; li < land_diag_.size(); ++li) {
+    const int g0 = n_nav_ + land_diag_[li].first;
+    Eigen::Matrix3d V = Eigen::Matrix3d(H.block(g0, g0, 3, 3).selfadjointView<Eigen::Lower>());
+    V.diagonal().array() += 1e-10;
+    const Eigen::Matrix3d Vinv = V.inverse();
+    const Eigen::Vector3d gl = grad.segment(g0, 3);
+    if (stats)
+      stats->land_decrement += gl.dot(Vinv * gl);
+    const std::vector<int> &adj = land_adj_[li];
+    const int P = (int)adj.size();
+    if ((int)schur_off_.size() < P) {
+      schur_off_.resize(P);
+      schur_W_.resize(P);
+      schur_Ma_.resize(P);
+    }
+    for (int ia = 0; ia < P; ++ia) {
+      const Block &ba = blocks_[adj[ia]];
+      schur_off_[ia] = ba.offset;
+      schur_W_[ia] = H.block(g0, ba.offset, 3, ba.lsize);
+      schur_Ma_[ia].noalias() = schur_W_[ia].transpose() * Vinv;
+      gnav.segment(ba.offset, ba.lsize).noalias() -= schur_Ma_[ia] * gl;
+    }
+    // FULL (both-triangle) fill-in: the kept/nuisance partition below indexes
+    // Hnav at arbitrary (row, col), unlike solve_step's lower-only Hred.
+    for (int ia = 0; ia < P; ++ia)
+      for (int ib = 0; ib < P; ++ib)
+        Hnav.block(schur_off_[ia], schur_off_[ib], schur_Ma_[ia].rows(), schur_W_[ib].cols()).noalias() -=
+            schur_Ma_[ia] * schur_W_[ib];
+  }
+
+  // Partition nav into kept vs nuisance indices (kept in requested order).
+  std::vector<int> kidx, nidx;
+  kidx.reserve(out_dim);
+  std::vector<char> is_kept(n_nav_, 0);
+  for (const auto &of : req)
+    for (int k = 0; k < of.second; ++k) {
+      kidx.push_back(of.first + k);
+      is_kept[of.first + k] = 1;
+    }
+  for (int i = 0; i < n_nav_; ++i)
+    if (!is_kept[i])
+      nidx.push_back(i);
+
+  const int nk = (int)kidx.size(), nn = (int)nidx.size();
+  Eigen::MatrixXd Hkk(nk, nk), Hkn(nk, nn), Hnn(nn, nn);
+  Eigen::VectorXd gk(nk), gn(nn);
+  for (int a = 0; a < nk; ++a) {
+    gk(a) = gnav(kidx[a]);
+    for (int b = 0; b < nk; ++b)
+      Hkk(a, b) = Hnav(kidx[a], kidx[b]);
+    for (int b = 0; b < nn; ++b)
+      Hkn(a, b) = Hnav(kidx[a], nidx[b]);
+  }
+  for (int a = 0; a < nn; ++a) {
+    gn(a) = gnav(nidx[a]);
+    for (int b = 0; b < nn; ++b)
+      Hnn(a, b) = Hnav(nidx[a], nidx[b]);
+  }
+
+  if (nn == 0) {
+    Lambda = Hkk;
+    gred = gk;
+    if (stats)
+      stats->nuis_decrement = stats->land_decrement;
+    return true;
+  }
+  Eigen::LDLT<Eigen::MatrixXd> ldlt(Hnn);
+  if (ldlt.info() != Eigen::Success || (ldlt.vectorD().array() <= 0.0).any())
+    return false;
+  const Eigen::MatrixXd HnnInvHnk = ldlt.solve(Hkn.transpose());
+  Lambda = Hkk - Hkn * HnnInvHnk;
+  gred = gk - HnnInvHnk.transpose() * gn;
+  if (stats) {
+    // nuisance Newton decrement q_n = g_z' H_zz^{-1} g_z = sum_l gl'V^{-1}gl
+    // + gn'Hnn^{-1}gn (exact block-elimination identity; one extra O(nn^2)
+    // solve on the factorization formed above). q_n/2 = the cost decrease a
+    // further inner solve could still achieve at this linearization — the P1
+    // stationarity certificate's statistic.
+    stats->nuis_decrement = stats->land_decrement + gn.dot(ldlt.solve(gn));
+    stats->nuis_grad_inf = gn.lpNorm<Eigen::Infinity>();
+  }
+  Lambda = 0.5 * (Lambda + Lambda.transpose()).eval(); // symmetrize
+  return Lambda.allFinite() && gred.allFinite();
 }

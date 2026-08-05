@@ -413,6 +413,18 @@ private:
         node_result = false;
         return;
       }
+      // A trailing comment containing a COLON silently destroys the value: OpenCV's YAML reader
+      // tokenizes before it strips comments, so `key: false  # no-op: re-solved anyway` parses as
+      // a nested MAP and the scalar is gone. The node then reads back empty and the setting keeps
+      // its default -- a config the operator wrote and we ignored, with no error. Catch it here and
+      // say exactly what to do, because the failure is otherwise invisible.
+      if (file_node[node_name].isMap()) {
+        PRINT_WARNING(YELLOW "the node %s parsed as a MAP, not a bool -- a ':' in its trailing comment?\n" RESET,
+                      node_name.c_str());
+        PRINT_WARNING(YELLOW "\tOpenCV's YAML reader splits on it. Move the comment to its own line above the key.\n" RESET);
+        all_params_found_successfully = false;
+        return;
+      }
       // NOTE: we select the first bit of text as there can be a comment afterwards
       // NOTE: for example we could have "key: true #comment here..." where we only want "true"
       std::string value;

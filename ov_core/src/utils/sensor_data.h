@@ -77,6 +77,22 @@ struct CameraData {
   /// Tracking masks for each camera we have
   std::vector<cv::Mat> masks;
 
+  /// Exposure time [s] of each image (0 when the source does not publish one).
+  ///
+  /// Per-FRAME, not per-session: auto-exposure moves during a run, and a consumer that stamps at
+  /// mid-exposure (t + exposure/2) needs the exposure of THIS frame. It rides on the message
+  /// because the thread holding the driver metadata is not, in general, the thread that consumes
+  /// the image -- an async ingest hands frames to a different consumer entirely.
+  ///
+  /// *** INERT TO THE ESTIMATOR -- DO NOT CONSUME THIS IN VIO. ***
+  /// The filter's time base is `timestamp` AS DELIVERED (start of exposure), and the calibrated
+  /// `calib_camimu_dt` it runs with is defined in exactly that convention. Shifting camera times
+  /// by exposure/2 anywhere in the estimator would DOUBLE-COUNT the offset the calibrator already
+  /// folded into td, silently biasing every clone. The calibrator (ov_zcalib) stamps its own clones
+  /// at mid-exposure internally and converts back to start-of-exposure before it writes td out --
+  /// that conversion is the ONLY place this field belongs. VIO must ignore it.
+  std::vector<float> exposures;
+
   /// Sort function to allow for using of STL containers
   bool operator<(const CameraData &other) const {
     if (timestamp == other.timestamp) {

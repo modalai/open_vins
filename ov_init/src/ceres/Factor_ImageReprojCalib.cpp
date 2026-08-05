@@ -22,6 +22,7 @@
 
 #include "Factor_ImageReprojCalib.h"
 
+#include "ceres_free/DistortDouble.h"
 #include "utils/quat_ops.h"
 
 using namespace ov_init;
@@ -70,13 +71,14 @@ bool Factor_ImageReprojCalib::Evaluate(double const *const *parameters, double *
   Eigen::Matrix<double, 2, 2> sqrtQ_gate = gate * sqrtQ;
 
   // Get the distorted raw image coordinate using the camera model
+  // (forward projection in DOUBLE via the shared helper: CamBase::distort_d is
+  // float32-quantized, and the two reprojection backends must agree bit-level)
   // Also if jacobians are requested, then compute derivatives
-  Eigen::Vector2d uv_dist;
+  Eigen::Vector2d uv_dist = ov_init::distort_double(camera_vals, uv_norm, is_fisheye);
   Eigen::MatrixXd H_dz_dzn, H_dz_dzeta;
   if (is_fisheye) {
     ov_core::CamEqui cam(0, 0);
     cam.set_value(camera_vals);
-    uv_dist = cam.distort_d(uv_norm);
     if (jacobians) {
       cam.compute_distort_jacobian(uv_norm, H_dz_dzn, H_dz_dzeta);
       H_dz_dzn = sqrtQ_gate * H_dz_dzn;
@@ -85,7 +87,6 @@ bool Factor_ImageReprojCalib::Evaluate(double const *const *parameters, double *
   } else {
     ov_core::CamRadtan cam(0, 0);
     cam.set_value(camera_vals);
-    uv_dist = cam.distort_d(uv_norm);
     if (jacobians) {
       cam.compute_distort_jacobian(uv_norm, H_dz_dzn, H_dz_dzeta);
       H_dz_dzn = sqrtQ_gate * H_dz_dzn;

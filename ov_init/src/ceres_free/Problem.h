@@ -101,6 +101,11 @@ struct SolverSummary {
   double time_linear_solve_seconds = 0.0; ///< damped (Schur) linear solves, incl. rejected trials
   double time_residual_seconds = 0.0;     ///< residual-only trial scoring (evaluate_cost)
   bool converged = false;
+  /// True iff the wall-clock budget ended the solve (any of the in-loop checks).
+  /// A binding time cap couples machine load into the ITERATE — callers that
+  /// need run-to-run bit-identity must treat a time-stopped solve as tainted
+  /// and surface this flag (ov_zcalib evidence table does).
+  bool time_stopped = false;
   std::string message;
 };
 
@@ -109,7 +114,7 @@ class ParallelExecutor; // fwd
 class Problem {
 public:
   Problem() = default;
-  ~Problem();
+  virtual ~Problem(); // virtual: Problem is the reusable ceres-free base (ov_zcalib derives)
 
   /**
    * @brief Opt in to Ceres-style memory ownership: when enabled, the Problem
@@ -150,7 +155,32 @@ public:
    */
   bool ComputeCovariance(const std::vector<double *> &blocks, Eigen::MatrixXd &covariance, const SolverOptions &options);
 
-private:
+  /**
+   * @brief Reduced information + gradient of the requested blocks at the CURRENT iterate.
+   *
+   * Linearizes once (undamped) and marginalizes EVERY other variable block — landmarks
+   * and nuisances alike: Lambda = H_kk - H_kn H_nn^-1 H_nk and the matching reduced
+   * gradient g_k - H_kn H_nn^-1 g_n of the robustified cost, in LOCAL (error-state)
+   * coordinates, requested-block order. This is the per-window export of the VarPro
+   * calibration fusion: the global step solves (sum Lambda_w + prior) dp = -(sum g_w).
+   * Requires the nuisance system to be PD (per-window gauge anchored); returns false
+   * otherwise. Additive API: Solve()/ComputeCovariance() behavior is unchanged.
+   */
+  /// Optional per-export convergence evidence (P1 stationarity certificate).
+  /// nuis_decrement = g_z' H_zz^{-1} g_z summed over ALL marginalized blocks
+  /// (landmark + nav-nuisance terms; exact block-elimination identity) — the
+  /// model energy of the remaining inner correction: 2x the cost decrease a
+  /// further inner solve could still achieve at this linearization. Computed
+  /// from factorizations this export already forms (one extra O(nn^2) solve).
+  struct ExportStats {
+    double nuis_decrement = 0.0;
+    double land_decrement = 0.0;
+    double nuis_grad_inf = 0.0;
+  };
+  bool ExportReducedInformation(const std::vector<double *> &blocks, Eigen::MatrixXd &Lambda, Eigen::VectorXd &gred,
+                                const SolverOptions &options, ExportStats *stats = nullptr);
+
+protected: // protected (not private): the base-class seam for derived solvers (ov_zcalib)
   struct Block {
     double *data = nullptr;
     int gsize = 0;
@@ -203,9 +233,67 @@ private:
   mutable Eigen::VectorXd lm_delta_, lm_Dvec_; // LM: preallocated step and Marquardt damping diagonal
 
   // Arrowhead-Schur scratch (reused; no per-call heap traffic): for one landmark's adjacency,
-  // schur_off_[k] = nav offset of pose block k, schur_W_[k] = H[off_k, landmark], schur_Ma_[k] = W_k * V^-1.
-  mutable std::vector<Eigen::Matrix3d> schur_W_, schur_Ma_;
+  // schur_off_[k] = nav offset of adjacent block k, schur_W_[k] = H[landmark, off_k] (3 x lsize_k),
+  // schur_Ma_[k] = W_k^T * V^-1 (lsize_k x 3). GENERAL block widths: an adjacent block may be a
+  // clone pose (3) or an unlocked calibration block (e.g. 8-dof camera intrinsics) — the old
+  // Matrix3d scratch silently dropped columns beyond 3 (the latent Schur bug; fixed here).
+  mutable std::vector<Eigen::Matrix<double, 3, Eigen::Dynamic>> schur_W_;
+  mutable std::vector<Eigen::Matrix<double, Eigen::Dynamic, 3>> schur_Ma_;
+  mutable std::vector<Eigen::Matrix3d> schur_Vinv_; // per-landmark damped V^-1 (Schur pass -> back-substitution)
   mutable std::vector<int> schur_off_;
+
+  // FIXED-SIZE (3x3) Schur scratch -- the fast path.
+  //
+  // In the inner solve EVERY block a landmark touches is a clone pose (q or p), so every
+  // adjacency has lsize == 3. The general path above still declares them Dynamic, so the
+  // O(P^2) fill-in `Hred.block(...) -= Ma * W_b` compiles to Eigen's DYNAMIC gemm: a runtime
+  // dispatch that cannot unroll or vectorize, wrapped around 54 flops of actual arithmetic.
+  // PROFILED (D0014 record, one session): 73.5 MILLION such products, delivering 3.97 GFLOP
+  // at 1.42 GFLOP/s = ~2% of machine peak, and 36% of solve_step's wall time. The dense
+  // Cholesky next to it runs at 38 GFLOP/s (58% of peak) -- the Schur loop is not doing
+  // arithmetic, it is paying dispatch. (This is exactly why Ceres template-specializes its
+  // SchurEliminator on the (2,3,3) block shape.)
+  //
+  // These fixed-size buffers let the compiler see 3x3 at compile time: full unroll, SIMD, no
+  // dispatch. The general Dynamic path stays for the EXPORT, where the calibration blocks are
+  // variable and adjacencies really can be 1 (td), 3 (quat/pos) or 8 (camera) wide.
+  mutable std::vector<Eigen::Matrix3d> schur_W3_, schur_Ma3_;
+  std::vector<char> land_all3_; // per landmark: every adjacency is lsize 3 (=> fixed-size path)
+
+  // ---- BORDERED-BANDED direct solver for the reduced nav system (analyze_band) ----
+  //
+  // The reduced nav Hessian is NOT dense, it is banded with a low-rank border:
+  //   * IMU preintegration couples clone k to clone k+1 only          -> half-bandwidth 30
+  //   * a landmark's Schur fill makes a clique of the clones that SEE it, so the fill reaches
+  //     as far as the longest track                                    -> 15 * max_track_len
+  //   * the S2 gravity block couples to EVERY clone, and is registered LAST (WindowBA.cpp),
+  //     so it lands at the end of the nav partition -> a rank-2 BORDER, not band.
+  //
+  // Whether that is worth exploiting is a property of the WINDOW SHAPE, and the design
+  // review that rejected a banded solver is correct for the shape it was measured at:
+  // at 70 clones / 40-obs tracks the fill reaches ~600 of 1052 dofs (57% dense) and banded
+  // buys nothing. The FLIGHT shape caps tracks at 10 obs / 32 clones, and there the MEASURED
+  // half-bandwidth is 74 of 467 (16%) -> n*b^2 = 2.6 MFLOP vs n^3/3 = 33.9 MFLOP, 13x fewer.
+  //
+  // So the choice is not hard-coded to a profile: analyze_band() measures the actual fill from
+  // the actual residual/landmark structure and enables the banded path ONLY when it is
+  // cheaper. A long-track (host) window falls back to the dense LLT automatically, which is
+  // exactly what the note asks for. The band is also 280 KB instead of 1.75 MB -- it fits in
+  // L2, which matters more on the target than the flop count does.
+  mutable Eigen::MatrixXd band_AB_; // (b+1) x nb, lower band storage: AB(k,j) = B(j+k, j)
+  mutable Eigen::MatrixXd band_C_;  // nb x nbord   border columns
+  mutable Eigen::MatrixXd band_Y_;  // nb x nbord   = B^-1 C
+  mutable Eigen::MatrixXd band_S_;  // nbord x nbord Schur complement of the border
+  mutable Eigen::VectorXd band_z_;  // nb           scratch
+  int band_half_ = 0;               ///< half-bandwidth of the leading banded block
+  int band_nb_ = 0;                 ///< size of the leading banded block
+  int band_border_ = 0;             ///< size of the trailing dense border (0 = pure band)
+  bool use_banded_ = false;         ///< analyze_band()'s verdict for THIS window's structure
+
+  /// Measure the reduced nav system's fill from the residual + landmark structure and decide
+  /// whether the bordered-banded path beats the dense Cholesky. Structure-only: called once
+  /// per ordering, never per trial.
+  void analyze_band();
   std::vector<double> plus_tmp_; // apply_delta Plus() scratch, sized once to the max ambient block size
 
   // Diagnostics (reset each Solve), surfaced in SolverSummary: linearization / cost-eval counts.
