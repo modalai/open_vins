@@ -13,8 +13,9 @@ Two front doors, one engine:
 
 - **On device**: `voxl-open-vins-server --calibrate` feeds this module
   in-process from the server's own MPA drivers with the TrackOCL front-end
-  (the only tracker on target), and writes the mandatory session record
-  mirror at consumption.
+  (the only tracker on target), and writes the session record mirror at
+  consumption (`record_session` profile key, ON by default; an unrecorded
+  session cannot be replayed).
 - **On host**: the `ov_zcalibrate` CLI replays recorded sessions
   (`--replay`, the CI and forensics path), converts voxl-logger logs
   (`--voxl`), and runs a writeback smoke test (`--selftest`).
