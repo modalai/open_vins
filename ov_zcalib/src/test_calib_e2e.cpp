@@ -147,7 +147,7 @@ static WindowData make_window(const Truth &tr, double phase, double dur, double 
       CloneObs o;
       o.feat_id = (size_t)f;
       o.uv = uv + w.pix_sigma * Eigen::Vector2d(nrm(rng), nrm(rng));
-      o.u_frac = uv(1) / 480.0;
+      o.u_frac = uv(1) / 480.0 - 0.5; // centered convention
       w.obs.back().push_back(o);
     }
   }

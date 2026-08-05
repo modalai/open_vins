@@ -316,7 +316,11 @@ bool WindowHarvester::assemble_(WindowData &out, WindowMeta &meta) {
       const FrameObs &fr = frames_[(size_t)fi];
       const size_t c = (size_t)fr.cam;
       const CamCalib &kc = seed_.cams[c];
-      const double t_obs = fr.timestamp + 0.5 * (double)fr.exposure_s + kc.td;
+      // fr.timestamp is the producer's center-row mid-exposure instant (SOF + (readout+exposure)/2
+      // applied at INGEST — server camera layer / log feeder). Nothing is re-added here: exposure_s
+      // rides along as provenance only, and re-applying it would double-count (the old SOF-stamp
+      // convention died with the tr-estimation machinery).
+      const double t_obs = fr.timestamp + kc.td;
       for (const FrameObsPoint &p : fr.pts) {
         auto it = id_map.find(p.id);
         if (it == id_map.end())
@@ -331,7 +335,9 @@ bool WindowHarvester::assemble_(WindowData &out, WindowMeta &meta) {
         o.uv = Eigen::Vector2d((double)p.u, (double)p.v);
         o.cam = (int)c;
         o.dt_ref = t_obs - clone_t[k]; // 0 unless this frame was merged onto another camera's clone
-        o.u_frac = std::min(1.0, std::max(0.0, (double)p.v / (double)kc.img_h));
+        // CENTERED row fraction: 0 at the image center (the row the frame stamp anchors), matching
+        // the filter's (v/h - 0.5) convention. Row time = u_frac * tr with tr the fixed HAL3 readout.
+        o.u_frac = std::min(0.5, std::max(-0.5, (double)p.v / (double)kc.img_h - 0.5));
         o.bearing = CamUndistort::bearing(o.uv, kc.cam, kc.fisheye);
         out.obs[k].push_back(o);
         rows.push_back(o.u_frac);
@@ -353,29 +359,13 @@ bool WindowHarvester::assemble_(WindowData &out, WindowMeta &meta) {
     return false;
   out.pix_sigma = cfg_.pix_sigma;
   out.td_ref.resize((size_t)n_cams);
-  out.tr_ref.resize((size_t)n_cams);
-  for (int c = 0; c < n_cams; ++c) {
+  for (int c = 0; c < n_cams; ++c)
     out.td_ref[(size_t)c] = seed_.cams[(size_t)c].td;
-    // tr_ref is STRUCTURALLY ZERO, and that is not a shortcut -- it is what the clone timeline says.
-    //
-    // A clone is stamped at (t_sof + exposure/2 + td_seed): a per-FRAME instant, with no per-ROW
-    // term in it. The observation on row u happened at (t_sof + exposure/2 + u*tr + td). So the
-    // shift the factor must transport is
-    //
-    //     Delta = (td - td_seed) + u*tr        -- ABSOLUTE in tr, a DEVIATION only in td
-    //
-    // Seeding tr_ref with the camera's tr made the factor apply (tr - tr_seed)*u instead, which is
-    // ZERO whenever tr is held at its seed: the hires rolling shutter was then not modelled AT ALL,
-    // and td silently absorbed ~tr/2 of it (defect D10). Note VIO gets this right --
-    // UpdaterHelper.cpp applies the full v_frac * t_readout, gated on the VALUE, not on whether the
-    // readout is being estimated -- so the calibrator was handing VIO a td fitted under a different
-    // camera model than VIO consumes it with.
-    //
-    // Zeroing it makes the existing formula exactly correct and leaves the Jacobian untouched
-    // (d/dtr of u*tr and of (tr - tr_ref)*u are both u). Byte-identical on any global-shutter
-    // camera, where tr == 0 either way.
-    out.tr_ref[(size_t)c] = 0.0;
-  }
+  // The rolling-shutter row time needs no reference here: tr is the fixed HAL3 readout (never a
+  // parameter), so each observation's centered row time u_frac * tr is a known constant that
+  // WindowBA folds into the factor's dt_ref at construction. The td deviation (td - td_ref) is
+  // the only temporal quantity the factors transport as an estimate. This matches VIO exactly:
+  // UpdaterHelper applies (v/h - 0.5) * t_readout around the same center-anchored frame stamp.
 
   // ---- padded IMU slice ----
   const double t_lo = out.clone_times.front() - cfg_.imu_pad_s;

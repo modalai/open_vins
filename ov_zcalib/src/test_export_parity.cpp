@@ -157,7 +157,7 @@ static WindowData make_window(const Truth &tr, double phase, double dur, double 
       CloneObs o;
       o.feat_id = (size_t)f;
       o.uv = uv + w.pix_sigma * Eigen::Vector2d(nrm(rng), nrm(rng));
-      o.u_frac = uv(1) / 480.0;
+      o.u_frac = uv(1) / 480.0 - 0.5; // centered convention
       w.obs.back().push_back(o);
     }
   }
@@ -301,7 +301,7 @@ int main() {
       SharedCalib cf = c2;
       cf.imu.calib_dw = cf.imu.calib_da = cf.imu.calib_RAtoI = false;
       cf.imu.calib_tg = false;
-      cf.cams[0].free_ext = cf.cams[0].free_td = cf.cams[0].free_tr = false;
+      cf.cams[0].free_ext = cf.cams[0].free_td = false;
       cf.cams[0].cam_mode = 0;
       CHECK(cf.local_dim() == 0, "probe calib not fully frozen (np=%d)", cf.local_dim());
       WindowWarmState entryQ = z0;

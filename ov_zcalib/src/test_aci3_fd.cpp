@@ -271,9 +271,10 @@ static void test_factor_fd() {
 // Stinger-class intrinsics. The synthetic e2e suites are radtan-only, so the
 // fisheye distortion Jacobians (k1..k4 columns and their fx/theta chain) ship
 // otherwise untested against the values the real AR0144 rigs exercise. Covers
-// all 8 blocks of Factor_ReprojTd including the first-order td/tr transport
-// columns (tolerance loosened there: the analytic column omits O(|w Delta|^2)
-// normalization terms by design).
+// all 7 blocks of Factor_ReprojTd including the td transport column and the
+// fixed dt_ref shift (the centered rolling-shutter row time folds in there;
+// tolerance loosened under transport: the analytic pose columns reuse the
+// transported-frame Jacobians, an O(|w| Delta) omission by design).
 static void test_reproj_fd(bool fisheye, bool with_transport) {
   // Stinger tracking_front (AR0144 fisheye 1280x800): per-unit yml values.
   // The radtan variant reuses the pinhole row with small k1/k2/p1/p2 as the
@@ -315,22 +316,25 @@ static void test_reproj_fd(bool fisheye, bool with_transport) {
   }
   uv += Eigen::Vector2d(0.3, -0.2);
 
-  // Clone kinematics; the transported variant moves td/tr away from the
-  // linearization point (Delta != 0), the exact variant sits at Delta == 0
-  // where EVERY column must match FD to double-FD precision.
+  // Clone kinematics; the transported variant moves td away from the
+  // linearization point AND carries a fixed dt_ref (the centered row time
+  // (v/h - 0.5)*tr_hw of a rolling frame, a known constant), the exact
+  // variant sits at Delta == 0 where EVERY column must match FD to double-FD
+  // precision.
   const Eigen::Vector3d w_clone(1.2, -0.8, 0.9), v_clone(0.4, -0.3, 0.2);
-  double td = with_transport ? 1.3e-3 : 1.0e-3, tr = with_transport ? 2.0e-3 : 0.0;
-  const double Delta = (td - 1.0e-3) + tr * 0.37;
-  Factor_ReprojTd f(uv, 1.0, fisheye, w_clone, v_clone, /*u_frac=*/0.37, /*td_lin=*/1.0e-3, /*tr_lin=*/0.0);
+  double td = with_transport ? 1.3e-3 : 1.0e-3;
+  const double dt_ref = with_transport ? 2.0e-3 * (0.37 - 0.5) : 0.0; // row 0.37 of a tr=2 ms frame
+  const double Delta = dt_ref + (td - 1.0e-3);
+  Factor_ReprojTd f(uv, 1.0, fisheye, w_clone, v_clone, /*td_lin=*/1.0e-3, dt_ref);
 
-  double *params[8] = {q_GtoI.data(), p_IinG.data(), p_FinG.data(), q_ItoC.data(), p_IinC.data(), cam.data(), &td, &tr};
-  const int gsize[8] = {4, 3, 3, 4, 3, 8, 1, 1};
-  const bool is_quat[8] = {true, false, false, true, false, false, false, false};
+  double *params[7] = {q_GtoI.data(), p_IinG.data(), p_FinG.data(), q_ItoC.data(), p_IinC.data(), cam.data(), &td};
+  const int gsize[7] = {4, 3, 3, 4, 3, 8, 1};
+  const bool is_quat[7] = {true, false, false, true, false, false, false};
 
   Eigen::Vector2d res0;
-  std::vector<Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>> J(8);
-  double *jac[8];
-  for (int b = 0; b < 8; ++b) {
+  std::vector<Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>> J(7);
+  double *jac[7];
+  for (int b = 0; b < 7; ++b) {
     J[b].resize(2, gsize[b]);
     jac[b] = J[b].data();
   }
@@ -339,7 +343,7 @@ static void test_reproj_fd(bool fisheye, bool with_transport) {
 
   const double eps = 1e-7;
   double max_rel = 0.0;
-  for (int b = 0; b < 8; ++b) {
+  for (int b = 0; b < 7; ++b) {
     const int loc = is_quat[b] ? 3 : gsize[b];
     for (int k = 0; k < loc; ++k) {
       std::vector<double> backup(params[b], params[b] + gsize[b]);
@@ -366,8 +370,8 @@ static void test_reproj_fd(bool fisheye, bool with_transport) {
       max_rel = std::max(max_rel, rel);
       // Tolerances by CONTRACT: everything is exact at Delta == 0; under
       // transport the clone-attitude column reuses the transported-frame
-      // Jacobian (documented O(|w| Delta) omission), and the td/tr chain
-      // carries the same first-order normalization slack.
+      // Jacobian (documented O(|w| Delta) omission), and the td chain
+      // carries the same first-order slack.
       double tol = 5e-6;
       if (b == 0 || b >= 6)
         tol = std::max(tol, 3.0 * w_clone.norm() * std::abs(Delta));
@@ -376,7 +380,7 @@ static void test_reproj_fd(bool fisheye, bool with_transport) {
       CHECK(rel < tol, "%s reproj block %d col %d: rel err %.3e (tol %.1e)", fisheye ? "fisheye" : "radtan", b, k, rel, tol);
     }
   }
-  std::printf("[ok] %s reproj FD (%s, @ Stinger-class intrinsics): max rel err %.3e over all 8 blocks\n", fisheye ? "fisheye" : "radtan",
+  std::printf("[ok] %s reproj FD (%s, @ Stinger-class intrinsics): max rel err %.3e over all 7 blocks\n", fisheye ? "fisheye" : "radtan",
               with_transport ? "transported" : "Delta=0 exact", max_rel);
 }
 

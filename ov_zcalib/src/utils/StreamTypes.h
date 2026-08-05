@@ -38,8 +38,12 @@ struct FrameObsPoint {
 /// hands out ids from a single atomic counter), so tracks never collide -- but a track never
 /// crosses cameras either, and `cam` is what makes that structural instead of accidental.
 struct FrameObs {
-  double timestamp = 0.0;  ///< START of exposure, camera clock [s] (ANDROID_SENSOR_TIMESTAMP domain)
-  float exposure_s = 0.f;  ///< exposure time (mid-exposure correction = t + 0.5*exposure)
+  /// Center-row mid-exposure instant, camera clock [s]: the PRODUCER (server camera ingest /
+  /// VoxlLogFeeder) stamps HAL3 start-of-exposure + (readout + exposure)/2 before anything
+  /// downstream sees the frame. Consumers use it verbatim -- re-adding exposure or readout
+  /// double-counts. Rows deviate from it by the centered fraction (v/h - 0.5) * readout.
+  double timestamp = 0.0;
+  float exposure_s = 0.f;  ///< exposure time [s] -- provenance/diagnostics only (already in timestamp)
   float temp_c = 0.f;      ///< IMU temperature snapshot at ingest (0 if unavailable)
   uint32_t seq = 0;        ///< producer frame counter (gap/drop detection)
   uint32_t cam = 0;        ///< camera id (index into the per-camera calibration blocks)

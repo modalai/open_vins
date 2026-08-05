@@ -35,13 +35,11 @@ namespace ov_zcalib {
 /// session that produced it, by construction.
 enum class SessionProfile : uint8_t { LIBRARY = 0, VOXL = 1, VOXL_FLIGHT = 2, EUROC = 3 };
 
-/// Seed snapshot stored in the record header (what the live session ran with)
+/// Seed snapshot stored in the record header (what the live session ran with).
+/// The rolling-shutter readout needs no separate field: CamCalib::tr IS the HAL3 hardware value
+/// (never estimated), stored per camera inside the calib block like every other hardware fact.
 struct SessionSeed {
   SharedCalib calib; ///< seed calibration for the whole rig: N cameras + the one IMU
-  /// HAL3 frame_readout_time_ns seed [s], per camera. The solved tr is cross-checked against it at
-  /// VERIFY -- it is a hardware fact, so a solved value far from it means the session is wrong, not
-  /// the datasheet. (Image geometry lives on CamCalib, where it belongs: it is per camera too.)
-  std::vector<double> tr_hw_seed;
   /// The effective configuration. A seed-only record is NOT replayable -- the config is half the
   /// computation (see SessionProfile).
   SessionProfile profile = SessionProfile::LIBRARY;

@@ -715,7 +715,8 @@ struct VioManagerOptions {
   /// Defaults to calib_camimu_dt for every camera (legacy single-offset behavior). Keys: sim_camimu_dt_camN.
   std::vector<double> sim_camimu_dts;
 
-  /// Per-camera TRUE rolling-shutter readout times in seconds (row v sampled at event time + (v/h)*readout).
+  /// Per-camera TRUE rolling-shutter readout times in seconds (row v sampled at event time +
+  /// (v/h - 0.5)*readout -- centered, frame stamps anchor mid-frame).
   /// Zero (default) = global shutter, which short-circuits to the legacy projection path. Keys: sim_readout_camN.
   std::vector<double> sim_cam_readouts;
 

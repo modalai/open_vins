@@ -218,7 +218,7 @@ int main() {
             "F2A: imu slice does not cover clones");
       for (auto &obs : wA[i].obs)
         for (auto &o : obs) {
-          CHECK(o.u_frac >= 0.0 && o.u_frac <= 1.0, "F2A: u_frac %.3f", o.u_frac);
+          CHECK(o.u_frac >= -0.5 && o.u_frac <= 0.5, "F2A: u_frac %.3f (centered convention)", o.u_frac);
           CHECK(std::abs(o.bearing.norm() - 1.0) < 1e-9, "F2A: non-unit bearing");
         }
     }
@@ -377,7 +377,6 @@ int main() {
     // live-style pass WITH the mandatory record mirror (arrival order = time order)
     SessionSeed ss;
     ss.calib = seed;
-    ss.tr_hw_seed.assign(1, 0.0);
     const std::string rec_path = "/tmp/ov_zcalib_f4_session.bin";
     std::vector<WindowData> w_live;
     {

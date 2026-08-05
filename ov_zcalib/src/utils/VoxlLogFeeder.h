@@ -42,12 +42,14 @@ public:
    *        record: IMU csv (timestamp/accel/gyro/temp) + camera csv
    *        (timestamp/exposure) + PNGs through TrackKLT at the seed
    *        intrinsics (CamEqui when seed.calib.cam_fisheye). Timestamps are
-   *        rebased to the first IMU sample; frame stamps are start-of-exposure
-   *        with the logged per-frame exposure.
+   *        rebased to the first IMU sample. This feeder is the PRODUCER for
+   *        replay logs, so it applies the system stamp convention: the logged
+   *        start-of-exposure stamp becomes t = SOF + (readout + exposure)/2,
+   *        the frame's center-row mid-exposure instant (readout = the fixed
+   *        HAL3 value in seed.calib.cams[0].tr; per-frame exposure from the
+   *        log). Identical to the server's live camera ingest.
    * @param mean_exposure_s optional out: mean logged exposure [s] of the
-   *        converted frames — the exact td convention bridge (ov_zcalib stamps
-   *        clones at MID-exposure; kalibr-style start-of-exposure chains leave
-   *        exposure/2 inside td, so td_kalibr ~= td_ours + mean_exposure/2).
+   *        converted frames (diagnostic; the stamps above already contain it).
    */
   static bool convert(const std::string &log_dir, const std::string &cam_pipe, const SessionSeed &seed, const std::string &record_out,
                       double max_seconds, int num_feats, double *mean_exposure_s = nullptr);

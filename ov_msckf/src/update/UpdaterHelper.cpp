@@ -135,7 +135,7 @@ void UpdaterHelper::get_feature_jacobian_representation(std::shared_ptr<State> s
       }
     }
 
-    // Compute v_frac from anchor observation pixel row (for RS component)
+    // Compute centered v_frac from anchor observation pixel row (RS component; stamps anchor mid-frame)
     auto ts_it = feature.timestamps.find(feature.anchor_cam_id);
     if (ts_it != feature.timestamps.end()) {
       const auto &anc_timestamps = ts_it->second;
@@ -145,7 +145,7 @@ void UpdaterHelper::get_feature_jacobian_representation(std::shared_ptr<State> s
         const auto &anc_uvs = feature.uvs.at(feature.anchor_cam_id);
         double v_pixel_anc = (double)anc_uvs.at(anc_idx)(1);
         double inv_img_h_anc = 1.0 / (double)state->_cam_intrinsics_cameras.at(feature.anchor_cam_id)->h();
-        v_frac_anc = v_pixel_anc * inv_img_h_anc;
+        v_frac_anc = v_pixel_anc * inv_img_h_anc - 0.5;
       }
     }
 
@@ -155,7 +155,7 @@ void UpdaterHelper::get_feature_jacobian_representation(std::shared_ptr<State> s
       dt_total_anc += v_frac_anc * t_readout_anc;
     }
     if (std::abs(dt_total_anc) > 1e-10) {
-      R_GtoI = (Eigen::Matrix3d::Identity() - skew_x(omega_anc_val) * dt_total_anc) * R_GtoI;
+      R_GtoI = exp_so3(-omega_anc_val * dt_total_anc) * R_GtoI;
       p_IinG = p_IinG + v_anc_val * dt_total_anc;
     }
   }
@@ -175,7 +175,7 @@ void UpdaterHelper::get_feature_jacobian_representation(std::shared_ptr<State> s
         dt_total_anc_fej += v_frac_anc * t_readout_anc_lin;
       }
       if (std::abs(dt_total_anc_fej) > 1e-10) {
-        R_GtoI = (Eigen::Matrix3d::Identity() - skew_x(omega_anc_lin) * dt_total_anc_fej) * R_GtoI;
+        R_GtoI = exp_so3(-omega_anc_lin * dt_total_anc_fej) * R_GtoI;
         p_IinG = p_IinG + v_anc_lin * dt_total_anc_fej;
       }
     }
@@ -454,13 +454,13 @@ void UpdaterHelper::get_feature_jacobian_full(std::shared_ptr<State> state, Upda
         const auto &anc_uvs = feature.uvs.at(feature.anchor_cam_id);
         double v_pixel_anc = (double)anc_uvs.at(anc_idx)(1);
         double inv_img_h_anc = 1.0 / (double)state->_cam_intrinsics_cameras.at(feature.anchor_cam_id)->h();
-        dt_total_anc += (v_pixel_anc * inv_img_h_anc) * t_readout_anc;
+        dt_total_anc += (v_pixel_anc * inv_img_h_anc - 0.5) * t_readout_anc;
       }
     }
     if (std::abs(dt_total_anc) > 1e-10) {
       auto kin_anc_it = state->_clones_kinematics.find(feature.anchor_clone_timestamp);
       if (kin_anc_it != state->_clones_kinematics.end()) {
-        R_GtoI = (Eigen::Matrix3d::Identity() - skew_x(kin_anc_it->second.omega) * dt_total_anc) * R_GtoI;
+        R_GtoI = exp_so3(-kin_anc_it->second.omega * dt_total_anc) * R_GtoI;
         p_IinG = p_IinG + kin_anc_it->second.vel * dt_total_anc;
       } else {
         state->_kin_miss_count++;
@@ -552,14 +552,15 @@ void UpdaterHelper::get_feature_jacobian_full(std::shared_ptr<State> state, Upda
       // Time correction of this observation's pose to its true sampling instant.
       // With a bridge (epoch-snapped frame): EXACT ACI2 composition over the KNOWN residual,
       // bias-corrected to first order via J_b (never re-integrated); only the small ESTIMATED
-      // parts (dt delta drift since build + RS row time) remain first-order, linearized at the
-      // bridge ENDPOINT kinematics. Without a bridge: the S4 first-order model over the whole
-      // dt_total. Tolerant kinematics lookup throughout (warm-restored clones may have none).
+      // parts (dt delta drift since build + RS row time) compose as exact SO(3) under constant
+      // bridge-ENDPOINT kinematics (Jacobian columns stay first-order). Without a bridge: the
+      // same constant-kinematics model over the whole dt_total. Tolerant kinematics lookup
+      // throughout (warm-restored clones may have none).
       const double clone_time = cam_timestamps.at(m);
       const double dt_epoch = state->epoch_residual(cam_id, clone_time);
       const PreintBridgeData *bridge = state->epoch_bridge(cam_id, clone_time);
       const bool need_obs_terms = need_rs_terms || std::abs(dt_epoch) > 1e-12;
-      // First-order part: with a bridge the KNOWN residual is integrated exactly, so it drops out
+      // Estimated shift: with a bridge the KNOWN residual is integrated exactly, so it drops out
       double dt_total = dt_camoff + ((bridge == nullptr) ? dt_epoch : 0.0);
       Eigen::Vector3d omega_clone_val = Eigen::Vector3d::Zero();
       Eigen::Vector3d v_clone_val = Eigen::Vector3d::Zero();
@@ -592,7 +593,7 @@ void UpdaterHelper::get_feature_jacobian_full(std::shared_ptr<State> state, Upda
           }
         }
         if (rs_on_value) {
-          dt_total += (v_pixel * inv_img_h) * t_readout;
+          dt_total += (v_pixel * inv_img_h - 0.5) * t_readout;
         }
         if (bridge != nullptr) {
           // EXACT composition of the clone pose over the known residual, with the first-order
@@ -611,13 +612,13 @@ void UpdaterHelper::get_feature_jacobian_full(std::shared_ptr<State> state, Upda
           omega_end_lin = bridge->w_end;
           v_end_lin = v_end_val;
           R_clone_lin = R_clone_val;
-          // Remaining ESTIMATED shift, first-order at the endpoint kinematics
+          // Remaining ESTIMATED shift, exact SO(3) under constant endpoint kinematics
           if (have_clone_kin && std::abs(dt_total) > 1e-10) {
-            R_GtoIi = (Eigen::Matrix3d::Identity() - skew_x(bridge->w_end) * dt_total) * R_GtoIi;
+            R_GtoIi = exp_so3(-bridge->w_end * dt_total) * R_GtoIi;
             p_IiinG = p_IiinG + v_end_val * dt_total;
           }
         } else if (have_clone_kin && std::abs(dt_total) > 1e-10) {
-          R_GtoIi = (Eigen::Matrix3d::Identity() - skew_x(omega_clone_val) * dt_total) * R_GtoIi;
+          R_GtoIi = exp_so3(-omega_clone_val * dt_total) * R_GtoIi;
           p_IiinG = p_IiinG + v_clone_val * dt_total;
         }
       }
@@ -648,12 +649,12 @@ void UpdaterHelper::get_feature_jacobian_full(std::shared_ptr<State> state, Upda
         p_IiinG = clone_Ii->pos_fej();
         // Apply async timeoffset and RS correction to FEJ values. With a bridge, the KNOWN
         // residual composes at the FIXED build-time linearization (b0), which is exactly what
-        // FEJ prescribes; the estimated remainder stays first-order at the endpoint kinematics.
+        // FEJ prescribes; the estimated remainder composes exactly on SO(3) at the endpoint kinematics.
         R_clone_lin = R_GtoIi;
         if (need_obs_terms) {
           double dt_total_fej = dt_camoff_lin + ((bridge == nullptr) ? dt_epoch : 0.0);
           if (rs_on_linearization) {
-            dt_total_fej += (v_pixel * inv_img_h) * t_readout_lin;
+            dt_total_fej += (v_pixel * inv_img_h - 0.5) * t_readout_lin;
           }
           if (bridge != nullptr) {
             const Eigen::Matrix3d R_clone_fej = R_GtoIi;
@@ -662,11 +663,11 @@ void UpdaterHelper::get_feature_jacobian_full(std::shared_ptr<State> state, Upda
             v_end_lin = v_clone_lin + bridge->v_grav + R_clone_fej.transpose() * bridge->beta;
             omega_end_lin = bridge->w_end;
             if (have_clone_kin && std::abs(dt_total_fej) > 1e-10) {
-              R_GtoIi = (Eigen::Matrix3d::Identity() - skew_x(omega_end_lin) * dt_total_fej) * R_GtoIi;
+              R_GtoIi = exp_so3(-omega_end_lin * dt_total_fej) * R_GtoIi;
               p_IiinG = p_IiinG + v_end_lin * dt_total_fej;
             }
           } else if (have_clone_kin && std::abs(dt_total_fej) > 1e-10) {
-            R_GtoIi = (Eigen::Matrix3d::Identity() - skew_x(omega_clone_lin) * dt_total_fej) * R_GtoIi;
+            R_GtoIi = exp_so3(-omega_clone_lin * dt_total_fej) * R_GtoIi;
             p_IiinG = p_IiinG + v_clone_lin * dt_total_fej;
           }
         }
@@ -741,7 +742,7 @@ void UpdaterHelper::get_feature_jacobian_full(std::shared_ptr<State> state, Upda
       // Derivative of measurement in respect to rolling shutter readout time
       // (column skipped when the window motion is degenerate or this clone has no kinematics)
       if (readout_hx_col >= 0 && dt_rs_cols_active && have_clone_kin) {
-        double v_frac = v_pixel * inv_img_h;
+        double v_frac = v_pixel * inv_img_h - 0.5;
         Eigen::Vector3d dpfI_dtrd = -(skew_x(w_col) * p_FinIi + R_GtoIi * v_col) * v_frac;
         H_x.block(2 * c, readout_hx_col, 2, 1).noalias() += dz_dpfc * R_ItoC * dpfI_dtrd;
       }

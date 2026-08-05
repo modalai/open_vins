@@ -207,12 +207,12 @@ struct JointConfig {
   /// 2e-4 step cap is half the part-class scale (first-order validity, mirrors dw's ratio); the
   /// 1e-3 prior admits any physical value at <1 sigma from a blind (zero) start.
   std::map<std::string, double> step_cap = {{"dw", 5e-3},     {"da", 5e-3},  {"q_AtoI", 5e-3}, {"q_ItoC", 0.01},
-                                            {"p_IinC", 0.01}, {"td", 1e-3},  {"tr", 5e-4},     {"cam", 1.0},
-                                            {"tg", 2e-4}};
+                                            {"p_IinC", 0.01}, {"td", 1e-3},  {"cam", 1.0},     {"tg", 2e-4}};
   /// Global seed priors (1-sigma), applied ONCE at fusion. Group name -> sigma.
-  std::map<std::string, double> prior_sigma = {{"dw", 0.02},    {"da", 0.02}, {"q_AtoI", 0.02}, {"q_ItoC", 0.05},
-                                               {"p_IinC", 0.05}, {"td", 0.005}, {"tr", 0.005},  {"cam", 2.0},
-                                               {"tg", 1e-3}};
+  /// (no "tr" entry on either map: the rolling-shutter readout is a fixed HAL3 hardware input,
+  /// never a free block, so it has no step to cap and no prior to weigh)
+  std::map<std::string, double> prior_sigma = {{"dw", 0.02},    {"da", 0.02},  {"q_AtoI", 0.02}, {"q_ItoC", 0.05},
+                                               {"p_IinC", 0.05}, {"td", 0.005}, {"cam", 2.0},    {"tg", 1e-3}};
   /// Per-dof camera prior override [fx fy cx cy k1 k2 k3 k4] (S5 staging: refine
   /// mode = tight priors; a ~1e-9 sigma is an information-level FREEZE, which is
   /// how the radial-coverage gate holds k3/k4 without a per-dof constancy API).

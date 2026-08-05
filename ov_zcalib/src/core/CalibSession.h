@@ -57,8 +57,6 @@ public:
       prompt = "slow tilt sweeps re-orienting gravity (" + weak + ")";
     else if (weak.rfind("td", 0) == 0)
       prompt = "increase angular rate (time offset weak)";
-    else if (weak.rfind("tr", 0) == 0)
-      prompt = "sweep the scene vertically for row coverage (readout weak)";
     else if (weak.rfind("p_IinC", 0) == 0)
       prompt = "sharp rotation bursts about two axes (lever arm weak)";
     else

@@ -15,9 +15,11 @@
  *   --selftest               seed-identity writeback smoke test
  *
  * Common: --out <yaml> --cam-mode {0 fixed | 1 refine (default) | 2 full}
- *         --tr (estimate RS readout)
- *         --tr-seed <s> (HAL3 readout seed) --max-sec <s>
- *         --cam-pipe <name> --quiet
+ *         --tr <s> (fixed HAL3 rolling-shutter readout; 0 = global shutter.
+ *                   NEVER estimated -- it anchors frame stamps at
+ *                   SOF + (readout + exposure)/2 and scales the centered
+ *                   per-row transport. Mandatory for rolling cams.)
+ *         --max-sec <s> --cam-pipe <name> --quiet
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -49,8 +51,8 @@ static void print_report(const SessionReport &rep) {
   std::printf("windows: harvested %d, retained %d (holdout %d), seed-rejected %d, invalidated %d, fused %d (min-eig %.2e)\n",
               rep.windows_harvested, rep.windows_retained, rep.windows_holdout, rep.windows_rejected_seed, rep.windows_invalidated,
               rep.windows_fused, rep.min_eig_whitened);
-  std::printf("verify: holdout cost %.4e -> %.4e (improve %.1f%%)%s\n", rep.holdout_cost_seed, rep.holdout_cost_committed,
-              100.0 * rep.verify_improve, rep.tr_hw_ok ? "" : "  [tr disagrees with the CONFIG readout seed -- seed suspect]");
+  std::printf("verify: holdout cost %.4e -> %.4e (improve %.1f%%)\n", rep.holdout_cost_seed, rep.holdout_cost_committed,
+              100.0 * rep.verify_improve);
   std::printf("blocks:");
   for (const auto &b : rep.blocks)
     std::printf("  %s=%s(%.2f)", b.label().c_str(), b.committed ? "COMMIT" : "seed", b.worst_ratio);
@@ -72,7 +74,7 @@ int main(int argc, char **argv) {
   std::string replay_path, voxl_dir, out_yaml = "ov_zcalib_result.yaml";
   std::string cam_pipe = "tracking_front";
   std::string profile_ovr; ///< --profile voxl|flight|library (v1 records / deliberate re-scoring)
-  bool selftest = false, quiet = false, free_tr = false, joint_verbose = false;
+  bool selftest = false, quiet = false, joint_verbose = false;
   bool flight = false, have_cam_mode = false;
   // experiment knobs (-1 = keep library/profile default)
   int outer_iters_ovr = -1, window_iters_ovr = -1, select_k_ovr = -1, cam_alt_ovr = -1;
@@ -83,7 +85,7 @@ int main(int argc, char **argv) {
   int stage_select_ovr = -1, k_a0_ovr = -1, k_a1_ovr = -1, k_b_ovr = -1;
   int eoa_ovr = -1; // --export-on-accept {0|1}: forensic within-binary A/B of the deferred-export mechanism
   int cam_mode = 1; // refine by default (plan decision); --cam-mode 0 pins the existing intrinsics
-  double tr_seed = 0.0, max_sec = 0.0, grav_mag = 9.80665;
+  double tr_hw = 0.0, max_sec = 0.0, grav_mag = 9.80665;
   // vcc mechanical seed for --voxl (RPY_parent_to_child intrinsic-XYZ [deg], T_child_wrt_parent [m])
   // Built-in LAST-RESORT reference (Stinger tracking_front nominals). The real
   // reference comes from the log's own etc/modalai/extrinsics.conf (the log is
@@ -172,8 +174,6 @@ int main(int argc, char **argv) {
       selftest = true;
     else if (arg("--quiet"))
       quiet = true;
-    else if (arg("--tr"))
-      free_tr = true;
     else if (arg("--out") && i + 1 < argc)
       out_yaml = argv[++i];
     else if (arg("--cam-mode") && i + 1 < argc) {
@@ -181,8 +181,8 @@ int main(int argc, char **argv) {
       have_cam_mode = true;
     } else if (arg("--flight"))
       flight = true;
-    else if (arg("--tr-seed") && i + 1 < argc)
-      tr_seed = std::atof(argv[++i]);
+    else if (arg("--tr") && i + 1 < argc)
+      tr_hw = std::atof(argv[++i]); // fixed HAL3 readout [s]; never estimated
     else if (arg("--max-sec") && i + 1 < argc)
       max_sec = std::atof(argv[++i]);
     else if (arg("--cam-pipe") && i + 1 < argc)
@@ -246,7 +246,6 @@ int main(int argc, char **argv) {
 
   SessionConfig cfg;
   cfg.cam_mode = cam_mode;
-  cfg.free_tr = free_tr;
   cfg.out_yaml = out_yaml;
   cfg.verbose = !quiet;
   cfg.joint.verbose = joint_verbose; // per-pass ACCEPT/damp lines + the per-stage timing split
@@ -440,8 +439,10 @@ int main(int argc, char **argv) {
       seed.calib.noise.sigma_ab = noise_ovr[3];
       std::printf("[voxl] IMU noise override: w=%.4e wb=%.4e a=%.4e ab=%.4e\n", noise_ovr[0], noise_ovr[1], noise_ovr[2], noise_ovr[3]);
     }
-    seed.tr_hw_seed.assign(1, tr_seed);
-    seed.calib.cams[0].rolling = (tr_seed > 0.0); // AR0144-class tracking cams are global shutter: 0
+    // Fixed HAL3 readout: declares the shutter AND anchors every frame stamp (the log feeder
+    // applies SOF + (readout + exposure)/2) AND scales the centered per-row transport.
+    seed.calib.cams[0].tr = tr_hw;
+    seed.calib.cams[0].rolling = (tr_hw > 0.0); // AR0144-class tracking cams are global shutter: 0
     if (no_imu_intrinsics) {
       // Attribution/ablation: freeze Dw/Da/R_AtoI at the seed (identity) so the
       // solve estimates ext/td/cam only. On weakly-excited data the IMU
@@ -500,8 +501,11 @@ int main(int argc, char **argv) {
     }
     // CONVENTION bridges for external (kalibr-style) comparison. Two silent
     // frame/clock disagreements measured to dominate naive scoring:
-    //  (1) td: we stamp clones at MID-exposure (the optical instant); chains
-    //      that keep start-of-exposure stamps leave exposure/2 inside td.
+    //  (1) td: every stamp in THIS system is center-row mid-exposure (producer
+    //      applies SOF + (readout + exposure)/2 at ingest), so our td needs no
+    //      conversion internally. A kalibr chain fitted against raw SOF stamps
+    //      absorbs (readout + exposure)/2 into its timeshift — the print below
+    //      re-expresses our td in that legacy convention for comparison only.
     //  (2) gauge: our IMU frame is GYRO-aligned (R_GtoI = I structural, Dw
     //      upper-tri closes the gauge); kalibr's body is ACCEL-aligned (M_a
     //      lower-tri, gyro carries M_w * C_gyro_i). The rotation between the
@@ -512,8 +516,8 @@ int main(int argc, char **argv) {
     //      estimated accel chain — when da/q_AtoI are gate-frozen, S = I and
     //      the gyro-gauge matrix IS the deliverable (VIO consumes Dw with it).
     {
-      std::printf("[voxl] td (kalibr start-of-exposure convention): %.6f s = committed %.6f + mean_exposure/2 %.6f\n",
-                  rep.committed.cams[0].td + 0.5 * mean_exp_s, rep.committed.cams[0].td, 0.5 * mean_exp_s);
+      std::printf("[voxl] td (kalibr raw-SOF convention, comparison only): %.6f s = committed %.6f + (readout + mean_exposure)/2 %.6f\n",
+                  rep.committed.cams[0].td + 0.5 * (tr_hw + mean_exp_s), rep.committed.cams[0].td, 0.5 * (tr_hw + mean_exp_s));
       const Eigen::Matrix3d Da_c = ImuIntrinsicModel::ut(rep.committed.imu.da);
       const Eigen::Matrix3d R_A = ov_core::quat_2_Rot(rep.committed.imu.q_AtoI);
       const Eigen::Matrix3d Fa = Da_c.inverse() * R_A.transpose();

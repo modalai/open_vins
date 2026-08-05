@@ -165,7 +165,6 @@ inline WindowData make_window(const Truth &tr, double t_start, double dur, doubl
 
   const double td_ref = (td_ref_override > -1e8) ? td_ref_override : tr.td;
   w.td_ref.assign(1, td_ref); // the synthetic world is a single-camera rig
-  w.tr_ref.assign(1, 0.0);
 
   for (double t = t_start - 0.06; t <= t_start + dur + 0.06 + std::abs(tr.td) + 0.01; t += 1.0 / imu_hz)
     w.imu.push_back(raw_imu_at(tr, tj, t, rng, 2e-4, 2e-3));
@@ -187,7 +186,7 @@ inline WindowData make_window(const Truth &tr, double t_start, double dur, doubl
       CloneObs o;
       o.feat_id = (size_t)id_map[f];
       o.uv = uv + pix_noise * Eigen::Vector2d(nrm(rng), nrm(rng));
-      o.u_frac = uv(1) / tr.img_h;
+      o.u_frac = uv(1) / tr.img_h - 0.5; // centered convention (sim world is global-shutter: tr=0)
       o.bearing = Eigen::Vector3d((o.uv(0) - tr.cam(2)) / tr.cam(0), (o.uv(1) - tr.cam(3)) / tr.cam(1), 1.0).normalized();
       w.obs.back().push_back(o);
     }
@@ -227,8 +226,11 @@ inline void make_streams(const Truth &tr, const Trajectory &tj, const StreamOpti
     if (dropped)
       continue;
     FrameObs fo;
-    // stamp = START of exposure; the trajectory is sampled at mid-exposure
-    fo.timestamp = tc - 0.5 * so.exposure_s;
+    // PRODUCER convention (same as the server ingest / log feeder): the stamp IS the frame's
+    // center-row mid-exposure instant. The sim world is global-shutter (tr = 0) and samples the
+    // trajectory at the optical instant tc, so the stamp is tc itself; exposure_s rides along as
+    // provenance only (the retired SOF back-shift existed for the harvester's +exp/2, now gone).
+    fo.timestamp = tc;
     fo.exposure_s = (float)so.exposure_s;
     fo.temp_c = (float)(so.temp_c0 + so.temp_slope * tc);
     fo.seq = seq;

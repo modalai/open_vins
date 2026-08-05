@@ -251,7 +251,6 @@ struct SessionConfig {
   /// windows until n_hold >= min(min_holdout, clamp(N_ret/4,1,3)) while
   /// keeping N_fused >= max(2, N_ret-3). 1 = legacy single retro-designation.
   int min_holdout = 1;
-  double tr_hw_tol = 0.15;           ///< |tr - tr_hw_seed| / tr_hw_seed gate (when both exist)
   double commit_sigma_factor = 3.0;  ///< block commits only if 3*sigma_post < sigma_prior for all dofs
   /// A block must be DISTINGUISHABLE from the value it would otherwise ship (the
   /// revert point: its seed) before it may claim a calibration. The 3-sigma rule
@@ -285,14 +284,10 @@ struct SessionConfig {
   /// Leave-one-block-out holdout deltas for committed blocks (accuracy-side
   /// falsifier; costs a few extra held-out window solves).
   bool commit_attribution = true;
-  bool free_tr = false;              ///< estimate rolling-shutter readout
-  /// C3 tr gates (rolling cams). Row-coverage floor: std of observed u_frac over the fused set
-  /// must clear this before tr stays free (uniform rows = 0.289; below it, tr aliases td and the
-  /// session would earn a junk readout while biasing td -- the D10 mechanism, refused up front).
-  double tr_row_cov_floor = 0.20;
-  /// td-aliasing ceiling at commit: |rho(td,tr)| from the joint posterior above this refuses the
-  /// tr commit (the pair is one dof wearing two names; ship the seed, keep td honest).
-  double tr_td_corr_ceiling = 0.95;
+  // NOTE: there is deliberately no free_tr and no tr gate machinery here. The rolling-shutter
+  // readout is HAL3 hardware truth (camN_readout_time_s -> seed CamCalib::tr), a fixed transport
+  // constant of every reprojection — estimating it re-opens the td-aliasing class (D10/C3) this
+  // pipeline used to need gates for.
   /// Estimate Tg (gyro g-sensitivity, 9 dof). EARNED, never trusted from a chain: the rig's own
   /// kalibr sessions scatter beyond the value's magnitude (measured 2026-07-13, |Tg(D1)-Tg(F3)|
   /// at the size of Tg itself), so a seed is an init and the session must certify its own
@@ -409,12 +404,11 @@ struct SessionReport {
   double mixture_improve = 0.0;
   int verify_windows_used = 0;    ///< holdout windows where EVERY candidate solved
   int verify_windows_dropped = 0; ///< holdout windows dropped symmetrically (any candidate failed)
-  bool tr_hw_ok = true;
-  /// Session-mean camera exposure [s], PER CAMERA. The committed td is in the MID-EXPOSURE
-  /// convention (clones stamped at the optical instant); consumers that stamp frames at
-  /// start-of-exposure (the raw MPA/kalibr convention) must use td + mean_exposure_s/2. Written to
-  /// the YAML as an explicit field pair. Per camera because both terms are: cameras run their own
-  /// auto-exposure and have their own td.
+  /// Session-mean camera exposure [s], PER CAMERA — DIAGNOSTIC ONLY. Frame timestamps arrive
+  /// already anchored at center-row mid-exposure (the producer applies SOF + (readout+exposure)/2
+  /// at ingest), so the committed td needs NO exposure conversion for any consumer: every stamp in
+  /// the system is in the same convention. Kept in the report/YAML because the session's exposure
+  /// range is real evidence about the record (AE behavior, lighting).
   std::vector<double> mean_exposure_s;
   // timings (wall clock)
   double t_solve_s = 0.0, t_verify_s = 0.0, t_total_s = 0.0;

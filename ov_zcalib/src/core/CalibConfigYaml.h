@@ -65,7 +65,8 @@ struct SeedPolicy {
   bool extrinsic_rotation = false; ///< no-op in practice: the hand-eye bootstrap re-solves it
   bool extrinsic_position = false; ///< HARMFUL: the chain's lever arm is a mechanical nominal
   bool time_offset = false;        ///< HARMFUL: the shipped td is not a per-unit value
-  bool readout_time = true;        ///< tr: hardware fact (HAL3 sensor mode), not a guess
+  // NOTE: no readout knob. tr is a hardware fact (HAL3 sensor mode) that ALWAYS seeds from the
+  // estimator config's camN_readout_time_s and is never estimated -- there is no policy to set.
   /// Tg (g-sensitivity) chain seed -- its OWN axis, deliberately decoupled from imu_intrinsics
   /// (the SeedOverride doctrine): "earn the dw/da/qA chain blind" must not silently zero the
   /// g-sensitivity the chain measured; with the seed discarded, |Tg|*g rides as a real gyro
@@ -79,7 +80,6 @@ struct SeedPolicy {
 struct EstimatePolicy {
   bool imu_intrinsics = true; ///< false => seed AND FREEZE: skips A1a/A1b entirely (~30% faster solve)
   int cam_intrinsics = 0;     ///< 0 fixed | 1 refine (tight priors) | 2 full (weak priors, gated)
-  bool readout_time = false;  ///< estimate rolling-shutter tr (needs row coverage; hires only)
   /// Estimate Tg (gyro g-sensitivity). EARNED per unit: the rig's own kalibr sessions scatter
   /// beyond |Tg| between runs (measured 2026-07-13), so no chain value deserves seed authority.
   /// Unlocks only through the A1b excitation gate + split-half/Wald falsifier; requires an
@@ -148,16 +148,14 @@ inline bool load_calib_profile(const std::string &path, CalibProfile &out) {
   parser->parse_config("seed_extrinsic_rotation", out.seed.extrinsic_rotation, false);
   parser->parse_config("seed_extrinsic_position", out.seed.extrinsic_position, false);
   parser->parse_config("seed_time_offset", out.seed.time_offset, false);
-  parser->parse_config("seed_readout_time", out.seed.readout_time, false);
   parser->parse_config("seed_tg", out.seed.tg, false);
 
   // ---- estimation policy: what it may EARN and COMMIT ----
+  // (no readout key on either axis: tr is the fixed HAL3 hardware value, never estimated)
   parser->parse_config("estimate_imu_intrinsics", out.estimate.imu_intrinsics, false);
   parser->parse_config("estimate_cam_intrinsics", out.estimate.cam_intrinsics, false);
-  parser->parse_config("estimate_readout_time", out.estimate.readout_time, false);
   parser->parse_config("estimate_tg", out.estimate.tg, false);
   out.session.cam_mode = out.estimate.cam_intrinsics;
-  out.session.free_tr = out.estimate.readout_time;
   out.session.free_tg = out.estimate.tg;
 
   // ---- ingest ----
@@ -185,12 +183,11 @@ inline bool load_calib_profile(const std::string &path, CalibProfile &out) {
   parser->parse_config("verify_min_improve", out.session.verify_min_improve, false);
 
   PRINT_INFO("[ov_zcalib] profile '%s' from %s\n", out.base.c_str(), path.c_str());
-  PRINT_INFO("[ov_zcalib]   SEED   cam_intr=%d imu_intr=%d ext_R=%d ext_p=%d td=%d tr=%d\n", (int)out.seed.cam_intrinsics,
-             (int)out.seed.imu_intrinsics, (int)out.seed.extrinsic_rotation, (int)out.seed.extrinsic_position,
-             (int)out.seed.time_offset, (int)out.seed.readout_time);
-  PRINT_INFO("[ov_zcalib]   EARN   imu_intr=%d cam_mode=%d tr=%d tg=%d   (everything not seeded is blind)\n",
-             (int)out.estimate.imu_intrinsics, out.estimate.cam_intrinsics, (int)out.estimate.readout_time,
-             (int)out.estimate.tg);
+  PRINT_INFO("[ov_zcalib]   SEED   cam_intr=%d imu_intr=%d ext_R=%d ext_p=%d td=%d (tr: HAL3 hardware, always)\n",
+             (int)out.seed.cam_intrinsics, (int)out.seed.imu_intrinsics, (int)out.seed.extrinsic_rotation,
+             (int)out.seed.extrinsic_position, (int)out.seed.time_offset);
+  PRINT_INFO("[ov_zcalib]   EARN   imu_intr=%d cam_mode=%d tg=%d   (everything not seeded is blind; tr never earned)\n",
+             (int)out.estimate.imu_intrinsics, out.estimate.cam_intrinsics, (int)out.estimate.tg);
   PRINT_INFO("[ov_zcalib]   WEIGHT gyro %.4e/%.4e  accel %.4e/%.4e  (nd/rw -- calibration weighting, NOT the filter's)\n",
              out.noise.sigma_w, out.noise.sigma_wb, out.noise.sigma_a, out.noise.sigma_ab);
   return true;

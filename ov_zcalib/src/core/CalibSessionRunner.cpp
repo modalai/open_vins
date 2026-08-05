@@ -32,10 +32,9 @@ CalibSessionRunner::CalibSessionRunner(const SessionConfig &cfg, const SessionSe
   calib_ = seed.calib;
   for (CamCalib &k : calib_.cams) {
     k.cam_mode = 0; // camera intrinsics enter only in the staged phase B
-    // A global-shutter camera has NO readout time, so tr is not a free parameter for it no matter
-    // what the profile asks for -- an unobservable dof does not stay put, it absorbs whatever the
-    // residual has lying around, and tr aliases straight into td.
-    k.free_tr = cfg_.free_tr && k.rolling;
+    // tr is NEVER estimated: it is the HAL3 hardware readout carried in the seed, a fixed
+    // transport constant of every reprojection. A global-shutter camera has NO readout time,
+    // so its tr is forced to zero no matter what the seed claims.
     if (!k.rolling)
       k.tr = 0.0;
   }
@@ -1480,9 +1479,9 @@ void CalibSessionRunner::solve_verify_commit_() {
     {
       int off = 0;
       for (auto &b : calib_.free_blocks()) {
-        const bool sA0 = (b.name == "q_ItoC" || b.name == "p_IinC" || b.name == "td" || b.name == "tr");
+        const bool sA0 = (b.name == "q_ItoC" || b.name == "p_IinC" || b.name == "td");
         const bool sA1 = (b.name == "dw" || b.name == "da" || b.name == "q_AtoI" || b.name == "tg");
-        const bool sB = (b.name == "cam" || b.name == "tr");
+        const bool sB = (b.name == "cam");
         for (int k = 0; k < b.lsize; ++k) {
           if (sA0) idx_a0.push_back(off + k);
           if (sA1) idx_a1.push_back(off + k);
@@ -1492,9 +1491,6 @@ void CalibSessionRunner::solve_verify_commit_() {
       }
     }
     const int N = (int)Lw.size();
-    int n_tr = 0;
-    for (const CamCalib &kc : calib_.cams)
-      n_tr += kc.free_tr ? 1 : 0;
     // gravity-direction convention: SET-level rule mirroring the accel gate
     // (seeded and mean directions have opposite sign conventions; never mix)
     int n_gseed = 0;
@@ -1510,7 +1506,7 @@ void CalibSessionRunner::solve_verify_commit_() {
       const WindowData &w = slots_[cand_slot[i]];
       const Eigen::Matrix<double, 12, 1> nfp =
           scorer_->meta(cand_slot[i]).fingerprint.cwiseQuotient(cfg_.scorer.fp_scale);
-      Eigen::VectorXd g0 = Eigen::VectorXd::Zero(4 + 2 * n_tr);
+      Eigen::VectorXd g0 = Eigen::VectorXd::Zero(4);
       g0.head<4>() << nfp(0), nfp(1), nfp(2), nfp(6);
       // A1: specific-force direction x magnitude (gate formulas, :1539-1564)
       Eigen::Vector3d m3 = Eigen::Vector3d::Zero();
@@ -1540,14 +1536,13 @@ void CalibSessionRunner::solve_verify_commit_() {
       Eigen::VectorXd g1(4);
       g1 << ghat, dyn / std::max(cfg_.a_full_dyn_gate, 1e-6);
       // B: per-camera radial/quadrant fractions about the CURRENT center
-      // (identical geometry to the phase-B gate loop) + per-rolling-cam rows
-      Eigen::VectorXd gb = Eigen::VectorXd::Zero(5 * n_cams_ + 2 * n_tr);
-      int tri = 0;
+      // (identical geometry to the phase-B gate loop)
+      Eigen::VectorXd gb = Eigen::VectorXd::Zero(5 * n_cams_);
       for (int c = 0; c < n_cams_; ++c) {
         const CamCalib &kc = calib_.cams[(size_t)c];
         const double cx = kc.cam(2), cy = kc.cam(3);
         const double r_max = std::hypot(std::max(cx, kc.img_w - cx), std::max(cy, kc.img_h - cy));
-        double n_all = 0, n_far = 0, nq[4] = {0, 0, 0, 0}, rs1 = 0, rs2 = 0;
+        double n_all = 0, n_far = 0, nq[4] = {0, 0, 0, 0};
         for (const auto &cl : w.obs)
           for (const CloneObs &o : cl) {
             if (o.cam != c)
@@ -1556,20 +1551,11 @@ void CalibSessionRunner::solve_verify_commit_() {
             if (std::hypot(o.uv(0) - cx, o.uv(1) - cy) > 0.7 * r_max)
               n_far += 1.0;
             nq[(o.uv(0) >= cx ? 1 : 0) + (o.uv(1) >= cy ? 2 : 0)] += 1.0;
-            rs1 += o.u_frac;
-            rs2 += o.u_frac * o.u_frac;
           }
         if (n_all > 0) {
           gb(5 * c + 0) = (n_far / n_all) / cfg_.k34_radial_gate;
           for (int q = 0; q < 4; ++q)
             gb(5 * c + 1 + q) = (nq[q] / n_all) / (4.0 * cfg_.cam_center_quadrant_gate);
-        }
-        if (kc.free_tr) {
-          const double rm = (n_all > 0) ? rs1 / n_all : 0.5;
-          const double rv = (n_all > 1) ? std::max(0.0, rs2 / n_all - rm * rm) : 0.0;
-          g0(4 + 2 * tri) = gb(5 * n_cams_ + 2 * tri) = (rm - 0.5) / 0.25;
-          g0(4 + 2 * tri + 1) = gb(5 * n_cams_ + 2 * tri + 1) = std::sqrt(rv) / 0.25;
-          ++tri;
         }
       }
       fA0[i] = g0;
@@ -1604,33 +1590,6 @@ void CalibSessionRunner::solve_verify_commit_() {
     rep_.windows_a0 = (int)w_a0->size();
     rep_.windows_a1 = (int)w_a1->size();
     rep_.windows_b = (int)w_b->size();
-  }
-
-  // ---- C3 (tr row-coverage gate) -- BEFORE A0, because free_tr is live from A0 on.
-  // With t(row) = t_stamp + td + tr*u, weak row spread gives corr(td,tr) ~ -0.9: the
-  // session cannot separate readout from time offset, would EARN a junk tr and lend
-  // its error to td (the D10 silent-bias mechanism, now refused up front). Demand
-  // real observed-row spread (uniform rows = std 0.289) or freeze tr at its seed.
-  for (size_t c = 0; c < calib_.cams.size(); ++c) {
-    CamCalib &kc = calib_.cams[c];
-    if (!kc.free_tr)
-      continue;
-    double s0 = 0, s1 = 0, s2 = 0;
-    for (const WindowData &w : *w_a0)
-      for (const auto &cl : w.obs)
-        for (const CloneObs &o : cl)
-          if (o.cam == (int)c) {
-            s0 += 1;
-            s1 += o.u_frac;
-            s2 += o.u_frac * o.u_frac;
-          }
-    const double ustd = s0 > 1 ? std::sqrt(std::max(0.0, s2 / s0 - (s1 / s0) * (s1 / s0))) : 0.0;
-    if (ustd < cfg_.tr_row_cov_floor) {
-      kc.free_tr = false;
-      std::printf("[session] cam %zu: tr FROZEN at seed -- fused row-coverage std %.3f < %.3f "
-                  "(uniform = 0.289; without row spread tr aliases td)\n",
-                  c, ustd, cfg_.tr_row_cov_floor);
-    }
   }
 
   // ---- phase A0: extrinsics + td only (IMU intrinsics frozen) ----
@@ -2268,15 +2227,14 @@ void CalibSessionRunner::solve_verify_commit_() {
     // block-coordinate descent inside the camera block (operator directive).
     {
       const bool f_dw = calib_.imu.calib_dw, f_da = calib_.imu.calib_da, f_qa = calib_.imu.calib_RAtoI;
-      std::vector<char> f_ext, f_td, f_tr;
+      std::vector<char> f_ext, f_td;
       for (const CamCalib &kc : calib_.cams) {
         f_ext.push_back(kc.free_ext ? 1 : 0);
         f_td.push_back(kc.free_td ? 1 : 0);
-        f_tr.push_back(kc.free_tr ? 1 : 0);
       }
       calib_.imu.calib_dw = calib_.imu.calib_da = calib_.imu.calib_RAtoI = false;
       for (CamCalib &kc : calib_.cams)
-        kc.free_ext = kc.free_td = kc.free_tr = false;
+        kc.free_ext = kc.free_td = false;
       if (cfg_.cam_alt_rounds > 0) {
         for (int round = 0; round < cfg_.cam_alt_rounds; ++round) {
           JointConfig ja = jc; // (a) pinhole + k1/k2; k3/k4 frozen this half-step
@@ -2325,7 +2283,6 @@ void CalibSessionRunner::solve_verify_commit_() {
       for (int c = 0; c < n_cams_; ++c) {
         calib_.cams[(size_t)c].free_ext = (f_ext[(size_t)c] != 0);
         calib_.cams[(size_t)c].free_td = (f_td[(size_t)c] != 0);
-        calib_.cams[(size_t)c].free_tr = (f_tr[(size_t)c] != 0);
       }
     }
     // B-2: joint polish with the camera block open
@@ -2355,31 +2312,6 @@ void CalibSessionRunner::solve_verify_commit_() {
   rep_.solved = calib_;
   rep_.t_solve_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_solve0).count();
 
-  // ---- t_r seed cross-check: ADVISORY provenance, never a veto (2026-07-13 operator directive).
-  // The "hardware" seed is whatever the estimator config declared (camN_readout_time_s, or the
-  // chain's t_readout) — an operator-editable guess that has shipped as a placeholder (D0014:
-  // a round 1.000 ms on a 720p60 rolling sensor) — and kalibr-parity demands tr be EARNABLE
-  // BLIND. A wrong seed must be RECOVERABLE, so agreement with it cannot outrank the data: the
-  // commit machinery (precision ratio + absolute ceiling + moved-sigma + holdout VERIFY)
-  // adjudicates tr like every other block. What DOES veto, at commit below, is physics: a
-  // readout outside (0, frame_period] is not a calibration, it is a divergence. ----
-  if (cfg_.free_tr) {
-    for (int c = 0; c < n_cams_ && (size_t)c < seed0_.tr_hw_seed.size(); ++c) {
-      const double hw = seed0_.tr_hw_seed[(size_t)c];
-      if (hw <= 1e-6)
-        continue; // no seed to compare against (global shutter, or tr earned blind)
-      const double tr = calib_.cams[(size_t)c].tr;
-      if (std::abs(tr - hw) > cfg_.tr_hw_tol * hw) {
-        rep_.tr_hw_ok = false; // provenance only: the CONFIG's readout disagrees with the data
-        if (cfg_.verbose)
-          std::printf("[session] NOTE: cam %d earned t_r %.4f ms vs the CONFIG seed %.4f ms (outside %.0f%%) — the seed is "
-                      "the suspect here (a config value, not a hardware readback); tr commits on its own evidence and the "
-                      "disagreement is recorded\n",
-                      c, 1e3 * tr, 1e3 * hw, 100.0 * cfg_.tr_hw_tol);
-      }
-    }
-  }
-
   // ---- COMMIT decisions (precision ratio + absolute ceiling, frozen dofs
   // excluded), THEN the solved point, the resulting mixture, and the
   // leave-one-out variants all face the SAME held-out windows below ----
@@ -2401,7 +2333,6 @@ void CalibSessionRunner::solve_verify_commit_() {
   for (int c = 0; c < n_cams_; ++c) {
     ref.cams[(size_t)c].free_ext = out.cams[(size_t)c].free_ext;
     ref.cams[(size_t)c].free_td = out.cams[(size_t)c].free_td;
-    ref.cams[(size_t)c].free_tr = out.cams[(size_t)c].free_tr;
     ref.cams[(size_t)c].cam_mode = out.cams[(size_t)c].cam_mode;
   }
   const double frozen_eps = 1e-8; // prior sigma at/below this = information-frozen dof
@@ -2451,49 +2382,6 @@ void CalibSessionRunner::solve_verify_commit_() {
       // real value with it). Refuse, loudly.
       bc.not_estimated = (bc.moved_sigma < cfg_.commit_min_move_sigma);
       bc.committed = (bc.worst_ratio < 1.0) && bc.ceiling_ok && !bc.not_estimated;
-      if (b.name == "tr" && bc.committed) {
-        // Physics gate (replaces the seed-agreement veto): a rolling sensor's readout lies in
-        // (0, frame_period]. A wrong CONFIG seed must be recoverable — kalibr earns line delay
-        // blind — so seed disagreement is provenance (tr_hw_ok), never authority. The fps here
-        // is the DECLARED ingest rate (<= sensor rate), so the band can only be LOOSER than the
-        // physical one: it still refuses sign flips and runaway values, and the precision
-        // ceilings above carry the rest.
-        const CamCalib &kc = calib_.cams[(size_t)b.cam];
-        const double frame_dt = (kc.fps > 0.0) ? 1.0 / kc.fps : 0.0;
-        if (!(kc.tr > 0.0) || (frame_dt > 0.0 && kc.tr > frame_dt + 1e-9)) {
-          bc.committed = false;
-          if (cfg_.verbose)
-            std::printf("[session] cam %d tr REFUSED on physics: %.4f ms outside (0, %.2f ms]\n", b.cam, 1e3 * kc.tr,
-                        1e3 * frame_dt);
-        }
-        // C3b (td-aliasing guard): even past the row-coverage gate the joint solve can
-        // park in a td/tr trade. rho from the joint posterior over THIS camera's (td, tr):
-        // |rho| at ~1 means the data never separated readout from time offset -- the pair
-        // is one degree of freedom wearing two names. Ship the seed, keep td honest.
-        if (bc.committed && rep_.joint.Lambda.size() > 0) {
-          int off_td = -1, off_tr = -1, o2 = 0;
-          for (auto &fb : calib_.free_blocks()) {
-            if (fb.cam == b.cam && fb.name == "td")
-              off_td = o2;
-            if (fb.cam == b.cam && fb.name == "tr")
-              off_tr = o2;
-            o2 += fb.lsize;
-          }
-          if (off_td >= 0 && off_tr >= 0 && o2 == rep_.joint.Lambda.rows()) {
-            const Eigen::MatrixXd Cov =
-                rep_.joint.Lambda.ldlt().solve(Eigen::MatrixXd::Identity(rep_.joint.Lambda.rows(), rep_.joint.Lambda.cols()));
-            const double rho =
-                Cov(off_td, off_tr) / std::sqrt(std::max(1e-30, Cov(off_td, off_td) * Cov(off_tr, off_tr)));
-            if (std::abs(rho) > cfg_.tr_td_corr_ceiling) {
-              bc.committed = false;
-              if (cfg_.verbose)
-                std::printf("[session] cam %d tr REFUSED on td-aliasing: |rho(td,tr)| %.3f > %.2f "
-                            "(row coverage did not separate them)\n",
-                            b.cam, std::abs(rho), cfg_.tr_td_corr_ceiling);
-            }
-          }
-        }
-      }
       rep_.blocks.push_back(bc);
       off += b.lsize;
     }
@@ -2556,8 +2444,6 @@ void CalibSessionRunner::solve_verify_commit_() {
       dst.cams[(size_t)cam].p_IinC = src.cams[(size_t)cam].p_IinC;
     else if (name == "td")
       dst.cams[(size_t)cam].td = src.cams[(size_t)cam].td;
-    else if (name == "tr")
-      dst.cams[(size_t)cam].tr = src.cams[(size_t)cam].tr;
     else if (name == "cam")
       dst.cams[(size_t)cam].cam = src.cams[(size_t)cam].cam;
   };
@@ -2728,7 +2614,8 @@ void CalibSessionRunner::solve_verify_commit_() {
     // Blocks with no free parameters at all (frozen IMU chain, cam_mode 0) never appear in the
     // layout — they are seed passengers too, and a writeback must know that. The IMU chain is
     // asked once; the camera blocks are asked once PER CAMERA, because a block can be free on one
-    // camera and absent on another (a global-shutter camera has no tr to estimate at all).
+    // camera and absent on another. tr is ALWAYS in this list: the readout is HAL3 hardware
+    // truth, never estimated, so camN_t_readout ships as a passenger for every camera.
     for (const char *nm : {"dw", "da", "q_AtoI", "tg"}) {
       bool present = false;
       for (const auto &bc : rep_.blocks)
