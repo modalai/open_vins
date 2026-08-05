@@ -690,7 +690,16 @@ void UpdaterHelper::get_feature_jacobian_full(std::shared_ptr<State> state, Upda
       // Derivative of p_FinCi in respect to p_FinIi
       Eigen::MatrixXd dpfc_dpfg = R_ItoC * R_GtoIi;
 
-      // Derivative of p_FinCi in respect to camera clone state
+      // Derivative of p_FinCi in respect to camera clone state.
+      // NOTE (2026-07-28, MEASURED): differentiating at the SAMPLED pose while assigning to the
+      // CLONE block strictly wants the warp transport dtheta_sample = (R_sample R_clone^T) *
+      // dtheta_clone (+ the bridged R_clone^T*(alpha+beta*dt) lever arm). Applying that transport
+      // to THIS block alone was built and A/B-measured: synced sim NEES 32.0 -> 45.1 and ori RMSE
+      // 0.397 -> 0.510 deg -- the classic FEJ observability-violation signature. The legacy
+      // CONSISTENTLY-first-order Jacobian set preserves the nullspace cancellations that a
+      // piecemeal-exact block breaks; a warp-coherent linearization would have to move every
+      // coupled block (feature, calib, temporal columns) together. Until that program exists,
+      // this block stays at the t8-era first-order pairing on purpose.
       Eigen::MatrixXd dpfc_dclone = Eigen::MatrixXd::Zero(3, 6);
       dpfc_dclone.block(0, 0, 3, 3).noalias() = R_ItoC * skew_x(p_FinIi);
       dpfc_dclone.block(0, 3, 3, 3) = -dpfc_dpfg;
