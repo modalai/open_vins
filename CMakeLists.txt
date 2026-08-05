@@ -13,3 +13,10 @@ if (BUILD_OV_EVAL)
 	add_subdirectory(ov_eval)
 endif()
 
+# Optionally build the targetless calibrator (an on-demand tool, never part of
+# the filter build). The server's --calibrate mode links ov_zcalib_lib.
+option(OV_BUILD_CALIB "Enable or disable building of ov_zcalib" OFF)
+if (OV_BUILD_CALIB)
+	add_subdirectory(ov_zcalib)
+endif()
+
