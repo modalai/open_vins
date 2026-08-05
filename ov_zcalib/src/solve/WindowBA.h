@@ -48,7 +48,12 @@ struct CamCalib {
   Eigen::Matrix<double, 8, 1> cam = (Eigen::Matrix<double, 8, 1>() << 450, 450, 640, 400, 0, 0, 0, 0).finished();
   bool fisheye = false;
   double td = 0.0; ///< camera-IMU time offset (this camera's own; they are NOT equal across cams)
-  double tr = 0.0; ///< rolling-shutter readout (0 on a global-shutter camera)
+  /// Rolling-shutter readout time [s], full frame top to bottom (0 on a global-shutter camera).
+  /// A HARDWARE fact (HAL3 ANDROID_SENSOR_ROLLING_SHUTTER_SKEW), sourced from the estimator
+  /// config's camN_readout_time_s — NEVER estimated. The reprojection transport consumes it as a
+  /// fixed constant: each observation's centered row time (v/h - 0.5)*tr folds into the factor's
+  /// dt_ref at construction (see WindowBA.cpp).
+  double tr = 0.0;
   int img_w = 640, img_h = 480;
   /// Declared frame rate [Hz], 0 = unknown. NOT an estimated quantity -- a hardware fact, sourced
   /// from the estimator chain's cam_N_fps (there is exactly one place a rig declares its cadence,
@@ -56,14 +61,13 @@ struct CamCalib {
   /// this so the first window's drop accounting is right instead of learned.
   double fps = 0.0;
   /// Declared shutter, from the chain's cam_N_shutter. A GLOBAL-shutter camera exposes every row at
-  /// the same instant: it has no readout time, so tr is not a quantity that exists to be estimated.
-  /// Freeing it anyway would hand the solver a parameter with no signal, which it would happily
-  /// fill with noise -- and tr aliases into td, so that noise would land in the time offset. free_tr
-  /// is forced off for any camera that is not rolling.
+  /// the same instant: it has no readout time, so tr is forced to 0 for any camera that is not
+  /// rolling. There is deliberately no free-flag for tr: the readout is hardware truth, and a
+  /// "calibrated" readout aliases into td (D10 class) while calibrating away a number the sensor
+  /// already told us.
   bool rolling = false;
   bool free_ext = true; ///< extrinsics q_ItoC, p_IinC
   bool free_td = true;  ///< camera-IMU time offset
-  bool free_tr = false; ///< rolling-shutter readout
   int cam_mode = 0;     ///< 0 fixed | 1 refine (priors) | 2 full (weak priors)
 };
 
@@ -134,8 +138,6 @@ struct SharedCalib {
       }
       if (k.free_td)
         v.push_back({&k.td, 1, 1, false, "td", c});
-      if (k.free_tr)
-        v.push_back({&k.tr, 1, 1, false, "tr", c});
       if (k.cam_mode > 0)
         v.push_back({k.cam.data(), 8, 8, false, "cam", c});
     }
@@ -153,7 +155,10 @@ struct SharedCalib {
 struct CloneObs {
   size_t feat_id = 0;
   Eigen::Vector2d uv = Eigen::Vector2d::Zero();
-  double u_frac = 0.5; ///< row fraction (rolling shutter)
+  /// CENTERED row fraction (v/h - 0.5) in [-0.5, 0.5]: 0 = image center, the row the frame stamp
+  /// anchors (producers stamp HAL3 SOF + (readout + exposure)/2). Rolling-shutter row time is
+  /// u_frac * tr — matching the filter's centered convention (UpdaterHelper v/h - 0.5).
+  double u_frac = 0.0;
   /// Which camera saw it -- i.e. which CamCalib block this residual reprojects through. A track
   /// never crosses cameras (ov_core hands out feature ids from one atomic counter, and the rigs
   /// here have no shared field of view), so this is constant along a track.
@@ -183,21 +188,20 @@ struct WindowData {
   std::uint32_t uid = 0;
   /// Temporal reference at which clone_times were laid down (harvest time), PER CAMERA — each
   /// camera has its own time offset, so each has its own linearization point. The reprojection
-  /// transport applies Delta = dt_ref + (td[c] - td_ref[c]) + (tr[c] - tr_ref[c])*u — the TOTAL
-  /// shift since harvest, NOT the shift since the last outer relinearization (using the current td
-  /// as the reference zeroes the value transport forever: the false-stationary-point bug).
+  /// transport applies Delta = dt_ref + (td[c] - td_ref[c]) — the TOTAL shift since harvest, NOT
+  /// the shift since the last outer relinearization (using the current td as the reference zeroes
+  /// the value transport forever: the false-stationary-point bug).
   ///
-  /// td and tr are NOT symmetric here, and the asymmetry is physical. A clone is stamped at a
-  /// per-FRAME instant (t_sof + exposure/2 + td_seed) which already CONTAINS td_seed, so td must be
-  /// transported as a DEVIATION from it. That stamp contains no per-ROW term, so the readout must be
-  /// transported ABSOLUTELY: tr_ref is structurally ZERO (see WindowHarvester), and Delta carries the
-  /// full u*tr. Seeding tr_ref instead made the transport vanish whenever tr was pinned at its seed,
-  /// which left the rolling shutter unmodelled and pushed ~tr/2 into td (D10).
+  /// A clone is stamped at a per-FRAME instant (the producer's center-row mid-exposure stamp
+  /// + td_seed) which already CONTAINS td_seed, so td is transported as a DEVIATION from it. The
+  /// stamp contains no per-ROW term: each observation's centered row time u_frac * tr is a KNOWN
+  /// constant (tr is the fixed HAL3 readout, never estimated) and folds into the factor's dt_ref
+  /// at construction — the historical tr_ref machinery (D10) is gone with the tr parameter.
   ///
   /// Defaults to ONE camera at a zero reference, so a hand-built single-camera window (the sim
   /// harness, the unit tests) is valid on construction. Indexed by CloneObs::cam, which defaults to
   /// 0 to match — an empty vector here would be an out-of-bounds read on the first residual.
-  std::vector<double> td_ref{0.0}, tr_ref{0.0};
+  std::vector<double> td_ref{0.0};
   /// Optional nuisance seeds (window frame), provided by the harvester/bootstrap
   /// (in production the Dong-Si linear initializer fills these; the sim harness
   /// fills them from perturbed truth so the gates isolate CALIBRATION recovery).

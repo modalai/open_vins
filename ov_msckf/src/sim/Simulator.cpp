@@ -522,7 +522,8 @@ std::vector<std::pair<size_t, Eigen::VectorXf>> Simulator::project_pointcloud_rs
   // Loop through our map
   for (const auto &feat : feats) {
 
-    // Row v is sampled at time_event + (v/h)*readout: fixed point on the row, re-sampling the pose
+    // Row v is sampled at time_event + (v/h - 0.5)*readout (stamp = mid-frame, matching the
+    // estimator's centered RS model): fixed point on the row, re-sampling the pose
     double time_sample = time_event;
     Eigen::Vector2f uv_dist;
     bool in_view = false;
@@ -555,7 +556,7 @@ std::vector<std::pair<size_t, Eigen::VectorXf>> Simulator::project_pointcloud_rs
       in_view = true;
 
       // Row determines the next sample time; stop when converged
-      double time_next = time_event + ((double)uv_dist(1) / height) * readout;
+      double time_next = time_event + ((double)uv_dist(1) / height - 0.5) * readout;
       if (std::abs(time_next - time_sample) < 1e-6)
         break;
       time_sample = time_next;

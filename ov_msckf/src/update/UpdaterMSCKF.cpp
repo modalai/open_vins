@@ -107,7 +107,7 @@ void UpdaterMSCKF::update(std::shared_ptr<State> state, std::vector<std::shared_
 
       // Get current IMU pose corrected to this camera's sampling instant: EXACT bridge
       // composition when the frame was epoch-snapped (bias correction unnecessary at
-      // triangulation accuracy), else the first-order model over the full correction
+      // triangulation accuracy), else the constant-kinematics exact-SO(3) model over the full correction
       Eigen::Matrix<double, 3, 3> R_GtoIi = clone_imu.second->Rot();
       Eigen::Matrix<double, 3, 1> p_IiinG = clone_imu.second->pos();
       const PreintBridgeData *br = state->epoch_bridge(clone_calib.first, clone_imu.first);
@@ -120,12 +120,12 @@ void UpdaterMSCKF::update(std::shared_ptr<State> state, std::vector<std::shared_
         p_IiinG = p_IiinG + kin_it->second.vel * br->dt + br->p_grav + R_clone.transpose() * br->alpha;
         if (std::abs(dt_extra) > 1e-10) {
           const Eigen::Vector3d v_end = kin_it->second.vel + br->v_grav + R_clone.transpose() * br->beta;
-          R_GtoIi = (Eigen::Matrix3d::Identity() - skew_x(br->w_end) * dt_extra) * R_GtoIi;
+          R_GtoIi = exp_so3(-br->w_end * dt_extra) * R_GtoIi;
           p_IiinG = p_IiinG + v_end * dt_extra;
         }
       } else if (std::abs(dt_extra) > 1e-10) {
         if (have_kin) {
-          R_GtoIi = (Eigen::Matrix3d::Identity() - skew_x(kin_it->second.omega) * dt_extra) * R_GtoIi;
+          R_GtoIi = exp_so3(-kin_it->second.omega * dt_extra) * R_GtoIi;
           p_IiinG = p_IiinG + kin_it->second.vel * dt_extra;
         } else {
           state->_kin_miss_count++;
@@ -177,7 +177,7 @@ void UpdaterMSCKF::update(std::shared_ptr<State> state, std::vector<std::shared_
           if (clones_cam_rs.at(cam_id).find(clone_time) == clones_cam_rs.at(cam_id).end()) continue;
           if (state->_clones_kinematics.find(clone_time) == state->_clones_kinematics.end()) continue;
           double v_pixel = (double)(*it1)->uvs.at(cam_id).at(m)(1);
-          double dt_rs = (v_pixel * inv_img_h) * t_readout;
+          double dt_rs = (v_pixel * inv_img_h - 0.5) * t_readout;
           if (std::abs(dt_rs) < 1e-10) continue;
           // Recover IMU pose from camera pose (undo camera transform)
           Eigen::Matrix3d R_GtoCi = clones_cam_rs.at(cam_id).at(clone_time).Rot();
@@ -186,7 +186,7 @@ void UpdaterMSCKF::update(std::shared_ptr<State> state, std::vector<std::shared_
           Eigen::Vector3d p_IiinG = p_CiinG + R_GtoCi.transpose() * p_IinC;
           // Apply RS correction in IMU frame
           const State::CloneKinematics &kin = state->_clones_kinematics.at(clone_time);
-          R_GtoIi = (Eigen::Matrix3d::Identity() - skew_x(kin.omega) * dt_rs) * R_GtoIi;
+          R_GtoIi = exp_so3(-kin.omega * dt_rs) * R_GtoIi;
           p_IiinG = p_IiinG + kin.vel * dt_rs;
           // Recompute camera pose
           R_GtoCi = R_ItoC * R_GtoIi;

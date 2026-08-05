@@ -173,6 +173,11 @@ bool VoxlLogFeeder::convert(const std::string &log_dir, const std::string &cam_p
   int written = 0;
   double exp_sum = 0.0;
   char png[64];
+  // PRODUCER-SIDE stamp convention (identical to the server's camera ingest): the logged MPA
+  // stamp is HAL3 start-of-exposure of the FIRST row; the system convention anchors every frame
+  // at its center-row mid-exposure instant, t = SOF + (readout + exposure)/2. readout is the
+  // fixed HAL3 value carried in the seed (--tr on the CLI; 0 = global shutter).
+  const double tr_hw = seed.calib.cams[0].tr;
   for (const auto &cf : cams) {
     if (cf.t > t_end)
       break;
@@ -189,14 +194,15 @@ bool VoxlLogFeeder::convert(const std::string &log_dir, const std::string &cam_p
     cv::Mat img = cv::imread(log_dir + "/run/mpa/" + cam_pipe + png, cv::IMREAD_GRAYSCALE);
     if (img.empty())
       continue;
+    const double t_center = cf.t - t0 + 0.5 * (tr_hw + cf.exposure_s);
     ov_core::CameraData cd;
-    cd.timestamp = cf.t - t0;
+    cd.timestamp = t_center;
     cd.sensor_ids.push_back(0);
     cd.images.push_back(img);
     cd.masks.push_back(cv::Mat::zeros(img.rows, img.cols, CV_8UC1));
     klt.feed_new_camera(cd);
     FrameObs fo;
-    fo.timestamp = cf.t - t0;
+    fo.timestamp = t_center;
     fo.exposure_s = (float)cf.exposure_s;
     fo.temp_c = 0.f;
     fo.seq = seq++;

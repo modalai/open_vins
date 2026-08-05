@@ -5,14 +5,21 @@
  * Copyright (C) 2018-2023 Guoquan Huang
  * Copyright (C) 2018-2023 OpenVINS Contributors
  *
- * ov_zcalib: reprojection factor with time-offset / rolling-shutter-readout blocks.
+ * ov_zcalib: reprojection factor with a time-offset block.
  * Wraps the proven Factor_ImageReprojCalib: the value transport applies the
- * first-order kinematic shift Delta = (td - td_lin) + (tr - tr_lin)*u to the
- * observing pose BEFORE delegating (R' = (I - skew(w*Delta)) R, p' = p + v*Delta,
- * the standard Li-Mourikis model with the window-solve clone kinematics), and the
- * td/tr columns are the exact chain J_td = J_theta*w + J_p*v (row-scaled by u for
- * tr). The pose-block Jacobians are reused from the inner factor (the O(|w|Delta)
- * transport of those columns only affects convergence rate, never the optimum).
+ * exact-SO(3) kinematic shift Delta = dt_ref + (td - td_lin) to the observing
+ * pose BEFORE delegating (R' = exp_so3(-w*Delta) R, p' = p + v*Delta, constant
+ * clone kinematics from the window solve), and the td column is the exact
+ * chain J_td = J_theta*w + J_p*v. The pose-block Jacobians are reused from the
+ * inner factor (the O(|w|Delta) transport of those columns only affects
+ * convergence rate, never the optimum).
+ *
+ * Rolling shutter enters through dt_ref, not through a parameter: the readout
+ * time is a HARDWARE fact (HAL3 sensor mode), never estimated, so each
+ * observation's row time (v/h - 0.5)*tr is a KNOWN constant folded into dt_ref
+ * at factor construction (WindowBA). Frame timestamps anchor mid-frame: the
+ * producer stamps HAL3 SOF + (readout + exposure)/2, and rows deviate by the
+ * CENTERED fraction around that instant.
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -35,40 +42,36 @@ namespace ov_zcalib {
  *
  * Parameter blocks (2 residuals):
  *  [0] q_GtoIi (4) [1] p_IiinG (3) [2] p_FinG (3) [3] q_ItoC (4) [4] p_IinC (3)
- *  [5] cam intrinsics (8) [6] td (1) [7] tr (1)
+ *  [5] cam intrinsics (8) [6] td (1)
  */
 class Factor_ReprojTd : public ov_init::zbft_sfm::CostFunction {
 public:
   ov_init::zbft_sfm::Factor_ImageReprojCalib inner;
   Eigen::Vector3d w_clone, v_clone; ///< clone kinematics (window frame; w in IMU frame)
-  double u_frac = 0.5;              ///< row fraction m/M of this observation
-  double td_lin = 0.0, tr_lin = 0.0;
-  /// Constant offset [s] from this observation's own seed-mapped instant to its clone's stamp
-  /// (CloneObs::dt_ref). Zero whenever the clone IS this observation's frame, which is the normal
-  /// case; nonzero only for a frame merged onto a neighbouring camera's clone. It shifts the
+  double td_lin = 0.0;
+  /// Constant offset [s] from this observation's own sampling instant to its clone's stamp:
+  /// the centered rolling-shutter row time (v/h - 0.5)*tr_hw plus, for a frame merged onto a
+  /// neighbouring camera's clone, the frame-merge offset (CloneObs::dt_ref). It shifts the
   /// transport but not its derivative, so no Jacobian below changes.
   double dt_ref = 0.0;
 
   Factor_ReprojTd(const Eigen::Vector2d &uv, double pix_sigma, bool is_fisheye, const Eigen::Vector3d &w_at_clone,
-                  const Eigen::Vector3d &v_at_clone, double u_row_frac, double td_lin_, double tr_lin_, double dt_ref_ = 0.0)
-      : inner(uv, pix_sigma, is_fisheye), w_clone(w_at_clone), v_clone(v_at_clone), u_frac(u_row_frac), td_lin(td_lin_),
-        tr_lin(tr_lin_), dt_ref(dt_ref_) {
+                  const Eigen::Vector3d &v_at_clone, double td_lin_, double dt_ref_ = 0.0)
+      : inner(uv, pix_sigma, is_fisheye), w_clone(w_at_clone), v_clone(v_at_clone), td_lin(td_lin_), dt_ref(dt_ref_) {
     set_num_residuals(2);
-    for (int s : {4, 3, 3, 4, 3, 8, 1, 1})
+    for (int s : {4, 3, 3, 4, 3, 8, 1})
       mutable_parameter_block_sizes()->push_back(s);
   }
 
   bool Evaluate(double const *const *parameters, double *residuals, double **jacobians) const override {
-    const double td = parameters[6][0], tr = parameters[7][0];
-    const double Delta = dt_ref + (td - td_lin) + (tr - tr_lin) * u_frac;
+    const double td = parameters[6][0];
+    const double Delta = dt_ref + (td - td_lin);
 
-    // Transported observing pose (value-exact first-order kinematic shift)
+    // Transported observing pose: exact SO(3) composition under constant clone kinematics
+    // (JPL: R(dq) = exp_so3(-w*Delta), the same map the filter's updaters apply)
     Eigen::Map<const Eigen::Vector4d> q(parameters[0]);
     Eigen::Map<const Eigen::Vector3d> p(parameters[1]);
-    Eigen::Vector4d dq;
-    dq.head<3>() = 0.5 * w_clone * Delta;
-    dq(3) = 1.0;
-    dq /= dq.norm();
+    const Eigen::Vector4d dq = ov_core::rot_2_quat(ov_core::exp_so3(-w_clone * Delta));
     Eigen::Vector4d q_t = ov_core::quat_multiply(dq, q);
     Eigen::Vector3d p_t = p + v_clone * Delta;
 
@@ -96,15 +99,11 @@ public:
       Eigen::Map<Eigen::Matrix<double, 2, 3, Eigen::RowMajor>> J(jacobians[1]);
       J = Jp;
     }
-    // Temporal columns: dr/dDelta = J_theta * w + J_p * v  (theta-left convention)
-    const Eigen::Vector2d dr_dDelta = Jq.leftCols<3>() * w_clone + Jp * v_clone;
+    // Temporal column: dr/dDelta = J_theta * w + J_p * v  (theta-left convention)
     if (jacobians[6]) {
+      const Eigen::Vector2d dr_dDelta = Jq.leftCols<3>() * w_clone + Jp * v_clone;
       jacobians[6][0] = dr_dDelta(0);
       jacobians[6][1] = dr_dDelta(1);
-    }
-    if (jacobians[7]) {
-      jacobians[7][0] = dr_dDelta(0) * u_frac;
-      jacobians[7][1] = dr_dDelta(1) * u_frac;
     }
     return true;
   }

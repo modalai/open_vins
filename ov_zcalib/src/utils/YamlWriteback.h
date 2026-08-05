@@ -24,8 +24,9 @@ namespace ov_zcalib {
 
 /**
  * @param mean_exposure_s session-mean camera exposure [s], PER CAMERA (negative/absent = unknown).
- *        timeshift_cam_imu is MID-EXPOSURE by definition here; the _sof field (start-of-exposure
- *        consumers: raw MPA stamps, kalibr chains) is only written when the exposure is known.
+ *        DIAGNOSTIC only: every stamp in the system is center-row mid-exposure (producers apply
+ *        SOF + (readout + exposure)/2 at ingest), so timeshift_cam_imu is directly consumable by
+ *        VIO with no exposure arithmetic anywhere downstream.
  *
  * Layout: the IMU chain is written once (there is one IMU), then each camera's own block under a
  * camN_ prefix. Flat keys, because that is what an OpenCV FileStorage consumer can actually read.
@@ -49,8 +50,10 @@ inline bool write_calib_yaml(const std::string &path, SharedCalib &c, const std:
                   "# closes the rotational gauge). Kalibr-style chains are ACCEL-aligned (M_a\n"
                   "# lower-tri): their R_ItoC differs by the physical gyro-vs-accel misalignment\n"
                   "# (~0.8 deg on ICM-class dies). Consume R_ItoC together with Dw/Da/R_ACCtoIMU.\n"
-                  "# TD: clone stamps are MID-exposure; start-of-exposure chains (kalibr) carry\n"
-                  "# exposure/2 inside timeshift_cam_imu.\n"
+                  "# TD: frame stamps system-wide are CENTER-ROW MID-EXPOSURE (producers stamp\n"
+                  "# HAL3 SOF + (readout + exposure)/2 at ingest), so timeshift_cam_imu here is\n"
+                  "# directly what VIO consumes. Legacy raw-SOF chains (kalibr) differ by\n"
+                  "# (readout + exposure)/2. t_readout is the HAL3 hardware value, never estimated.\n"
                   "# The IMU chain below is SHARED by every camera; each camera then has its own\n"
                   "# extrinsic, time offset, readout and intrinsics under its camN_ prefix.\n");
   mat("Dw", Dw);
@@ -60,7 +63,7 @@ inline bool write_calib_yaml(const std::string &path, SharedCalib &c, const std:
   // for human eyes regardless of internal storage. Ships its seed unless the tg block committed.
   mat("Tg", c.imu.Tg);
   std::fprintf(f, "num_cameras: %d\n", c.n_cams());
-  std::fprintf(f, "td_convention: mid_exposure\n");
+  std::fprintf(f, "td_convention: center_row_mid_exposure\n");
   for (int n = 0; n < c.n_cams(); ++n) {
     const CamCalib &k = c.cams[(size_t)n];
     const std::string pre = "cam" + std::to_string(n) + "_";
@@ -68,14 +71,9 @@ inline bool write_calib_yaml(const std::string &path, SharedCalib &c, const std:
     std::fprintf(f, "%sp_IinC: [%.9f, %.9f, %.9f]\n", pre.c_str(), k.p_IinC(0), k.p_IinC(1), k.p_IinC(2));
     std::fprintf(f, "%stimeshift_cam_imu: %.9f\n", pre.c_str(), k.td);
     const double expo = ((size_t)n < mean_exposure_s.size()) ? mean_exposure_s[(size_t)n] : -1.0;
-    if (expo >= 0.0) {
-      // start-of-exposure compatibility value (t_imu = t_frame_sof + td_sof). The session-mean
-      // exposure is baked in: ONLY valid for consumers that do not mid-exposure-correct their
-      // stamps, and it degrades under autoexposure.
-      std::fprintf(f, "%stimeshift_cam_imu_sof: %.9f\n", pre.c_str(), k.td + 0.5 * expo);
-      std::fprintf(f, "%smean_exposure_s: %.9f\n", pre.c_str(), expo);
-    }
-    std::fprintf(f, "%st_readout: %.9f\n", pre.c_str(), k.tr);
+    if (expo >= 0.0)
+      std::fprintf(f, "%smean_exposure_s: %.9f\n", pre.c_str(), expo); // diagnostic (AE evidence)
+    std::fprintf(f, "%st_readout: %.9f\n", pre.c_str(), k.tr); // HAL3 hardware value, pass-through
     std::fprintf(f, "%scam_k: [%.6f, %.6f, %.6f, %.6f]\n%scam_d: [%.9f, %.9f, %.9f, %.9f]\n", pre.c_str(), k.cam(0), k.cam(1),
                  k.cam(2), k.cam(3), pre.c_str(), k.cam(4), k.cam(5), k.cam(6), k.cam(7));
   }

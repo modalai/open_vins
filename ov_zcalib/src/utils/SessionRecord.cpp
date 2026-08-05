@@ -29,7 +29,8 @@ constexpr uint32_t kMagic = 0x5343564Fu; // "OVCS"
 /// added afterwards (each one grows another `if (version >= N)` that must be reasoned about forever).
 /// Bump this whenever the layout below changes; old records then fail cleanly instead of silently
 /// decoding as garbage.
-constexpr uint32_t kFormat = 4; // 4: +imu.Tg (9, storage order) in the shared chain block
+constexpr uint32_t kFormat = 5; // 5: tr_hw_seed dropped (tr IS the hardware value now) + frame
+                                // stamps are center-row mid-exposure (producer-anchored). 4: +imu.Tg
 constexpr uint8_t kRecImu = 0;
 constexpr uint8_t kRecFrame = 1;
 
@@ -70,8 +71,6 @@ bool write_seed(FILE *f, const SessionSeed &s) {
     ok = ok && wr(f, k.fps);
     const uint8_t roll = k.rolling ? 1 : 0;
     ok = ok && wr(f, roll);
-    const double trhw = (n < s.tr_hw_seed.size()) ? s.tr_hw_seed[n] : 0.0;
-    ok = ok && wr(f, trhw);
   }
   const uint8_t prof = (uint8_t)s.profile;
   const int32_t cm = (int32_t)s.cam_mode;
@@ -91,7 +90,6 @@ bool read_seed(FILE *f, SessionSeed &s) {
     return false;
   SharedCalib &c = s.calib;
   c.cams.assign(n_cams, CamCalib());
-  s.tr_hw_seed.assign(n_cams, 0.0);
   bool ok = true;
   for (int i = 0; i < 6; ++i)
     ok = ok && rd(f, c.imu.dw(i));
@@ -123,7 +121,6 @@ bool read_seed(FILE *f, SessionSeed &s) {
     uint8_t roll = 0;
     ok = ok && rd(f, roll);
     k.rolling = (roll != 0);
-    ok = ok && rd(f, s.tr_hw_seed[n]);
   }
   uint8_t prof = 0;
   int32_t cm = -1;

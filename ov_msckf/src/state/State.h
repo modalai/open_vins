@@ -275,7 +275,9 @@ public:
   /// Per-camera time offset base IMU to camera (t_imu = t_cam_i + t_off_i)
   std::unordered_map<size_t, std::shared_ptr<ov_type::Vec>> _calib_dt_CAMtoIMU_map;
 
-  /// Rolling shutter readout time per camera (seconds; 0 = global shutter)
+  /// Rolling shutter readout time per camera (seconds, full frame top to bottom; 0 = global
+  /// shutter). CENTERED convention: row v samples at stamp + (v/h - 0.5)*readout, so image
+  /// timestamps MUST anchor mid-frame (producers stamp HAL3 SOF + (readout + exposure)/2)
   std::unordered_map<size_t, std::shared_ptr<ov_type::Vec>> _calib_camera_readout;
 
   /// Kinematic metadata at each clone time (metadata, not in state/covariance)

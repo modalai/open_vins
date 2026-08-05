@@ -308,7 +308,6 @@ bool WindowBA::solve_and_export(const WindowData &win, SharedCalib &calib, bool 
       problem.AddParameterBlock(kc.p_IinC.data(), 3);
       problem.AddParameterBlock(kc.cam.data(), 8);
       problem.AddParameterBlock(&kc.td, 1);
-      problem.AddParameterBlock(&kc.tr, 1);
     }
     for (size_t f = 0; f < feats.size(); ++f) {
       problem.AddParameterBlock(feats[f].data(), 3);
@@ -321,7 +320,7 @@ bool WindowBA::solve_and_export(const WindowData &win, SharedCalib &calib, bool 
   if (G.calib.tg_enabled)
     problem.SetParameterBlockConstant(G.calib.imu.Tg.data());
   for (CamCalib &kc : G.calib.cams) {
-    for (double *ptr : {kc.q_ItoC.data(), kc.p_IinC.data(), kc.cam.data(), &kc.td, &kc.tr})
+    for (double *ptr : {kc.q_ItoC.data(), kc.p_IinC.data(), kc.cam.data(), &kc.td})
       problem.SetParameterBlockConstant(ptr);
   }
 
@@ -408,14 +407,17 @@ bool WindowBA::solve_and_export(const WindowData &win, SharedCalib &calib, bool 
         // landmarks, the gravity and the IMU chain are shared, and the cameras meet nowhere else.
         const size_t c = (size_t)o.cam;
         CamCalib &kc = G.calib.cams[c];
-        auto *f = new Factor_ReprojTd(o.uv, win.pix_sigma, calib.cams[c].fisheye, w_k, v[k], o.u_frac, win.td_ref[c],
-                                      win.tr_ref[c], o.dt_ref);
+        // Rolling shutter enters HERE and only here: the centered row time u_frac * tr (tr = fixed
+        // HAL3 readout, never a parameter) is a known constant of this observation, folded into the
+        // factor's dt_ref beside the frame-merge offset.
+        auto *f = new Factor_ReprojTd(o.uv, win.pix_sigma, calib.cams[c].fisheye, w_k, v[k], win.td_ref[c],
+                                      o.dt_ref + o.u_frac * kc.tr);
         G.owned.push_back(f);
         G.rp_f.push_back(f);
         G.rp_clone.push_back(k);
         problem.AddResidualBlock(f, &G.cauchy,
                                  {q[k].data(), p[k].data(), feats[o.feat_id].data(), kc.q_ItoC.data(), kc.p_IinC.data(),
-                                  kc.cam.data(), &kc.td, &kc.tr});
+                                  kc.cam.data(), &kc.td});
       }
     }
   } else {

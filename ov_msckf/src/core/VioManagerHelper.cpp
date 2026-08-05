@@ -259,7 +259,7 @@ void VioManager::retriangulate_active_tracks(const ov_core::CameraData &message)
     const double dt_cam_delta = state->cam_imu_dt_delta(cam_id) + state->epoch_residual(cam_id, active_tracks_time);
     if (std::abs(dt_cam_delta) > 1e-10 && state->_clones_kinematics.find(active_tracks_time) != state->_clones_kinematics.end()) {
       const State::CloneKinematics &kin = state->_clones_kinematics.at(active_tracks_time);
-      R_GtoI = (Eigen::Matrix3d::Identity() - skew_x(kin.omega) * dt_cam_delta) * R_GtoI;
+      R_GtoI = exp_so3(-kin.omega * dt_cam_delta) * R_GtoI;
       p_IinG = p_IinG + kin.vel * dt_cam_delta;
     }
 
