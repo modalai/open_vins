@@ -165,10 +165,12 @@ public:
 
   // --- Frontend state snapshot/restore (replay harness rewind/branch) --------------------------
   // Captures the CPU-side last-frame tracking state so a restored State can continue tracking.
-  // Polymorphic: a GPU tracker (TrackOCL) extends FrontendState with its extra CPU state and
-  // overrides capture/restore. The GPU-resident previous-frame pyramid is NOT captured here (it
-  // is not host-visible); the harness rebuilds it by re-feeding the snapshot frame's image
-  // through feed_new_camera() before restoring this CPU state on top.
+  // The struct is polymorphic so a tracker COULD extend it with extra CPU state; today no
+  // tracker does -- TrackOCL's only extra CPU-side member (stereo_confidence_) has no consumers
+  // yet and is left un-captured; add the override when that wiring lands. The GPU-resident
+  // previous-frame pyramid is NOT captured here (it is not host-visible); the harness rebuilds
+  // it by re-feeding the snapshot frame's image through feed_new_camera() before restoring this
+  // CPU state on top.
 
   /// Base CPU frontend state common to all trackers. Derive to add tracker-specific fields.
   struct FrontendState {

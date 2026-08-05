@@ -172,7 +172,21 @@ public:
     double last_ref_frame_time = -1;
     double ref_period_ema = -1;
     bool epoch_marg_pending = false;
-    std::map<double, std::vector<std::shared_ptr<ov_core::Feature>>> used_features_map;
+    // ZUPT gating flags travel with the state: has_moved_since_zupt permanently disables ZUPT
+    // under zupt_only_at_beginning (restoring a pre-motion snapshot must re-arm it), and
+    // did_zupt_update is the carried same-timestamp decision an epoch-snapped companion frame
+    // re-reads right after a restore.
+    bool did_zupt_update = false;
+    bool has_moved_since_zupt = false;
+    std::map<double, std::vector<std::shared_ptr<ov_core::Feature>>> used_features_map; // deep copies
+    // NOT captured, by policy (restore() resets them instead): the async-init machinery
+    // (thread flags + queued init timestamps), the ZUPT updater's own IMU window and hold
+    // counters (it re-accumulates after a rewind), the initializer's IMU buffer (recreated on
+    // pre-init restores), the active-track retriangulation accumulators and viz outputs
+    // (self-heal on the next base-cam frame), and telemetry counters (epoch_snapped etc. keep
+    // counting across the rewind). trackARUCO state is neither captured nor reset -- snapshot()
+    // warns when an aruco tracker is active, since its database would replay duplicated
+    // observations on a branch.
   };
 
   /// Capture the full mutable filter state (deep copies; the returned snapshot is independent of
