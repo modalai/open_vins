@@ -2,7 +2,7 @@
  * OpenVINS: An Open Platform for Visual-Inertial Research
  * Copyright (C) 2025-2026 Joao Leonardo Silva Cotta
  *
- * ov_zcalib: per-window preintegration value cache (P3).
+ * ov_zcalib: per-window preintegration value cache.
  *
  * DEPENDENCE THEOREM (the reuse license). With Tg == 0 and bg_lin = ba_lin = 0
  * (structural in WindowBA), every AciPreintResult field is a function of
@@ -12,7 +12,7 @@
  * (the factor's first-order CPI correction absorbs bias motion). A window's
  * preintegration therefore deduplicates across the warm/cold two-path at the
  * same p, across passes in frozen-pi stages, and across STAGES whose entry pi
- * bytes match — keyed by VALUE, never by pass index or stage name.
+ * bytes match -- keyed by VALUE, never by pass index or stage name.
  *
  * KEY DISCIPLINE: bitwise equality (memcmp) on the exact 32-double value key
  * (live pi + noise-linearization pi), never an epsilon tolerance (hits would
@@ -30,10 +30,10 @@
  * under the fixed-range partition, and the pool join is the happens-before
  * edge. Lock-free by construction, serial == parallel bit-identical.
  *
- * A-CHAIN LEGACY INVARIANT COMPATIBILITY: this cache is pure memoization — a
- * hit returns the exact bytes recomputation would produce (replay-proven), so
- * it changes NO numbers and is legal in A0/A1a/A1b/split-halves, unlike the
- * P1 cert/carry/early-stop mechanisms, which change ARBITRATION.
+ * STAGE COMPATIBILITY: this cache is pure memoization -- a hit returns the
+ * exact bytes recomputation would produce (replay-proven), so it changes NO
+ * numbers and is legal in A0/A1a/A1b/split-halves, unlike cert/carry/early-stop
+ * shortcuts, which change ARBITRATION.
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -56,16 +56,16 @@ namespace ov_zcalib {
 /**
  * @brief Bitwise value key for one window's preintegration.
  *
- * v[0..15]  = live pi (dw6 | da6 | q_AtoI4) — the mean/column linearization.
+ * v[0..15]  = live pi (dw6 | da6 | q_AtoI4) -- the mean/column linearization.
  * v[16..31] = noise-linearization pi (mirrors live pi when noise is unfrozen).
- * v[32..35] = ImuNoise sigmas (w, wb, a, ab) — they feed P15/the whitener;
+ * v[32..35] = ImuNoise sigmas (w, wb, a, ab) -- they feed P15/the whitener;
  *             session-constant today, keyed so a future per-stage weighting
  *             change can never silently reuse a stale whitener.
  * v[36..54] = Tg extension, written ONLY when the session estimates Tg
  *             (SharedCalib::tg_enabled): live Tg (9) + noise-lin Tg (9) + a
  *             1.0 marker slot, so a 15-column entry can never serve a
  *             24-column request. Stays zero (the initializer) when tg is off
- *             — legacy keys keep their exact bytes.
+ *             -- legacy keys keep their exact bytes.
  * The remaining fields are the window-content checksum (fixed-stream guard).
  */
 struct PreintKey {
@@ -99,7 +99,7 @@ inline bool preint_bitwise_equal(const AciPreintResult &a, const AciPreintResult
 
 /**
  * @brief One window's cached preintegration + whitener (single-entry: the last
- *        key wins — frozen-pi stages hit every pass, moving-pi stages dedup the
+ *        key wins -- frozen-pi stages hit every pass, moving-pi stages dedup the
  *        two-path within a pass).
  */
 struct WindowPreint {
@@ -110,7 +110,7 @@ struct WindowPreint {
   std::vector<Eigen::Matrix<double, 15, 3>> Wfold;    ///< gravity-fold columns per interval
   /// Persistent per-window problem graph (WindowBA-internal WindowGraph,
   /// type-erased; deleter bound at creation). Built once per window: the
-  /// factor set and parameter registry are window-structure-fixed — per eval
+  /// factor set and parameter registry are window-structure-fixed -- per eval
   /// only VALUES and linearization members are rewritten (IMU factors on
   /// preint-key change, reproj clone kinematics always, prior anchors
   /// always). Same single-writer-per-uid discipline as the preint fields.

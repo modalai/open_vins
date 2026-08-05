@@ -6,7 +6,7 @@
  * observations only (raw DISTORTED pixels, stable ids), so ANY ov_core
  * TrackBase front-end plugs in here: TrackKLT on the host (log conversion,
  * tests), TrackOCL inside voxl-open-vins-server on the device (the only
- * tracker that exists on target — DISABLE_TRACK_KLT strips KLT there).
+ * tracker that exists on target -- DISABLE_TRACK_KLT strips KLT there).
  * Tracker choice therefore never touches solver parity: device sessions
  * record TrackOCL observations, host replays them tracker-free.
  *

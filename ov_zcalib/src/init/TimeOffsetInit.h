@@ -14,23 +14,21 @@
  * compares the camera rate at t with the IMU rate at t + tau, and the argmax
  * IS the td seed directly.
  *
- * WHAT THE PEAK VALUE MAY AND MAY NOT VETO. The downstream contract of this
- * module is small: the td seed must land inside the hand-eye fine sweep
- * (+/- td_fine_range), which re-solves td by re-preintegration anyway. The
- * peak-corr floor exists to reject a FLAT ridge (near-constant |w|), where the
- * argmax is noise and the seed is a lottery ticket. But a LOW peak with a
- * REPRODUCIBLE interior argmax is not that failure: broadband pair noise
- * (blur-slipped KLT tracks, rolling-shutter shear at rate reversals) depresses
- * rho without moving the peak. Measured on D0014 (2026-07-13, hires 60 fps
- * rolling): peak pinned at 0.51-0.57 for minutes with a stable argmax and
- * sharpness ~1.5e2 -- a td the gate kept rejecting that the fine sweep would
- * have eaten alive. So besides the raw peak, solve() now reports:
+ * WHAT THE PEAK VALUE MAY AND MAY NOT VETO. The downstream contract is small:
+ * the td seed must land inside the hand-eye fine sweep (+/- td_fine_range),
+ * which re-solves td by re-preintegration anyway. The peak-corr floor exists
+ * to reject a FLAT ridge (near-constant |w|), where the argmax is noise. A
+ * LOW peak with a REPRODUCIBLE interior argmax is not that failure: broadband
+ * pair noise (blur-slipped tracks, rolling-shutter shear at rate reversals)
+ * depresses rho without moving the peak -- measured on a 60 fps rolling-shutter
+ * unit: peak pinned at 0.51-0.57 with a stable argmax and sharpness ~1.5e2, a
+ * perfectly usable td the raw floor alone rejects. So besides the raw peak,
+ * solve() reports certificate evidence:
  *   - a quality-WEIGHTED correlation (the same per-pair trust the hand-eye
- *     already uses; an unweighted xcorr gives a blur-slipped pair the same
- *     vote as a crisp one),
- *   - one Hampel trim-and-rescan at the found lag (fat-tail pairs removed;
- *     retention and argmax-consistency reported, so a peak cannot be BOUGHT
- *     by discarding the data),
+ *     uses; unweighted xcorr gives a blur-slipped pair a crisp pair's vote),
+ *   - one Hampel trim-and-rescan at the found lag (retention and
+ *     argmax-consistency reported, so a peak cannot be BOUGHT by discarding
+ *     the data),
  *   - a split-half check (even/odd samples, so both halves span the whole
  *     session): two independent halves reproducing the same lag is a direct
  *     identifiability certificate, immune to the rho depression above.
@@ -42,19 +40,19 @@
  * bit-exact with the legacy gate: every log that passes the raw floor produces
  * the identical td seed it always did, so the validated replay corpus cannot
  * churn. Weights act ONLY inside the certificate evidence (trim + split-half),
- * i.e. only on sessions the legacy gate would have rejected anyway. Measured
- * reason (position_push flight leg, 2026-07-13): weighting the primary shifted
- * the td seed by 139 us, a knife-edge probation window flipped at post-A0, and
- * the starved log walked from COMMIT to ABORT -- a seed-vintage churn the
- * recovery path must never impose on healthy sessions.
+ * i.e. only on sessions the legacy gate would have rejected anyway. Measured:
+ * weighting the primary shifted a flight log's td seed by 139 us, a knife-edge
+ * probation window flipped at post-A0, and the session walked from COMMIT to
+ * ABORT -- seed-vintage churn the recovery path must never impose on healthy
+ * sessions.
  *
  * The primary below is the VERBATIM legacy loop, not a w=1 call into the
  * subset scanner. Under -ffast-math "multiply by 1.0" is only value-exact per
  * operation -- a different CODE SHAPE reassociates/vectorizes differently, and
  * the low-bit td drift that costs is invisible at print precision yet measured
- * on the starved flight leg as an A1a pass-count change (12 -> 17) and
- * 4th-decimal calibration churn. Bit-exactness across binaries is a property
- * of the EMITTED LOOP here, so the emitted loop is kept literally identical.
+ * as an A1a pass-count change (12 -> 17) with 4th-decimal calibration churn.
+ * Bit-exactness across binaries is a property of the EMITTED LOOP here, so the
+ * emitted loop is kept literally identical.
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -99,7 +97,7 @@ public:
   /**
    * @brief Weighted normalized xcorr over a lag grid with linear IMU interpolation.
    * @param cam    camera rotation-rate samples (any spacing; gaps fine; weight 1 = legacy)
-   * @param imu    raw IMU (only wm used; bias left in — see header note)
+   * @param imu    raw IMU (only wm used; bias left in -- see header note)
    * @param search half-width of the lag search [s]
    * @param step   coarse lag step [s] (parabolic refine goes sub-step)
    */

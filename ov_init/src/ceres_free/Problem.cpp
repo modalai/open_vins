@@ -48,14 +48,14 @@ inline double seconds_since(const std::chrono::steady_clock::time_point &t0) {
   return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
 }
 
-// ---- R5 measure-first probe (env OV_ZCALIB_ORDER_PROBE=1) -------------------------------
+// ---- Ordering-cost probe (env OV_ZCALIB_ORDER_PROBE=1) ----------------------------------
 // t_order = accumulated wall of assign_ordering()+analyze_band(), reported against the wall
 // of the entry points that recompute it (Solve / ComputeCovariance / ExportReducedInformation;
 // 2 recomputes per warm eval, 4 per duel). The symbolic/ordering pass is a pure function of
-// (graph structure, constancy signature) and so is a CACHE candidate — but the WindowGraph
-// session's "rebuild was never the cost" verdict says MEASURE before caching. One stderr line
-// at process exit; atomic counters because window solves run concurrently under the session
-// scheduler; two clock reads per call when armed, zero work when the env is unset.
+// (graph structure, constancy signature) and so is a CACHE candidate -- but caching is
+// justified by measurement, never by suspicion; this probe is that measurement. One stderr
+// line at process exit; atomic counters because window solves run concurrently under the
+// session scheduler; two clock reads per call when armed, zero work when the env is unset.
 struct OrderProbe {
   std::atomic<long long> order_ns{0}, entry_ns{0}, calls{0};
   const bool on;
@@ -803,21 +803,21 @@ void Problem::apply_delta(const Eigen::VectorXd &delta) {
 }
 
 SolverSummary Problem::Solve(const SolverOptions &options) {
-  OrderEntryScope order_probe_scope; // R5 probe denominator (no-op unless armed)
+  OrderEntryScope order_probe_scope; // ordering-probe denominator (no-op unless armed)
   SolverSummary summary;
   const auto t0 = std::chrono::steady_clock::now();
 
-  // R2 [BIT-EXACT dead-state]: an accepted step's re-linearization is consumed only by the
-  // NEXT iteration (its gradient check, damping diagonal and step solve). When the accepted
-  // step is the LAST permitted iteration (iter + 1 == max_num_iterations) there is no next
-  // iteration: H/grad are function-locals, the re-linearization's cost lands in a discarded
-  // dummy, and ExportReducedInformation/ComputeCovariance re-linearize independently. Under
-  // fused_iters=1 warm evals this fires on EVERY capped eval — one of the eval's two inner
-  // linearizations is pure dead state. Skipping it changes ONLY SolverSummary::jacobian_evals
-  // and the time_* splits (consumed by ov_init bench tools alone, grep-verified 2026-07-13);
-  // every parameter byte, cost, iterate and message is untouched by construction.
-  // OV_ZCALIB_TERMLIN_LEGACY=1 restores the unconditional re-linearize (replay byte-parity
-  // kill-switch: same binary, rungs on vs off, YAML must be byte-identical).
+  // [BIT-EXACT dead-state elision]: an accepted step's re-linearization is consumed only by
+  // the NEXT iteration (its gradient check, damping diagonal and step solve). When the
+  // accepted step is the LAST permitted iteration (iter + 1 == max_num_iterations) there is
+  // no next iteration: H/grad are function-locals, the re-linearization's cost lands in a
+  // discarded dummy, and ExportReducedInformation/ComputeCovariance re-linearize
+  // independently. Under fused_iters=1 warm evals this fires on EVERY capped eval -- one of
+  // the eval's two inner linearizations is pure dead state. Skipping it changes ONLY
+  // SolverSummary::jacobian_evals and the time_* splits (consumed by bench tools alone,
+  // grep-verified); every parameter byte, cost, iterate and message is untouched by
+  // construction. OV_ZCALIB_TERMLIN_LEGACY=1 restores the unconditional re-linearize
+  // (replay byte-parity kill-switch: same binary, on vs off, YAML must be byte-identical).
   static const bool termlin_legacy = (std::getenv("OV_ZCALIB_TERMLIN_LEGACY") != nullptr);
 
   if (options.pin_eigen_single_thread)
@@ -988,8 +988,8 @@ SolverSummary Problem::Solve(const SolverOptions &options) {
             std::fprintf(stderr, "[zbft/dl] it=%2d cost=%.8e rel=%.3e gnorm=%.3e radius=%.2e rho=%.3f\n", iter, cost, rel,
                          grad.lpNorm<Eigen::Infinity>(), radius, rho);
           // Re-linearize at the accepted iterate (the candidate checks above already handled
-          // the terminal case, so an accepted step here always continues). R2: skipped when
-          // this was the last permitted iteration — nothing consumes it (see Solve() head).
+          // the terminal case, so an accepted step here always continues). Skipped when this
+          // was the last permitted iteration -- nothing consumes it (see Solve() head).
           if (termlin_legacy || iter + 1 < options.max_num_iterations) {
             const auto tt = std::chrono::steady_clock::now();
             double cc = 0.0;
@@ -1113,8 +1113,8 @@ SolverSummary Problem::Solve(const SolverOptions &options) {
           std::fprintf(stderr, "[zbft/lm] it=%2d cost=%.8e rel=%.3e gnorm=%.3e lambda=%.2e rho=%.3f\n", iter, cost, rel,
                        grad.lpNorm<Eigen::Infinity>(), lambda, rho);
         // Re-linearize at the accepted iterate (the candidate checks above already handled the
-        // terminal case, so an accepted step here always continues to the next iteration). R2:
-        // skipped when this was the last permitted iteration — nothing consumes it (Solve() head).
+        // terminal case, so an accepted step here always continues to the next iteration).
+        // Skipped when this was the last permitted iteration -- nothing consumes it (Solve() head).
         if (termlin_legacy || iter + 1 < options.max_num_iterations) {
           const auto tt = std::chrono::steady_clock::now();
           double relin_cost = 0.0;
@@ -1157,21 +1157,20 @@ SolverSummary Problem::Solve(const SolverOptions &options) {
   return summary;
 }
 
-// R6 spectral landmark elimination: eliminate each landmark's 3x3 information block by
-// EIGENDECOMPOSITION with a relative rank cutoff — THE method, not a fallback. A landmark
+// Spectral landmark elimination: eliminate each landmark's 3x3 information block by
+// EIGENDECOMPOSITION with a relative rank cutoff -- THE method, not a fallback. A landmark
 // direction carrying (near-)zero information (the shallow-depth / short-track degeneracy
 // class) contributes ZERO fill-in to the reduced system: that is the flat-prior marginal
-// limit, the statistically honest reduction. The historical absolute +1e-10 floor + inverse
-// instead injected 1/(0+1e-10) = 1e10-scale rank-deficient fill-in whose cancellation drove
-// the reduced nuisance Hessian indefinite at converged points (measured on-device, Stinger
-// hires close-depth class: Hnn min pivots -5.5e9 / -1.7e8 / -8.8e2 at dim 467 — the
-// export-veto class, and the last-ulp load-race suspect). The cutoff is RELATIVE
-// (tol = 1e-8 * lambda_max): it caps the elimination's condition number at 1e8 — Schur
-// complement PSD to fp64 roundoff — while a direction 8 orders below the landmark's
-// strongest carries >= 1e4 x the whitened sigma, i.e. no usable signal. The 1e-12 absolute
-// floor retires all-dust landmarks (no real landmark information sits below it) whole.
-// computeDirect() is the closed-form 3x3 path: allocation-free, iteration-free,
-// deterministic — real-time-safe inside the worker pool (no locks, fixed work).
+// limit, the statistically honest reduction. An absolute +1e-10 floor + inverse instead
+// injects 1/(0+1e-10) = 1e10-scale rank-deficient fill-in whose cancellation drives the
+// reduced nuisance Hessian indefinite at converged points (measured on-device on a
+// close-depth class: Hnn min pivots -5.5e9 / -1.7e8 / -8.8e2 at dim 467 -- the export-veto
+// class). The cutoff is RELATIVE (tol = 1e-8 * lambda_max): it caps the elimination's
+// condition number at 1e8 -- Schur complement PSD to fp64 roundoff -- while a direction 8
+// orders below the landmark's strongest carries >= 1e4 x the whitened sigma, i.e. no
+// usable signal. The 1e-12 absolute floor retires all-dust landmarks (no real landmark
+// information sits below it) whole. computeDirect() is the closed-form 3x3 path:
+// allocation-free, iteration-free, deterministic -- real-time-safe inside the worker pool.
 static Eigen::Matrix3d eliminate_landmark_pinv(const Eigen::Matrix3d &V, Problem::ExportStats *st) {
   Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> es;
   es.computeDirect(V);
@@ -1194,7 +1193,7 @@ static Eigen::Matrix3d eliminate_landmark_pinv(const Eigen::Matrix3d &V, Problem
 }
 
 bool Problem::ComputeCovariance(const std::vector<double *> &blocks, Eigen::MatrixXd &covariance, const SolverOptions &options) {
-  OrderEntryScope order_probe_scope; // R5 probe denominator (no-op unless armed)
+  OrderEntryScope order_probe_scope; // ordering-probe denominator (no-op unless armed)
   assign_ordering();
   if (n_total_ == 0)
     return false;
@@ -1228,11 +1227,11 @@ bool Problem::ComputeCovariance(const std::vector<double *> &blocks, Eigen::Matr
     // the small (lsize x lsize) inverses directly -- never materialize the dense
     // n_land x n_land D^-1 (that costs an O(n_land^2) zero-fill plus an O(n_nav*n_land^2)
     // gemm for what is O(n_nav*n_land*lsize) work).
-    // Landmark blocks eliminate via the R6 spectral pinv (rank-clamped): a degenerate
+    // Landmark blocks eliminate via the spectral pinv (rank-clamped): a degenerate
     // landmark contributes zero along its unobserved directions instead of absolute-floor
-    // poison — this covariance feeds the COMMIT certification sigmas, where 1e10-scale
+    // poison -- this covariance feeds the COMMIT certification sigmas, where 1e10-scale
     // fill-in error is a silent cert corruption. Blocks here are 3-dof landmarks (the
-    // only landmark class in this problem); the generic-lsize fallback keeps the old
+    // only landmark class in this problem); the generic-lsize fallback keeps a
     // shape-agnostic contract for any future non-3 block.
     const auto Bt = H.block(n_nav_, 0, n_land_, n_nav_); // = B^T (landmark row-strip, always written)
     Eigen::MatrixXd BD(n_nav_, n_land_);
@@ -1287,7 +1286,7 @@ bool Problem::ComputeCovariance(const std::vector<double *> &blocks, Eigen::Matr
 
 bool Problem::ExportReducedInformation(const std::vector<double *> &blocks, Eigen::MatrixXd &Lambda, Eigen::VectorXd &gred,
                                        const SolverOptions &options, ExportStats *stats) {
-  OrderEntryScope order_probe_scope; // R5 probe denominator (no-op unless armed)
+  OrderEntryScope order_probe_scope; // ordering-probe denominator (no-op unless armed)
   assign_ordering();
   if (n_total_ == 0)
     return false;
@@ -1319,7 +1318,7 @@ bool Problem::ExportReducedInformation(const std::vector<double *> &blocks, Eige
       nidx.push_back(i);
   const int nk = (int)kidx.size(), nn = (int)nidx.size();
 
-  // R1-T1 layout probe: the calibrator's export keeps a CONTIGUOUS TRAILING offset range —
+  // Layout probe: the calibrator's export keeps a CONTIGUOUS TRAILING offset range --
   // WindowBA registers clones + gravity before the calib blocks and assign_ordering assigns
   // nav offsets in registration order, so nuisance = [0, nn) and kept = [nn, n_nav) always
   // (the kept range may be internally permuted vs the request order, e.g. cam vs td). kidx
@@ -1333,10 +1332,9 @@ bool Problem::ExportReducedInformation(const std::vector<double *> &blocks, Eige
       break;
     }
 
-  // R1-T1 [BIT-EXACT] rung switches: OV_ZCALIB_EXPORT_LEGACY forces the historical full-fill
-  // path (replay byte-parity kill-switch); OV_ZCALIB_EXPORT_AUDIT computes BOTH paths per
-  // export and memcmps every consumed output byte (Lambda, gred, stats, ok) — the P3-c1
-  // dual-path in-binary proof method.
+  // [BIT-EXACT] switches: OV_ZCALIB_EXPORT_LEGACY forces the legacy full-fill path (replay
+  // byte-parity kill-switch); OV_ZCALIB_EXPORT_AUDIT computes BOTH paths per export and
+  // memcmps every consumed output byte (Lambda, gred, stats, ok) -- dual-path in-binary proof.
   static const bool export_legacy = (std::getenv("OV_ZCALIB_EXPORT_LEGACY") != nullptr);
   static const bool export_audit = (std::getenv("OV_ZCALIB_EXPORT_AUDIT") != nullptr);
 
@@ -1346,14 +1344,14 @@ bool Problem::ExportReducedInformation(const std::vector<double *> &blocks, Eige
   double cost = 0.0;
   linearize(H, grad, cost, exec); // at the current iterate, undamped
 
-  // ---- LEGACY marginalization (pre-R1 code, verbatim): the kill-switch path, the audit
+  // ---- LEGACY marginalization (kept verbatim): the kill-switch path, the audit
   // reference, and the general path for non-trailing kept layouts. ----
   const auto run_legacy = [&](Eigen::MatrixXd &L_out, Eigen::VectorXd &g_out, ExportStats *st) -> bool {
     // Landmark-marginalized nav system, VISIBILITY-AWARE like solve_step: the
     // dense (n_nav x n_land) x (n_land x n_nav) product multiplied through the
     // structural zeros of every landmark's non-observing poses (measured ~9% of
     // window-solve thread-CPU). Per landmark, only its adjacent nav blocks are
-    // touched; the landmark block eliminates via the R6 spectral pinv (rank-
+    // touched; the landmark block eliminates via the spectral pinv (rank-
     // clamped) and the gradient fold g_nav' = g_nav - (B V^+) g_l.
     Eigen::MatrixXd Hnav = H.topLeftCorner(n_nav_, n_nav_).selfadjointView<Eigen::Lower>();
     Eigen::VectorXd gnav = grad.head(n_nav_);
@@ -1423,7 +1421,7 @@ bool Problem::ExportReducedInformation(const std::vector<double *> &blocks, Eige
       // nuisance Newton decrement q_n = g_z' H_zz^{-1} g_z = sum_l gl'V^{-1}gl
       // + gn'Hnn^{-1}gn (exact block-elimination identity; one extra O(nn^2)
       // solve on the factorization formed above). q_n/2 = the cost decrease a
-      // further inner solve could still achieve at this linearization — the P1
+      // further inner solve could still achieve at this linearization -- the
       // stationarity certificate's statistic.
       st->nuis_decrement = st->land_decrement + gn.dot(ldlt.solve(gn));
       st->nuis_grad_inf = gn.lpNorm<Eigen::Infinity>();
@@ -1432,15 +1430,15 @@ bool Problem::ExportReducedInformation(const std::vector<double *> &blocks, Eige
     return L_out.allFinite() && g_out.allFinite();
   };
 
-  // ---- R1-T1 fast marginalization [BIT-EXACT]: dead-write elimination + contiguous
+  // ---- Fast marginalization [BIT-EXACT]: dead-write elimination + contiguous
   // gathers, valid only under the trailing-kept layout probed above.
   //
   // Consumed-region catalogue of the legacy Hnav (every read between the fold and the LDLT):
   //   (1) Hnn gather -> nuisance x nuisance; only the LOWER triangle ever reaches arithmetic
-  //       (Eigen's LDLT<Lower> factors from the lower triangle — the upper copy was dead the
+  //       (Eigen's LDLT<Lower> factors from the lower triangle -- the upper copy was dead the
   //       moment it was made);
   //   (2) Hkn gather -> kept rows x nuisance cols; kept offsets >= nn > nuisance offsets,
-  //       i.e. STRICTLY BELOW the diagonal — lower triangle again;
+  //       i.e. STRICTLY BELOW the diagonal -- lower triangle again;
   //   (3) Hkk gather -> kept x kept, BOTH triangles (the request order permutes inside the
   //       trailing range).
   // Therefore the nuisance-ROW upper strip (rows < nn, cols > row) is dead state: its
@@ -1479,7 +1477,7 @@ bool Problem::ExportReducedInformation(const std::vector<double *> &blocks, Eige
       }
       // Fill-in with the dead nuisance-row upper-strip writes SKIPPED: a block lands there
       // iff its row block starts above the diagonal (ra < cb; distinct blocks never straddle
-      // it) AND its row block is nuisance (ra < nn). Kept-row upper blocks (ra >= nn — the
+      // it) AND its row block is nuisance (ra < nn). Kept-row upper blocks (ra >= nn -- the
       // Hkk gather consumes them) keep their OWN gemm, not a transpose-mirror of the lower
       // slot: Vinv = V.inverse() is not bitwise-symmetric and byte identity is the contract.
       for (int ia = 0; ia < P; ++ia) {

@@ -42,15 +42,14 @@ bool JointCalib::solve(const std::vector<WindowData> &windows, SharedCalib &cali
   calib.noise_lin = calib.imu;
   calib.noise_frozen = true;
   // Entry whitener stamp (carry validity): cost values are comparable across
-  // stages ONLY under the identical noise_lin — which freezes HERE, from the
-  // entry imu values, not from the recording stage's exit (verifier-caught:
-  // A1a/A1b move imu, so their exit stamp matches the next entry while the
-  // whitener does not).
+  // stages ONLY under the identical noise_lin -- which freezes HERE, from the
+  // entry imu values, not from the recording stage's exit (A1a/A1b move imu,
+  // so their exit stamp matches the next entry while the whitener does not).
   Eigen::Matrix<double, 16, 1> entry_noise;
   entry_noise << calib.imu.dw, calib.imu.da, calib.imu.q_AtoI;
   // Full-vector parameter stamp (33 doubles: ALL calib blocks, free or
   // frozen). Window costs depend on the frozen blocks too, and the staged
-  // calls free DIFFERENT subsets — a free-subset stamp can never match across
+  // calls free DIFFERENT subsets -- a free-subset stamp can never match across
   // a stage boundary and would demote every consume to jump duels. The full
   // vector matches exactly when the calib object is untouched between calls,
   // which is the condition under which carried costs are valid.
@@ -72,7 +71,7 @@ bool JointCalib::solve(const std::vector<WindowData> &windows, SharedCalib &cali
   };
   // Free-set signature: full consume is only sound between calls solving the
   // SAME problem shape (kept-path seeds and cost references are arbitration
-  // products of that shape — see JointWarmCarry docs). Keyed on the per-camera
+  // products of that shape -- see JointWarmCarry docs). Keyed on the per-camera
   // LABEL, so two cameras' blocks of the same physical kind stay distinguishable.
   std::string layout_sig;
   for (auto &b : layout)
@@ -137,7 +136,7 @@ bool JointCalib::solve(const std::vector<WindowData> &windows, SharedCalib &cali
   };
 
   // Prior cost at the current p. The damped step is computed from the
-  // prior-AUGMENTED system, so acceptance must judge the same objective —
+  // prior-AUGMENTED system, so acceptance must judge the same objective --
   // comparing data cost alone accepts points that are not minima of the
   // objective whose curvature ships in rep.sigma.
   auto prior_cost_now = [&]() {
@@ -178,7 +177,7 @@ bool JointCalib::solve(const std::vector<WindowData> &windows, SharedCalib &cali
   // valley the true curvature carries second-order residual terms GN cannot
   // see (measured ~10-30x stiffer at linear-seed residual levels), so a raw
   // Newton step overshoots the valley wall. Damping bends the step toward
-  // gradient descent using the SAME (Lambda, g) — a rejected candidate costs
+  // gradient descent using the SAME (Lambda, g) -- a rejected candidate costs
   // one evaluation pass, never a new linearization.
   Eigen::MatrixXd Lsum(np, np);
   Eigen::MatrixXd accepted_L = Eigen::MatrixXd::Zero(np, np);
@@ -187,23 +186,24 @@ bool JointCalib::solve(const std::vector<WindowData> &windows, SharedCalib &cali
   double prev_merit = std::numeric_limits<double>::infinity();
   std::vector<std::vector<double>> accepted_p = snapshot();
 
-  // Working copies + GUARDED warm starts (the S1 two-start design). Naive
-  // warm-carrying strands: LM from the previous optimum can sit above the
-  // shifted valley floor at the new p and the outer loop stalls. Cold
-  // re-seeding every pass avoids that but leaves %-level inner hysteresis in
-  // the merit (re-seeds at nearby p take different inner paths), which on real
-  // data exceeds the acceptance band and stalls the outer loop in reject
-  // loops. The guard takes both: solve from the ACCEPTED point's nuisance
-  // optimum (continuous, few inner iterations); if that fails or lands
-  // suspiciously above the window's accepted cost, ALSO solve from a fresh
-  // seed at the current p and keep the cheaper result. Bias/gauge priors are
+  // Working copies + GUARDED two-path warm starts (strand/duel vocabulary:
+  // see JointConfig). Warm-only carrying can strand -- LM from the previous
+  // optimum may sit above the shifted valley floor at the new p and the
+  // outer loop stalls; cold re-seeding every pass avoids that but leaves
+  // %-level inner hysteresis in the merit (re-seeds at nearby p take
+  // different inner paths), which on real data exceeds the acceptance band
+  // and stalls the outer loop in reject loops. The guard takes both: solve
+  // from the ACCEPTED point's nuisance optimum (path A, the warm strand:
+  // continuous, few inner iterations); if that fails or lands suspiciously
+  // above the window's accepted cost, ALSO solve from a fresh seed at the
+  // current p (path B) and keep the cheaper result. Bias/gauge priors are
   // anchored at the p-independent window seed, so both paths minimize the
   // same objective.
   std::vector<WindowData> work(windows.begin(), windows.end());
   std::vector<char> dead(work.size(), 0); // failed at an accepted point: never fusable
-  // P3 preint-cache slots, resolved by uid on the MAIN thread (ensure() may
+  // Preint-cache slots, resolved by uid on the MAIN thread (ensure() may
   // resize the store; pointers are taken only after every ensure() ran).
-  // Workers touch only their own windows' entries (fixed-range partition).
+  // Workers touch only their own window's entry (window i writes slot i).
   std::vector<WindowPreint *> pslot(work.size(), nullptr);
   if (store) {
     for (const WindowData &w : work)
@@ -217,19 +217,19 @@ bool JointCalib::solve(const std::vector<WindowData> &windows, SharedCalib &cali
   std::vector<WindowWarmState> warm_dual(work.size()); // duel_on_accept: deferred path-B optima
   std::vector<double> cost_acc(work.size(), std::numeric_limits<double>::infinity());
   const double strand_guard = 0.05; // warm result above accepted cost by more than this -> try a fresh seed too
-  // P1 certificate state: accepted q_n references (+inf = no reference yet ->
+  // Certificate state: accepted q_n references (+inf = no reference yet ->
   // only the cost-relative ceiling applies) and the accepted q_n per window.
   std::vector<double> qn_ref(work.size(), std::numeric_limits<double>::infinity());
   std::vector<double> qn_acc(work.size(), 0.0);
   std::vector<char> jump(work.size(), 0); // carry stamp mismatch: force one duel at entry
   // Export-on-accept veto arm: a window whose DEFERRED export failed at an
   // accepted candidate switches to inline eval exports (the legacy path) for
-  // the rest of this solve, so further failures surface at eval time — where
+  // the rest of this solve, so further failures surface at eval time -- where
   // the path-B rescue and the candidate veto live. Never set on a healthy
   // record (the deferred export then fails nowhere), so the eoa byte-parity
   // contract is untouched.
   std::vector<char> export_suspect(work.size(), 0);
-  // Seed anchors of record (promoted at ACCEPTANCE only, per kept path — a
+  // Seed anchors of record (promoted at ACCEPTANCE only, per kept path -- a
   // rejected candidate's path-B re-seed must never leak into the carry).
   std::vector<SeedSnap> seeds_acc(work.size());
   auto snap_seeds = [](const WindowData &w, SeedSnap &out) {
@@ -254,8 +254,8 @@ bool JointCalib::solve(const std::vector<WindowData> &windows, SharedCalib &cali
     w.seed_bg = in.bg;
     w.seed_ba = in.ba;
   };
-  // EXACT seed restore (export-on-accept): unlike apply_seeds — which is a
-  // carry consumer and correctly no-ops on an empty snapshot — this puts the
+  // EXACT seed restore (export-on-accept): unlike apply_seeds -- which is a
+  // carry consumer and correctly no-ops on an empty snapshot -- this puts the
   // window's seed fields back bit-for-bit INCLUDING has_seeds=false, so a
   // kept-A export re-entry sees precisely the anchors its evaluation solved
   // under, and the post-export state is precisely what legacy leaves behind.
@@ -305,7 +305,8 @@ bool JointCalib::solve(const std::vector<WindowData> &windows, SharedCalib &cali
   }
 
   // Per-window evaluation slots, reduced IN WINDOW ORDER after the parallel
-  // sweep — serial == parallel bit-identical (fixed ranges, no shared writes).
+  // sweep -- the fixed-order reduction contract: serial == parallel
+  // bit-identical (window i writes only slot i; the fold below is serial).
   struct EvalSlot {
     bool attempted = false, ok = false;
     Eigen::MatrixXd L;
@@ -313,17 +314,17 @@ bool JointCalib::solve(const std::vector<WindowData> &windows, SharedCalib &cali
     double cost = 0.0;
     double t_seed = 0.0, t_preint = 0.0, t_inner = 0.0, t_export = 0.0;
     int iters = 0;
-    // P0 evidence (per pass): which paths ran, why cold fired, whether it won
+    // two-path evidence (per pass): which paths ran, why cold fired, whether it won
     char ran_warm = 0, cold_cause = 0, cold_win = 0;
     double cold_gain = 0.0;
-    // P1: kept-result q_n, kept path ('A'/'B'/0), dual agreement, and the
+    // kept-result q_n, kept path ('A'/'B'/0), dual agreement, and the
     // pre-path-B seed stash (path A's anchors of record when A is kept on a
-    // pass where B re-seeded — verifier correction: the snapshot must match
-    // the KEPT path's objective, not the post-re-seed state)
+    // pass where B re-seeded: the promoted snapshot must match the KEPT
+    // path's objective, not the post-re-seed state)
     double qn = 0.0;
     char kept_path = 0, dual_agree = 0;
     SeedSnap seeds_pre;
-    // P3: preint cache hits/misses this pass + factor-construction thread-CPU
+    // preint cache hits/misses this pass + factor-construction thread-CPU
     int phit = 0, pmiss = 0;
     double t_factor = 0.0;
     // wall-clock hang-guard firings (must stay 0; nonzero = load-tainted run)
@@ -374,28 +375,27 @@ bool JointCalib::solve(const std::vector<WindowData> &windows, SharedCalib &cali
   bool have_lin = false; // (accepted_L, accepted_g) valid at accepted_p
   const int max_evals = cfg.outer_iterations * (1 + cfg.max_backtracks);
   int accepted_steps = 0;
-  // P1 early-stop state: last applied step's post-cap whitened norm, predicted
+  // Early-stop state: last applied step's post-cap whitened norm, predicted
   // reduction (undamped model), lambda, cap flag; consecutive-stable counter
   // and the deterministic cold stop-confirmation pass.
-  // STAGE-AWARE certificate eligibility (the P0 verdict, confirmed by the
-  // synthetic suite): the legacy plateau/anchor cold-solves are pure waste
-  // ONLY where the shallow subspace (da off-diag, q_AtoI) is frozen — cam/
-  // ext/td stages. Where the accel chain is FREE, the cold cross-checks are
-  // load-bearing (P0: 4.9-15.5% mean cold-win gains; calib_e2e S3 regressed
-  // 0.074->0.100 deg ext / ->0.321 deg qA under a global certificate), so
-  // those solves keep the full legacy two-path.
+  // STAGE-AWARE certificate eligibility: the legacy plateau/anchor cold-solves
+  // are pure waste ONLY where the shallow subspace (da off-diag, q_AtoI) is
+  // frozen -- cam/ext/td stages. Where the accel chain is FREE, the cold
+  // cross-checks are load-bearing (measured: 4.9-15.5% mean cold-win gains;
+  // an end-to-end sim regressed 0.074->0.100 deg ext / ->0.321 deg qA under
+  // a global certificate), so those solves keep the full legacy two-path.
   // (single-window solves excluded: with N=1 the fused step IS the window
-  // step, the second-order argument collapses, and the calib_e2e p_IinC probe
-  // measured 4.0 -> 4.8 mm under a global certificate)
+  // step, the second-order argument collapses, and a single-window p_IinC
+  // probe measured 4.0 -> 4.8 mm under a global certificate)
   const bool cert_on = cfg.use_cert && (cfg.cert_open_imu || (!calib.imu.calib_da && !calib.imu.calib_RAtoI)) &&
                        (int)windows.size() >= cfg.cert_min_windows;
   // duel_on_accept is MEASURED-INCOMPATIBLE with fused (capped) evals: the
   // strand duels are what make candidate merits comparable to the accepted
   // baseline (full-vs-full); deferring them leaves 1-iter candidate merits
   // against a full-solve baseline -> every candidate 'rises' -> entry
-  // deadlock (Sting: td frozen at bootstrap, zero accepts). The loose-vs-
-  // loose baseline variant is the scoped follow-on; until then the flag
-  // self-disarms under fused_schur.
+  // deadlock (measured on real data: td frozen at its bootstrap value, zero
+  // accepts). A loose-vs-loose baseline would restore comparability; until
+  // one exists the flag self-disarms under fused_schur.
   JointConfig cfg_eff = cfg;
   if (cfg_eff.duel_on_accept && cfg_eff.fused_schur) {
     if (cfg.verbose)
@@ -404,19 +404,19 @@ bool JointCalib::solve(const std::vector<WindowData> &windows, SharedCalib &cali
   }
   const bool duel_defer = cfg_eff.duel_on_accept;
   // Export-on-accept (see JointConfig::export_on_accept): evaluations run
-  // cost-only — except cert-stage path A, which exports inline because the
+  // cost-only -- except cert-stage path A, which exports inline because the
   // certificate consumes its q_n pre-accept and q_n must be the export's
-  // exact bits — and the accepted candidate's (Lambda, g, qn) are produced
+  // exact bits -- and the accepted candidate's (Lambda, g, qn) are produced
   // by ONE deferred pass inside the accept branch (stored where inline,
   // entry-faithful re-entry elsewhere). eoa=false is the legacy inline-
-  // export path, byte-identical to the pre-t7 binary.
+  // export path, byte-identical to the reference binary.
   //
   // duel_on_accept DISARMS eoa: the deferred-duel fold is INCREMENTAL
   // (Lsum += d_L - s.L on a winner), so legacy's accepted linearization
-  // carries the loser's export in its rounding — sum_orig + (win - orig)
+  // carries the loser's export in its rounding -- sum_orig + (win - orig)
   // and a rebuilt direct sum differ in the last ulp. Reproducing those bits
   // would require exporting the duel LOSER too, which is the very work eoa
-  // exists to elide; the experimental mode keeps legacy exports instead
+  // exists to elide; this experimental mode keeps legacy exports instead
   // (same one-flag-one-behavior doctrine as the fused disarm above).
   const bool eoa = cfg.export_on_accept && !duel_defer;
   if (cfg.export_on_accept && duel_defer && cfg.verbose)
@@ -436,9 +436,9 @@ bool JointCalib::solve(const std::vector<WindowData> &windows, SharedCalib &cali
       break;
     }
     // stop-confirmation pass: force one duel on every window whose accepted
-    // q_n is material — the fixed-order, deterministic cross-check that a
+    // q_n is material -- the fixed-order, deterministic cross-check that a
     // stable-looking outer point is not resting on under-converged nuisances
-    // (the v5 lesson: time-stable junk defeats pure consistency)
+    // (temporal stability alone cannot distinguish the two)
     confirm_active = confirm_pending;
     confirm_pending = false;
     if (confirm_active)
@@ -468,7 +468,7 @@ bool JointCalib::solve(const std::vector<WindowData> &windows, SharedCalib &cali
         if (dead[wi])
           return;
         s.attempted = true;
-        // ---- path A (continuity): solve from the accepted point's optimum ----
+        // ---- path A (warm strand): solve from the accepted point's optimum ----
         WindowSolveReport wrA;
         WindowWarmState wA = warm_acc[wi]; // copy: the solve mutates its warm state
         bool okA = false;
@@ -477,16 +477,16 @@ bool JointCalib::solve(const std::vector<WindowData> &windows, SharedCalib &cali
           const bool cap_now = cfg.fused_schur && pass >= cfg.fused_warmup_passes &&
                                accepted_steps < cfg.outer_iterations - cfg.fused_polish_accepts;
           const int itA = cap_now ? cfg.fused_iters : cfg.window_max_iters;
-          // eoa: cost-only eval — EXCEPT on cert-on stages, where the P1
+          // eoa: cost-only eval -- EXCEPT on cert-on stages, where the
           // certificate consumes wrA.qn BEFORE the accept decision. q_n must
           // be the full export's bits: a calib-column-free "qn-only" stats
-          // path was measured 1-ulp off (the smaller H's leading dimension
+          // path was measured 1 ulp off (the smaller H's leading dimension
           // changes SIMD peeling under -ffast-math; see the note at
           // Problem::ExportReducedInformation), and q_n feeds thresholded
           // duel arbitration. So cert stages keep path A's inline export
-          // (its Lambda is then REUSED at accept — not re-computed), and the
+          // (its Lambda is then REUSED at accept -- not re-computed), and the
           // eoa savings there are the path-B/duel-loser exports. Dimension
-          // consistency reads the layout dim, not the (absent) Lambda —
+          // consistency reads the layout dim, not the (absent) Lambda --
           // equal to Lambda.rows() whenever an export ran.
           okA = WindowBA::solve_and_export(work[wi], calib, !eoa || cert_on || export_suspect[wi], wrA, itA, false, &wA, pslot[wi]) &&
                 wrA.free_dim == np;
@@ -499,8 +499,8 @@ bool JointCalib::solve(const std::vector<WindowData> &windows, SharedCalib &cali
           s.tstop += wrA.time_stopped ? 1 : 0;
           s.ran_warm = 1;
         }
-        // ---- path B (fresh seed). Under the P1 CERTIFICATE (use_cert): the
-        // duplicate solve runs only on genuine suspicion — warm failure,
+        // ---- path B (fresh seed). Under the CERTIFICATE (use_cert): the
+        // duplicate solve runs only on genuine suspicion -- warm failure,
         // non-stationary inner exit, cost stranding, material nuisance Newton
         // decrement (q_n polices exactly the stale-shallow-gradient case the
         // legacy plateau trigger over-approximated: the exported gred is the
@@ -515,9 +515,9 @@ bool JointCalib::solve(const std::vector<WindowData> &windows, SharedCalib &cali
         if (cert_on && okA && !strand) {
           const double qn_band =
               std::max(cfg.cert_qn_rel * wrA.cost_final, std::isfinite(qn_ref[wi]) ? cfg.cert_ref_growth * qn_ref[wi] : 0.0);
-          // Capped-regime certificate (P4): a capped eval is structurally
-          // !inner_converged, but qn — the nuisance Newton decrement the
-          // export computes AT the current point — measures stationarity
+          // Capped-regime certificate: a capped eval is structurally
+          // !inner_converged, but qn -- the nuisance Newton decrement the
+          // export computes AT the current point -- measures stationarity
           // regardless of how many iterations produced the point. Under
           // fused_schur the cert polices on qn alone; in the legacy regime a
           // non-stationary exit stays suspect as before.
@@ -525,7 +525,7 @@ bool JointCalib::solve(const std::vector<WindowData> &windows, SharedCalib &cali
         }
         const bool suspect = !okA || anchor_pass || plateau || cert_fail || jump[wi] || strand;
         // duel_on_accept: quality duels on HEALTHY warm evals defer until the
-        // candidate is accepted (rescue duels stay inline — only path there)
+        // candidate is accepted (rescue duels stay inline -- only path there)
         const bool defer = duel_defer && suspect && okA && had_warm;
         if (defer)
           s.deferred_cause = jump[wi] ? 'j' : strand ? 's' : cert_fail ? 'c' : plateau ? 'p' : 'a';
@@ -537,14 +537,14 @@ bool JointCalib::solve(const std::vector<WindowData> &windows, SharedCalib &cali
           const auto t_s0 = std::chrono::steady_clock::now();
           LinearSeedReport sr;
           // Re-seed at the current p; on a GATE failure fall back to the
-          // window's existing seeds (harvest/bootstrap/sim provenance) — the
+          // window's existing seeds (harvest/bootstrap/sim provenance) -- the
           // fallback is load-bearing: stage entries arrive at a moved p where
           // marginal windows gate-fail, and killing them starves the very
-          // stages (A1 IMU intrinsics) the windows were collected for.
+          // stages (the A1a/A1b IMU intrinsics) the windows were collected for.
           const bool seeded = LinearSeed::seed_window(work[wi], calib, work[wi].seed_bg, sr, cfg.seed);
           s.t_seed += std::chrono::duration<double>(std::chrono::steady_clock::now() - t_s0).count();
           if (seeded || work[wi].has_seeds) {
-            // eoa: cost-only duel — the loser's export was ALWAYS dead state,
+            // eoa: cost-only duel -- the loser's export was ALWAYS dead state,
             // and the winner's is deferred to the accept pass. q_n is not
             // consumed from path B pre-accept (the cert reads wrA.qn only;
             // the accepted point's q_n comes from the export pass).
@@ -558,7 +558,7 @@ bool JointCalib::solve(const std::vector<WindowData> &windows, SharedCalib &cali
             s.iters += wrB.iterations;
             (wrB.preint_hit ? s.phit : s.pmiss)++;
             s.tstop += wrB.time_stopped ? 1 : 0;
-            // P0/P1 cause attribution, priority first > warmfail > jump > strand > cert > plateau > anchor
+            // cold-cause attribution, priority first > warmfail > jump > strand > cert > plateau > anchor
             s.cold_cause = !had_warm ? 'f'
                            : !okA    ? 'x'
                            : jump[wi] ? 'j'
@@ -721,9 +721,9 @@ bool JointCalib::solve(const std::vector<WindowData> &windows, SharedCalib &cali
           default:  rep.cold_anchor++; break;
           }
           // the duel RAN: mark the cause regardless of winner so the accept
-          // block promotes the PRE-re-seed anchors for kept-A windows (the
-          // verifier-correction semantics; omitting this drifts the bias/gauge
-          // priors onto post-re-seed anchors and collapses the session)
+          // block promotes the PRE-re-seed anchors for kept-A windows --
+          // omitting this drifts the bias/gauge priors onto post-re-seed
+          // anchors and collapses the session
           s.cold_cause = s.deferred_cause;
           if (s.d_ok && std::abs(s.cost - s.d_cost) <= cfg.cert_agree_rel * std::max(s.cost, 1e-300)) {
             s.dual_agree = 1;
@@ -759,20 +759,20 @@ bool JointCalib::solve(const std::vector<WindowData> &windows, SharedCalib &cali
     // ---- export-on-accept: the evaluations above ran cost-only (except
     // cert-stage path A and export_suspect windows, whose inline exports are
     // REUSED here, never re-derived); produce the WINNING candidate's
-    // (Lambda_w, g_w, qn_w) NOW, once, at the UNCHANGED kept optima — before
+    // (Lambda_w, g_w, qn_w) NOW, once, at the UNCHANGED kept optima -- before
     // the accept/reject decision commits, because an export failure at a
     // candidate point must still be able to VETO it (the doctrine at the
     // entry reduction: the fused set never silently shrinks at a candidate).
     // A re-entry is entry-faithful so its bytes equal the export legacy
     // computed inline during the evaluation:
     //   * kept-A: enter from the PRE-promotion warm baseline (the state A's
-    //     eval entered from) — a LOCAL copy, so the warm write-back inside
+    //     eval entered from) -- a LOCAL copy, so the warm write-back inside
     //     the call never touches warm_acc (promotion below owns that);
     //     if a duel re-seeded this window this pass, A's anchors of record
-    //     are the PRE-re-seed seeds (seeds_pre) — swap them in, restore
+    //     are the PRE-re-seed seeds (seeds_pre) -- swap them in, restore
     //     after (work[wi] must keep the post-re-seed seeds, as legacy does).
     //   * kept-B: enter cold from the window's current (post-re-seed) seeds
-    //     — exactly B's evaluation entry.
+    //     -- exactly B's evaluation entry.
     // Then state_at overrides to the kept optimum (warm_cand, still un-
     // moved) and max_iters=0 exports there. Calib holds the accepted p
     // (apply_dp runs only at the bottom of the loop).
@@ -784,9 +784,9 @@ bool JointCalib::solve(const std::vector<WindowData> &windows, SharedCalib &cali
         double qn = 0.0;
         double t_pre = 0.0, t_fac = 0.0, t_exp = 0.0;
         int phit = 0, pmiss = 0;
-        double min_pivot = 0.0; // veto dossier: failing export's Hnn min pivot
+        double min_pivot = 0.0; // veto diagnostics: failing export's Hnn min pivot
         int nn = 0;
-        int clamped = 0; // R6 spectral elimination: rank-clamped landmark dirs
+        int clamped = 0; // spectral elimination: rank-clamped landmark dirs
       };
       std::vector<ExpSlot> ex(work.size());
       pool.parallel_dynamic((int)work.size(), [&](int /*worker*/, int k) {
@@ -804,7 +804,7 @@ bool JointCalib::solve(const std::vector<WindowData> &windows, SharedCalib &cali
             e.ok = e.stored = true;
             return;
           }
-          WindowWarmState entry; // kept-A entry context (local copy — see block comment)
+          WindowWarmState entry; // kept-A entry context (local copy -- see block comment)
           WindowWarmState *w0 = nullptr;
           if (s.kept_path == 'A') {
             entry = warm_acc[wi];
@@ -836,10 +836,10 @@ bool JointCalib::solve(const std::vector<WindowData> &windows, SharedCalib &cali
           }
         }
       });
-      // Forensic fault injection (parity/veto-path investigations only, the
-      // OV_ZCALIB_EXPORT_* family's pattern): fail window uid U's deferred
-      // export, optionally only at pass P ("U" or "U:P"). Keyed on the uid so
-      // it stays deterministic when the A1b halves run this solve concurrently.
+      // OV_ZCALIB_EOA_FAIL_UID ("U" or "U:P"): forensic fault injection for
+      // parity/veto-path tests -- fail window uid U's deferred export,
+      // optionally only at pass P. Keyed on the uid so it stays deterministic
+      // when concurrent solves (the A1b split halves) share a pass counter.
       static const char *eoa_inj = std::getenv("OV_ZCALIB_EOA_FAIL_UID");
       static const long inj_uid = eoa_inj ? std::atol(eoa_inj) : -1;
       static const long inj_pass = (eoa_inj && std::strchr(eoa_inj, ':')) ? std::atol(std::strchr(eoa_inj, ':') + 1) : -1;
@@ -862,10 +862,10 @@ bool JointCalib::solve(const std::vector<WindowData> &windows, SharedCalib &cali
           // semantics (the doctrine at the entry reduction):
           //   * candidate point (have_lin): legacy's inline export failed the
           //     window AT EVAL, and a window failure at a candidate VETOES the
-          //     candidate — the fused set never silently shrinks. Reproduce
+          //     candidate -- the fused set never silently shrinks. Reproduce
           //     that: veto, keep the window, and arm inline exports for it so
           //     later failures surface at eval, where the path-B rescue lives.
-          //   * entry point: legacy never admitted the window — dead, and the
+          //   * entry point: legacy never admitted the window -- dead, and the
           //     survivor-order merit re-derive below reproduces the accounting
           //     byte-exactly.
           if (have_lin) {
@@ -890,7 +890,7 @@ bool JointCalib::solve(const std::vector<WindowData> &windows, SharedCalib &cali
         } else {
           Lsum += e.L;
           gsum += e.g;
-          // the accepted point's q_n — the value the eval's inline export
+          // the accepted point's q_n -- the value the eval's inline export
           // would have carried; promoted to qn_acc/qn_ref below
           slots[wi].qn = e.qn;
         }
@@ -958,16 +958,16 @@ bool JointCalib::solve(const std::vector<WindowData> &windows, SharedCalib &cali
           // the absolute band alone.
           if (!std::isfinite(qn_ref[wi]) || slots[wi].dual_agree)
             qn_ref[wi] = slots[wi].qn;
-          // seed anchors of record, per KEPT path (verifier correction: a pass
-          // where B re-seeded but A was kept must promote A's PRE-re-seed
-          // anchors — the objective A minimized — not the post-B state)
+          // seed anchors of record, per KEPT path: a pass where B re-seeded
+          // but A was kept must promote A's PRE-re-seed anchors -- the
+          // objective A minimized -- not the post-B state
           if (slots[wi].kept_path == 'A' && slots[wi].cold_cause != 0)
             seeds_acc[wi] = slots[wi].seeds_pre;
           else
             snap_seeds(work[wi], seeds_acc[wi]);
         }
       lm_lambda = std::max(lm_lambda * 0.25, 1e-4);
-      // ---- P1 early-stop: consecutive stable accepted steps + confirmation ----
+      // ---- early-stop: consecutive stable accepted steps + confirmation ----
       if (estop_on && have_pending) {
         const double actual = std::isfinite(merit_before) ? merit_before - merit : 0.0;
         const double rel = std::abs(actual) / std::max(merit, 1.0);
@@ -1069,7 +1069,7 @@ bool JointCalib::solve(const std::vector<WindowData> &windows, SharedCalib &cali
   // report the last ACCEPTED point: its Lambda/sigma were evaluated exactly
   // there, and a trailing un-evaluated (or rejected) step must not ship
   restore(accepted_p);
-  // ---- P4 finalize: capped evals carried the outer loop; the SHIPPED
+  // ---- fused-eval finalize: capped evals carried the outer loop; the SHIPPED
   // linearization (commit gates read rep sigmas) must be commit-grade. One
   // tight pass at the accepted point from the accepted warm states, fixed-
   // order reduction, replacing accepted_L/accepted_g and the warm states.
@@ -1138,7 +1138,7 @@ bool JointCalib::solve(const std::vector<WindowData> &windows, SharedCalib &cali
     if (!dead[wi])
       rep.qn_max_final = std::max(rep.qn_max_final, qn_acc[wi]);
   // ---- carry write-back (accepted point only; pre-linearization failures
-  // leave the container untouched — the stale stamp self-arbitrates at the
+  // leave the container untouched -- the stale stamp self-arbitrates at the
   // next consume, e.g. the A1b-failure restore re-matching the A1a stamp) ----
   if (carry_on && have_lin) {
     carry->p_stamp = full_stamp(); // calib holds accepted_p (restored above); frozen blocks never moved

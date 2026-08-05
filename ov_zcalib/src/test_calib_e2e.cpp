@@ -152,8 +152,8 @@ static WindowData make_window(const Truth &tr, double phase, double dur, double 
     }
   }
 
-  // Nuisance seeds from perturbed truth (window frame = I0 at t0): the gates isolate
-  // CALIBRATION recovery; window bootstrapping is the production Dong-Si path (S4).
+  // Nuisance seeds from perturbed truth (window frame = I0 at t0): these gates isolate
+  // CALIBRATION recovery; Dong-Si window bootstrapping is exercised by the session e2e suite.
   const double t0c = w.clone_times.front();
   const Eigen::Matrix3d R0 = R_of(t0c, phase);
   const Eigen::Vector3d p0 = p_of(t0c, phase);
@@ -226,7 +226,7 @@ int main() {
   // ---------------- S2: single window, extrinsics + td only ----------------
   // Data generated with IDENTITY IMU intrinsics so the frozen dw/da/qA are consistent
   // (freezing them at identity against non-identity truth would push model error into
-  // ext/td — that is an S3 coupling question, not the S2 gate).
+  // ext/td -- that is an S3 coupling question, not the S2 gate).
   {
     Truth tr2 = tr;
     tr2.imu = ImuIntrinsicModel();
@@ -422,8 +422,7 @@ int main() {
     report_errors(c, tr, er, ep, et, edw, eda, eqa);
     std::printf("[S0b] drift 0.08 px/frame -> bias floor: ext_rot=%.3f deg ext_pos=%.2f mm td=%.3f ms dw=%.2e da=%.2e (ok=%d)\n", er, ep,
                 et, edw, eda, (int)ok);
-    // Informational (the falsifier REPORTS the floor; spec gates live in the plan):
-    // still assert the floor is bounded, not divergent
+    // The falsifier REPORTS the floor; assert only that it is bounded, not divergent.
     CHECK(ok && et < 3.0 && er < 0.5, "S0b: systematics run diverged (td=%.3f ms rot=%.3f deg)", et, er);
   }
 

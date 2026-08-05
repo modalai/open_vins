@@ -416,8 +416,8 @@ private:
       // A trailing comment containing a COLON silently destroys the value: OpenCV's YAML reader
       // tokenizes before it strips comments, so `key: false  # no-op: re-solved anyway` parses as
       // a nested MAP and the scalar is gone. The node then reads back empty and the setting keeps
-      // its default -- a config the operator wrote and we ignored, with no error. Catch it here and
-      // say exactly what to do, because the failure is otherwise invisible.
+      // its default -- a written config silently ignored, with no error. Catch it here and say
+      // exactly what to do, because the failure is otherwise invisible.
       if (file_node[node_name].isMap()) {
         PRINT_WARNING(YELLOW "the node %s parsed as a MAP, not a bool -- a ':' in its trailing comment?\n" RESET,
                       node_name.c_str());

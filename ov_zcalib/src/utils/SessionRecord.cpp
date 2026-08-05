@@ -22,13 +22,10 @@ namespace {
 constexpr uint32_t kMagic = 0x5343564Fu; // "OVCS"
 
 /// The record is a SESSION ARTIFACT, not an interchange format: the binary that writes it is the
-/// binary that reads it, and a session that needs replaying is re-run or re-fed from its log. So
-/// there is no version ladder here and there must not become one -- kFormat is a single fingerprint
-/// the reader demands EXACTLY, and a mismatch is a loud error rather than a compatibility branch.
-/// Back-compat shims on an internal format buy nothing and cost a permanent tax on every field
-/// added afterwards (each one grows another `if (version >= N)` that must be reasoned about forever).
-/// Bump this whenever the layout below changes; old records then fail cleanly instead of silently
-/// decoding as garbage.
+/// binary that reads it, and a stale session is re-recorded or re-fed from its log. So there is
+/// no version ladder here and there must not become one -- kFormat is a single fingerprint the
+/// reader demands EXACTLY; a mismatch is a loud error, never a compatibility branch. Bump it on
+/// any layout change below; old records then fail cleanly instead of decoding as garbage.
 constexpr uint32_t kFormat = 5; // 5: tr_hw_seed dropped (tr IS the hardware value now) + frame
                                 // stamps are center-row mid-exposure (producer-anchored). 4: +imu.Tg
 constexpr uint8_t kRecImu = 0;
@@ -164,7 +161,7 @@ void SessionRecordWriter::write_frame(const FrameObs &f) {
   wr(f_, f.exposure_s);
   wr(f_, f.temp_c);
   wr(f_, f.seq);
-  wr(f_, f.cam); // v3
+  wr(f_, f.cam);
   const uint32_t n = (uint32_t)f.pts.size();
   wr(f_, n);
   if (n)

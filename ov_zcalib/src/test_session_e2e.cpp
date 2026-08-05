@@ -2,7 +2,7 @@
  * OpenVINS: An Open Platform for Visual-Inertial Research
  * Copyright (C) 2025-2026 Joao Leonardo Silva Cotta
  *
- * ov_zcalib session end-to-end gates (the S4/S6 acceptance):
+ * ov_zcalib session end-to-end gates:
  *
  *  [S1] Full synthetic session through the RECORD -> REPLAY path with NO truth
  *       anywhere downstream (SETTLE still baseline, bootstrap hand-eye/xcorr,
@@ -12,9 +12,11 @@
  *  [S2] Determinism: two replays of the same record produce byte-identical
  *       committed YAML (the deterministic-reduction contract, session level).
  *  [S3] Degenerate-motion suite (RSS Table I style): a single-axis-rotation
- *       session must NOT commit the unexcited blocks — either the bootstrap
+ *       session must NOT commit the unexcited blocks -- either the bootstrap
  *       diversity gate aborts, or the sigma rule holds every gated parameter
  *       at its prior/seed.
+ *  [S4] Staged camera-intrinsic refinement (cam_mode=1): the committed cam
+ *       block must improve on its seed without sacrificing temporal/IMU blocks.
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -56,17 +58,16 @@ static void write_session_record(const synth::Truth &tr, const std::string &path
   std::vector<RawImu> imu;
   std::vector<FrameObs> frames;
   if (!single_axis && pump_amp > 0.0) {
-    // g-aligned "pumping" at the real Sting handheld dynamics class (std|a_m| 2.8-3.2
-    // m/s^2; the shared shape's 0.37 starves the split-half chain judge of per-half
-    // q_AtoI conditioning — the tg-arbiter ladder measured the halves' own basin at
-    // 0.6-1.0 deg vs 0.3 deg bands there, and the honest judge refuses). 3.1 rad/s:
-    // the ladder's da-CLEAN frequency (best chain conditioning, z 0.77; da col-3 stays
-    // ~3.1e-3 where 3.7 parks it ~9e-3-1e-2 at short durations). Its one weakness —
-    // Tg(2,2) shrinkage against the 3.1-2.9 beat — is a TG-RECOVERY concern; this
-    // suite's worlds carry Tg=0 and tg correctly refuses (tg_e2e T1 owns recovery at
-    // 3.7 / 240 s). Generated HERE like the single-axis branch, NOT via a
-    // synth::Trajectory knob: the -ffast-math SLP seam repacks p_of's sin group if the
-    // shared expression grows a guarded term (see test_tg_e2e / parity probe evidence).
+    // g-aligned "pumping" at real handheld dynamics (std|a_m| 2.8-3.2 m/s^2). The
+    // weak 0.37 m/s^2 shape starves the split-half chain judge of per-half q_AtoI
+    // conditioning (per-half basins 0.6-1.0 deg vs 0.3 deg agreement bands), so the
+    // honest judge refuses there. 3.1 rad/s is the measured da-clean frequency:
+    // da col-3 stays ~3.1e-3 where 3.7 rad/s parks it ~1e-2 at short durations.
+    // Its one weakness -- Tg(2,2) shrinkage against the 3.1-2.9 beat -- is a
+    // Tg-RECOVERY concern; these worlds carry Tg=0 and the tg gate correctly
+    // refuses (tg_e2e T1 owns recovery at 3.7 / 240 s). Generated HERE like the
+    // single-axis branch, NOT via a synth::Trajectory knob: the -ffast-math SLP
+    // seam repacks p_of's sin group if the shared expression grows a guarded term.
     std::mt19937 g(rng);
     std::normal_distribution<double> nrm(0.0, 1.0);
     const double w_z = 3.1;
@@ -236,18 +237,18 @@ int main(int argc, char **argv) {
   cfg.joint.verbose = false;
   cfg.cam_mode = 0; // S1/S2/S3 are the frozen temporal/IMU gates; S4 below gates the camera path
   // Window pool at the machine width: serial == parallel BIT-IDENTICAL (fixed-range partition,
-  // worker-ordered fold — see ov_init::zbft_sfm::ParallelExecutor), so this is pure wall-clock.
+  // worker-ordered fold -- see ov_init::zbft_sfm::ParallelExecutor), so this is pure wall-clock.
   // NO wall budgets anywhere in the tests: solve_budget_s stays 0 and the only time limit is the
-  // 60 s inner hang guard that must never bind — a binding budget couples machine load into the
+  // 60 s inner hang guard that must never bind -- a binding budget couples machine load into the
   // iterate and makes a determinism suite flake under load.
   cfg.joint.num_threads = std::max(4u, std::thread::hardware_concurrency());
 
-  // 6 s quiet head (settle), excitation [6, 120]; bootstrap ~[6, 20+], collection after
-  // S1 = the DESIGNED rich-excitation case: real-log dynamics (pump 0.35 m @ 3.1 rad/s,
-  // std|a_m| ~2.4 m/s^2) so the accel-chain unlock question is really asked. The legacy
-  // 0.37 m/s^2 shape now honestly REFUSES under the arbiter's split-half judge (its
-  // per-half qA basin is wider than the agreement band there) — that refusal world is
-  // tg_e2e's T2/T3 territory; S1 must be the certify world.
+  // 6 s quiet head (settle), excitation [6, 120]; bootstrap ~[6, 20+], collection after.
+  // S1 = the DESIGNED rich-excitation case (pump 0.35 m @ 3.1 rad/s, std|a_m| ~2.4
+  // m/s^2) so the accel-chain unlock question is really asked. The weak 0.37 m/s^2
+  // shape REFUSES under the arbiter's split-half judge (its per-half qA basin is
+  // wider than the agreement band) -- that refusal world is tg_e2e's T2/T3 territory;
+  // S1 must be the certify world.
   if (s1)
     write_session_record(tr, rec, 120.0, 6.0, 118.0, 4242, false, nullptr, 0.35);
 
@@ -283,13 +284,13 @@ int main(int argc, char **argv) {
   // The S1 sweep is the DESIGNED rich-excitation case: the accel-chain unlock
   // must OPEN here. Pinned explicitly because an abstention can masquerade as
   // a small qA error (truth is ~1.1 deg from the identity it would freeze at)
-  // — a gate-state-conditional tolerance would let a broken gate pass silently.
+  // -- a gate-state-conditional tolerance would let a broken gate pass silently.
   CHECK(rep.a_full_open, "S1: accel-chain gate failed to open on rich synthetic excitation (att %.1f deg, dyn %.2f m/s^2)",
         rep.accel_att_spread_deg, rep.accel_dyn_ms2);
   // qA gate = truth-recovery bound OUTSIDE the estimator's own reproducibility
   // band: the split-half measures ~0.23 deg half-to-half scatter and full runs
   // land 0.57-0.73 deg across numerics-equivalent builds (float-path/summation
-  // order) — qA sits in a flat valley at this excitation. 0.80 still asserts
+  // order) -- qA sits in a flat valley at this excitation. 0.80 still asserts
   // genuine recovery (abstention reads ~1.13 = the truth offset itself, pinned
   // by the a_full_open check above); a tighter gate flaps on benign changes.
   CHECK(eqa < 0.80, "S1: qA err %.3f deg", eqa);
@@ -303,9 +304,8 @@ int main(int argc, char **argv) {
     const std::string y1 = slurp(cfg.out_yaml);
     SessionConfig cfg2 = cfg;
     cfg2.out_yaml = "/tmp/ov_zcalib_session_e2e_2.yaml";
-    // A stale yaml from a PREVIOUS run makes the byte-compare below pass vacuously when replay #2
-    // fails before writeback (measured: masked a budget-class flake on 2026-07-28). Fresh file or
-    // nothing.
+    // A stale yaml from a PREVIOUS run makes the byte-compare below pass vacuously when
+    // replay #2 fails before writeback (measured to mask a real flake). Fresh file or nothing.
     std::remove(cfg2.out_yaml.c_str());
     cfg2.verbose = false;
     SessionReport rep2;
@@ -370,25 +370,20 @@ int main(int argc, char **argv) {
     CHECK(cam_committed, "S4: cam block not committed");
     // Measured-honest bounds for ONE ~110 s single-camera session (focal/center
     // trade against metric depth; distortion is the strongest-recovered pair).
-    // Every dof must also IMPROVE on its seed — refine must never harm.
+    // Every dof must also IMPROVE on its seed -- refine must never harm.
     // Center bound 1.0: the cx/cy pair lives in the flat valley, and its
-    // landing moves ~0.1-0.2 px under JUSTIFIED solver operating points
-    // (legacy (-0.39,+0.87); A-legacy+B-cert (-0.60,+0.92); the A-chain
-    // legacy invariant is forced by the REAL Sting split-half and B-cert by
-    // the P0 waste measurement — while focal/distortion improve outright).
-    // A bound at the historical point + epsilon flaps on benign changes (the
-    // qA gate's documented philosophy); genuine harm is caught by the
-    // improve-on-seed contract below and the 0.8 focal bound.
+    // landing moves ~0.1-0.2 px across JUSTIFIED solver operating points
+    // while focal/distortion improve outright. A bound at any one landing +
+    // epsilon flaps on benign changes (the qA gate's philosophy); genuine harm
+    // is caught by the improve-on-seed contract below and the 0.8 focal bound.
     CHECK(std::abs(dcam(0)) < 0.8 && std::abs(dcam(1)) < 0.8, "S4: focal err %.2f/%.2f px", dcam(0), dcam(1));
     CHECK(std::abs(dcam(2)) < 1.0 && std::abs(dcam(3)) < 1.0, "S4: center err %.2f/%.2f px", dcam(2), dcam(3));
-    // Distortion bound RE-PINNED 1.5e-3 -> 2.0e-3 (2026-07-28, center-stamp convention flip;
-    // still half the k1 seed error, so genuine recovery is asserted). Bisected on this exact
-    // world: pristine b8b20d8 lands k1/k2 at -0.0001/+0.0001; the flipped tree at +0.0016/-0.0015;
-    // R6-only overlay reproduces pristine EXACTLY and a legacy-transport A/B reproduces the
-    // flipped tree EXACTLY — the shift is the flip's STRUCTURAL delta (tr parameter-block removal
-    // reorders the problem under -ffast-math; center stamps shift the clone timeline), i.e. the
-    // documented float-path/summation-order basin class, not a defect in any one term. The
-    // improve-on-seed contract below still polices genuine harm dof-by-dof.
+    // Distortion bound 2.0e-3: still half the k1 seed error, so genuine recovery is
+    // asserted. The exact k1/k2 landing was bisected to the center-stamp convention's
+    // STRUCTURAL delta (removing the tr parameter block reorders the problem under
+    // -ffast-math; center stamps shift the clone timeline) -- the float-path/
+    // summation-order basin class, not a defect in any one term. The improve-on-seed
+    // contract below still polices genuine harm dof-by-dof.
     CHECK(std::abs(dcam(4)) < 2.0e-3 && std::abs(dcam(5)) < 2.0e-3, "S4: distortion err %.4f/%.4f", dcam(4), dcam(5));
     for (int k = 0; k < 6; ++k)
       CHECK(std::abs(dcam(k)) <= std::abs(dseed(k)) + 0.35, "S4: dof %d worse than seed (%.3f vs %.3f)", k, dcam(k), dseed(k));

@@ -9,10 +9,10 @@
  * fingerprint (generalizing the rotation-axis-only criterion): each slot
  * caches its max similarity to any other slot, so admission/eviction is O(N)
  * amortized. Every holdout_every-th ACCEPTED window is flagged holdout: never
- * evicted, never fused — the VERIFY stage's held-out data. Selection at solve
+ * evicted, never fused -- the VERIFY stage's held-out data. Selection at solve
  * time is greedy logdet (D-optimal, submodular (1-1/e) on the prior-whitened
  * one-pass information) with a time-overlap penalty against double counting,
- * and the whitened minimum eigenvalue (E-optimal) is reported alongside —
+ * and the whitened minimum eigenvalue (E-optimal) is reported alongside --
  * min-eig catches near-degenerate selections that logdet smooths over. The
  * degenerate-motion gating this implements follows the observability analysis
  * of Yang et al. (RSS 2020 / T-RO 2023); windows that never excite a subspace
@@ -60,7 +60,7 @@ public:
   ReservoirDecision consider(const WindowMeta &meta);
 
   /// Read-only admission probe: would consider() accept this window right now?
-  /// Admission is FINGERPRINT-only by design, so the probe is exact — the
+  /// Admission is FINGERPRINT-only by design, so the probe is exact -- the
   /// session uses it to pay the nonlinear window solve/export ONLY for windows
   /// that will actually be retained (on long collections every overflow window
   /// otherwise burns a full BA just to be discarded).

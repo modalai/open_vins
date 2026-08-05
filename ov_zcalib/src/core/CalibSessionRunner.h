@@ -11,7 +11,7 @@
  * All per-window work (linear seed, display-Lambda micro-BA, reservoir
  * admission) runs SYNCHRONOUSLY on this thread: windows close every few
  * seconds and cost ~100-300 ms on target, so the duty cycle stays low, the
- * rings upstream absorb the burst, and — decisive — live and replay execute
+ * rings upstream absorb the burst, and -- decisive -- live and replay execute
  * the IDENTICAL deterministic computation (the S4 bit-parity gate extends to
  * the committed answer). The streaming one-pass fusion drives DISPLAY ONLY;
  * the committed calibration always comes from the end-of-session VarPro
@@ -66,19 +66,19 @@ struct SessionConfig {
   int min_pair_matches = 12;
   /// Evidence recency horizon [s] for the xcorr/hand-eye buffers (0 = whole session). The gate
   /// judges the operator's RECENT motion: an early bad stretch (AE settling, blur, the pick-up)
-  /// must age out instead of capping the achievable peak forever — measured on D0014
-  /// (2026-07-13) the cumulative peak crawled 0.52->0.57 over a minute because the prefix never
-  /// left the sum. Also bounds per-attempt cost and memory on a long bootstrap. Sessions whose
-  /// bootstrap passes within the horizon are byte-identical to the unwindowed behaviour.
+  /// must age out instead of capping the achievable peak forever -- measured: the cumulative
+  /// peak crawled 0.52->0.57 over a minute because the prefix never left the sum. Also bounds
+  /// per-attempt cost and memory on a long bootstrap. Sessions whose bootstrap passes within
+  /// the horizon are byte-identical to the unwindowed behaviour.
   double bootstrap_window_s = 45.0;
   // COLLECT
   /// Merge-replay the bootstrap-span frames+imu into the harvester once it
-  /// exists (see try_bootstrap_). MEASURED 2026-07-10: transformative on
-  /// starved flight logs (position_push front: 4->10 harvested, ABORT->COMMIT)
-  /// but HARMFUL on rich handheld sessions (Sting: 2 early cold-start windows
-  /// joined the fused set, flipped split-half INCONSISTENT at dqA 0.823 deg
-  /// vs 0.305 band — freezing the accel chain — and dragged cam 1.4-1.8 px
-  /// off kalibr). Default OFF preserves the validated rich-session path; the
+  /// exists (see try_bootstrap_). Measured: transformative on starved flight
+  /// logs (4->10 harvested windows, ABORT->COMMIT) but HARMFUL on rich
+  /// handheld sessions (two early cold-start windows joined the fused set,
+  /// flipped split-half INCONSISTENT at dqA 0.823 deg vs the 0.305 band --
+  /// freezing the accel chain -- and dragged cam 1.4-1.8 px off the kalibr
+  /// reference). Default OFF preserves the validated rich-session path; the
   /// --flight profile turns it on.
   bool retro_harvest = false;
   double collect_max_s = 240.0;
@@ -95,14 +95,14 @@ struct SessionConfig {
   /// units) -- the real gates still adjudicate at solve time.
   double collect_min_eig = 0.0;
   double thermal_hold_slope = 1.5 / 60.0; ///< deg C/s: pause window opening above this
-  // SOLVE / S5 camera staging
+  // SOLVE / camera staging
   int select_K = 18;
   double select_overlap_penalty = 0.5;
-  /// Task 8: stage-specific D-optimal subsets over the retained reservoir.
+  /// Stage-specific D-optimal subsets over the retained reservoir.
   /// SELECTION-SIDE ONLY: admission fingerprints and reservoir retention are
   /// parity-frozen (WindowScorer untouched); holdouts never enter any set
   /// (thermal_bin excludes them). OFF = the single master selection feeds
-  /// every stage — byte-identical legacy path.
+  /// every stage -- byte-identical legacy path.
   bool stage_select = false;
   int select_K_a0 = 0; ///< A0 (ext/td/tr) budget; 0 = select_K
   int select_K_a1 = 0; ///< A1a/A1b + accel/tg gates budget; 0 = select_K (keep >= a_full_min_windows)
@@ -118,11 +118,11 @@ struct SessionConfig {
   /// still make progress). JointCalib stops at its best accepted point when
   /// exceeded, so a tight budget degrades polish, never consistency. The
   /// per-call joint.max_wall_s remains available but is overridden when this
-  /// is set — staging multiplied the call count, so only a shared deadline
+  /// is set -- staging multiplied the call count, so only a shared deadline
   /// bounds the session (flight profiles set this to meet the <=60 s target).
   double solve_budget_s = 0.0;
-  /// 0 fixed | 1 refine (tight priors from the existing cal — the DEFAULT per
-  /// the plan) | 2 full (weak priors; gated, loud). Intrinsics unlock only in
+  /// 0 fixed | 1 refine (tight priors from the existing cal -- the default)
+  /// | 2 full (weak priors; gated, loud). Intrinsics unlock only in
   /// phase B AFTER temporal/IMU converge (RS/td residue aliases into k1/f
   /// otherwise) and ship only if the block beats its prior 3x AND the
   /// refinement-hurt detector stays quiet.
@@ -130,59 +130,57 @@ struct SessionConfig {
   double k34_radial_gate = 0.12; ///< min fraction of obs beyond 0.7*r_max to free k3/k4
   /// C1 (center gate): min per-quadrant fraction of this camera's fused observations, quadrants
   /// taken about the current (cx, cy). Below it the data never brackets the center and cx/cy walk
-  /// into self-consistent junk (the v5 wander: cy +2.9 px COMMITTED); freeze them at seed via the
-  /// k3/k4 sigma mechanism -- D2 exclusion keeps the block committable with frozen dofs at seed.
+  /// into self-consistent junk (measured: cy walked +2.9 px and COMMITTED); freeze them at seed
+  /// via the k3/k4 sigma mechanism -- the frozen-dof exclusion keeps the block committable.
   double cam_center_quadrant_gate = 0.10;
   Eigen::Matrix<double, 8, 1> cam_refine_prior = (Eigen::Matrix<double, 8, 1>() << 2, 2, 2, 2, 0.01, 0.01, 1e-9, 1e-9).finished();
   Eigen::Matrix<double, 8, 1> cam_full_prior = (Eigen::Matrix<double, 8, 1>() << 20, 20, 20, 20, 0.1, 0.1, 1e-9, 1e-9).finished();
-  /// Camera-block coordinate alternation inside phase B (operator directive):
-  /// fx<->k1 correlate at |rho|~0.9 on equidistant, so a monolithic 8-dof pass
-  /// walks the shared valley slowly and drifts the pinhole row. Each round runs
+  /// Camera-block coordinate alternation rounds inside phase B: fx<->k1
+  /// correlate at |rho|~0.9 on equidistant, so a monolithic 8-dof pass walks
+  /// the shared valley slowly and drifts the pinhole row. Each round runs
   /// (a) pinhole+k1/k2 with k3/k4 frozen, then (b) distortion-only k1..k4 with
   /// the pinhole row frozen (k3/k4 still behind the radial-coverage gate).
-  /// 0 disables (monolithic B-1, the pre-directive behavior).
-  /// Cam alternation rounds. SEED QUALITY IS THE MODERATOR (2026-07-11):
-  /// on a well-seeded rig (Sting v8_alt1 A/B, per-unit cal reproj 0.31 px)
-  /// one round reproduces the two-round kalibr scorecard exactly and saves
-  /// ~30 s — but on existing-cal-grade seeds (S4 sim, 1.5 px off: the
-  /// production cam-refine case) round 2 is load-bearing for the flattest
-  /// dof (cy +0.70 vs +0.94 px, carry-free). Library default serves the
-  /// general case; drop to 1 via --cam-alt-rounds when the rig's existing
-  /// cal is known-good. (An alt-rounds saving measured UNDER the warm-carry
-  /// is an artifact: carried basins made round 2 a no-op at any setting.)
+  /// 0 disables (monolithic B-1). SEED QUALITY moderates the round count:
+  /// on a well-seeded rig (per-unit cal, reproj 0.31 px) one round reproduces
+  /// the two-round kalibr scorecard exactly and saves ~30 s, but on
+  /// existing-cal-grade seeds (S4 sim, 1.5 px off: the production cam-refine
+  /// case) round 2 is load-bearing for the flattest dof (cy +0.70 vs +0.94 px,
+  /// carry-free). Library default serves the general case; drop to 1 via
+  /// --cam-alt-rounds when the rig's existing cal is known-good. Judge
+  /// alt-round savings carry-free: carried basins make round 2 a no-op at any
+  /// setting.
   int cam_alt_rounds = 2;
-  /// Run the pinhole-only settle pass after the alternation rounds. P0
-  /// measured settle merit-flat alongside round 2; the round-2 A/B proved a
-  /// byte-level no-op. Profiles may drop settle (~9 s host) after the same
-  /// byte-level A/B on their shape.
+  /// Run the pinhole-only settle pass after the alternation rounds. Measured
+  /// merit-flat alongside round 2; profiles may drop settle (~9 s host) after
+  /// a byte-level A/B on their own shape.
   bool cam_settle = true;
   /// Arm the stationarity certificate in B2-polish (IMU chain open there, so
   /// JointConfig::cert_open_imu is required): replaces the legacy
-  /// plateau/anchor double-solves P0 measured as ~85% waste in that stage.
+  /// plateau/anchor double-solves, measured ~85% redundant in that stage.
   /// Off by default; profiles enable after their falsifier+scorecard A/B.
   bool b2_cert = false;
-  /// s7 RE-BASELINE CANDIDATE (default off; --a-candidate CLI): the A-chain
+  /// Re-baseline candidate (default off; --a-candidate CLI): the A-chain
   /// stages (A0/A1a/A1b-full) run the certificate instead of legacy
   /// plateau/anchor, and every staged solve arms the Newton-decrement
   /// conv-stop. The split HALVES stay legacy two-path unconditionally (they
   /// ARE the falsifier). This deliberately moves the A-chain statistics the
-  /// legacy invariant pins — verdicts are adjudicated by the s7 protocol
-  /// (suite verdicts + both logs + kalibr-gauge envelope), never assumed.
+  /// legacy invariant pins -- verdicts are adjudicated against the suite,
+  /// both reference logs, and the kalibr-gauge envelope, never assumed.
   bool a_candidate = false;
-  /// P4 fused evaluation in every staged solve EXCEPT the split halves (the
+  /// Fused evaluation in every staged solve EXCEPT the split halves (the
   /// mode-0/2 falsifier keeps its legacy statistics in every configuration).
   /// At host mode-1 the operative falsifier is the wald gate, whose stability
-  /// under the P4 solver is measured by test_wald_mc --p4 (composed endgame).
+  /// under the fused solver is measured by test_wald_mc --p4.
   bool p4 = false;
   /// A-chain warm-carry (mode-1 experiment): carry nuisance optima across
-  /// A0->A1a->A1b. REJECTION HISTORY: carried seeds poisoned the SPLIT-HALF
-  /// falsifier (S1 sim flip) -- which never runs at mode-1, where the wald
+  /// A0->A1a->A1b. Carried seeds poison the SPLIT-HALF falsifier (measured:
+  /// S1 sim verdict flip) -- which never runs at mode-1, where the wald
   /// gate + kalibr scoring adjudicate instead. B-chain carry stays OFF
   /// unconditionally (S4 cy flat-dof walk, measured).
   bool a_carry = false;
   // Accel-chain unlock (A1b): the full accel intrinsic chain (da off-diagonals
   /// + q_AtoI) needs specific-force DIRECTION diversity (attitude spread) to be
-  /// identifiable at all — the cheap pre-gate below — but on real sensors the
+  /// identifiable at all -- the cheap pre-gate below -- but on real sensors the
   /// weakly-excited dofs also absorb unmodeled systematics (-1%-level scale
   /// junk measured on a handheld ICM while kalibr resolves 0.3-0.6%). The
   /// authoritative gate is therefore SPLIT-HALF CONSISTENCY: the chain is
@@ -199,12 +197,12 @@ struct SessionConfig {
                                       ///< agree 8x better than the suite's own documented da valley tolerance
   double a_split_qa_floor_deg = 0.1;  ///< band floor for the q_AtoI angle
   /// Band floor for tg dofs [(rad/s)/(m/s^2)]: agreement is demanded at the scale of the accuracy
-  /// CLAIM — the a_split_da_floor doctrine — i.e. 0.3x the MEASURED 4e-4 part class (D0014 chain
-  /// 0.22 dps/g), the per-element bound the recovery gate and the commit ceiling ship. The old
-  /// 1e-4 sat below the claim and let the falsifier's own noise adjudicate: measured on the T1
-  /// synthetic (real all-9-distinct part-class Tg), the halves' worst |d| held at 1.1-1.2e-4 from
-  /// 8 to 12 windows/half — inside the claim, refused by the floor. Kalibr's BETWEEN-session
-  /// scatter (+/-5e-4) stays 4x above this floor: scatter-class junk still refuses.
+  /// CLAIM -- the a_split_da_floor doctrine -- i.e. 0.3x the measured 4e-4 part class (~0.22
+  /// dps/g), the per-element bound the recovery gate and the commit ceiling ship. A floor below
+  /// the claim lets the falsifier's own noise adjudicate: on a synthetic with a real part-class
+  /// Tg the halves' worst |d| held at 1.1-1.2e-4 across window budgets -- inside the claim, yet
+  /// refused by a 1e-4 floor. Kalibr's BETWEEN-session scatter (+/-5e-4) stays 4x above this
+  /// floor: scatter-class junk still refuses.
   double a_split_tg_floor = 1.2e-4;
   /// Signal-fraction term of the agreement band: halves also agree when their
   /// disagreement is below this fraction of the SIGNAL they claim (deviation
@@ -213,32 +211,32 @@ struct SessionConfig {
   /// so a pure sigma band wrongly freezes a well-observed chain; junk modes
   /// have scatter ~ signal and still fail this ratio.
   double a_split_signal_frac = 0.34;
-  // ---- Wald reduced-information accel gate (DESIGNS #1 / S11): replaces the
-  // two nonlinear half-solves with ONE widened warm evaluation pass at the
-  // A1a accepted point + marginal Wald / cross-prediction / observability
-  // statistics on the 6-dof gate subspace {da off-diag, qA}. Sequencing
-  // theorem (2026-07-11 adjudication): the half-solves' launch sensitivity is
-  // what pins A1a's pass count — this gate dissolves that constraint.
-  int a_gate_mode = 0;           ///< 0 split-half decides (v15-exact); 1 wald decides; 2 shadow (split decides, wald logged)
+  // ---- Wald reduced-information accel gate: replaces the two nonlinear
+  // half-solves with ONE widened warm evaluation pass at the A1a accepted
+  // point + marginal Wald / cross-prediction / observability statistics on
+  // the 6-dof gate subspace {da off-diag, qA}. The half-solves' launch
+  // sensitivity is what pins A1a's pass count -- this gate dissolves that
+  // constraint.
+  int a_gate_mode = 0;           ///< 0 split-half decides (legacy-exact); 1 wald decides; 2 shadow (split decides, wald logged)
   double a_info_deflate = 2.0;   ///< kappa: measured exported-Lambda under-dispersion, VARIANCE semantics (MC harness re-pins per shape)
   double a_obs_min_eig = 4.5;    ///< per-half prior-whitened eigenvalue floor along joint eigendirections
   double a_wald_thresh_scale = 1.0;
   double a_qa_phys_ceiling_deg = 2.0;  ///< fused-step ceiling (vs 0.776 deg die misalignment + ICM cross-axis spec class)
   double a_da_off_phys_ceiling = 0.02;
   /// Fused-step ceiling for tg elements. ANCHORED TO THE MEASURED PART CLASS, not the datasheet
-  /// typ: the D0014 chain carries |Tg| ~ 4e-4 (0.22 dps/g) and kalibr's own per-session estimates
-  /// scatter +/-5e-4 -- a blind (zero-seeded) session recovering the REAL value implies a fused
-  /// step of ~4-6e-4, which the old 5e-4 ceiling refused as "unphysical" (measured: front log
-  /// refused at 5.9e-4). 3x the part class = 1.5e-3: junk basins still hit it, physics does not.
+  /// typ: the reference chain carries |Tg| ~ 4e-4 (0.22 dps/g) and kalibr's own per-session
+  /// estimates scatter +/-5e-4 -- a blind (zero-seeded) session recovering the REAL value implies
+  /// a fused step of ~4-6e-4, which a 5e-4 ceiling refuses as "unphysical" (measured: a flight
+  /// log refused at 5.9e-4). 3x the part class = 1.5e-3: junk basins still hit it, physics does not.
   double a_tg_phys_ceiling = 1.5e-3;
-  // Identifiability gates (diagnostics with AUTHORITY; previously computed-but-unused)
+  // Identifiability gates (diagnostics with AUTHORITY)
   double xcorr_min_peak = 0.6;      ///< normalized xcorr peak floor: a flat correlation ridge
                                     ///< (near-constant |w|) yields a noisy td seed that must not pass
   double xcorr_min_sharpness = 0.0; ///< curvature floor at the xcorr peak (0 = off; grid-scale dependent)
   double min_eig_floor = 1.0;       ///< whitened min-eig ABORT floor on the selected window set
                                     ///< (catastrophic-only: committability needs ~(commit_sigma_factor)^2 per dof)
   double min_window_parallax = 0.0; ///< admission floor on the fingerprint median parallax [px]
-                                    ///< (0 = off; enable on bench data — far-field/translation-free guard)
+                                    ///< (0 = off; enable on bench data -- far-field/translation-free guard)
   // VERIFY / COMMIT
   double verify_min_improve = 0.05;  ///< held-out cost must improve by >= 5%
   /// Small-n honesty floors: a +5% improvement on ONE holdout window is weak
@@ -254,24 +252,23 @@ struct SessionConfig {
   double commit_sigma_factor = 3.0;  ///< block commits only if 3*sigma_post < sigma_prior for all dofs
   /// A block must be DISTINGUISHABLE from the value it would otherwise ship (the
   /// revert point: its seed) before it may claim a calibration. The 3-sigma rule
-  /// above is PRECISION-only — it asks "is the posterior tight?", never "did the
-  /// data actually move this block?" — and a block the solver never stepped still
+  /// above is PRECISION-only -- it asks "is the posterior tight?", never "did the
+  /// data actually move this block?" -- and a block the solver never stepped still
   /// accumulates information at the linearization point, so its posterior
-  /// collapses and it COMMITS AT ITS SEED. Measured on D0014 (2026-07-12): a
-  /// budget-truncated A1a took zero accepted steps, and dw/da were reported
-  /// `COMMIT` while carrying identity — which a writeback would then have written
-  /// over the rig's real factory Dw. The bar here is deliberately low (did it move
-  /// at all, in posterior units), not a significance test: it fires only on the
-  /// pathology, and every converged block clears it by orders of magnitude.
+  /// collapses and it COMMITS AT ITS SEED. Measured: a budget-truncated A1a took
+  /// zero accepted steps, and dw/da were reported `COMMIT` while carrying
+  /// identity -- which a writeback would then have written over the rig's real
+  /// factory Dw. The bar here is deliberately low (did it move at all, in
+  /// posterior units), not a significance test: it fires only on the pathology,
+  /// and every converged block clears it by orders of magnitude.
   double commit_min_move_sigma = 0.1;
   /// Absolute posterior ceilings [local units] per block: commit additionally
   /// requires sigma_post <= ceiling on every non-frozen dof. This ties the
   /// commit rule to the acceptance targets (the 3x-prior rule alone admits
   /// sigmas 3-5x looser than the flight acceptance numbers). tg's ceiling is the
-  /// CLAIM scale — 0.3x the measured 4e-4 part class, the same 1.2e-4 the split
+  /// CLAIM scale -- 0.3x the measured 4e-4 part class, the same 1.2e-4 the split
   /// floor demands agreement at (a_split_tg_floor doctrine): a pair certified at
-  /// claim-scale agreement must not then be refused for claim-scale precision
-  /// (the old 1.0e-4 pin predated the floor re-pin and sat below the claim).
+  /// claim-scale agreement must not then be refused for claim-scale precision.
   std::map<std::string, double> commit_abs_ceiling = {{"q_ItoC", 1.7e-3}, {"p_IinC", 2.5e-3}, {"td", 2.5e-4}, {"tg", 1.2e-4}};
   /// q_ItoC and td commit/revert TOGETHER: they move jointly in the solve, and
   /// a mixed state (new rotation, seed td) can be worse than either endpoint.
@@ -286,20 +283,19 @@ struct SessionConfig {
   bool commit_attribution = true;
   // NOTE: there is deliberately no free_tr and no tr gate machinery here. The rolling-shutter
   // readout is HAL3 hardware truth (camN_readout_time_s -> seed CamCalib::tr), a fixed transport
-  // constant of every reprojection — estimating it re-opens the td-aliasing class (D10/C3) this
-  // pipeline used to need gates for.
+  // constant of every reprojection -- estimating it re-opens the td-aliasing failure class.
   /// Estimate Tg (gyro g-sensitivity, 9 dof). EARNED, never trusted from a chain: the rig's own
-  /// kalibr sessions scatter beyond the value's magnitude (measured 2026-07-13, |Tg(D1)-Tg(F3)|
-  /// at the size of Tg itself), so a seed is an init and the session must certify its own
-  /// estimate. Unlocks ONLY through the A1b full-chain gate (accel excitation pre-gate +
-  /// split-half / Wald falsifier) and commits through the standard machinery + its ceiling.
+  /// kalibr sessions scatter beyond the value's magnitude between runs, so a seed is an init and
+  /// the session must certify its own estimate. Unlocks ONLY through the A1b full-chain gate
+  /// (accel excitation pre-gate + split-half / Wald falsifier) and commits through the standard
+  /// machinery + its ceiling.
   /// Requires an estimable IMU chain (a frozen factory chain freezes tg with it).
   bool free_tg = true;
   std::string out_yaml = "ov_zcalib_result.yaml";
   bool verbose = true;
-  /// P0 evidence: print the per-stage cost table ([evidence] lines) at the end
-  /// of the session solve. Counters are always collected (they are cheap and
-  /// ship in SessionReport::evidence); this only gates the print.
+  /// Print the per-stage cost table ([evidence] lines) at the end of the
+  /// session solve. Counters are always collected (they are cheap and ship in
+  /// SessionReport::evidence); this only gates the print.
   bool evidence_table = true;
 };
 
@@ -319,11 +315,11 @@ struct BlockCommit {
   double holdout_delta = 0.0;   ///< leave-one-out: holdout cost with this block reverted minus committed-mixture cost (>0 = block helps)
 };
 
-/// P0 evidence: one row per staged JointCalib solve, plus aggregated rows for
-/// the collection-side admission BAs and the verify sweep. Where a row comes
-/// from a JointCalib call the fields mirror JointReport; for BA-family rows
-/// passes/accepted count solves attempted/succeeded and the warm/cold columns
-/// stay zero. Timing fields are summed thread-CPU (> wall when parallel).
+/// Evidence table row: one per staged JointCalib solve, plus aggregated rows
+/// for the collection-side admission BAs and the verify sweep. Where a row
+/// comes from a JointCalib call the fields mirror JointReport; for BA-family
+/// rows passes/accepted count solves attempted/succeeded and the warm/cold
+/// columns stay zero. Timing fields are summed thread-CPU (> wall when parallel).
 struct StageEvidence {
   std::string label;
   int passes = 0;
@@ -331,9 +327,9 @@ struct StageEvidence {
   int windows = 0, dim_p = 0;
   double wall_s = 0, seed_s = 0, preint_s = 0, inner_s = 0, export_s = 0;
   long iters = 0, warm = 0, cold = 0, cold_plateau = 0, cold_anchor = 0, cold_won = 0, cold_won_guard = 0;
-  long cold_cert = 0, cold_jump = 0; ///< P1 certificate / carry-jump duels
-  long phit = 0, pmiss = 0;   ///< P3 preint-cache hits / misses (window solves)
-  double factor_s = 0.0;      ///< P3: IMU-factor construction thread-CPU (was untimed)
+  long cold_cert = 0, cold_jump = 0; ///< certificate / carry-jump duels
+  long phit = 0, pmiss = 0;   ///< preint-cache hits / misses (window solves)
+  double factor_s = 0.0;      ///< IMU-factor construction thread-CPU
   long tstop = 0;             ///< inner solves ended by the wall hang-guard (0 = healthy;
                               ///< nonzero = load leaked into numerics, run tainted for A/B)
   double merit = 0.0, qn_max = 0.0;
@@ -351,7 +347,7 @@ struct SessionReport {
   // collection
   int windows_harvested = 0, windows_retained = 0, windows_holdout = 0, windows_rejected_seed = 0, windows_invalidated = 0;
   int windows_rejected_gate = 0; ///< pre-seed admission gates (parallax floor etc.)
-  int windows_rejected_ba = 0;   ///< admission BA failures (previously a silent drop)
+  int windows_rejected_ba = 0;   ///< admission BA failures (counted, never a silent drop)
   int windows_probation = 0;         ///< retained via the drift-budget envelope (probation)
   int windows_probation_dropped = 0; ///< probation windows failing the post-A0 strict re-check
   bool verify_small_n = false;       ///< VERIFY decided under the small-n floors (n_hold <= 2)
@@ -359,7 +355,7 @@ struct SessionReport {
   // solve
   int windows_fused = 0;
   double min_eig_whitened = 0.0;
-  // Task 8 stage-specific selection (0/false when stage_select is off)
+  // stage-specific selection (0/false when stage_select is off)
   int windows_a0 = 0, windows_a1 = 0, windows_b = 0;
   double min_eig_a0 = 0.0, min_eig_a1 = 0.0, min_eig_b = 0.0;
   bool stage_a1_fallback = false; ///< balance guard reverted the A1 family to the master set
@@ -372,7 +368,7 @@ struct SessionReport {
   enum class AccelGateVerdict { PRE_CLOSED, SPLIT_CONSISTENT, SPLIT_INCONSISTENT, SPLIT_FAILED, WALD_CONSISTENT, WALD_INCONSISTENT, WALD_UNOBSERVABLE };
   AccelGateVerdict a_wald_verdict = AccelGateVerdict::PRE_CLOSED;
   /// tg's OWN gate verdict. Mode 1: the wald tg-subspace judge (runs only when the chain
-  /// certifies). Split modes: the tg half pair — which also runs when the frozen-tg chain judge
+  /// certifies). Split modes: the tg half pair -- which also runs when the frozen-tg chain judge
   /// REFUSED, because a certified-reproducible Tg falsifies that judge's tg=seed conditioning and
   /// arbitrates a re-judge on the tg-free halves. PRE_CLOSED = the question was never admitted
   /// (accel pre-gate closed, no solve, or the session does not estimate tg). A CONSISTENT verdict
@@ -384,7 +380,7 @@ struct SessionReport {
   double a_wald_x12 = 0.0, a_wald_x21 = 0.0; ///< cross-prediction excesses
   /// Cross-prediction thresholds AT THE RUN CONFIG. X12/X21 are kappa-free, but their
   /// Satterthwaite thresholds are exactly proportional to kap_eff * a_wald_thresh_scale
-  /// (AC = kap_eff * A*(A1^-1+A2^-1): gfac scales, nu is invariant) — recorded so the MC
+  /// (AC = kap_eff * A*(A1^-1+A2^-1): gfac scales, nu is invariant) -- recorded so the MC
   /// harness can re-size the rule offline across (floor, scale) cells without re-solving.
   double a_wald_xthr1 = 0.0, a_wald_xthr2 = 0.0;
   /// Fused-step physical magnitudes (the phys-ceiling inputs). Config-invariant across
@@ -404,7 +400,7 @@ struct SessionReport {
   double mixture_improve = 0.0;
   int verify_windows_used = 0;    ///< holdout windows where EVERY candidate solved
   int verify_windows_dropped = 0; ///< holdout windows dropped symmetrically (any candidate failed)
-  /// Session-mean camera exposure [s], PER CAMERA — DIAGNOSTIC ONLY. Frame timestamps arrive
+  /// Session-mean camera exposure [s], PER CAMERA -- DIAGNOSTIC ONLY. Frame timestamps arrive
   /// already anchored at center-row mid-exposure (the producer applies SOF + (readout+exposure)/2
   /// at ingest), so the committed td needs NO exposure conversion for any consumer: every stamp in
   /// the system is in the same convention. Kept in the report/YAML because the session's exposure
@@ -417,7 +413,7 @@ struct SessionReport {
   SharedCalib committed; ///< final calibration (uncommitted blocks reverted to seed)
   SharedCalib solved;    ///< raw post-VarPro calibration BEFORE verify/commit gating (diagnostics)
   std::string prompt;    ///< last guided-excitation prompt (live UX)
-  // P0 evidence rows (admission BAs, every staged solve, verify sweep)
+  // evidence rows (admission BAs, every staged solve, verify sweep)
   std::vector<StageEvidence> evidence;
 };
 
@@ -436,11 +432,11 @@ public:
   const SessionReport &report() const { return rep_; }
 
   /// True once the session has entered COLLECT (bootstrap accepted). Safe to read from OTHER
-  /// threads (relaxed atomic): the server's ingest decimation keys on it — the hand-eye pair
-  /// engine needs the full sensor rate (halving it doubles per-pair KLT displacement; measured
-  /// D0014 2026-07-13: cam 0 xcorr peak 0.2 at 30 Hz vs 0.55 at 60 Hz, same rig and operator),
-  /// while the saturation the decimation prevents is a COLLECT-phase problem (window
-  /// destruction). Never unset: THERMAL_HOLD and the solve states are all post-bootstrap.
+  /// threads (relaxed atomic): the server's ingest decimation keys on it -- the hand-eye pair
+  /// engine needs the full sensor rate (halving it doubles per-pair KLT displacement; measured:
+  /// xcorr peak 0.2 at 30 Hz vs 0.55 at 60 Hz on the same session), while the saturation the
+  /// decimation prevents is a COLLECT-phase problem (window destruction). Never unset:
+  /// THERMAL_HOLD and the solve states are all post-bootstrap.
   bool bootstrap_done() const { return past_bootstrap_.load(std::memory_order_relaxed); }
 
   /// Live collection-sufficiency probe: "if I stopped collecting RIGHT NOW, how
@@ -466,11 +462,10 @@ public:
   };
   CollectStatus collect_status();
   /// Per-block seed patches for a replay: which blocks start from the rig's own
-  /// chain instead of blind. The recorded CAMERA seed and the streams always stay
-  /// authoritative — this exists so ONE recorded session can be scored across the
-  /// seeding matrix (what earns its value from the data vs what should be given).
-  /// Patch a recorded seed so ONE recorded session can be scored across the seeding matrix (blind
-  /// vs chain-seeded, per block). The IMU chain is shared; the per-camera fields apply to `cam`.
+  /// chain instead of blind, so ONE recorded session can be scored across the
+  /// seeding matrix (what must be earned from the data vs what should be given).
+  /// The recorded CAMERA seed and the streams always stay authoritative. The IMU
+  /// chain is shared; the per-camera fields apply to `cam`.
   struct SeedOverride {
     const ImuIntrinsicModel *imu = nullptr; ///< dw/da/q_AtoI (+ their calib_* freeze flags)
     /// g-sensitivity, imu2 gauge (already conjugated: Tg_r = Tg_chain * Q_w). SEPARATE from `imu`
@@ -501,11 +496,11 @@ private:
   void print_evidence_() const;
   /// The Wald gate's one-evaluation pass (modes 1/2). Returns the ACCEL-chain verdict and fills
   /// the a_wald_* report fields; when tg_verdict is given (and the session estimates tg), the
-  /// SAME window-evaluation pass is judged a second time on the tg subspace — an unidentifiable
+  /// SAME window-evaluation pass is judged a second time on the tg subspace -- an unidentifiable
   /// tg must freeze tg alone, never veto the chain. budget_left_s <= 0 => safe abstention.
   SessionReport::AccelGateVerdict wald_accel_gate_(const std::vector<WindowData> &fused, std::vector<WindowWarmState> &warm,
                                                    double budget_left_s, SessionReport::AccelGateVerdict *tg_verdict = nullptr);
-  /// Task 8 stage selection: greedy D-optimal (WindowScorer::select_logdet)
+  /// Stage selection: greedy D-optimal (WindowScorer::select_logdet)
   /// over blkdiag( Lw[dof_idx,dof_idx], stage_feat_gain * g g^T ) per
   /// candidate. Deterministic (fixed candidate order, no RNG). Empty result =
   /// caller falls back to the master set.
@@ -520,12 +515,12 @@ private:
   RunnerState state_ = RunnerState::SETTLE;
   SessionReport rep_;
 
-  // mean exposure, PER CAMERA (td convention bridge; see SessionReport)
+  // mean exposure, PER CAMERA (diagnostic only; see SessionReport::mean_exposure_s)
   std::vector<double> exp_sum_;
   std::vector<long> exp_n_;
-  // P0 evidence: collection-side admission BA aggregate (one row at table time)
+  // collection-side admission BA aggregate (one evidence row at table time)
   StageEvidence adm_ev_;
-  // P3 session preint store (PreintCache.h): pure value-keyed memoization —
+  // Session preint store (PreintCache.h): pure value-keyed memoization --
   // hits return the exact bytes recomputation would produce (replay-proven),
   // so it is A-CHAIN-LEGACY-INVARIANT-compatible and threads through EVERY
   // window solve: admission BAs pre-fill at the seed pi (== the A0/A1a entry
@@ -533,12 +528,12 @@ private:
   // split halves use disjoint windows, VERIFY's shared-pi candidates collapse.
   PreintStore store_;
   // Retroactive harvest: frames buffered during BOOTSTRAP are merge-replayed
-  // (with boot_imu_) into the harvester the moment it exists — on a 41 s
-  // flight log SETTLE+BOOTSTRAP otherwise eat ~54% of the collection span.
-  // RESOURCE CONTRACT (operator directive): FrameObs is the POST-TRACKING
-  // point set (id,u,v — 12 B/point, ~2 KB/frame, no image payload). The
-  // tracker ran ONCE per frame in the feeder; replay is harvester bookkeeping
-  // only — NO re-detection, NO KLT re-run, ~8 MB worst-case at the 4000 cap.
+  // (with boot_imu_) into the harvester the moment it exists -- on a short
+  // flight log SETTLE+BOOTSTRAP otherwise eat ~half the collection span.
+  // RESOURCE CONTRACT: FrameObs is the POST-TRACKING point set (id,u,v --
+  // 12 B/point, ~2 KB/frame, no image payload). The tracker ran ONCE per
+  // frame in the feeder; replay is harvester bookkeeping only -- NO
+  // re-detection, NO KLT re-run, ~8 MB worst-case at the 4000 cap.
   std::deque<FrameObs> boot_frames_;
   std::vector<char> probation_; ///< per-slot: retained via the drift envelope
   // SETTLE

@@ -12,7 +12,7 @@
  * frames or > max_frame_gap_s splits; > max_drop_frac of expected frames
  * invalidates). At close it assembles a solver-ready WindowData: clone
  * subsampling to the dense-solver budget, min/max track-length filtering (the
- * cap bounds correlated KLT drift — the S0b floor), dense feature-id remap,
+ * cap bounds correlated KLT drift), dense feature-id remap,
  * mid-exposure clone stamps mapped to the IMU clock at the SEED td (td_ref),
  * seed-intrinsics bearings, and the padded raw-IMU slice. Memory is bounded:
  * one fixed-capacity IMU ring + the open window's frame list; no allocation
@@ -41,7 +41,7 @@ struct HarvesterConfig {
   double min_excite_a = 0.35;  ///< m/s^2
   double excite_win_s = 1.0;
   // window shape (3-5 s default per the solver clone budget; 2 s floor, 8 s
-  // only with subsampling — configure max_window_s up alongside max_clones)
+  // only with subsampling -- configure max_window_s up alongside max_clones)
   double min_window_s = 2.0;
   double max_window_s = 5.0;
   double quiet_close_s = 0.75; ///< close after this long below the gate
@@ -52,14 +52,13 @@ struct HarvesterConfig {
   /// window itself survives on whatever cameras are still healthy, and is invalidated only when
   /// none are.
   ///
-  /// This used to be a rig-level number: one pooled drop counter over one pooled expectation, and a
-  /// window that failed it died whole. On a rig where the cameras have different ingest costs that
-  /// is not a health gate, it is a contagion. MEASURED (D0014, hires 60 Hz rolling + tracking_down
-  /// 30 Hz global): the hires stream saturates the shared tracker and sheds ~1500 frames, which
-  /// invalidated 71 windows against 3 for the same session with hires removed -- so the DOWN camera
-  /// lost two thirds of its windows to a camera it shares no feature with. Its weakest direction
-  /// went 8.10 -> 3.23 and its held-out VERIFY 71.7% -> 60.2%. A camera must be answerable for its
-  /// own frames and no one else's.
+  /// Per camera by design: a pooled rig-level drop counter is not a health gate, it is a contagion
+  /// on rigs whose cameras have different ingest costs. MEASURED (dual-camera rig, 60 Hz rolling +
+  /// 30 Hz global sharing one tracker): the 60 Hz stream saturated the tracker and shed ~1500
+  /// frames, invalidating 71 windows against 3 for the same session with that camera removed --
+  /// the OTHER camera lost two thirds of its windows to a camera it shares no feature with
+  /// (weakest direction 8.10 -> 3.23, held-out VERIFY 71.7% -> 60.2%). A camera must be
+  /// answerable for its own frames and no one else's.
   double max_drop_frac = 0.10;
   // solver budgets
   int max_clones = 70;

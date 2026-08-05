@@ -15,7 +15,7 @@
  * constraint (K = skew(b) R_ItoC R_k)
  *      K p_f - T_k K v0 + 0.5 T_k^2 K g = K S_k - skew(b) p_IinC.
  * The joint LS over [v0, g, {p_f}] has arrowhead normal equations: per-feature
- * 3x3 blocks + a 6x6 Schur complement on [v0, g] — O(F) total, no projector,
+ * 3x3 blocks + a 6x6 Schur complement on [v0, g] -- O(F) total, no projector,
  * no big matrix. Features whose 3x3 block is near-singular (short/parallax-
  * free tracks) fall back to a median-depth bearing seed after the solve.
  * The gravity magnitude is solved FREE and its deviation from the configured
@@ -54,7 +54,7 @@ struct LinearSeedConfig {
   double max_g_mag_dev = 0.20;    ///< reject if | |g|-grav_mag | / grav_mag exceeds this
   double max_mean_ang_resid = 0.035; ///< angular backstop (far scenes; see metric gate)
   /// PRIMARY residual gate, depth-invariant: mean angular residual x median
-  /// depth. A fixed angular gate is depth-blind — 0.1 m of kinematic drift is
+  /// depth. A fixed angular gate is depth-blind -- 0.1 m of kinematic drift is
   /// 1.4 deg at 4 m but 14 deg at 0.4 m (close-range kalibr-sample lesson).
   double max_mean_metric_resid = 0.10; ///< [m]
   double max_fallback_frac = 0.5; ///< reject if most tracks were unsolvable
@@ -72,7 +72,7 @@ struct LinearSeedConfig {
   /// Drift-budget envelope on the metric gate for FACTORY-FRESH rigs: an
   /// uncalibrated accel chain with effective scale/misalignment error eps_eff
   /// MUST produce ~eps_eff*g*T^2/4 of kinematic drift the linear seed cannot
-  /// absorb — a fixed 0.10 m gate structurally rejects long windows on exactly
+  /// absorb -- a fixed 0.10 m gate structurally rejects long windows on exactly
   /// the rigs the calibrator exists for. gate(T) = max_mean_metric_resid +
   /// 0.25*drift_budget_ms2*T^2 (drift_budget_ms2 ~= eps_eff*g, e.g. 0.10 for a
   /// 1% envelope). 0 = exact legacy behavior. Envelope admissions are flagged
@@ -87,7 +87,7 @@ public:
    *        sim truth seeds). Uses win.obs[].bearing, win.imu, calib {q_ItoC,
    *        p_IinC, imu model, grav_mag} and the bootstrap gyro bias.
    * @return false (and win.has_seeds untouched) when the window fails the
-   *         seed-health gates — the caller drops the window.
+   *         seed-health gates -- the caller drops the window.
    */
   static bool seed_window(WindowData &win, const SharedCalib &calib, const Eigen::Vector3d &bg_boot, LinearSeedReport &rep);
   static bool seed_window(WindowData &win, const SharedCalib &calib, const Eigen::Vector3d &bg_boot, LinearSeedReport &rep,

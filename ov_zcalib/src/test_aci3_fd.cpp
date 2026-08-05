@@ -2,16 +2,16 @@
  * OpenVINS: An Open Platform for Visual-Inertial Research
  * Copyright (C) 2025-2026 Joao Leonardo Silva Cotta
  *
- * ov_zcalib S1 gate: two-level FD oracle for the ACI3 preintegration.
+ * Two-level FD oracle for the ACI3 calibration preintegration.
  *
  *  Level 1 (sweep): mean exactness vs dense sub-step integration, and every
  *    intrinsic/bias column of (DeltaR, alpha, beta) vs central differences of a
- *    full RE-INTEGRATION at perturbed parameters -- run at 800 Hz AND 200 Hz under
- *    a 1e-6 relative tolerance (the J_r-flavor episode is the standing precedent
- *    for exactly this oracle design).
+ *    full RE-INTEGRATION at perturbed parameters, at 800 Hz and 200 Hz under a
+ *    1e-6 relative tolerance. Re-integration FD is the oracle of record: it
+ *    cannot share a sign or Jr-flavor convention with the analytic accumulation.
  *  Level 2 (factor): analytic Jacobians of Factor_ImuAci3 vs central differences
  *    of its residual for ALL 14 parameter blocks (quaternions perturbed through
- *    the JPL local Plus). This pins every convention end to end.
+ *    the JPL local Plus). Pins every convention end to end.
  *
  * Standalone: g++ -O2 -std=c++17 -I<eigen> -I<ov_core/src> -I<ov_init/src> ...
  *
@@ -74,19 +74,18 @@ static ImuIntrinsicModel make_model() {
   return m;
 }
 
-// Dense sub-step reference (same per-raw-step constant signals, M Euler substeps)
+// Dense reference: fine-grid midpoint integration of the exact continuous signals
 static void dense_ref(const std::vector<RawImu> &imu, double t0, double t1, const ImuIntrinsicModel &model, const Eigen::Vector3d &bg,
                       const Eigen::Vector3d &ba, Eigen::Matrix3d &DR, Eigen::Vector3d &alpha, Eigen::Vector3d &beta) {
   AciPreintResult r;
   ImuNoise nz;
-  // reuse the sweep's sample selection by integrating with very fine virtual sampling
   DR.setIdentity();
   alpha.setZero();
   beta.setZero();
   const int M = 400;
   std::vector<RawImu> sel;
-  AciCalibPreint::integrate(imu, t0, t1, model, bg, ba, nz, r); // for parity of selection only
-  // re-select the same way (boundary interp) by sampling signal functions directly
+  AciCalibPreint::integrate(imu, t0, t1, model, bg, ba, nz, r); // result unused; exercises boundary-interp selection
+  // integrate the signal functions directly on a grid far finer than the raw rate
   double T = t1 - t0;
   int steps = (int)std::round(T * 100000.0); // ~10 us grid cap
   (void)steps;
@@ -268,23 +267,23 @@ static void test_factor_fd() {
 }
 
 // FD oracle for the reprojection factor's EQUIDISTANT (fisheye) branch at
-// Stinger-class intrinsics. The synthetic e2e suites are radtan-only, so the
-// fisheye distortion Jacobians (k1..k4 columns and their fx/theta chain) ship
-// otherwise untested against the values the real AR0144 rigs exercise. Covers
-// all 7 blocks of Factor_ReprojTd including the td transport column and the
-// fixed dt_ref shift (the centered rolling-shutter row time folds in there;
+// production-unit intrinsics. The synthetic e2e suites are radtan-only, so the
+// fisheye distortion Jacobians (k1..k4 columns and their fx/theta chain) would
+// otherwise ship untested at values real wide-FOV units exercise. Covers all
+// 7 blocks of Factor_ReprojTd including the td transport column and the fixed
+// dt_ref shift (the centered rolling-shutter row time folds in there);
 // tolerance loosened under transport: the analytic pose columns reuse the
-// transported-frame Jacobians, an O(|w| Delta) omission by design).
+// transported-frame Jacobians, an O(|w| Delta) omission by design.
 static void test_reproj_fd(bool fisheye, bool with_transport) {
-  // Stinger tracking_front (AR0144 fisheye 1280x800): per-unit yml values.
-  // The radtan variant reuses the pinhole row with small k1/k2/p1/p2 as the
-  // harness CONTROL: it isolates CamEqui-specific defects from factor plumbing.
+  // Per-unit calibration of a real AR0144 fisheye (1280x800). The radtan
+  // variant reuses the pinhole row with small k1/k2/p1/p2 as the harness
+  // CONTROL: it isolates CamEqui-specific defects from factor plumbing.
   Eigen::Matrix<double, 8, 1> cam;
   if (fisheye)
     cam << 457.377, 457.147, 643.895, 409.041, 0.0679821, -5.607e-5, 0.0091765, -0.0051205;
   else
     cam << 457.377, 457.147, 643.895, 409.041, -0.28, 0.07, 1.9e-4, -3.1e-4;
-  Eigen::Vector4d q_ItoC(0.353, -0.612, 0.352, 0.615); // ~Stinger-like mounting
+  Eigen::Vector4d q_ItoC(0.353, -0.612, 0.352, 0.615); // representative real IMU-to-camera mounting
   q_ItoC /= q_ItoC.norm();
   Eigen::Vector3d p_IinC(0.0195, 0.0088, -0.0934);
   Eigen::Vector4d q_GtoI(0.11, -0.05, 0.21, 1.0);

@@ -114,10 +114,10 @@ bool WindowHarvester::push_frame(const FrameObs &f) {
   // shedding frames -- which is charged to IT below, and evicts it if it sheds too many. Only a gap
   // in which NOTHING arrived, from ANY camera, is a real discontinuity.
   //
-  // Splitting on one camera's gap is what turned the D0014 ingest overrun into a CALIBRATION bug:
-  // 1522 shed hires frames fragmented the session into sub-min_window_s pieces, and the down camera
-  // -- which had dropped nothing -- lost them all. On a one-camera rig dt_any == dt, so the rule
-  // below is the old rule by construction, and every single-camera reference is untouched.
+  // Splitting on one camera's gap turns an ingest overrun into a CALIBRATION bug (measured: ~1500
+  // frames shed by a saturated stream fragmented the session into sub-min_window_s pieces, and the
+  // camera that had dropped nothing lost every one of its windows). On a one-camera rig
+  // dt_any == dt, so the rule below reduces to the single-camera rule by construction.
   const double dt_any = f.timestamp - frames_.back().timestamp;
   const bool sole_cam = (nominal_dt_.size() <= 1);
   const bool split = sole_cam ? (dt > cfg_.max_frame_gap_s || missing > cfg_.max_consec_drops)
@@ -264,7 +264,7 @@ bool WindowHarvester::assemble_(WindowData &out, WindowMeta &meta) {
   // degenerate. So clones closer than kMinCloneDt are MERGED, and each observation records the
   // residual offset from its own instant to the merged clone's stamp (CloneObs::dt_ref) -- which
   // the reprojection then transports across exactly.
-  constexpr double kMinCloneDt = 2e-3; // well below any frame period on these rigs
+  constexpr double kMinCloneDt = 2e-3; // well below any practical frame period
   std::vector<std::pair<double, int>> stamped; // (seed-mapped IMU time, frames_ index)
   stamped.reserve(sel.size());
   for (int i : sel) {
@@ -317,9 +317,8 @@ bool WindowHarvester::assemble_(WindowData &out, WindowMeta &meta) {
       const size_t c = (size_t)fr.cam;
       const CamCalib &kc = seed_.cams[c];
       // fr.timestamp is the producer's center-row mid-exposure instant (SOF + (readout+exposure)/2
-      // applied at INGEST — server camera layer / log feeder). Nothing is re-added here: exposure_s
-      // rides along as provenance only, and re-applying it would double-count (the old SOF-stamp
-      // convention died with the tr-estimation machinery).
+      // applied at INGEST -- server camera layer / log feeder). Nothing is re-added here: exposure_s
+      // rides along as provenance only, and re-applying it would double-count.
       const double t_obs = fr.timestamp + kc.td;
       for (const FrameObsPoint &p : fr.pts) {
         auto it = id_map.find(p.id);

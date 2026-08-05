@@ -19,7 +19,7 @@
  * model_lin.calib_tg is set (n_pi 15 -> 24). That asymmetry is deliberate: the
  * Tg-off arithmetic must stay BYTE-IDENTICAL to the validated corpus, and under
  * -ffast-math even multiplying through nine explicitly-zero columns reassociates
- * the reductions (the measured 1-ulp lesson of 2026-07-13). The legacy 15-wide
+ * the reductions (a measured 1-ulp regression class). The legacy 15-wide
  * statements below are therefore kept verbatim in their own branch; the 24-wide
  * path is separate code that only runs when Tg is being estimated. tg is packed
  * in Matrix3d STORAGE order (column-major) to match mixing()'s enumeration.
@@ -65,14 +65,14 @@ public:
                  const Eigen::Vector3d &ba_lin_);
 
   /**
-   * @brief Cache-fed overload (P3): identical factor, but the whitener comes
+   * @brief Cache-fed overload: identical factor, but the whitener comes
    *        precomputed so construction skips the double 15x15 factorization
-   *        entirely — the dominant, previously untimed cost of rebuilding
-   *        factors every window evaluation. The caller obtains sqrtI_ext /
-   *        fold_ext ONLY by copying them out of a legacy-constructed factor
-   *        (WindowBA cache fill): a separate whitener implementation compiled
-   *        in a different codegen context measurably drifts 1 ulp under
-   *        -ffast-math (see the parity contract in the legacy ctor).
+   *        entirely -- the dominant cost of rebuilding factors every window
+   *        evaluation. The caller obtains sqrtI_ext / fold_ext ONLY by
+   *        copying them out of a legacy-constructed factor (WindowBA cache
+   *        fill): a separate whitener implementation compiled in a different
+   *        codegen context measurably drifts 1 ulp under -ffast-math (see
+   *        the parity contract in the legacy ctor).
    */
   Factor_ImuAci3(const AciPreintResult &meas, const ImuIntrinsicModel &model_lin, const Eigen::Vector3d &bg_lin_,
                  const Eigen::Vector3d &ba_lin_, const Eigen::Matrix<double, 15, 15> &sqrtI_ext,

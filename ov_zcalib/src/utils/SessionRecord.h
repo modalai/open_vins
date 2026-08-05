@@ -2,14 +2,14 @@
  * OpenVINS: An Open Platform for Visual-Inertial Research
  * Copyright (C) 2025-2026 Joao Leonardo Silva Cotta
  *
- * ov_zcalib: session record — the MANDATORY disk mirror of every live session
+ * ov_zcalib: session record -- the MANDATORY disk mirror of every live session
  * and the replay input (CI path). The record stores the post-tracking streams
  * (RawImu + FrameObs) in ARRIVAL order plus the seed-calibration snapshot the
  * live session used, so a replay reproduces the downstream computation
  * bit-identically (same numbers in, same deterministic reduction). Images are
  * NOT stored by design (budget; the tracker already ran). Little-endian
  * fixed-layout records, no compression: a 10-min session is ~40 MB IMU +
- * ~15 MB tracks. Live-vs-replay bit-parity is the S4a/S4b stage gate.
+ * ~15 MB tracks. Live-vs-replay bit-parity is a hard release gate.
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -29,7 +29,7 @@
 namespace ov_zcalib {
 
 /// The effective PROFILE a session ran under. A record that carries only the seed is NOT
-/// replayable — the config is half the computation, and replaying a device session under library
+/// replayable -- the config is half the computation, and replaying a device session under library
 /// defaults silently scores a DIFFERENT estimator (measured: the euroc record aborts instantly on
 /// replay). The profile tag makes the record self-describing, so `--replay <bin>` reproduces the
 /// session that produced it, by construction.

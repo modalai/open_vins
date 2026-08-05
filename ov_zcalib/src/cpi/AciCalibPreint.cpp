@@ -7,11 +7,11 @@
  *
  * ov_zcalib: ACI3 calibration preintegration sweep (see AciCalibPreint.h).
  *
- * The mean/bias recursions mirror the verified async-bridge sweep (left/end-frame
- * J_theta with the exact factored increment R_step*(J + Jr(-w dt)*M*dt)); the
- * intrinsic columns generalize the bias columns through per-sample mixing matrices;
- * the 15x15 covariance is propagated per step in (theta, alpha, beta, bg, ba) order
- * with the same Phi/G blocks the columns imply (noise enters exactly like the
+ * The mean/bias recursions accumulate the LEFT/end-frame J_theta with the exact
+ * factored increment R_step*(J + Jr(-w dt)*M*dt); the intrinsic columns
+ * generalize the bias columns through per-sample mixing matrices; the 15x15
+ * covariance is propagated per step in (theta, alpha, beta, bg, ba) order with
+ * the same Phi/G blocks the columns imply (noise enters exactly like the
  * corresponding bias), then permuted to the Factor_ImuCPIv1 residual order.
  * Every column and the covariance are pinned by the FD oracle in test_aci3_fd.
  *
@@ -162,9 +162,9 @@ bool AciCalibPreint::integrate(const std::vector<RawImu> &imu, double t0, double
     Mw_all.middleCols(n_pi + 3, 3) = Mw_ba;
     Ma_all.middleCols(n_pi + 3, 3) = Ma_ba;
 
-    // ---- parameter columns (consume PRE-update J_th/J_be, then advance; bridge order) ----
-    // Chain signs: d(theta_step)/d(w_hat) = -Jr(+w dt)*dt (the bridge's +Jr already has the
-    // raw-bias mixing d(w_hat)/d(bg) = -I folded in; here the mixing is explicit in Mw_all).
+    // ---- parameter columns (consume PRE-update J_th/J_be, then advance) ----
+    // Chain signs: d(theta_step)/d(w_hat) = -Jr(+w dt)*dt. A raw-bias-only sweep can fold
+    // d(w_hat)/d(bg) = -I into a +Jr; here the mixing is explicit in Mw_all, so the minus stays.
     J_al += J_be * dt + A * (Xi_2 * Ma_all + T2 * Mw_all) + AsX2 * J_th;
     J_be += A * (Xi_1 * Ma_all + T1 * Mw_all) + AsX1 * J_th;
     J_th = R_step * (J_th - Jr_neg * Mw_all * dt); // exact factored -Jr(+w dt) increment
@@ -179,7 +179,7 @@ bool AciCalibPreint::integrate(const std::vector<RawImu> &imu, double t0, double
     Phi.block<3, 3>(0, 9) = -R_step * (Jr_neg * Mw_bg * dt);
     // Tg feeds a_hat into w_hat (Mw_ba = -Dw*Tg*Ma_ba), so ba -- and n_a, below -- reach the
     // ROTATION as well, exactly the way bg does. Both blocks are identically zero at Tg == 0,
-    // which is the only reason they were omissible while Tg was forced off (defect D12).
+    // the only regime in which omitting them would go unnoticed.
     Phi.block<3, 3>(0, 12) = -R_step * (Jr_neg * Mw_ba * dt);
     Phi.block<3, 3>(3, 0) = AsX2;
     Phi.block<3, 3>(3, 6) = dt * Eigen::Matrix3d::Identity();
@@ -217,7 +217,7 @@ bool AciCalibPreint::integrate(const std::vector<RawImu> &imu, double t0, double
   out.J_q = J_th.middleCols(n_pi, 3);
   out.H_b = J_be.middleCols(n_pi + 3, 3);
   out.H_a = J_al.middleCols(n_pi + 3, 3);
-  out.H_q = J_th.middleCols(n_pi + 3, 3); // zero unless Tg (D12: ba -> rotation)
+  out.H_q = J_th.middleCols(n_pi + 3, 3); // zero unless Tg (ba -> rotation)
   out.J_b = J_be.middleCols(n_pi, 3);
   out.J_a = J_al.middleCols(n_pi, 3);
   // Intrinsic columns
@@ -357,7 +357,7 @@ bool AciCalibPreint::integrate_chain(const std::vector<RawImu> &imu, const std::
           Phi.setIdentity();
           Phi.block<3, 3>(0, 0) = R_step;
           Phi.block<3, 3>(0, 9) = -R_step * (Jr_neg * Mw_bg * dt);
-          Phi.block<3, 3>(0, 12) = -R_step * (Jr_neg * Mw_ba * dt); // see the serial path (D12)
+          Phi.block<3, 3>(0, 12) = -R_step * (Jr_neg * Mw_ba * dt); // see the serial path (ba -> rotation)
           Phi.block<3, 3>(3, 0) = AsX2;
           Phi.block<3, 3>(3, 6) = dt * Eigen::Matrix3d::Identity();
           Phi.block<3, 3>(3, 9) = A * (T2 * Mw_bg);
@@ -397,7 +397,7 @@ bool AciCalibPreint::integrate_chain(const std::vector<RawImu> &imu, const std::
     o.J_q = J_th.middleCols(n_pi, 3);
     o.H_b = J_be.middleCols(n_pi + 3, 3);
     o.H_a = J_al.middleCols(n_pi + 3, 3);
-    o.H_q = J_th.middleCols(n_pi + 3, 3); // zero unless Tg (D12: ba -> rotation)
+    o.H_q = J_th.middleCols(n_pi + 3, 3); // zero unless Tg (ba -> rotation)
     o.J_b = J_be.middleCols(n_pi, 3);
     o.J_a = J_al.middleCols(n_pi, 3);
     o.Jq_pi = J_th.leftCols(n_pi);

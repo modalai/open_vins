@@ -4,7 +4,7 @@
  *
  * ov_zcalib: stream-level types shared by the feeders, the recorder and the
  * harvester. FrameObs is the post-tracking camera sample: the session record
- * stores tracked observations (compact, ~KB/s), NOT images — replay is then
+ * stores tracked observations (compact, ~KB/s), NOT images -- replay is then
  * bit-identical by construction and a full session stays under the retention
  * budget. Bearings are NOT stored: the consumer recomputes them from the
  * recorded seed intrinsics, so live and replay share one code path.
