@@ -162,6 +162,7 @@ void AsyncCameraBuffer::drain(double newest_imu_time, const DtMaxFn &dt_max_for_
       out.sensor_ids.insert(out.sensor_ids.end(), s.staged.sensor_ids.begin(), s.staged.sensor_ids.end());
       out.images.insert(out.images.end(), s.staged.images.begin(), s.staged.images.end());
       out.masks.insert(out.masks.end(), s.staged.masks.begin(), s.staged.masks.end());
+      out.exposures.insert(out.exposures.end(), s.staged.exposures.begin(), s.staged.exposures.end());
 #if HAVE_OPENCL
       out.img_frames.insert(out.img_frames.end(), s.staged.img_frames.begin(), s.staged.img_frames.end());
       out.cl_images.insert(out.cl_images.end(), s.staged.cl_images.begin(), s.staged.cl_images.end());
