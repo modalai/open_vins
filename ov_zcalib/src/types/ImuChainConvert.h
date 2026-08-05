@@ -16,43 +16,40 @@
  *       a_hat = R_AtoI * Da_r * (a_m - ba)
  *
  * The two IMU frames differ by the physical gyro-vs-accel die misalignment R
- * (~0.8 deg on ICM-class parts), with w_hat^K = R w_hat^R and a_hat^K = R a_hat^R.
- * Matching the gyro rows gives  R_GYROtoIMU * Dw_k = R * Dw_r  and matching the
- * accel rows gives  R_ACCtoIMU * Da_k = R * R_AtoI * Da_r. Each is an
- * "orthogonal x upper-triangular" factorization of a KNOWN matrix -- i.e. a QR:
+ * (~0.8 deg on ICM-class parts): w_hat^K = R w_hat^R, a_hat^K = R a_hat^R.
+ * Matching gyro rows gives  R_GYROtoIMU * Dw_k = R * Dw_r ; accel rows give
+ * R_ACCtoIMU * Da_k = R * R_AtoI * Da_r. Each is an "orthogonal x upper-
+ * triangular" factorization of a KNOWN matrix -- i.e. a QR:
  *
  *   M := R_GYROtoIMU * Dw_chain          QR:  M = Q_w U_w   =>  R = Q_w,  Dw_r = U_w
  *   N := Q_w^T * R_ACCtoIMU * Da_chain   QR:  N = Q_a U_a   =>  R_AtoI = Q_a, Da_r = U_a
  *
- * Scale factors are positive by construction, so the QR is made sign-canonical
+ * Scale factors are positive by construction, so the QR is sign-canonicalized
  * (positive diagonal). An rpng-gauge chain is the identity case of this map
- * (R_GYROtoIMU = I and Dw already upper-tri => Q_w = I), so ONE path serves both
- * models and a same-gauge chain round-trips exactly.
+ * (Q_w = I), so ONE path serves both models and a same-gauge chain round-trips
+ * exactly.
  *
- * WHY SEED AT ALL (operator directive, 2026-07-12): the extrinsics and td are
- * earned BLIND, but the IMU and camera intrinsics are per-unit factory data that
- * the rig already ships. Seeding them (a) starts the accel/gyro chain at the
- * truth instead of identity, so the solve converges far sooner, and (b) makes an
- * unmoved block ship the FACTORY value rather than an uncalibrated identity --
- * the failure that would otherwise silently overwrite a good factory Dw.
+ * WHY SEED AT ALL: extrinsics and td are earned BLIND, but the IMU and camera
+ * intrinsics are per-unit factory data the rig already ships. Seeding them
+ * (a) starts the chain at the truth instead of identity, so the solve
+ * converges far sooner, and (b) makes an unmoved block ship the FACTORY value
+ * rather than an uncalibrated identity -- the failure mode that silently
+ * overwrites a good factory Dw.
  *
- * Tg (g-sensitivity) IS seeded, and the gauge change conjugates it -- but only on
- * one side. In both models the bracket is (w_m - b_g - Tg * a_hat): w_m and b_g are
- * RAW GYRO AXES quantities, identical in either gauge, so the only thing that moves
- * is a_hat's frame. With a_hat^K = R a_hat^R (R = Q_w, the same rotation the QR
- * above already produces),
+ * Tg (g-sensitivity) is seeded too, and the gauge change conjugates it on one
+ * side only: in both models the bracket is (w_m - b_g - Tg * a_hat), where w_m
+ * and b_g are RAW GYRO AXES quantities identical in either gauge, so only
+ * a_hat's frame moves. With a_hat^K = Q_w a_hat^R,
  *
  *   Tg_k * a_hat^K = Tg_k * Q_w * a_hat^R  ==  Tg_r * a_hat^R   =>   Tg_r = Tg_chain * Q_w
  *
- * An rpng-gauge chain has Q_w = I, so Tg round-trips exactly, like Dw and Da: one
- * path still serves both models.
- *
- * It is seeded FIXED (calib_tg stays false). Estimating it is a different question
- * and remains closed -- Factor_ImuAci3 rejects n_pi != 15. What was NOT closed until
- * now is that zeroing Tg threw away a term the chain actually measured: at ~4e-4
- * (rad/s)/(m/s^2) it is 0.23 deg/s of spurious rate at 1 g, and the session keeps
- * SLOW-TILT windows (the fast ones are seed-gate rejected), where that is a ~1%
- * relative gyro error -- landing squarely on dw, the one block both cameras share.
+ * and an rpng-gauge chain (Q_w = I) round-trips exactly, like Dw and Da. The
+ * port seeds Tg FIXED (calib_tg = false); whether a session ESTIMATES it is
+ * runner policy behind the A1b excitation gate. Zeroing the seed instead would
+ * discard a term the chain actually measured: at ~4e-4 (rad/s)/(m/s^2) that is
+ * 0.23 deg/s of spurious rate at 1 g -- a ~1% relative gyro error on the
+ * SLOW-TILT windows the session keeps (fast ones are seed-gate rejected),
+ * landing squarely on dw, the one block every camera shares.
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by

@@ -73,7 +73,7 @@ static void print_report(const SessionReport &rep) {
 int main(int argc, char **argv) {
   std::string replay_path, voxl_dir, out_yaml = "ov_zcalib_result.yaml";
   std::string cam_pipe = "tracking_front";
-  std::string profile_ovr; ///< --profile voxl|flight|library (v1 records / deliberate re-scoring)
+  std::string profile_ovr; ///< --profile voxl|flight|library (untagged records / deliberate re-scoring)
   bool selftest = false, quiet = false, joint_verbose = false;
   bool flight = false, have_cam_mode = false;
   // experiment knobs (-1 = keep library/profile default)
@@ -83,15 +83,15 @@ int main(int argc, char **argv) {
   double conv_tol_ovr = -1.0;
   int max_clones_ovr = -1, max_track_ovr = -1, a_carry_ovr = -1, fused_iters_ovr = -1, duel_accept_ovr = -1, threads_ovr = -1;
   int stage_select_ovr = -1, k_a0_ovr = -1, k_a1_ovr = -1, k_b_ovr = -1;
-  int eoa_ovr = -1; // --export-on-accept {0|1}: forensic within-binary A/B of the deferred-export mechanism
+  int eoa_ovr = -1; // --export-on-accept {0|1}: within-binary A/B of the deferred-export mechanism
   int cam_mode = 1; // refine by default (plan decision); --cam-mode 0 pins the existing intrinsics
   double tr_hw = 0.0, max_sec = 0.0, grav_mag = 9.80665;
   // vcc mechanical seed for --voxl (RPY_parent_to_child intrinsic-XYZ [deg], T_child_wrt_parent [m])
-  // Built-in LAST-RESORT reference (Stinger tracking_front nominals). The real
+  // Built-in LAST-RESORT reference (one SKU's front-cam nominals). The real
   // reference comes from the log's own etc/modalai/extrinsics.conf (the log is
-  // self-describing) or explicit --ext-rpy/--ext-t; a log from another SKU
-  // (e.g. Starling2 front = [0,90,90]) scored against these defaults reads a
-  // phantom ~180 deg (measured on position_push before conf sourcing landed).
+  // self-describing) or explicit --ext-rpy/--ext-t: camera mounts differ by up
+  // to ~180 deg across SKUs, so a log scored against another SKU's built-ins
+  // reads a phantom rotation of exactly that size.
   double ext_rpy[3] = {0.0, 90.0, -90.0};
   double ext_t[3] = {0.0618, 0.0191, 0.022};
   bool have_ext_rpy = false, have_ext_t = false;
@@ -110,12 +110,12 @@ int main(int argc, char **argv) {
   // g-sensitivity on the SAME recorded session.
   double tg_seed[9] = {0};
   bool have_tg = false;
-  // --no-tg-est : freeze Tg at its seed (zero, or --tg) and keep the LEGACY 15-column layout —
+  // --no-tg-est : freeze Tg at its seed (zero, or --tg) and keep the LEGACY 15-column layout --
   // the corpus-parity ablation for the estimated-Tg default.
   bool no_tg_est = false;
-  // Seeding study (operator, 2026-07-12): which blocks EARN their value from the
-  // data, and which should start from the rig's own chain? Each axis is separately
-  // seedable on replay so one recorded session can be scored across the matrix.
+  // Seeding axes: which blocks EARN their value from the data, and which start
+  // from the rig's own chain? Each axis is separately seedable on replay so one
+  // recorded session can be scored across the whole matrix.
   double seed_rot[4] = {0, 0, 0, 1}, seed_pos[3] = {0, 0, 0}, seed_td_v = 0.0;
   bool have_seed_rot = false, have_seed_pos = false, have_seed_td = false;
   for (int i = 1; i < argc; ++i) {
@@ -189,7 +189,7 @@ int main(int argc, char **argv) {
       cam_pipe = argv[++i];
     else if (arg("--profile") && i + 1 < argc)
       profile_ovr = argv[++i]; // replay: state the profile for an UNTAGGED (v1) record, or re-score deliberately
-    // ---- experiment knobs (P-wave / flight-profile studies; default = library/profile values) ----
+    // ---- experiment knobs (solver / flight-profile studies; default = library/profile values) ----
     else if (arg("--outer-iters") && i + 1 < argc)
       outer_iters_ovr = std::atoi(argv[++i]);
     else if (arg("--window-max-iters") && i + 1 < argc)
@@ -231,7 +231,7 @@ int main(int argc, char **argv) {
     else if (arg("--duel-accept"))
       duel_accept_ovr = 1;
     else if (arg("--export-on-accept") && i + 1 < argc)
-      eoa_ovr = std::atoi(argv[++i]); // forensic A/B: 0 = legacy inline exports (byte-parity instrument)
+      eoa_ovr = std::atoi(argv[++i]); // A/B: 0 = legacy inline exports (byte-parity instrument)
     else if (arg("--threads") && i + 1 < argc)
       threads_ovr = std::atoi(argv[++i]); // window-pool width: results are thread-count-invariant (fixed-range partition, worker-ordered fold)
     else if (arg("--max-clones") && i + 1 < argc)
@@ -250,7 +250,7 @@ int main(int argc, char **argv) {
   cfg.verbose = !quiet;
   cfg.joint.verbose = joint_verbose; // per-pass ACCEPT/damp lines + the per-stage timing split
   // Experiment overrides apply LAST (after any profile defaults) via this
-  // helper called at each run-branch entry — CLI always wins over profiles.
+  // helper called at each run-branch entry -- CLI always wins over profiles.
   auto apply_cli_overrides = [&](SessionConfig &c) {
     if (no_tg_est)
       c.free_tg = false; // ablation: 15-column legacy layout, byte-identical to the pre-tg corpus
@@ -322,10 +322,9 @@ int main(int argc, char **argv) {
   // ---- Seed overrides are built ONCE, above every ingest branch. They apply at RECORD-REPLAY
   // time inside run_replay (the record's seed is patched; the record itself stays pristine and
   // byte-replayable to the blind run), and the voxl path replays the record it just
-  // converted -- so the SAME flags work identically on --replay and --voxl. They used to
-  // be wired into --replay only, and --voxl SILENTLY IGNORED them: the 2026-07-13 Tg matrix ran 9
-  // legs that were all byte-identical blind runs. An explicit operator flag must bind or refuse,
-  // never no-op. ----
+  // converted -- so the SAME flags work identically on --replay and --voxl. An explicit flag
+  // must bind or refuse, never silently no-op: a seed flag honored on one ingest path and
+  // ignored on the other turns a seeding study into byte-identical blind runs. ----
   ImuIntrinsicModel imu_ovr;
   if (have_imu_seed) {
     for (int k = 0; k < 6; ++k)
@@ -379,11 +378,11 @@ int main(int argc, char **argv) {
     std::printf("--voxl log ingest is host-only (device build strips TrackKLT); use --replay <session.bin>\n");
     return 1;
 #else
-    // voxl-logger MPA log (log000N/): the log is self-describing — per-unit
+    // voxl-logger MPA log (log000N/): the log is self-describing -- per-unit
     // fisheye intrinsics ship inside it; the mechanical extrinsic seed comes
     // from --ext-rpy/--ext-t in the vcc convention, composed exactly as
     // VoxlConfigure does (R_ItoC = R_child_to_parent^T, p_IinC = -R_ItoC p_CinI).
-    // The VOXL base profile + flight overlay live in SessionProfiles.h — ONE
+    // The VOXL base profile + flight overlay live in SessionProfiles.h -- ONE
     // definition shared verbatim with the in-server live mode
     // (voxl-open-vins-server --calibrate), so host studies and device
     // sessions can never drift apart. Evidence trail for every value is
@@ -396,12 +395,12 @@ int main(int argc, char **argv) {
     SessionSeed seed;
     if (!VoxlLogFeeder::load_seed_intrinsics(voxl_dir, cam_pipe, seed))
       return 1;
-    // BLIND protocol (operator directive): extrinsics.conf is the evaluation
-    // TRUTH — never seed from it. The pipeline starts with NO mechanical
-    // prior (identity rotation, zero lever arm) and must EARN R_ItoC/td in
-    // bootstrap and p_IinC in the joint solve. The reference comes from the
-    // log's own extrinsics.conf snapshot (per-SKU correct by construction);
-    // --ext-rpy/--ext-t override it, the Stinger built-ins are last resort.
+    // BLIND protocol: extrinsics.conf is the evaluation TRUTH -- never seed
+    // from it. The pipeline starts with NO mechanical prior (identity
+    // rotation, zero lever arm) and must EARN R_ItoC/td in bootstrap and
+    // p_IinC in the joint solve. The reference comes from the log's own
+    // extrinsics.conf snapshot (per-SKU correct by construction);
+    // --ext-rpy/--ext-t override it, the built-in nominals are last resort.
     VoxlLogFeeder::RefExtrinsics refx;
     const bool have_conf_ref = VoxlLogFeeder::load_ref_extrinsics(voxl_dir, cam_pipe, refx);
     const char *ref_src = (have_ext_rpy || have_ext_t) ? "--ext-rpy/--ext-t" : "built-in Stinger defaults";
@@ -447,14 +446,14 @@ int main(int argc, char **argv) {
       // Attribution/ablation: freeze Dw/Da/R_AtoI at the seed (identity) so the
       // solve estimates ext/td/cam only. On weakly-excited data the IMU
       // intrinsics are barely identified and their co-estimation can BEND the
-      // extrinsics through the A1 coupling (T-RO Sec-13 schedule made a flag).
+      // extrinsics through the A1 coupling; this flag isolates that effect.
       seed.calib.imu.calib_dw = seed.calib.imu.calib_da = seed.calib.imu.calib_RAtoI = false;
       std::printf("[voxl] IMU intrinsics FROZEN at seed (--no-imu-intrinsics)\n");
     }
     const std::string rec = out_yaml + ".voxl_session.bin";
     double mean_exp_s = 0.0;
     apply_cli_overrides(cfg);
-    // The record carries the config it ran under (v2), so --replay of this bin
+    // The record carries the config it ran under, so --replay of this bin
     // reproduces THIS session exactly instead of scoring library defaults.
     seed.profile = flight ? SessionProfile::VOXL_FLIGHT : SessionProfile::VOXL;
     seed.cam_mode = cfg.cam_mode;
@@ -477,10 +476,10 @@ int main(int argc, char **argv) {
     // FRAME re-expressions for external comparison: the logged imu_apps stream
     // is the imu-server COMMON frame (imu0_rotate_common_frame). References
     // expressed against the vehicle BODY frame differ by the vcc body->imu_apps
-    // rotation — PER RIG, from the log's conf (Stinger [180,0,0], Starling2
-    // identity): print both so a kalibr/body-frame truth compares against the
-    // right matrix. v_cam = R_ItoC * R_BtoI * v_body with R_BtoI =
-    // (RxRyRz(body_rpy))^T in the vcc child->parent composition.
+    // rotation -- PER RIG, from the log's conf snapshot: print both so a
+    // kalibr/body-frame truth compares against the right matrix.
+    // v_cam = R_ItoC * R_BtoI * v_body with R_BtoI = (RxRyRz(body_rpy))^T in
+    // the vcc child->parent composition.
     {
       Eigen::Matrix3d R_BtoI = Eigen::AngleAxisd(M_PI, Eigen::Vector3d::UnitX()).toRotationMatrix(); // legacy Rx180 fallback
       char bsrc[64] = "assumed Rx180";
@@ -504,7 +503,7 @@ int main(int argc, char **argv) {
     //  (1) td: every stamp in THIS system is center-row mid-exposure (producer
     //      applies SOF + (readout + exposure)/2 at ingest), so our td needs no
     //      conversion internally. A kalibr chain fitted against raw SOF stamps
-    //      absorbs (readout + exposure)/2 into its timeshift — the print below
+    //      absorbs (readout + exposure)/2 into its timeshift -- the print below
     //      re-expresses our td in that legacy convention for comparison only.
     //  (2) gauge: our IMU frame is GYRO-aligned (R_GtoI = I structural, Dw
     //      upper-tri closes the gauge); kalibr's body is ACCEL-aligned (M_a
@@ -513,7 +512,7 @@ int main(int argc, char **argv) {
     //      ICM-class parts) and lives in our accel chain: with the forward map
     //      F_a = Da^-1 * R_AtoI^T (body -> accel measurement), LQ(F_a) = L * S
     //      gives R_ItoC^(accel-gauge) = R_ItoC * S^T. S is only as good as the
-    //      estimated accel chain — when da/q_AtoI are gate-frozen, S = I and
+    //      estimated accel chain -- when da/q_AtoI are gate-frozen, S = I and
     //      the gyro-gauge matrix IS the deliverable (VIO consumes Dw with it).
     {
       std::printf("[voxl] td (kalibr raw-SOF convention, comparison only): %.6f s = committed %.6f + (readout + mean_exposure)/2 %.6f\n",
@@ -544,12 +543,12 @@ int main(int argc, char **argv) {
   }
 
   if (!replay_path.empty()) {
-    // The record is SELF-DESCRIBING (v2): rebuild the producing session's
-    // profile from its header before solving, so a device session
+    // The record is SELF-DESCRIBING: rebuild the producing session's profile
+    // from its header before solving, so a device session
     // (voxl-open-vins-server --calibrate) replays here under the SAME
-    // estimator it ran with on target. v1 records carry no tag and keep the
-    // historical behavior (library defaults + explicit CLI flags). Explicit
-    // CLI flags still win — they are applied after.
+    // estimator it ran with on target. Untagged records keep the historical
+    // behavior (library defaults + explicit CLI flags). Explicit CLI flags
+    // still win -- they are applied after.
     SessionSeed hdr;
     if (!read_session_header(replay_path, hdr)) {
       std::printf("cannot open session record %s\n", replay_path.c_str());
@@ -569,7 +568,7 @@ int main(int argc, char **argv) {
         return 1;
       }
     } else if (flight && hdr.profile == SessionProfile::VOXL) {
-      prof = SessionProfile::VOXL_FLIGHT; // operator overlay on a base-profile record
+      prof = SessionProfile::VOXL_FLIGHT; // --flight overlay on a base-profile record
     }
     const char *pname = apply_profile_tag(cfg, prof, have_cam_mode ? cam_mode : hdr.cam_mode);
     if (!pname) {

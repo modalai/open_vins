@@ -232,7 +232,7 @@ bool VoxlLogFeeder::convert(const std::string &log_dir, const std::string &cam_p
 bool VoxlLogFeeder::load_ref_extrinsics(const std::string &log_dir, const std::string &cam_pipe, RefExtrinsics &out) {
   // voxl-logger snapshots /etc/modalai into the log; the conf is modal_json
   // (JSON + C comments). The entries are flat objects, so a comment-strip +
-  // per-object key scan is exact enough — this feeds the evaluation REFERENCE
+  // per-object key scan is exact enough -- this feeds the evaluation REFERENCE
   // print only, never the estimator.
   std::ifstream f(log_dir + "/etc/modalai/extrinsics.conf");
   if (!f.is_open())

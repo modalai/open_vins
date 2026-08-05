@@ -11,7 +11,7 @@
  * produce bit-identical hypotheses (the live-vs-replay parity gate depends on
  * it). Translation-induced flow biases a rotation-only fit; the consumers
  * (hand-eye Wahba, xcorr) carry their own Hampel/ratio gates and the joint
- * MLE re-estimates everything downstream — this is a SEED source only.
+ * MLE re-estimates everything downstream -- this is a SEED source only.
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -55,7 +55,7 @@ public:
     int inliers = 0;
     double inlier_ratio = 0.0;
     /// Mean inlier angular residual AFTER derotation [rad]: translation flow +
-    /// noise. The errors-in-variables weight for hand-eye consumers — pairs
+    /// noise. The errors-in-variables weight for hand-eye consumers -- pairs
     /// where this rivals |theta| carry a rotation-only bias, not information.
     double mean_resid_rad = 0.0;
   };
@@ -73,7 +73,7 @@ public:
 
   /**
    * @brief RANSAC + inlier refit. @param rng_seed pass the frame timestamp in
-   *        nanoseconds (or any replay-stable integer) — NEVER a wall clock.
+   *        nanoseconds (or any replay-stable integer) -- NEVER a wall clock.
    */
   static Result solve(const std::vector<Eigen::Vector3d> &b1, const std::vector<Eigen::Vector3d> &b2, uint64_t rng_seed) {
     return solve(b1, b2, rng_seed, Options());
@@ -140,37 +140,36 @@ public:
  *
  * Rotation-only Procrustes carries a translation-induced bias ~ (baseline /
  * depth) per pair: negligible at far range, 30-100 mrad per frame pair on
- * close-range handheld data (measured on the kalibr sample at 0.3-0.5 m) —
+ * close-range handheld data (measured on the kalibr sample at 0.3-0.5 m) --
  * E-decomposed rotations are the primary path for this reason.
  * Falls back to Procrustes when E is degenerate (pure rotation / low inliers),
  * which is exactly the regime where Procrustes is unbiased.
  *
  * Why ESSENTIAL and not FUNDAMENTAL: R is extractable only from E; F would
  * have to be mapped through the intrinsics anyway (E = K2^T F K1), so
- * estimating F here just adds 2 noise-absorbing DOF (7 vs 5) for zero
- * information gain when a calibration seed exists — and under real radtan
- * distortion (k1 ~ -0.28) raw-pixel epipolar lines are CURVES, so the F
- * model is violated unless points are undistorted first, at which point the
- * problem IS the calibrated one. Operating on unit bearings is also the
- * exact analogue of Hartley normalization (conditioning), keeps the RANSAC
- * threshold ANGULAR (resolution/lens-agnostic, fisheye-compatible through
- * the same interface), and the seed-intrinsics error (~1.5 px / 1e-3 k)
- * perturbs bearings by ~0.1% — far below KLT epipolar noise, and the joint
- * MLE re-estimates the intrinsics downstream regardless. F earns its keep
- * only with UNKNOWN intrinsics (self-calibration), which contradicts this
- * module's existing-cal seed contract.
+ * estimating F just adds 2 noise-absorbing DOF (7 vs 5) when a calibration
+ * seed exists -- and under real radtan distortion (k1 ~ -0.28) raw-pixel
+ * epipolar lines are CURVES, so the F model is violated unless points are
+ * undistorted first, at which point the problem IS the calibrated one. Unit
+ * bearings are also the exact analogue of Hartley normalization
+ * (conditioning), keep the RANSAC threshold ANGULAR (resolution/lens-
+ * agnostic, fisheye-compatible through the same interface), and the
+ * seed-intrinsics error (~1.5 px / 1e-3 k) perturbs bearings by ~0.1% --
+ * far below KLT epipolar noise; the joint MLE re-estimates the intrinsics
+ * downstream regardless. F earns its keep only with UNKNOWN intrinsics
+ * (self-calibration), which contradicts this module's seed contract.
  *
  * PLANAR scenes (a target wall filling the view) make the LINEAR 8-point
- * degenerate for E — and F inherits it worse (the plane-homography ambiguity
- * family). The implemented cure is the third model of the classic family:
- * the calibrated HOMOGRAPHY H = R + t n^T (DLT on bearings, Faugeras/MASKS
- * SVD decomposition, visibility + cheirality disambiguation), which is the
- * EXACT model for planar scenes and subsumes pure rotation (H -> R as t -> 0).
- * Nister 5-point was considered and deliberately skipped: on a true plane the
- * homography is exact while 5-point merely tolerates planarity, and a
- * Groebner-basis polynomial solver is a large delicate surface for a regime
- * H already covers; the selection rule below only trusts E where the scene
- * gives it non-planar support. Selection is Torr/Pollefeys-style:
+ * degenerate for E -- and F inherits it worse (the plane-homography ambiguity
+ * family). The cure is the third model of the classic family: the calibrated
+ * HOMOGRAPHY H = R + t n^T (DLT on bearings, Faugeras/MASKS SVD
+ * decomposition, visibility + cheirality disambiguation), the EXACT model
+ * for planar scenes, subsuming pure rotation (H -> R as t -> 0). Nister
+ * 5-point is deliberately skipped: on a true plane the homography is exact
+ * while 5-point merely tolerates planarity, and a Groebner-basis polynomial
+ * solver is a large delicate surface for a regime H already covers; the
+ * selection rule below only trusts E where the scene gives it non-planar
+ * support. Selection is Torr/Pollefeys-style:
  *   R-only  (3 dof) when the rotation-only residual sits at the noise floor;
  *   H       (8 dof) when H explains ~= as many inliers as E (planar or
  *                   rotation-dominant: E's R is untrustworthy exactly there);
@@ -186,7 +185,7 @@ public:
     double inlier_threshold_rad = 0.004; ///< angular distance of b2 to the epipolar plane
     double min_inlier_ratio = 0.5;
     /// planar-degeneracy rule: E's rotation is trustworthy only with enough
-    /// OFF-PLANE support — count E-inliers the best homography REJECTS. A raw
+    /// OFF-PLANE support -- count E-inliers the best homography REJECTS. A raw
     /// inlier-count ratio is too eager on near-planar real scenes (a dominant
     /// plane explains most of E's inliers even when the off-plane background
     /// fully determines E; measured: eager H cost 0.3 deg of hand-eye on the
@@ -294,7 +293,7 @@ public:
     const double l1 = eig.eigenvalues()(2), l3 = eig.eigenvalues()(0);
     const Eigen::Vector3d v1 = eig.eigenvectors().col(2), v2 = eig.eigenvectors().col(1), v3 = eig.eigenvectors().col(0);
     if (l1 - l3 < 1e-9) {
-      // pure rotation: H is (numerically) orthogonal — polar projection
+      // pure rotation: H is (numerically) orthogonal -- polar projection
       Eigen::JacobiSVD<Eigen::Matrix3d> s(H, Eigen::ComputeFullU | Eigen::ComputeFullV);
       Eigen::Matrix3d D = Eigen::Matrix3d::Identity();
       D(2, 2) = ((s.matrixU() * s.matrixV().transpose()).determinant() < 0.0) ? -1.0 : 1.0;
@@ -399,7 +398,7 @@ public:
       return fallback_(b1, b2, rng_seed, opt);
     // Model selection (GRIC-lite): the rotation-only model is UNBIASED and
     // lower-variance when the per-pair translation is inside the noise floor
-    // (far scenes) — there the extra E DOF only absorb noise. Prefer Procrustes
+    // (far scenes) -- there the extra E DOF only absorb noise. Prefer Procrustes
     // unless its residual shows real translation signal for E to model.
     const Result rot = fallback_(b1, b2, rng_seed, opt);
     if (rot.ok && rot.mean_resid_rad < std::max(opt.inlier_threshold_rad, 1.5e-3))
@@ -432,7 +431,7 @@ public:
     }
     // ---- homography model (deterministic sibling RANSAC; 4-point samples) ----
     // On a planar scene E's linear system has a solution FAMILY: it still
-    // "inlies" everything while its decomposed R is arbitrary — inlier counts,
+    // "inlies" everything while its decomposed R is arbitrary -- inlier counts,
     // not residuals, expose the degeneracy (Torr/Pollefeys H-vs-F test).
     Eigen::Matrix3d best_H = Eigen::Matrix3d::Zero();
     int best_hinl = -1;

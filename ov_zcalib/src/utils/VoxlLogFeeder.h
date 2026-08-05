@@ -2,7 +2,7 @@
  * OpenVINS: An Open Platform for Visual-Inertial Research
  * Copyright (C) 2025-2026 Joao Leonardo Silva Cotta
  *
- * ov_zcalib: voxl-logger feeder — converts a VOXL MPA log (log000N/run/mpa/
+ * ov_zcalib: voxl-logger feeder -- converts a VOXL MPA log (log000N/run/mpa/
  * {imu_apps,<cam_pipe>}/data.csv + per-frame PNGs) into a standard session
  * record through the same record->replay path as every other source. The log
  * is largely SELF-DESCRIBING: the per-unit camera intrinsics ship inside the
@@ -55,14 +55,14 @@ public:
                       double max_seconds, int num_feats, double *mean_exposure_s = nullptr);
 
   /// Reference extrinsics parsed from the log's own etc/modalai/extrinsics.conf
-  /// (voxl-logger snapshots the rig config — the log is self-describing).
+  /// (voxl-logger snapshots the rig config -- the log is self-describing).
   /// Evaluation REFERENCE only, never a seed (blind protocol).
   struct RefExtrinsics {
     bool have_cam = false;              ///< imu_apps -> <cam_pipe base> entry found
     bool have_body = false;             ///< body -> imu_apps entry found
     double cam_rpy[3] = {0, 0, 0};      ///< RPY_parent_to_child [deg], vcc convention
     double cam_t[3] = {0, 0, 0};        ///< T_child_wrt_parent [m]
-    double body_rpy[3] = {0, 0, 0};     ///< body -> imu_apps RPY [deg] (Stinger Rx180, Starling identity)
+    double body_rpy[3] = {0, 0, 0};     ///< body -> imu_apps RPY [deg] (mount-dependent; identity when IMU is body-aligned)
   };
   /**
    * @brief Parse the rig extrinsics snapshot inside the log. The cam entry is

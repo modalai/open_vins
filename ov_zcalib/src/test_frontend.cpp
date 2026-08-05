@@ -61,7 +61,7 @@ int main() {
 
   // ---------------- F1: linear seeding at the SEED calibration ----------------
   {
-    // Window laid down at the SEED td (0), truth td = 2.5 ms — exactly production.
+    // Window laid down at the SEED td (0), truth td = 2.5 ms -- exactly production.
     WindowData w = synth::make_window(tr, 0.4, 3.0, 20.0, 800.0, 42, 0.5, /*td_ref*/ 0.0);
     CHECK(!w.has_seeds, "F1: synth window must arrive seedless");
     SharedCalib c = make_seed_calib(tr);
@@ -116,9 +116,9 @@ int main() {
     {
       std::mt19937 rng(9);
       wt.has_seeds = true;
-      auto pf = synth::make_cloud(90, 42 ^ 0x9e3779b9u); // NOTE: window cloud used 60 — regenerate consistently below
+      auto pf = synth::make_cloud(90, 42 ^ 0x9e3779b9u); // discarded; truth seeds are rebuilt from the window's own geometry
       (void)pf;
-      // regenerate exact truth seeds by re-projecting the window's own geometry:
+      // exact truth seeds by re-projecting the window's own geometry:
       // window frame = I0 at clone0 TRUE imaging time
       wt.seed_q.clear();
       wt.seed_v.clear();
@@ -134,7 +134,7 @@ int main() {
       wt.seed_bg = tr.bg;
       wt.seed_ba = tr.ba;
       wt.seed_grav = g_true_win;
-      // features: triangulate-free — use the linear seeds' ids by re-solving? Simplest: use LinearSeed feats
+      // features: reuse the LinearSeed solutions; exact truth features are unnecessary for basin parity
       wt.seed_feats = w.seed_feats;
     }
     WindowSolveReport r_tru;
@@ -358,7 +358,7 @@ int main() {
     }
   }
 
-  // ---------------- F4: record -> replay bit-parity (the S4a/S4b stage gate) ----------------
+  // ---------------- F4: record -> replay bit-parity ----------------
   {
     SharedCalib seed = make_seed_calib(tr);
     HarvesterConfig hc;

@@ -8,7 +8,7 @@
  * ov_zcalib: Eigen-only pixel -> unit-bearing undistortion at the SEED
  * intrinsics (radtan k1..k4 = k1,k2,p1,p2 as in ov_core CamRadtan, or
  * equidistant k1..k4). Fixed-iteration Newton/fixed-point (deterministic,
- * allocation-free) — seed-level accuracy only; the MLE re-projects through
+ * allocation-free) -- seed-level accuracy only; the MLE re-projects through
  * the live cam block and never uses these bearings.
  *
  * This program is free software: you can redistribute it and/or modify

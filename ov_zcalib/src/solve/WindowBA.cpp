@@ -32,9 +32,9 @@ using namespace ov_zcalib;
 using namespace ov_init::zbft_sfm;
 
 namespace {
-// Persistent per-window problem (P5/S10): the graph STRUCTURE (parameter
+// Persistent per-window problem: the graph STRUCTURE (parameter
 // registry, factor set, bindings) depends only on the fixed window content,
-// so it is built ONCE and revisited with value/linearization RESETS — the
+// so it is built ONCE and revisited with value/linearization RESETS -- the
 // per-eval rebuild was the dominant remaining cost at 1-iteration fused
 // evals. Parameter storage and an internal SharedCalib live here so every
 // registered pointer stays stable across calls and calib objects.
@@ -116,7 +116,7 @@ bool WindowBA::solve_and_export(const WindowData &win, SharedCalib &calib, bool 
   // pointers INTO its elements, so a reallocation here would leave every registered calibration
   // block dangling. Copy-assignment only reuses the buffer while the size is unchanged, which holds
   // because the camera count is fixed once at seed time. Assert it rather than trust it -- the
-  // failure mode is silent memory corruption inside the solver, which is not a thing to debug twice.
+  // failure mode is silent memory corruption inside the solver.
   assert((!G.built || G.calib.cams.size() == calib.cams.size()) && "camera count changed under a built graph");
   G.calib = calib;
 
@@ -129,7 +129,7 @@ bool WindowBA::solve_and_export(const WindowData &win, SharedCalib &calib, bool 
   // stages (see SharedCalib::tg_enabled). Stage subsetting happens through block constancy.
   model_all.calib_tg = calib.tg_enabled;
   const auto t_pre0 = std::chrono::steady_clock::now();
-  // P3 value key: preintegration is a function of (pi, noise-pi) and the fixed
+  // Preint value key: preintegration is a function of (pi, noise-pi) and the fixed
   // window stream ONLY (see PreintCache.h); the key mirrors live pi into the
   // noise half when the whitener is unfrozen, exactly as integrate() would.
   PreintKey key;
@@ -156,7 +156,7 @@ bool WindowBA::solve_and_export(const WindowData &win, SharedCalib &calib, bool 
       put(&on, 1);
     }
     // Noise sigmas feed P15 (the whitener): session-constant today, but an
-    // unkeyed dependence is a silent-wrong-reuse landmine — key them.
+    // unkeyed dependence is a silent-wrong-reuse landmine -- key them.
     const double sig[4] = {calib.noise.sigma_w, calib.noise.sigma_wb, calib.noise.sigma_a, calib.noise.sigma_ab};
     put(sig, 4);
     key.clone_t0 = win.clone_times.front();
@@ -167,10 +167,12 @@ bool WindowBA::solve_and_export(const WindowData &win, SharedCalib &calib, bool 
     key.clone_n = (std::uint32_t)win.clone_times.size();
     key.noise_frozen = calib.noise_frozen ? 1 : 0;
   }
+  // OV_ZCALIB_PREINT_AUDIT: cross-check cached/chained preintegration against
+  // fresh recomputation, abort on any byte mismatch (forensic; not for production).
   static const bool preint_audit = (std::getenv("OV_ZCALIB_PREINT_AUDIT") != nullptr);
-  // Forensic bisection knobs (parity investigations only — no production use):
-  // P3_NOCACHE ignores the store (chain + per-factor whitener); P3_LOOP uses
-  // the legacy per-interval integrate() scan on the no-cache path.
+  // Forensic bisection knobs (parity investigations only -- no production use):
+  // OV_ZCALIB_P3_NOCACHE ignores the store (chain + per-factor whitener);
+  // OV_ZCALIB_P3_LOOP uses the legacy per-interval integrate() scan uncached.
   static const bool p3_nocache = (std::getenv("OV_ZCALIB_P3_NOCACHE") != nullptr);
   static const bool p3_loop = (std::getenv("OV_ZCALIB_P3_LOOP") != nullptr);
   if (p3_nocache)
@@ -178,7 +180,7 @@ bool WindowBA::solve_and_export(const WindowData &win, SharedCalib &calib, bool 
   std::vector<AciPreintResult> pre_local;
   const std::vector<AciPreintResult> *pre_p = nullptr;
   if (pc && pc->has_means && pc->mean_key == key && (int)pc->pre.size() == N - 1) {
-    pre_p = &pc->pre; // bit-identical reuse (dependence theorem; audited below)
+    pre_p = &pc->pre; // bit-identical reuse (preint depends only on the key; audited below)
     rep.preint_hit = true;
     if (preint_audit) {
       std::vector<AciPreintResult> chk;
@@ -192,7 +194,7 @@ bool WindowBA::solve_and_export(const WindowData &win, SharedCalib &calib, bool 
         }
     }
   } else if (pc) {
-    pc->has_means = pc->has_whit = false; // key moved: the whitener tracks the mean key (P3-c1: no freeze)
+    pc->has_means = pc->has_whit = false; // key moved: the whitener tracks the mean key (never frozen separately)
     if (!AciCalibPreint::integrate_chain(win.imu, win.clone_times, model_all, Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero(),
                                          calib.noise, pc->pre, calib.noise_frozen ? &calib.noise_lin : nullptr))
       return false;
@@ -284,7 +286,7 @@ bool WindowBA::solve_and_export(const WindowData &win, SharedCalib &calib, bool 
     }
   }
 
-  // ---- assemble (structure ONCE; constants re-pinned every call — the
+  // ---- assemble (structure ONCE; constants re-pinned every call -- the
   // previous export freed the calib blocks) ----
   Problem &problem = G.problem;
   if (!G.built) {
@@ -325,12 +327,12 @@ bool WindowBA::solve_and_export(const WindowData &win, SharedCalib &calib, bool 
   }
 
   // IMU factors. The whitener (two 15x15 factorizations per interval) is the
-  // dominant construction cost and previously fell UNTIMED between t_preint
-  // and t_inner. Cache discipline: a MISS constructs the LEGACY factor and
-  // copies its sqrtI/fold members into the cache — never a re-derivation in
-  // another function/TU, whose codegen under -ffast-math drifts 1 ulp (see
-  // the parity contract at the legacy ctor). A HIT feeds the copied bytes to
-  // the cache-fed ctor, skipping the factorization.
+  // dominant construction cost, timed as t_factor. Cache discipline: a MISS
+  // constructs the LEGACY factor and copies its sqrtI/fold members into the
+  // cache -- never a re-derivation in another function/TU, whose codegen
+  // under -ffast-math drifts 1 ulp (see the parity contract at the legacy
+  // ctor). A HIT feeds the copied bytes to the cache-fed ctor, skipping the
+  // factorization.
   const auto t_fac0 = std::chrono::steady_clock::now();
   const bool whit_hit = pc && pc->has_whit && pc->whit_key == key && (int)pc->W.size() == N - 1;
   if (pc && !whit_hit) {
@@ -430,14 +432,14 @@ bool WindowBA::solve_and_export(const WindowData &win, SharedCalib &calib, bool 
   // Gauge priors: first pose + first biases (window-frame gauge; NO calibration
   // priors here). The bias priors are PHYSICAL, not gauge: the per-window
   // gravity <-> accel-bias valley admits a family of (grav, ba, v) splits at
-  // near-equal cost, and where a window sits on that floor is set by its seed —
+  // near-equal cost, and where a window sits on that floor is set by its seed --
   // the exported (Lambda, g) then carries the seed, not the data, and the
   // fused optimum inherits it. Spec-sheet bias scales collapse the family to a
   // unique split (same role as the seeder's own ba Tikhonov).
   // The bias-prior MEANS must be anchored at the window's (p-independent)
   // seed values, NOT at the current state vector: under VarPro warm starts the
   // state at construction is the PREVIOUS pass's optimum, and a prior centered
-  // there chases the estimate — the gravity<->ba valley collapse this prior
+  // there chases the estimate -- the gravity<->ba valley collapse this prior
   // exists for silently disengages and da/qA drift along the valley floor.
   const Eigen::Vector3d bg_anchor = win.has_seeds ? win.seed_bg : bg[0];
   const Eigen::Vector3d ba_anchor = win.has_seeds ? win.seed_ba : ba[0];
@@ -484,19 +486,19 @@ bool WindowBA::solve_and_export(const WindowData &win, SharedCalib &calib, bool 
   // ---- inner (nuisance) solve ----
   SolverOptions opts;
   opts.max_num_iterations = max_iters;
-  // Hang guard ONLY — must never bind on a healthy solve. A binding wall cap
+  // Hang guard ONLY -- must never bind on a healthy solve. A binding wall cap
   // couples machine load into the ITERATE: a time-stopped inner solve returns
   // a different point, duel arbitration flips, and the session diverges
-  // run-to-run (measured 2026-07-11: 1-ulp YAML drift between quiet and loaded
-  // runs of the SAME binary via the old 5.0 s cap; A1b-half falsifier stats
-  // shifted). 60 s ≈ 25-50× the worst measured inner solve (host 70/40 shape);
-  // any firing is surfaced as time_stopped and flagged by the evidence table.
+  // run-to-run (measured: 1-ulp committed-YAML drift between quiet and loaded
+  // runs of the SAME binary under a 5.0 s cap; split-half falsifier stats
+  // shifted). 60 s is ~25-50x the worst measured inner solve; any firing is
+  // surfaced as time_stopped and flagged by the evidence table.
   opts.max_solver_time_seconds = 60.0;
   opts.num_threads = 1;
   opts.verbose = verbose;
   // Tight exits: the VarPro outer loop differences window costs across p, so
   // the inner candidate-exit noise IS the outer's merit-function noise floor.
-  // Loose (Ceres-default) tolerances leave ~0.5% hysteresis — larger than a
+  // Loose (Ceres-default) tolerances leave ~0.5% hysteresis -- larger than a
   // typical outer step's true improvement. Warm starts keep the extra
   // iterations cheap.
   opts.function_tolerance = 1e-10;
@@ -521,7 +523,7 @@ bool WindowBA::solve_and_export(const WindowData &win, SharedCalib &calib, bool 
     // export-only re-entry (max_iters=0, export-on-accept): the state was
     // placed at the kept optimum above; a Solve(0) would only pay one wasted
     // nuisance linearization (the export re-linearizes with the calib columns
-    // freed anyway). No cost/convergence claim is made — the consumers of
+    // freed anyway). No cost/convergence claim is made -- the consumers of
     // this call read only the export products.
     rep.cost_final = 0.0;
     rep.iterations = 0;
@@ -564,7 +566,7 @@ bool WindowBA::solve_and_export(const WindowData &win, SharedCalib &calib, bool 
     rep.t_export = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_ex0).count();
   }
   // (A qn-only stats path without the calib columns was built and measured NOT
-  // byte-equal to the full export's q_n — the smaller H's leading dimension
+  // byte-equal to the full export's q_n -- the smaller H's leading dimension
   // changes SIMD head-peeling under -ffast-math and H_zz drifts 1 ulp. See the
   // note at Problem::ExportReducedInformation. Cert-consuming evaluations must
   // therefore export fully; JointCalib owns that policy.)

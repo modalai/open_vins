@@ -9,29 +9,28 @@
  *  [T1] Recovery: rich 6-axis session whose truth carries an ICM-part-class
  *       Tg (~4e-4 (rad/s)/(m/s^2), all 9 elements distinct; the sim inverse
  *       map injects wm += Tg*a_hat). The tg block must unlock through the
- *       full-chain gate AND commit; recovery lands three prongs — MEDIAN
+ *       full-chain gate AND commit; recovery lands three prongs -- MEDIAN
  *       element within the 1.2e-4 claim (0.3x part class), EVERY element
  *       within 1.5x claim (the kappa-honest 3-sigma at this world's
- *       information — see the in-test note and the measured 6-world ladder),
- *       |Tg| magnitude within 10% — and co-estimating tg must not degrade
- *       dw/da/qA against the SAME world with Tg = 0 (the baseline run)
- *       beyond basin noise (documented 0.57-0.73 deg qA spread across
- *       numerics-equivalent builds => 1.35x + small floors, never a bare
- *       equality).
- *  [T1b] Unlock -> commit-walk refusal ships seed BYTES (the head-2026-07-13
- *       leak class: solved Tg shipped with tg=SEED in the ledger).
+ *       information -- see the in-test note), |Tg| magnitude within 10% --
+ *       and co-estimating tg must not degrade dw/da/qA against the SAME
+ *       world with Tg = 0 (the baseline run) beyond basin noise (documented
+ *       0.57-0.73 deg qA spread across numerics-equivalent builds => 1.35x +
+ *       small floors, never a bare equality).
+ *  [T1b] Unlock -> commit-walk refusal ships seed BYTES (a walk-refused but
+ *       already-solved Tg must never leak into the shipped calib).
  *  [T2] Hover / constant-a_hat refusal: a session with no excitation cannot
  *       distinguish Tg*a_hat from the gyro bias. Whatever path refuses
  *       (bootstrap starvation, excitation gates), the committed Tg must be
- *       BYTE-IDENTICAL to the seed — any nonzero byte means some stage wrote
+ *       BYTE-IDENTICAL to the seed -- any nonzero byte means some stage wrote
  *       an unearned g-sensitivity.
  *  [T3] One-axis rotation about gravity: bootstrap-viable motion whose a_hat
  *       is constant (R(t) about g fixes g), so the tg columns collapse onto
- *       the bias direction — verdict must be an abstention/refusal (wald
+ *       the bias direction -- verdict must be an abstention/refusal (wald
  *       UNOBSERVABLE r<9, split not-certified, or PRE_CLOSED), never a
  *       commit, and the committed Tg must again be the seed bytes. This is
  *       the falsifier for the refusal path itself (a refused-but-solved tg
- *       that skips the revert ships junk — the revert_block tg arm).
+ *       that skips the revert ships junk -- the revert_block tg arm).
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -72,35 +71,30 @@ static void write_tg_record(const synth::Truth &tr, const std::string &path, dou
   std::vector<RawImu> imu;
   std::vector<FrameObs> frames;
   if (world == World::RICH) {
-    // SynthWorld's rich 6-axis rotation + a g-aligned "pumping" translation at the real
-    // Sting handheld dynamics class (std|a_m| 2.8-3.2 m/s^2 measured on both logs; the
-    // shared shape's 0.36 starves the split-half chain judge of per-half q_AtoI
-    // conditioning and it fails on its own basin noise, z~1.2 — the falsifier was
-    // judging the WORLD, not the estimator). Generated HERE like the SINGLE_AXIS
-    // branch, NOT via a synth::Trajectory knob: probe-measured -ffast-math seam —
-    // growing p_of by a guarded 4th sin repacks the SLP sin group and shifts last-ulp
-    // stream bytes of the validated worlds (session_e2e, wald_mc MC calibration).
+    // SynthWorld's rich 6-axis rotation + a g-aligned "pumping" translation at real
+    // handheld dynamics (std|a_m| 2.8-3.2 m/s^2). The weak 0.36 m/s^2 shape starves
+    // the split-half chain judge of per-half q_AtoI conditioning and fails on its own
+    // basin noise (z~1.2) -- a falsifier judging the WORLD, not the estimator.
+    // Generated HERE like the SINGLE_AXIS branch, NOT via a synth::Trajectory knob:
+    // probe-measured -ffast-math seam -- growing p_of by a guarded 4th sin repacks the
+    // SLP sin group and shifts last-ulp stream bytes of the validated worlds
+    // (session_e2e, wald_mc MC calibration).
     tj.excite_t0 = 6.0;
     tj.excite_t1 = dur - 2.0;
     std::mt19937 g(rng);
     std::normal_distribution<double> nrm(0.0, 1.0);
-    // ONE g-aligned pump. The measured ladder that pinned this shape:
-    //  * z 0.35@3.1: best per-half conditioning (chain z 0.77 direct-certify, tg z 0.39)
-    //    but 3.1-2.9(w_z) = 0.2 rad/s — the mixed channel beats slower than a window and
-    //    Tg(2,2) trades against dw_z (31% shrinkage); els (0,1)/(2,2) miss at 1.4-1.9e-4.
-    //  * z@3.7 (0.30): clears cols 1-2 and the magnitude (|Tg| 0.320 vs 0.322) but its
-    //    4.1 m/s^2 peak drags da into the documented col-3 valley (9.0e-3, 2.1x the
-    //    same-world baseline) and col 0 goes under-determined.
-    //  * ANY x-pump (2.7 / 4.15 rad/s, 3 shapes): per-half qA balloons 0.9-1.3 deg and
-    //    the halves refuse — lateral translation wrecks the half-window seed geometry.
-    // Hence: z-only at 3.7 rad/s — >=0.8 from every FIRST-order w-line AND 0.3 from the
-    // second-order products (2x1.7 = 3.4, 1.7+2.3 = 4.0): 3.35 measured a 75% Tg(2,2)
-    // collapse against the 3.4 line (0.05 gap = 0.125 rad of phase drift per window,
-    // fully collinear with dw_z's own second-order content), while 3.7 recovered (2,2)
-    // exactly. Its 180 s side effects (col-0 starvation, the da col-3 valley at 9.0e-3)
-    // are what the 240 s / select_K 32 shape averages down — measured: the same world at
-    // 240 s passes the da not-worse contract (4.81e-3 vs 1.35x3.60e-3 + 5e-4) where the
-    // 180 s one breached it (9.03e-3 vs 4.26e-3 baseline).
+    // ONE g-aligned pump; the shape was pinned by measurement:
+    //  * z-pump at 3.1 rad/s: best per-half conditioning, but 3.1 - 2.9 (w_z) =
+    //    0.2 rad/s beats slower than a window -- Tg(2,2) trades against dw_z
+    //    (31% shrinkage) and two elements miss at 1.4-1.9e-4.
+    //  * ANY x-pump: per-half qA balloons 0.9-1.3 deg and the halves refuse --
+    //    lateral translation wrecks the half-window seed geometry.
+    //  * z-only at 3.7 rad/s: >=0.8 from every FIRST-order w-line and 0.3 from the
+    //    second-order products (2x1.7 = 3.4, 1.7+2.3 = 4.0). At 3.35 the 3.4-line
+    //    collinearity collapsed Tg(2,2) by 75%; 3.7 recovered it exactly. Its
+    //    short-duration side effects (col-0 starvation, da col-3 valley ~9e-3 at
+    //    180 s) are what the 240 s / select_K 32 shape averages down -- the da
+    //    not-worse contract passes at 240 s where 180 s breached it.
     const double amp_z = 0.30, w_z = 3.7;
     auto p1 = [&](double t) {
       Eigen::Vector3d p = tj.p_of(t);
@@ -150,14 +144,14 @@ static void write_tg_record(const synth::Truth &tr, const std::string &path, dou
     }
   } else if (world == World::HOVER) {
     // excitation segment strictly outside [0, dur]: env() stays at its 0.005
-    // residual-jitter floor — a hover with sensor-level wobble, a_hat ~ R*g.
+    // residual-jitter floor -- a hover with sensor-level wobble, a_hat ~ R*g.
     tj.excite_t0 = 2.0 * dur;
     tj.excite_t1 = 2.0 * dur + 1.0;
     synth::make_streams(tr, tj, so, rng, imu, frames);
   } else {
     // SINGLE_AXIS: yaw about gravity. Rotation exists (bootstrap can pair), but
     // R(t) about g fixes g: a_hat = R*g_W = g_W is CONSTANT, so Tg*a_hat is a
-    // constant gyro offset — exactly the bias direction. Same generator as the
+    // constant gyro offset -- exactly the bias direction. Same generator as the
     // session-e2e degenerate world, plus the Tg inverse-map injection.
     std::mt19937 g(rng);
     std::normal_distribution<double> nrm(0.0, 1.0);
@@ -212,7 +206,7 @@ static void write_tg_record(const synth::Truth &tr, const std::string &path, dou
   }
 
   // pre-bootstrap seed: identity IMU intrinsics, ZERO Tg (blind), ~1.2 deg
-  // extrinsic error, td = 0 — the production cold-start shape.
+  // extrinsic error, td = 0 -- the production cold-start shape.
   SessionSeed ss;
   ss.calib = SharedCalib();
   Eigen::Vector4d dq;
@@ -278,9 +272,9 @@ static void chain_errors(const SessionReport &rep, const synth::Truth &tr, doubl
 
 int main() {
   const double G = 9.81, R2D = 180.0 / M_PI;
-  // ICM-part-class truth Tg (D0014 chain carries ~0.22 deg/s @1g): all 9
-  // elements DISTINCT so a transposed/permuted recovery cannot pass by luck
-  // (the pi-convention seam the module removed — this keeps it removed).
+  // ICM-part-class truth Tg (a measured production chain carries ~0.22 deg/s
+  // @1g): all 9 elements DISTINCT so a transposed/permuted recovery cannot
+  // pass by luck (the pi-convention seam the module removed -- keeps it removed).
   Eigen::Matrix3d Tg_true;
   Tg_true << 3.5e-4, -1.2e-4, 2.1e-4, //
       -2.8e-4, 4.2e-4, -0.6e-4,       //
@@ -322,12 +316,11 @@ int main() {
   const std::string rec_1x = "/tmp/ov_zcalib_tg_e2e_1axis.bin";
 
   // ---------------- T1: recovery on the rich 6-axis world ----------------
-  // 180 s / select_K 24 (12 windows per split half): the tg falsifier judges
-  // HALF-agreement against the 1e-4 floor, and at the 120 s / 16-window S1
-  // shape its basin noise alone put the weakest element (tg[8] — the display's
-  // own weak-mode call all session) at z ~1.09: the verdict was the
-  // falsifier's noise, not the estimator. A recovery gate must run the
-  // unambiguously fully-excited shape; refusal margins stay T2/T3's job.
+  // The tg falsifier judges HALF-agreement against the 1e-4 floor; at a
+  // 120 s / 16-window shape its basin noise alone put the weakest element
+  // (tg[8]) at z ~1.09 -- the verdict was the falsifier's noise, not the
+  // estimator. A recovery gate must run the unambiguously fully-excited
+  // shape (240 s / select_K 32); refusal margins stay T2/T3's job.
   const double t1_dur = 240.0;
   const int t1_select_k = 32;
   double edw_tg = 0, eda_tg = 0, eqa_tg = 0;
@@ -358,17 +351,16 @@ int main() {
     std::printf("[T1] Tg recovery (est | err, (rad/s)/(m/s^2), storage order):");
     for (int k = 0; k < 9; ++k)
       std::printf(" %+.2e|%+.1e", rep.committed.imu.Tg.data()[k], dT.data()[k]);
-    // Recovery acceptance, three prongs (the arbiter's own basin-headroom doctrine —
-    // "documented basin noise => headroom + floors, never a bare equality"):
-    //  (1) MEDIAN element within the 1.2e-4 claim — most of the matrix at claim precision;
-    //  (2) EVERY element within 1.5x claim (1.8e-4): the measured 6-world ladder never got
-    //      all 9 under the raw claim (best world: 7/9 within, worst two at 1.43/1.23e-4),
-    //      and that is information-limited, not a defect — the wald MC's own measured
-    //      kappa (~2-2.4 exported-information under-dispersion, the a_info_deflate the
-    //      judges apply) puts the honest 3-sigma at ~1.7e-4 for these posteriors
-    //      (sigma_el ~3.9e-5): a bare 9-of-9 <= 3-sigma_raw bound flaps by construction;
+    // Recovery acceptance, three prongs (basin-headroom doctrine: documented
+    // basin noise => headroom + floors, never a bare equality):
+    //  (1) MEDIAN element within the 1.2e-4 claim -- most of the matrix at claim precision;
+    //  (2) EVERY element within 1.5x claim (1.8e-4): measured across six worlds, all 9
+    //      never landed under the raw claim at once -- information-limited, not a defect;
+    //      the wald MC's measured kappa (~2-2.4 information under-dispersion) puts the
+    //      honest 3-sigma at ~1.7e-4 for these posteriors (sigma_el ~3.9e-5), so a bare
+    //      9-of-9 <= 3-sigma_raw bound flaps by construction;
     //  (3) |Tg| row-norm magnitude within 10% of truth (junk recoveries fail this at the
-    //      30-75% shrinkage level measured on the mis-excited worlds).
+    //      30-75% shrinkage level measured on mis-excited worlds).
     double errs[9];
     for (int k = 0; k < 9; ++k)
       errs[k] = std::abs(dT.data()[k]);
@@ -420,8 +412,8 @@ int main() {
   // The path T1 cannot reach (its tg commits) and T2/T3 never reach (their sessions refuse
   // upstream): tg unlocks through the gate, solves through A1b/B, and the commit walk refuses
   // the BLOCK (here: an impossible sigma ceiling). The refused value must revert to the seed
-  // BYTES in the shipped calib — the head-2026-07-13 leak class (st1/det_head forensics: head
-  // shipped the solved Tg with tg=SEED in its own ledger) that the revert_block tg arm fixes.
+  // BYTES in the shipped calib -- a solved Tg once shipped while the ledger said SEED; the
+  // revert_block tg arm pins that leak class closed.
   {
     SessionConfig c1b = cfg;
     c1b.select_K = t1_select_k;

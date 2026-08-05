@@ -2,8 +2,7 @@
  * OpenVINS: An Open Platform for Visual-Inertial Research
  * Copyright (C) 2025-2026 Joao Leonardo Silva Cotta
  *
- * ov_zcalib: Monte-Carlo calibration harness for the Wald accel gate
- * (DESIGNS #1 test-plan item; SOLVER_TIME_METHOD / HANDOFF s7 blocker).
+ * ov_zcalib: Monte-Carlo calibration harness for the Wald accel gate.
  *
  * H0 study: replicate synthetic sessions at TRUTH (stationary parameter,
  * correct model) with per-replicate measurement-noise seeds, run the full
@@ -15,17 +14,17 @@
  *
  * (T is computed deflated: C = kap_eff (A1^-1 + A2^-1); multiplying back
  * recovers the raw statistic). kappa_hat pins the a_info_deflate FLOOR PER
- * SHAPE — the 2026-07-11 thin-shape discordant pair (split freezes, wald
- * CONSISTENT via GN-linearized understatement) is exactly the failure class
- * this harness exists to bound before mode 1 takes profile authority. The H0
- * freeze rate estimates the test's size; the --h1 junk study its power. The
- * per-replicate stat line carries everything an OFFLINE (floor, scale)
- * re-sizer needs (T and the X thresholds rescale analytically in kap_eff and
+ * SHAPE -- the thin-shape discordant pair (split freezes while wald reads
+ * CONSISTENT via GN-linearized understatement) is the failure class this
+ * harness bounds before mode 1 takes profile authority. The H0 freeze rate
+ * estimates the test's size; the --h1 junk study its power. The per-replicate
+ * stat line carries everything an OFFLINE (floor, scale) re-sizer needs (T
+ * and the X thresholds rescale analytically in kap_eff and
  * a_wald_thresh_scale), so a full ROC sweep costs ONE collection run per
- * hypothesis — run it with --floor set to the sweep's LOWEST floor, so
+ * hypothesis -- run it with --floor set to the sweep's LOWEST floor, so
  * observability reclassification (raw_eig / floor' >= a_obs_min_eig) only
  * ever REMOVES directions and every cell's verdict reconstructs exactly.
- * N here is small, so ctest asserts only loose sanity — the real study runs
+ * N here is small, so ctest asserts only loose sanity -- the real study runs
  * standalone with --reps >= 30.
  *
  * The record generator is duplicated VERBATIM from test_session_e2e.cpp
@@ -62,7 +61,7 @@ static int failures = 0;
   } while (0)
 
 // Duplicated from test_session_e2e.cpp (rich-excitation path; provenance
-// comment there) — a shared testlib refactor is deliberate future work so the
+// comment there) -- a shared testlib refactor is deliberate future work so the
 // MC harness lands with zero S-suite blast radius.
 static void write_session_record(const synth::Truth &tr, const std::string &path, double dur, double ex0, double ex1, unsigned rng,
                                  double h1_gyro_ramp = 0.0, double h1_accel_settle = 0.0) {
@@ -77,20 +76,18 @@ static void write_session_record(const synth::Truth &tr, const std::string &path
   synth::make_streams(tr, tj, so, rng, imu, frames);
   if ((h1_gyro_ramp > 0.0 || h1_accel_settle > 0.0) && !imu.empty()) {
     // H1 junk injection (thermal-transient class): a slow gyro-bias ramp PLUS accel-bias
-    // exponential transients. The original gyro-only 2e-5 rad/s/s ramp was measured NOT to be a
-    // falsifier of the v3 class: per-window bg nuisances absorb it almost entirely (implied
-    // dqA ~0.05-0.1 deg, 8/12 junk-passes at the 2026-07-13 sizing). The ACCEL term is the
-    // mechanism the gate historically caught (v3 real-log freeze, dqA 0.867 deg): a body-frame
-    // accel-bias error couples into qA/da through gravity leverage (thermal-VRE). What per-window
-    // ba CANNOT absorb is transient CURVATURE; a single warmup settle parks that entirely in the
-    // first half (measured here: dqA saturates ~0.33 deg and the joint A1a point absorbs the
-    // settled tail — at 2x amplitude the verdict even flips to a junk-PASS). So the injection is
-    // a transient PAIR: the warmup settle plus a SECOND onset at mid-session on an orthogonal
-    // body axis (the thermal-event class: payload/motor power step, airflow change, VRE onset) —
-    // each half then absorbs ITS transient through its own excitation geometry and the halves
+    // exponential transients. A gyro-only ramp is measured NOT to be a falsifier: per-window
+    // bg nuisances absorb it almost entirely (implied dqA ~0.05-0.1 deg, mostly junk-passes).
+    // The ACCEL term is what the gate catches in the field: a body-frame accel-bias error
+    // couples into qA/da through gravity leverage (thermal-VRE). Per-window ba cannot absorb
+    // transient CURVATURE, but a single warmup settle parks that in the first half (measured:
+    // dqA saturates ~0.33 deg and the joint A1a point absorbs the settled tail; at 2x
+    // amplitude the verdict even flips to a junk-PASS). Hence a transient PAIR: the warmup
+    // settle plus a SECOND onset at mid-session on an orthogonal body axis (payload/motor
+    // power step, airflow change, VRE onset) -- each half absorbs ITS transient and the halves
     // disagree at the size of the junk. Magnitude is pinned so the implied half-disagreement
-    // lands AT the v3 class (printed dqA ~0.6-0.9 deg on the gate subspace), not at a
-    // nuisance-absorbable token nor at the phys-ceiling (>2 deg) where every cell trivially
+    // lands at the observed freeze class (dqA ~0.6-0.9 deg on the gate subspace), not at a
+    // nuisance-absorbable token nor at the >2 deg phys-ceiling where every cell trivially
     // refuses and the ROC cannot discriminate.
     const Eigen::Vector3d axis_w = Eigen::Vector3d(0.6, -0.5, 0.62).normalized();
     const Eigen::Vector3d axis_a = Eigen::Vector3d(0.55, 0.60, -0.58).normalized();
@@ -142,7 +139,7 @@ int main(int argc, char **argv) {
     else if (!std::strcmp(argv[i], "--rep0") && i + 1 < argc)
       rep0 = std::atoi(argv[++i]);
     else if (!std::strcmp(argv[i], "--p4"))
-      p4 = true; // wald-verdict stability under the P4 solver (the composed-endgame validation)
+      p4 = true; // wald-verdict stability under the composed P4 solver path
     else if (!std::strcmp(argv[i], "--h1"))
       h1 = true; // junk-injection POWER study: the gate must refuse every replicate
     else if (!std::strcmp(argv[i], "--floor") && i + 1 < argc)
@@ -152,13 +149,13 @@ int main(int argc, char **argv) {
     else if (!std::strcmp(argv[i], "--h1a") && i + 1 < argc)
       h1a_ovr = std::atof(argv[++i]); // accel-settle amplitude override [m/s^2] (injection tuning only)
   }
-  // H1 = the v3-class thermal transient: gyro ramp (2e-5 rad/s/s ~= 0.10 deg/s wander over the
-  // session — absorbable alone, kept as the class's gyro component) + accel-bias transient pair
-  // whose amplitude is pinned so the implied half-disagreement prints dqA ~0.6-0.9 deg (v3
-  // measured 0.867 on real data). MEASURED on the seed-0 replicate: 0.12 -> dqA 0.51, 0.17 ->
-  // 0.65, 0.20 -> 0.66 with kap_sess inflating 4.7 -> 5.3 (the response saturates into common
-  // absorption while self-widening the threshold) — 0.17 is the v3-class point and the sharper
-  // falsifier (T 45.8 vs 42.1). See write_session_record for the mechanism.
+  // H1 = the field thermal-transient class: gyro ramp (2e-5 rad/s/s ~= 0.10 deg/s wander over
+  // the session -- absorbable alone, kept as the class's gyro component) + accel-bias transient
+  // pair whose amplitude is pinned so the implied half-disagreement prints dqA ~0.6-0.9 deg
+  // (0.867 deg measured on the real-log freeze this class replicates). MEASURED on the seed-0
+  // replicate: 0.12 -> dqA 0.51, 0.17 -> 0.65, 0.20 -> 0.66 with kap_sess inflating 4.7 -> 5.3
+  // (the response saturates into common absorption while self-widening the threshold) -- 0.17
+  // is the class point and the sharper falsifier (T 45.8 vs 42.1). See write_session_record.
   const double h1_gyro = h1 ? 2e-5 : 0.0;
   const double h1_accel = h1 ? (h1a_ovr > 0.0 ? h1a_ovr : 0.17) : 0.0;
 
@@ -199,10 +196,10 @@ int main(int argc, char **argv) {
       std::printf("[mc %02d] UNOBSERVABLE r=%d mineig=%.6g\n", rep, rp.a_wald_r, rp.a_wald_min_eig);
       continue;
     }
-    // kappa_hat per replicate: T is computed DEFLATED by kap_eff = max(floor, kap_sess) — the
+    // kappa_hat per replicate: T is computed DEFLATED by kap_eff = max(floor, kap_sess) -- the
     // session estimate, not the configured floor, is what divided T whenever it exceeded the
-    // floor. Multiplying kap_eff back recovers T_raw; the old `T * floor / r` silently
-    // under-reported kappa on every floor-unbound replicate.
+    // floor. Multiply kap_eff back to recover T_raw; using the floor here would silently
+    // under-report kappa on every floor-unbound replicate.
     const double kap_eff = std::max(cfg.a_info_deflate, rp.a_wald_kappa);
     const double k = rp.a_wald_T * kap_eff / std::max(1, rp.a_wald_r);
     khat.push_back(k);

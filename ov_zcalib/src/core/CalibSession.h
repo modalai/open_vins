@@ -5,7 +5,7 @@
  * ov_zcalib: live-session state machine + guided-excitation progress.
  * The streaming one-pass Lambda-sum drives the DISPLAY ONLY; the committed answer
  * always comes from the end-of-session VarPro refinement (JointCalib) over the
- * retained windows — committing the one-pass estimate is a correctness bug by
+ * retained windows -- committing the one-pass estimate is a correctness bug by
  * contract. Prompts are driven by the weakest eigenpairs of the prior-whitened
  * information sum (marginal sigmas lie under correlation).
  *

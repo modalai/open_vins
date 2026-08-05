@@ -12,6 +12,10 @@
  *       convention (theta_C = R_ItoC * theta_I) and the JPL quat output.
  *  [P4] Degeneracy: single-axis rotation must be REJECTED by the
  *       axis-diversity gate, not returned with false confidence.
+ *  [P5] Three-way model selection (Procrustes / homography / essential) on
+ *       planar, close-3D, and far-field scenes; deterministic per seed.
+ *  [P6] IMU-chain gauge port: kalibr/rpng chains must reproduce the same
+ *       corrected signals up to one frame rotation (Tg conjugated, not zeroed).
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -106,7 +110,7 @@ int main() {
     const double err_deg = std::acos(std::min(1.0, std::max(-1.0, ((rr.R_C1toC2 * R_true.transpose()).trace() - 1.0) / 2.0))) * 180.0 / M_PI;
     std::printf("[P1] rel-rot err %.4f deg (inliers %d/%d, translation present)\n", err_deg, rr.inliers, (int)b0.size());
     // Rotation-only fit with a 5 cm hop at ~5 m depth: the translation-induced bias
-    // is real physics (~0.5 deg here) — SEED-level bound; the hand-eye consumer
+    // is real physics (~0.5 deg here) -- SEED-level bound; the hand-eye consumer
     // averages it down over hundreds of direction-diverse pairs (see P3).
     CHECK(err_deg < 0.70, "P1: rel rot err %.3f deg", err_deg);
 
@@ -277,8 +281,8 @@ int main() {
     Eigen::Matrix3d Dw_k = Eigen::Matrix3d::Identity(), Da_k = Eigen::Matrix3d::Identity();
     Dw_k << 1.0021, 0, 0, -0.0032, 0.9985, 0, 0.0027, -0.0041, 1.0043;
     Da_k << 0.9974, 0, 0, 0.0019, 1.0032, 0, -0.0026, 0.0035, 0.9951;
-    // g-sensitivity at the real ICM-class magnitude (D0014's chain, ~4e-4 (rad/s)/(m/s^2)). Tg
-    // multiplies a_hat, and a_hat is the ONE quantity whose frame the gauge change moves, so the
+    // g-sensitivity at real ICM-class magnitude (~4e-4 (rad/s)/(m/s^2), a measured production
+    // chain). Tg multiplies a_hat, the ONE quantity whose frame the gauge change moves, so the
     // port must CONJUGATE it (Tg_r = Tg_k * Q_w) -- neither zero it nor copy it across.
     Eigen::Matrix3d Tg_k;
     Tg_k << 1.69362e-4, -7.07768e-5, 2.75611e-5, 1.20919e-4, 2.41152e-6, 1.30676e-4, -7.29277e-5, -3.83020e-4, 9.93289e-5;
@@ -329,7 +333,7 @@ int main() {
     // The misalignment is PHYSICAL: it must survive the port, not be zeroed.
     CHECK(2.0 * imu.q_AtoI.head<3>().norm() * 180.0 / M_PI > 0.2, "P6: gyro-vs-accel misalignment was zeroed by the port");
     // Tg likewise. The gyro channel above is only gauge-invariant if Tg was conjugated by the SAME
-    // frame rotation the QR produced -- zeroing it (the old behaviour) breaks worst_w outright.
+    // frame rotation the QR produced -- zeroing it breaks worst_w outright.
     CHECK(imu.Tg.norm() > 1e-6, "P6: Tg was zeroed by the port");
     const double tg_err = (imu.Tg - Tg_k * R_frame).norm();
     std::printf("[P6] Tg conjugation: |Tg_r - Tg_k*Q_w| %.2e | %.3f deg/s @1g\n", tg_err,

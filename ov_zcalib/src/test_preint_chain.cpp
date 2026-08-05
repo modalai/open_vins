@@ -2,11 +2,11 @@
  * OpenVINS: An Open Platform for Visual-Inertial Research
  * Copyright (C) 2025-2026 Joao Leonardo Silva Cotta
  *
- * ov_zcalib: BITWISE oracle for the P3 chronological preintegration sweep.
+ * ov_zcalib: BITWISE oracle for the chronological preintegration sweep.
  *
  * integrate_chain()'s reuse license is byte-exactness: the preint cache keys
  * on exact values and serves stored bytes, so the sweep must reproduce the
- * per-interval integrate() scan BIT-FOR-BIT — including boundary interpolants
+ * per-interval integrate() scan BIT-FOR-BIT -- including boundary interpolants
  * at interior clone times (shared straddling pair), clones landing exactly ON
  * sample stamps, intervals with no interior samples, duplicate-stamp (dt = 0)
  * pairs, and streams ending before the last clone. A randomized battery over
@@ -175,7 +175,7 @@ int main() {
     const bool ok1 = AciCalibPreint::integrate(imu, ct[1], ct[2], model, Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero(), noise, r1);
     std::vector<AciPreintResult> chain;
     const bool okc = AciCalibPreint::integrate_chain(imu, ct, model, Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero(), noise, chain);
-    // per-interval integrate: [0.2,0.6] fine, [0.6,1.4]: stream ends at 1.0 —
+    // per-interval integrate: [0.2,0.6] fine, [0.6,1.4]: stream ends at 1.0 --
     // integrate() still succeeds on the spanned part; the CHAIN must agree
     // with the AND of the two, and when it succeeds, bytes must match.
     CHECK(okc == (ok0 && ok1), "failure parity: chain %d vs per-interval %d&%d", okc, ok0, ok1);
@@ -190,8 +190,8 @@ int main() {
   }
 
   // ---- whitener: the cache-fill discipline is COPY-from-a-legacy-factor
-  // (WindowBA miss path), never a re-derivation — a separate implementation in
-  // a different codegen context drifted 1 ulp under -ffast-math (2026-07-11).
+  // (WindowBA miss path), never a re-derivation -- a second implementation in a
+  // different codegen context was measured to drift 1 ulp under -ffast-math.
   // This pins the full round trip: legacy ctor -> copied bytes -> cache-fed
   // ctor == legacy ctor, plus the whitener's defining identity.
   {

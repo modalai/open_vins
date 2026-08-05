@@ -102,7 +102,7 @@ struct SolverSummary {
   double time_residual_seconds = 0.0;     ///< residual-only trial scoring (evaluate_cost)
   bool converged = false;
   /// True iff the wall-clock budget ended the solve (any of the in-loop checks).
-  /// A binding time cap couples machine load into the ITERATE — callers that
+  /// A binding time cap couples machine load into the ITERATE -- callers that
   /// need run-to-run bit-identity must treat a time-stopped solve as tainted
   /// and surface this flag (ov_zcalib evidence table does).
   bool time_stopped = false;
@@ -158,7 +158,7 @@ public:
   /**
    * @brief Reduced information + gradient of the requested blocks at the CURRENT iterate.
    *
-   * Linearizes once (undamped) and marginalizes EVERY other variable block — landmarks
+   * Linearizes once (undamped) and marginalizes EVERY other variable block -- landmarks
    * and nuisances alike: Lambda = H_kk - H_kn H_nn^-1 H_nk and the matching reduced
    * gradient g_k - H_kn H_nn^-1 g_n of the robustified cost, in LOCAL (error-state)
    * coordinates, requested-block order. This is the per-window export of the VarPro
@@ -166,9 +166,9 @@ public:
    * Requires the nuisance system to be PD (per-window gauge anchored); returns false
    * otherwise. Additive API: Solve()/ComputeCovariance() behavior is unchanged.
    */
-  /// Optional per-export convergence evidence (P1 stationarity certificate).
+  /// Optional per-export convergence evidence (stationarity certificate).
   /// nuis_decrement = g_z' H_zz^{-1} g_z summed over ALL marginalized blocks
-  /// (landmark + nav-nuisance terms; exact block-elimination identity) — the
+  /// (landmark + nav-nuisance terms; exact block-elimination identity) -- the
   /// model energy of the remaining inner correction: 2x the cost decrease a
   /// further inner solve could still achieve at this linearization. Computed
   /// from factorizations this export already forms (one extra O(nn^2) solve).
@@ -176,25 +176,23 @@ public:
     double nuis_decrement = 0.0;
     double land_decrement = 0.0;
     double nuis_grad_inf = 0.0;
-    // Diagnostics only (veto dossier): the nuisance LDLT's smallest pivot and
-    // dimension. NaN pivot = factorization itself failed. Never consumed by
-    // solver logic; excluded from the export-audit memcmp by name.
+    // Veto diagnostics only: the nuisance LDLT's smallest pivot and dimension.
+    // NaN pivot = factorization itself failed. Never consumed by solver logic;
+    // excluded from the export-audit memcmp by name.
     double nuis_min_pivot = 0.0;
     int nuis_dim = 0;
-    /// landmark directions rank-clamped by the spectral elimination (R6):
+    /// landmark directions rank-clamped by the spectral landmark elimination:
     /// the window's degenerate-landmark load. Diagnostic only.
     int clamped_dirs = 0;
   };
-  // NOTE (export-on-accept, t7): a "qn-only" variant of this export (empty keep
+  // NOTE (export-on-accept): a "qn-only" variant of this export (empty keep
   // set, calibration columns never formed) was built and MEASURED as NOT
-  // byte-equal to the full export's ExportStats: removing the kept columns
-  // changes H's leading dimension (692 vs 722 on the probe window), the column
-  // base alignment mod 32 bytes changes with it, and under -ffast-math the
-  // SIMD head-peeling reassociates the accumulations — H_zz drifts ~1 ulp
-  // (3784/262144 entries, median 4e-16 rel) and q_n follows (~1e-10 rel).
-  // q_n feeds thresholded duel arbitration, so cert-consuming evaluations keep
-  // the full export instead (see ov_zcalib JointCalib). Do not resurrect the
-  // qn-only path without solving the emitted-loop parity problem first.
+  // byte-equal: the smaller leading dimension of H (692 vs 722 on the probe
+  // window) shifts column base alignment mod 32 bytes, and under -ffast-math
+  // the SIMD head-peeling reassociates the accumulations -- H_zz drifts ~1 ulp
+  // and q_n follows (~1e-10 rel). q_n feeds thresholded duel arbitration, so
+  // cert-consuming evaluations keep the full export (see ov_zcalib JointCalib).
+  // Do not resurrect the qn-only path without emitted-loop byte parity first.
   bool ExportReducedInformation(const std::vector<double *> &blocks, Eigen::MatrixXd &Lambda, Eigen::VectorXd &gred,
                                 const SolverOptions &options, ExportStats *stats = nullptr);
 
@@ -253,8 +251,8 @@ protected: // protected (not private): the base-class seam for derived solvers (
   // Arrowhead-Schur scratch (reused; no per-call heap traffic): for one landmark's adjacency,
   // schur_off_[k] = nav offset of adjacent block k, schur_W_[k] = H[landmark, off_k] (3 x lsize_k),
   // schur_Ma_[k] = W_k^T * V^-1 (lsize_k x 3). GENERAL block widths: an adjacent block may be a
-  // clone pose (3) or an unlocked calibration block (e.g. 8-dof camera intrinsics) — the old
-  // Matrix3d scratch silently dropped columns beyond 3 (the latent Schur bug; fixed here).
+  // clone pose (3) or an unlocked calibration block (e.g. 8-dof camera intrinsics) -- a fixed
+  // Matrix3d scratch would silently drop every column beyond the third.
   mutable std::vector<Eigen::Matrix<double, 3, Eigen::Dynamic>> schur_W_;
   mutable std::vector<Eigen::Matrix<double, Eigen::Dynamic, 3>> schur_Ma_;
   mutable std::vector<Eigen::Matrix3d> schur_Vinv_; // per-landmark damped V^-1 (Schur pass -> back-substitution)
@@ -263,41 +261,34 @@ protected: // protected (not private): the base-class seam for derived solvers (
   // FIXED-SIZE (3x3) Schur scratch -- the fast path.
   //
   // In the inner solve EVERY block a landmark touches is a clone pose (q or p), so every
-  // adjacency has lsize == 3. The general path above still declares them Dynamic, so the
-  // O(P^2) fill-in `Hred.block(...) -= Ma * W_b` compiles to Eigen's DYNAMIC gemm: a runtime
-  // dispatch that cannot unroll or vectorize, wrapped around 54 flops of actual arithmetic.
-  // PROFILED (D0014 record, one session): 73.5 MILLION such products, delivering 3.97 GFLOP
-  // at 1.42 GFLOP/s = ~2% of machine peak, and 36% of solve_step's wall time. The dense
-  // Cholesky next to it runs at 38 GFLOP/s (58% of peak) -- the Schur loop is not doing
-  // arithmetic, it is paying dispatch. (This is exactly why Ceres template-specializes its
-  // SchurEliminator on the (2,3,3) block shape.)
-  //
-  // These fixed-size buffers let the compiler see 3x3 at compile time: full unroll, SIMD, no
-  // dispatch. The general Dynamic path stays for the EXPORT, where the calibration blocks are
+  // adjacency has lsize == 3, yet with the Dynamic scratch above the O(P^2) fill-in
+  // `Hred.block(...) -= Ma * W_b` compiles to Eigen's dynamic gemm: runtime dispatch
+  // wrapped around 54 flops. PROFILED on one production session record: 73.5 million such
+  // products at 1.42 GFLOP/s (~2% of machine peak), 36% of solve_step's wall, while the
+  // dense Cholesky beside it runs at 58% of peak -- the loop pays dispatch, not arithmetic.
+  // (Ceres template-specializes its SchurEliminator on block shape for the same reason.)
+  // Fixed-size buffers give the compiler 3x3 at compile time: full unroll, SIMD, no
+  // dispatch. The Dynamic path stays for the EXPORT, where the calibration blocks are
   // variable and adjacencies really can be 1 (td), 3 (quat/pos) or 8 (camera) wide.
   mutable std::vector<Eigen::Matrix3d> schur_W3_, schur_Ma3_;
   std::vector<char> land_all3_; // per landmark: every adjacency is lsize 3 (=> fixed-size path)
 
   // ---- BORDERED-BANDED direct solver for the reduced nav system (analyze_band) ----
   //
-  // The reduced nav Hessian is NOT dense, it is banded with a low-rank border:
-  //   * IMU preintegration couples clone k to clone k+1 only          -> half-bandwidth 30
-  //   * a landmark's Schur fill makes a clique of the clones that SEE it, so the fill reaches
-  //     as far as the longest track                                    -> 15 * max_track_len
-  //   * the S2 gravity block couples to EVERY clone, and is registered LAST (WindowBA.cpp),
-  //     so it lands at the end of the nav partition -> a rank-2 BORDER, not band.
+  // The reduced nav Hessian is banded with a low-rank border, not dense:
+  //   * IMU preintegration couples clone k to clone k+1 only           -> half-bandwidth 30
+  //   * a landmark's Schur fill cliques the clones that SEE it         -> 15 * max_track_len
+  //   * the S2 gravity block couples to EVERY clone and is registered LAST (WindowBA.cpp),
+  //     landing at the end of the nav partition                        -> a rank-2 BORDER.
   //
-  // Whether that is worth exploiting is a property of the WINDOW SHAPE, and the design
-  // review that rejected a banded solver is correct for the shape it was measured at:
-  // at 70 clones / 40-obs tracks the fill reaches ~600 of 1052 dofs (57% dense) and banded
-  // buys nothing. The FLIGHT shape caps tracks at 10 obs / 32 clones, and there the MEASURED
-  // half-bandwidth is 74 of 467 (16%) -> n*b^2 = 2.6 MFLOP vs n^3/3 = 33.9 MFLOP, 13x fewer.
-  //
-  // So the choice is not hard-coded to a profile: analyze_band() measures the actual fill from
-  // the actual residual/landmark structure and enables the banded path ONLY when it is
-  // cheaper. A long-track (host) window falls back to the dense LLT automatically, which is
-  // exactly what the note asks for. The band is also 280 KB instead of 1.75 MB -- it fits in
-  // L2, which matters more on the target than the flop count does.
+  // Whether that is worth exploiting is a property of the WINDOW SHAPE: at 70 clones /
+  // 40-obs tracks the fill reaches ~600 of 1052 dofs (57% dense) and banded buys nothing --
+  // rejecting it there was correct. The flight shape caps tracks at 10 obs / 32 clones,
+  // where the MEASURED half-bandwidth is 74 of 467 (16%): n*b^2 = 2.6 MFLOP vs n^3/3 =
+  // 33.9 MFLOP, 13x fewer. So the choice is never hard-coded to a profile: analyze_band()
+  // measures the actual fill and enables the banded path ONLY when it is cheaper; long-track
+  // windows fall back to the dense LLT automatically. The band is also 280 KB instead of
+  // 1.75 MB -- it fits in L2, which matters more on the target than the flop count does.
   mutable Eigen::MatrixXd band_AB_; // (b+1) x nb, lower band storage: AB(k,j) = B(j+k, j)
   mutable Eigen::MatrixXd band_C_;  // nb x nbord   border columns
   mutable Eigen::MatrixXd band_Y_;  // nb x nbord   = B^-1 C

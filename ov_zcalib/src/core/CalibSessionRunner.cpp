@@ -40,7 +40,7 @@ CalibSessionRunner::CalibSessionRunner(const SessionConfig &cfg, const SessionSe
   }
   // Tg (g-sensitivity): SESSION-level column switch + per-stage free flag, set together HERE and
   // then only ever narrowed. The flag stays frozen until the A1b full-chain gate certifies the
-  // excitation (split-half / Wald) — exactly the accel chain's doctrine — but the preint COLUMN
+  // excitation (split-half / Wald) -- exactly the accel chain's doctrine -- but the preint COLUMN
   // WIDTH must be fixed for the whole session (persistent window graphs cannot change a factor's
   // parameter list in place), which is what tg_enabled pins. A frozen factory chain freezes tg
   // with it: earning a gyro cross-coupling while refusing to touch dw/da is not a coherent trust
@@ -158,8 +158,8 @@ void CalibSessionRunner::feed_frame(const FrameObs &f) {
   if (c >= (size_t)n_cams_)
     return; // a camera the session was never seeded for
   if (f.exposure_s > 0.f) {
-    // Mean exposure is PER CAMERA: it bridges the td convention (mid-exposure <-> start-of-
-    // exposure) and each camera has its own exposure and its own td.
+    // Mean exposure is PER CAMERA and DIAGNOSTIC ONLY: stamps arrive already centered at
+    // ingest (see SessionReport::mean_exposure_s), and each camera has its own AE history.
     exp_sum_[c] += (double)f.exposure_s;
     ++exp_n_[c];
   }
@@ -170,11 +170,11 @@ void CalibSessionRunner::feed_frame(const FrameObs &f) {
     break;
   case RunnerState::BOOTSTRAP: {
     // Retroactive harvest buffer: these frames replay into the harvester the
-    // moment bootstrap succeeds (see try_bootstrap_) — otherwise the bootstrap
-    // span is dead collection time (54% of a 41 s flight log). RING at the cap:
-    // the retro value lives in the FRESHEST span (keeping the oldest 4000 handed
-    // a long bootstrap its stalest minute and dropped the motion that finally
-    // passed the gate).
+    // moment bootstrap succeeds (see try_bootstrap_) -- otherwise the bootstrap
+    // span is dead collection time (~half of a short flight log). RING at the
+    // cap: the retro value lives in the FRESHEST span; keeping the oldest would
+    // hand a long bootstrap its stalest minute and drop the motion that finally
+    // passed the gate.
     if (cfg_.retro_harvest) {
       if ((int)boot_frames_.size() >= 4000)
         boot_frames_.pop_front();
@@ -216,7 +216,7 @@ void CalibSessionRunner::feed_frame(const FrameObs &f) {
           hp.theta_C = ov_core::log_so3(rr.R_C1toC2);
           // errors-in-variables gate/weight: the post-derotation residual is the
           // translation-flow scale; where it rivals |theta| the rotation-only
-          // fit is biased, not noisy — downweight, and drop the worst outright
+          // fit is biased, not noisy -- downweight, and drop the worst outright
           const double th = hp.theta_C.norm();
           const double eiv = rr.mean_resid_rad / std::max(th, 1e-9);
           if (eiv >= 0.30) {
@@ -266,7 +266,7 @@ void CalibSessionRunner::feed_frame(const FrameObs &f) {
 void CalibSessionRunner::try_bootstrap_(double now) {
   // RECENCY: the gate judges the operator's LAST bootstrap_window_s of motion, not the whole
   // history. An early bad stretch (AE settling, blur, the pick-up) must age out instead of
-  // capping the achievable peak forever — and a long bootstrap must not grow its per-attempt
+  // capping the achievable peak forever -- and a long bootstrap must not grow its per-attempt
   // cost without bound. Sessions that pass inside the horizon never evict anything, so their
   // behaviour is byte-identical to the unwindowed path.
   if (cfg_.bootstrap_window_s > 0.0 && boot_t0_ >= 0.0) {
@@ -342,16 +342,16 @@ void CalibSessionRunner::try_bootstrap_(double now) {
       TimeOffsetResult xr = TimeOffsetInit::solve(rates_[(size_t)c], boot_imu_, cfg_.td_search_s, 0.002);
       const bool sharp_ok = xr.peak_sharpness >= cfg_.xcorr_min_sharpness;
       const bool fast_ok = xr.ok && !xr.at_bound && xr.peak_corr >= cfg_.xcorr_min_peak && sharp_ok;
-      // ROBUST CERTIFICATE — a moderate peak whose LOCATION is reproducible identifies td exactly
+      // ROBUST CERTIFICATE -- a moderate peak whose LOCATION is reproducible identifies td exactly
       // as well as a tall one: the seed contract is only +/- td_fine_range (the hand-eye fine
       // sweep re-solves td by re-preintegration). Broadband pair noise (blur-slipped KLT tracks,
       // RS shear at rate reversals) depresses rho without moving the argmax; the FLAT ridge the
-      // floor exists to reject cannot pass this — its split halves land on different lags and its
+      // floor exists to reject cannot pass this -- its split halves land on different lags and its
       // trim buys nothing. Conditions: one Hampel trim clears the SAME floor while keeping >= 70%
       // of the evidence weight without moving the argmax, and both split halves independently
-      // reproduce the lag (each showing a real ridge of its own). Measured need: D0014 hires
-      // (2026-07-13) pinned at peak 0.51-0.57 with a stable argmax for minutes — a td the old
-      // single-number gate could never accept and the fine sweep would have eaten alive.
+      // reproduce the lag (each showing a real ridge of its own). Measured need: a real session
+      // pinned at peak 0.51-0.57 with a stable argmax for minutes -- a td a single-number floor
+      // can never accept, although the fine sweep resolves it cleanly.
       const bool cert_ok = xr.ok && !xr.at_bound && sharp_ok && !fast_ok && xr.trim_consistent &&
                            xr.peak_trimmed >= cfg_.xcorr_min_peak && xr.trim_retention >= 0.70 &&
                            xr.td_split_delta >= 0.0 && xr.td_split_delta <= cfg_.handeye.td_fine_range &&
@@ -417,7 +417,7 @@ void CalibSessionRunner::try_bootstrap_(double now) {
   // No still baseline: per-window visual bias pre-solve carries the gyro bias,
   // the window bias prior widens to visual confidence, and the seed-admission
   // gate scales with the bootstrap's own residual level (the extrinsic seed
-  // error is what the joint solve exists to remove — early windows must pass).
+  // error is what the joint solve exists to remove -- early windows must pass).
   if (!have_baseline_) {
     cfg_.seed.bias_presolve = true;
     calib_.bg_prior_sigma = 0.03;
@@ -464,7 +464,7 @@ void CalibSessionRunner::try_bootstrap_(double now) {
     display_.reset(new CalibSession(np, prior, labels));
   }
   // Retroactive harvest: merge-replay the bootstrap-span streams into the
-  // fresh harvester in timestamp order (IMU first on ties — one fixed rule so
+  // fresh harvester in timestamp order (IMU first on ties -- one fixed rule so
   // live == replay bit-identical). Windows close through the identical
   // handle_window_ path as live collection.
   if (cfg_.retro_harvest) {
@@ -473,7 +473,7 @@ void CalibSessionRunner::try_bootstrap_(double now) {
     int replayed = 0, decimated = 0;
     // The live ingest feeds the tracker at the FULL sensor rate during bootstrap (the pair engine
     // needs it: halving the rate doubles per-pair KLT displacement) and only decimates to the
-    // declared fps once COLLECT starts — so the retro span decimates HERE, or the harvester's
+    // declared fps once COLLECT starts -- so the retro span decimates HERE, or the harvester's
     // drop accounting (nominal dt = 1/fps of the seed) would read a 2x-rate stream. Same accept
     // rule as the live gate (0.75*min_dt) so a jittered frame cannot cascade into rate-halving.
     // Streams already at the declared rate (old records, undecimated cams) pass untouched.
@@ -530,9 +530,9 @@ void CalibSessionRunner::handle_window_(WindowData &&w, const WindowMeta &m) {
   if (!seeded_ok) {
     rep_.windows_rejected_seed++;
     if (cfg_.verbose) {
-      // diagnosis instrumentation (flight study): angular rate + flow scale
-      // separate seed-model failure (calibration-recoverable drift) from
-      // geometry failure (FOE-degenerate push, exposure*flow motion blur)
+      // rejection diagnosis: angular rate + flow scale separate seed-model
+      // failure (calibration-recoverable drift) from geometry failure
+      // (FOE-degenerate push, exposure*flow motion blur)
       double wsum = 0.0;
       for (const RawImu &s : w.imu)
         wsum += s.wm.norm();
@@ -547,7 +547,7 @@ void CalibSessionRunner::handle_window_(WindowData &&w, const WindowMeta &m) {
     return;
   }
   // Two-stage admission (solver-time): the reservoir decision is fingerprint-
-  // only, so probe it BEFORE paying the nonlinear window solve — the probe and
+  // only, so probe it BEFORE paying the nonlinear window solve -- the probe and
   // the real decision are exact twins (nothing mutates in between).
   if (!scorer_->peek(m))
     return;
@@ -564,7 +564,7 @@ void CalibSessionRunner::handle_window_(WindowData &&w, const WindowMeta &m) {
   (wr.preint_hit ? adm_ev_.phit : adm_ev_.pmiss)++;
   adm_ev_.tstop += wr.time_stopped ? 1 : 0;
   if (!adm_ok) {
-    rep_.windows_rejected_ba++; // previously a silent drop
+    rep_.windows_rejected_ba++; // counted rejection, never a silent drop
     return;
   }
   adm_ev_.accepted++;
@@ -609,11 +609,11 @@ const SessionReport &CalibSessionRunner::finish() {
   }
   rep_.t_total_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
   rep_.final_state = state_;
-  print_evidence_(); // P0 table: prints on every terminal path (DONE and ABORT alike)
+  print_evidence_(); // evidence table prints on every terminal path (DONE and ABORT alike)
   return rep_;
 }
 
-// P0 evidence helpers ---------------------------------------------------------
+// evidence helpers ------------------------------------------------------------
 static long vmrss_kb_() {
 #ifdef __linux__
   FILE *f = std::fopen("/proc/self/status", "r");
@@ -700,9 +700,9 @@ void CalibSessionRunner::print_evidence_() const {
               tot.factor_s, tot.inner_s, tot.export_s, vmrss_kb_() / 1024);
   // Determinism taint check: the inner-solve wall hang-guard must never fire
   // on a healthy run. A firing returns a load-dependent iterate (duel
-  // arbitration can then flip), so the run is NOT replay-deterministic —
-  // measured 2026-07-11 as 1-ulp committed-YAML drift between quiet and
-  // loaded runs of one binary under the old 5 s cap.
+  // arbitration can then flip), so the run is NOT replay-deterministic --
+  // measured as 1-ulp committed-YAML drift between quiet and loaded runs of
+  // one binary under a 5 s per-iterate cap.
   long tstop_total = 0;
   for (const StageEvidence &e : rep_.evidence)
     tstop_total += e.tstop;
@@ -746,7 +746,7 @@ SessionReport::AccelGateVerdict CalibSessionRunner::wald_accel_gate_(const std::
   calib_.noise_frozen = true;
   // label per local dim + PER-GROUP gate index sets (derived, never hardcoded). The accel chain
   // and tg are judged SEPARATELY: an unidentifiable tg (e.g. a rig whose true Tg is ~0 fits it
-  // from noise, so its halves disagree) must freeze TG, not veto da/qA — measured on the S1
+  // from noise, so its halves disagree) must freeze TG, not veto da/qA -- measured on the S1
   // synthetic: a monolithic verdict froze the whole chain and cost 1.13 deg of q_AtoI. When one
   // group is judged, the other group's dofs sit in the NUISANCE set (prior-folded).
   std::vector<std::string> lab;
@@ -904,11 +904,11 @@ SessionReport::AccelGateVerdict CalibSessionRunner::wald_accel_gate_(const std::
   Eigen::VectorXd wg(m);
   for (int a = 0; a < m; ++a)
     wg(a) = sig_of(lab[gidx[a]]);
-  // ---- per-session dispersion (the MC-mandated redesign, 2026-07-11):
-  // kappa_hat over H0 replicates measured 13.8 with a 15x per-session spread —
-  // a scalar deflation false-froze 81% of honest sessions. The session
-  // estimates its OWN dispersion from the scatter of time-quarter gate steps
-  // against their claimed covariances (method of moments): under H0,
+  // ---- per-session dispersion: kappa_hat over H0 replicates measured 13.8
+  // with a 15x per-session spread -- a scalar deflation false-froze 81% of
+  // honest sessions. The session estimates its OWN dispersion from the
+  // scatter of time-quarter gate steps against their claimed covariances
+  // (method of moments): under H0,
   // sum_q (dq - dbar)' A_q (dq - dbar) ~ kappa_true * chi2_{(J-1) r}, so the
   // ratio is kappa_sess with df = (J-1)*r. a_info_deflate becomes the FLOOR.
   // The quarter systems reuse the identical fold/Schur/whiten/project path.
@@ -1000,10 +1000,10 @@ SessionReport::AccelGateVerdict CalibSessionRunner::wald_accel_gate_(const std::
   // ---- (b) correlated Wald on the half-step disagreement ----
   Eigen::MatrixXd A1 = P.transpose() * St[0] * P, A2 = P.transpose() * St[1] * P;
   Eigen::VectorXd b1 = P.transpose() * gt[0], b2 = P.transpose() * gt[1];
-  // W3 (2026-07-13 review): LDLT.info() alone does not certify PD, and the kept-direction
-  // Rayleigh floor holds on the JOINT eigenvectors, not on each half's restriction to the
-  // span -- a half can be near-singular there, exploding delta_h into junk steps. An
-  // explicit min-eig floor turns that into honest abstention (freeze = safe).
+  // LDLT.info() alone does not certify PD, and the kept-direction Rayleigh floor holds on
+  // the JOINT eigenvectors, not on each half's restriction to the span -- a half can be
+  // near-singular there, exploding delta_h into junk steps. An explicit min-eig floor
+  // turns that into honest abstention (freeze = safe).
   auto pd_min_eig = [](const Eigen::MatrixXd &A) {
     Eigen::SelfAdjointEigenSolver<Eigen::MatrixXd> es(A);
     return es.info() == Eigen::Success ? es.eigenvalues()(0) : -1.0;
@@ -1020,25 +1020,18 @@ SessionReport::AccelGateVerdict CalibSessionRunner::wald_accel_gate_(const std::
     return V::WALD_UNOBSERVABLE;
   const Eigen::VectorXd d1 = -l1.solve(b1), d2 = -l2.solve(b2);
   const Eigen::VectorXd d = d1 - d2;
-  // ---- per-session kappa from WITHIN-HALF quarter scatter (df-corrected sizing;
-  // W1, 2026-07-13 review). The original construction scattered all J quarter steps
-  // around the GLOBAL GLS mean: its (J-1)r df then CONTAINED the between-halves
-  // contrast -- the very signal T tests. Consequences, derived and MC-consistent:
-  // under H1 the tested signal inflated kappa_hat (E[k] ~ kappa + lambda/((J-1)r)),
-  // so the threshold self-widened against exactly the alternative the gate exists
-  // to catch (the thin-shape discordant pair: split froze at dqA 0.762 deg while T
-  // read 3.2 -- GN understatement AND this contamination, compounding). Worse, at
-  // K<8 (Jq=2) the two "quarters" ARE the halves: the two-group scatter identity
-  // gives qsum = d'(A1^-1+A2^-1)^-1 d exactly, so whenever kappa_hat cleared the
-  // floor, T = r IDENTICALLY -- under every threshold, a violent disagreement
-  // passes. Fix: scatter each half's quarters around that half's OWN GLS mean.
-  // Within-group scatter is orthogonal to the between-half contrast (Cochran), so
-  // T/r ~ F_{r,df} holds with df = sum_h (n_h - 1) r (= (J-2)r at J=4), the
-  // threshold no longer inflates with the tested signal, and at Jq=2 there is no
-  // estimate -> the floor + chi2 legacy sizing applies (honest about K<8). Under
-  // H0 both constructions estimate the same kappa; the within-half df is smaller
-  // (12 vs 18 at r=6: r*F = 28.9 vs 24.1), slightly wider null-side, honest
-  // signal-side. The MC harness re-pins the per-shape floor on this sizing.
+  // ---- per-session kappa from WITHIN-HALF quarter scatter (df-corrected sizing):
+  // each half's quarters scatter around that half's OWN GLS mean, never the global
+  // one. The global construction folds the between-halves contrast -- the very
+  // signal T tests -- into the (J-1)r df: under H1 kappa_hat inflates (E[k] ~
+  // kappa + lambda/((J-1)r)) and the threshold self-widens against exactly that
+  // alternative (measured: split froze at dqA 0.762 deg while T read 3.2); at K<8
+  // (Jq=2) the two-group scatter identity even forces T = r whenever kappa_hat
+  // clears the floor -- violent disagreement passes. Within-group scatter is
+  // orthogonal to the contrast (Cochran): T/r ~ F_{r,df}, df = sum_h (n_h-1) r;
+  // at Jq=2 there is no estimate and the floor + chi2 legacy sizing applies.
+  // Under H0 both constructions agree (within-half df 12 vs 18 at r=6: slightly
+  // wider thresholds, honest signal-side); the MC harness re-pins per shape.
   const size_t K = order.size();
   const int Jq = (K >= 8) ? 4 : 2;
   std::vector<Eigen::MatrixXd> Aq;
@@ -1053,7 +1046,7 @@ SessionReport::AccelGateVerdict CalibSessionRunner::wald_accel_gate_(const std::
     Eigen::MatrixXd Ap = P.transpose() * Sq * P;
     Eigen::LDLT<Eigen::MatrixXd> lq(Ap);
     if (lq.info() != Eigen::Success || pd_min_eig(Ap) <= 1e-12 * std::max(1.0, Ap.trace()))
-      continue; // W3: a non-PD quarter drops (fewer df), never poisons the estimate
+      continue; // a non-PD quarter drops (fewer df), never poisons the estimate
     Aq.push_back(Ap);
     dq.push_back(-lq.solve(P.transpose() * gq));
     hq.push_back(q < Jq / 2 ? 0 : 1);
@@ -1089,7 +1082,8 @@ SessionReport::AccelGateVerdict CalibSessionRunner::wald_accel_gate_(const std::
   // measured under-dispersion (kappa_hat 13.8, spread [1.8, 28.3] over H0
   // replicates), the floor protects against a lucky low draw re-inflating
   // the gate's confidence. Observability classification stays at the floor
-  // (pre-P circularity); its final calibration belongs to the H1 study.
+  // (avoids kappa-estimate circularity); final sizing belongs to the
+  // junk-injection study.
   const double kap_eff = std::max(kap, kap_sess);
   if (write_rep) {
     rep_.a_wald_kappa = kap_sess;
@@ -1167,17 +1161,16 @@ SessionReport::AccelGateVerdict CalibSessionRunner::wald_accel_gate_(const std::
     rep_.a_wald_jqa_deg = jqa_deg;
     rep_.a_wald_jda = jda;
   }
-  // ---- decision order (design #1) ----
+  // ---- decision order ----
   if (jqa_deg > cfg_.a_qa_phys_ceiling_deg || jda > cfg_.a_da_off_phys_ceiling || jtg > cfg_.a_tg_phys_ceiling) {
     if (cfg_.verbose)
       std::printf("[session] wald %s gate: PHYS-CEILING fused step qA %.2f deg / da_off %.4f / tg %.5f -> INCONSISTENT\n", tag, jqa_deg, jda, jtg);
     return V::WALD_INCONSISTENT;
   }
-  // W2 (2026-07-13 review; the DESIGNS #1 adversarial verdict's demanded fix, landed
-  // here): r < m must dominate ANY consistent outcome. As previously ordered, the
-  // physical deadband could rescue a stat-failed session into CONSISTENT at r < m and
-  // unlock the full chain on uncertified directions -- the exact v5 time-stable-junk
-  // case the gate exists to refuse. No unlock without every direction eigen-certified.
+  // r < m must dominate ANY consistent outcome: ordered later, the physical deadband
+  // could rescue a stat-failed session into CONSISTENT at r < m and unlock the full
+  // chain on uncertified directions -- the time-stable-junk case the gate exists to
+  // refuse. No unlock without every direction eigen-certified.
   if (r < m) {
     if (cfg_.verbose)
       std::printf("[session] wald %s gate: UNOBSERVABLE r=%d/%d (agreement cannot certify unobserved directions)\n", tag, r, m);
@@ -1200,8 +1193,8 @@ SessionReport::AccelGateVerdict CalibSessionRunner::wald_accel_gate_(const std::
 
   // ---- ACCEL verdict decides the chain (tg dofs are nuisance for it); tg gets its OWN verdict,
   // judged only when the chain certifies (A1b will not run otherwise). An unidentifiable tg must
-  // freeze tg alone -- measured live on D0014 (2026-07-13): the monolithic 15-dof gate returned
-  // UNOBSERVABLE r=5/15 on 122.9 deg of spread and vetoed a certifiable accel chain. ----
+  // freeze tg alone -- measured live: a monolithic 15-dof gate returned UNOBSERVABLE r=5/15 on
+  // 122.9 deg of attitude spread and vetoed a certifiable accel chain. ----
   std::vector<int> o_accel = rest, o_tg = rest;
   o_accel.insert(o_accel.end(), gidx_t.begin(), gidx_t.end());
   o_tg.insert(o_tg.end(), gidx_a.begin(), gidx_a.end());
@@ -1240,7 +1233,7 @@ CalibSessionRunner::CollectStatus CalibSessionRunner::collect_status() {
     st.n_retained++;
     if (scorer_->is_holdout(slot)) {
       st.n_holdout++;
-      continue; // holdouts are never fused — they verify
+      continue; // holdouts are never fused -- they verify
     }
     if (slot_rep_[slot].Lambda.rows() != np)
       continue;
@@ -1251,7 +1244,7 @@ CalibSessionRunner::CollectStatus CalibSessionRunner::collect_status() {
   if (st.n_fusable == 0)
     return st;
   WindowScorer::select_logdet(Lw, spans, cfg_.select_K, cfg_.select_overlap_penalty, &st.min_eig);
-  // Enough to FUSE (select_K) and to VERIFY (min_holdout) — an unverifiable
+  // Enough to FUSE (select_K) and to VERIFY (min_holdout) -- an unverifiable
   // session must never be allowed to cut over early.
   const bool enough = (st.n_fusable >= cfg_.select_K) && (st.n_holdout >= std::max(1, cfg_.min_holdout));
   st.ready = enough && (cfg_.collect_min_eig > 0.0) && (st.min_eig >= cfg_.collect_min_eig);
@@ -1292,7 +1285,7 @@ void CalibSessionRunner::solve_verify_commit_() {
   for (int c = 0; c < n_cams_; ++c)
     if (exp_n_[(size_t)c] > 0)
       rep_.mean_exposure_s[(size_t)c] = exp_sum_[(size_t)c] / (double)exp_n_[(size_t)c];
-  if (adm_ev_.passes > 0) { // P0: collection-side admission BA aggregate
+  if (adm_ev_.passes > 0) { // collection-side admission BA aggregate
     adm_ev_.label = "admit-collect";
     adm_ev_.windows = rep_.windows_retained;
     adm_ev_.rss_kb = vmrss_kb_();
@@ -1300,8 +1293,8 @@ void CalibSessionRunner::solve_verify_commit_() {
   }
   // Thread the SESSION seeder config (incl. bootstrap adaptations: bias
   // presolve, widened no-still-baseline gates) into every fusion/verify
-  // re-seed — the default-config overload silently re-tightened the gates in
-  // exactly the stages that produce and validate the committed answer.
+  // re-seed -- a default-config re-seed would silently re-tighten the gates
+  // in exactly the stages that produce and validate the committed answer.
   cfg_.joint.seed = cfg_.seed;
   // Session-wide solve deadline: every staged call gets the REMAINING budget
   // (see SessionConfig::solve_budget_s). Pass configs through arm_budget_.
@@ -1315,22 +1308,21 @@ void CalibSessionRunner::solve_verify_commit_() {
     return j;
   };
   // A-CHAIN LEGACY INVARIANT: A0/A1a/A1b (and the split halves) run the
-  // LEGACY two-path solver — no cert, no carry, no early-stop. The split-half
+  // LEGACY two-path solver -- no cert, no carry, no early-stop. The split-half
   // falsifier's bands were calibrated on stage-independent legacy arbitration,
-  // and EVERY P1 mechanism measurably shifts the halves-vs-full statistics
-  // when it touches the A chain: carried seeds flip the S1 sim falsifier
-  // (dqA 0.551 z 2.84 vs 0.235 z 0.91 carry-free), and cert-in-A0 flips the
-  // REAL Sting log (v11: dqA 0.436 z 1.14 INCONSISTENT vs legacy v6 0.301
-  // z 0.78 CONSISTENT — the sim absorbed the same perturbation at z 0.91;
-  // real margins are thinner). P0 already measured A-stage cold paths as
-  // load-bearing (4.9-15.5% gains) — the certificate's rent is B-stage-only
-  // (~85% plateau double-solves). So P1 lives in the B chain: cert on
-  // (IMU chain frozen there), carry available behind its default-off flag,
-  // stage-entry p/whitener/shape jumps self-arbitrating through the stamps.
+  // and every newer solver mechanism measurably shifts the halves-vs-full
+  // statistics in the A chain: carried seeds flip the S1 sim falsifier (dqA
+  // 0.551 z 2.84 vs 0.235 z 0.91 carry-free); cert-in-A0 flips a real log
+  // (dqA 0.436 z 1.14 vs legacy 0.301 z 0.78 -- real margins are thinner than
+  // sim). A-stage cold paths are load-bearing (measured 4.9-15.5% gains); the
+  // certificate's rent is B-stage-only (~85% plateau double-solves). So the
+  // newer machinery lives in the B chain: cert on (IMU chain frozen there),
+  // carry behind its default-off flag, stage-entry p/whitener/shape jumps
+  // self-arbitrating through the stamps.
   if (cfg_.a_candidate)
     cfg_.joint.conv_stop = true; // candidate arms conv-stop in the B-chain configs derived from joint
-  // P4: fused evaluation everywhere (the capped-regime certificate polices
-  // the B chain on qn alone — the inner_converged clause is legacy-regime
+  // p4: fused evaluation everywhere (the capped-regime certificate polices
+  // the B chain on qn alone -- the inner_converged clause is legacy-regime
   // only; halves re-pin fused off below as always).
   if (cfg_.p4)
     cfg_.joint.fused_schur = true;
@@ -1340,15 +1332,14 @@ void CalibSessionRunner::solve_verify_commit_() {
   jc_legacyA.use_cert = false;
   jc_legacyA.use_carry = false;
   jc_legacyA.early_stop = false;
-  // s7 candidate: cert + conv-stop in the A stages (halves excluded below —
-  // they keep the falsifier's own legacy statistics in EVERY configuration).
+  // a_candidate re-baseline (halves excluded below -- they keep the
+  // falsifier's own legacy statistics in EVERY configuration).
   if (cfg_.a_candidate) {
-    // candidate-2 (2026-07-11): conv-stop ONLY. Candidate-1 (cert+conv) was
-    // REJECTED on the real log — cert-in-A re-flipped the falsifier (dqA
-    // 0.435 z 1.14, the v11 signature) and ran SLOWER (181.8 vs 162 s: the
-    // A-stage duels are load-bearing arbitration, the cert just re-routes
-    // them; the frozen chain then quadruples the cam phase downstream). The
-    // legacy two-path stays; only EXCESS PASSES go.
+    // conv-stop ONLY. Adding the certificate to the A chain was rejected:
+    // cert-in-A re-flips the falsifier (dqA 0.435 z 1.14) and runs SLOWER
+    // (181.8 vs 162 s: the A-stage duels are load-bearing arbitration, the
+    // cert just re-routes them; the wrongly-frozen chain then quadruples the
+    // cam phase downstream). The legacy two-path stays; only EXCESS PASSES go.
     jc_legacyA.conv_stop = true;
   }
   JointWarmCarry carry;
@@ -1371,7 +1362,7 @@ void CalibSessionRunner::solve_verify_commit_() {
   // short reservoirs, and an unverifiable session must never commit. Windows
   // feed nothing before this point, so retro-designating the LEAST informative
   // retained window (min whitened logdet contribution) is exact and
-  // deterministic — it sacrifices the least fusion value for verifiability.
+  // deterministic -- it sacrifices the least fusion value for verifiability.
   if (scorer_) {
     int n_hold_avail = 0, n_valid = 0;
     for (int slot = 0; slot < scorer_->size(); ++slot) {
@@ -1384,11 +1375,11 @@ void CalibSessionRunner::solve_verify_commit_() {
     }
     // Top-up loop (generalizes the single retro-designation): reach
     // min_holdout holdouts, capped by reservoir size (~N/4, max 3), by
-    // stratified information rank — weakest first (legacy pick), then the
+    // stratified information rank -- weakest first (legacy pick), then the
     // MEDIAN of the remainder (a representative window, so the small-n VERIFY
     // is not judged solely on the least-informative data). The first holdout
     // keeps the legacy floor (>= 2 valid, leaves >= 1 fused); later ones must
-    // keep N_fused >= max(2, N_ret-3) — verifiability never starves fusion.
+    // keep N_fused >= max(2, N_ret-3) -- verifiability never starves fusion.
     while (true) {
       int n_hold = 0, n_valid = 0;
       for (int slot = 0; slot < scorer_->size(); ++slot) {
@@ -1454,7 +1445,7 @@ void CalibSessionRunner::solve_verify_commit_() {
     std::printf("[session] fusing %d/%d windows (D-optimal, whitened min-eig %.2e)\n", rep_.windows_fused, (int)Lw.size(),
                 rep_.min_eig_whitened);
   // Abort floor on the selected set: a near-prior eigenvalue means an entire
-  // calibration subspace collected no excitation — solving anyway lets the
+  // calibration subspace collected no excitation -- solving anyway lets the
   // staged phases walk through a degenerate valley before COMMIT can abstain.
   if (rep_.min_eig_whitened < cfg_.min_eig_floor) {
     enter_(RunnerState::ABORT, "selected windows leave an unexcited calibration subspace (whitened min-eig below floor)");
@@ -1466,11 +1457,10 @@ void CalibSessionRunner::solve_verify_commit_() {
   // Read BEFORE A0, which frees/refreezes the flags internally.
   const bool imu_chain_free = calib_.imu.calib_dw || calib_.imu.calib_da || calib_.imu.calib_RAtoI || calib_.imu.calib_tg;
 
-  // ---- Task 8: stage-specific D-optimal subsets (selection-side only) ----
+  // ---- stage-specific D-optimal subsets (selection-side only) ----
   // Same candidate pool + whitened one-pass information as the master
-  // selection above (which keeps the abort floor and is the fallback set);
-  // per-stage objectives are defined in the plan header. Stage sets only
-  // re-route which windows each stage SOLVES.
+  // selection above (which keeps the abort floor and is the fallback set).
+  // Stage sets only re-route which windows each stage SOLVES.
   std::vector<WindowData> fused_a0, fused_a1, fused_b;
   std::vector<int> slot_a0, slot_a1, slot_b;
   std::vector<WindowData> *w_a0 = &fused, *w_a1 = &fused, *w_b = &fused;
@@ -1508,7 +1498,7 @@ void CalibSessionRunner::solve_verify_commit_() {
           scorer_->meta(cand_slot[i]).fingerprint.cwiseQuotient(cfg_.scorer.fp_scale);
       Eigen::VectorXd g0 = Eigen::VectorXd::Zero(4);
       g0.head<4>() << nfp(0), nfp(1), nfp(2), nfp(6);
-      // A1: specific-force direction x magnitude (gate formulas, :1539-1564)
+      // A1: specific-force direction x magnitude (mirrors the accel gate formulas)
       Eigen::Vector3d m3 = Eigen::Vector3d::Zero();
       double s1 = 0.0, s2 = 0.0;
       for (const RawImu &s : w.imu) {
@@ -1741,7 +1731,7 @@ void CalibSessionRunner::solve_verify_commit_() {
   // the per-window accel bias, let alone the off-diagonals/q_AtoI).
   {
     // Direction source: the SEEDED window gravity (BA/seeder-consistent, in the
-    // window body frame) — sustained kinematic acceleration cannot fake it the
+    // window body frame) -- sustained kinematic acceleration cannot fake it the
     // way a raw accel mean can. Windows without a usable seed gravity fall back
     // to the mean specific force, but NEVER mixed with seeded directions (the
     // two have opposite sign conventions and would fake ~180 deg of spread).
@@ -1789,11 +1779,11 @@ void CalibSessionRunner::solve_verify_commit_() {
   // ---- A-chain short circuit: nothing to unlock ----
   // The A1 stages exist ONLY to estimate the IMU intrinsic chain. When every IMU
   // block is frozen (a rig whose per-unit Dw/Da/R_AtoI are trusted factory data
-  // and were SEEDED, not searched), A1a's free set collapses to ext/td — i.e. it
+  // and were SEEDED, not searched), A1a's free set collapses to ext/td -- i.e. it
   // degenerates into a redundant re-solve of what A0 just converged, and the
-  // accel gates have nothing to adjudicate. MEASURED (D0014 record, host): that
-  // dead stage cost 3.7 s of an 11.8 s session — ~26 s of the target's budget,
-  // buying a re-polish of blocks A0 already owns. Skip straight to phase B.
+  // accel gates have nothing to adjudicate. Measured: that dead stage cost 3.7 s
+  // of an 11.8 s host session (~26 s at the device budget scale), buying a
+  // re-polish of blocks A0 already owns. Skip straight to phase B.
   // (imu_chain_free is read BEFORE A0, which frees/refreezes the flags itself.)
   if (!imu_chain_free && cfg_.verbose)
     std::printf("[session] IMU intrinsics frozen at the seed (factory chain): skipping A1a/A1b — ext/td are A0's, and the\n"
@@ -1813,13 +1803,13 @@ void CalibSessionRunner::solve_verify_commit_() {
     const bool f_qa = calib_.imu.calib_RAtoI;
     calib_.imu.calib_RAtoI = false;
     // tg stays FREE through A1a as a NUISANCE (session flag; a frozen chain never gets here with
-    // tg on). Its COMMIT still unlocks only through the A1b gate — the gate-closure paths below
+    // tg on). Its COMMIT still unlocks only through the A1b gate -- the gate-closure paths below
     // revert both the flag AND the value to seed. Why not frozen "like q_AtoI": conditioning the
-    // dw/da-diag stage on tg = seed(0) is a MODEL statement the data can falsify — on a rig with
+    // dw/da-diag stage on tg = seed(0) is a MODEL statement the data can falsify -- on a rig with
     // a real part-class Tg the stage absorbs Tg*a_hat into dw/da-diag, and every downstream judge
-    // inherits the contaminated entry (T1 measured: frozen-judge dqA 0.583 deg / worst z 1.65 vs
-    // 0.91 at Tg=0; entry-decontamination via A0-entered halves halves the scatter but loses the
-    // anchor). A Tg~0 rig fits ~0 under the 1e-3 prior — harmless by construction.
+    // inherits the contaminated entry (measured on a Tg-bearing synthetic: frozen-judge dqA 0.583
+    // deg / worst z 1.65 vs 0.91 at Tg=0). A Tg~0 rig fits ~0 under the 1e-3 prior -- harmless by
+    // construction.
     const bool okA1a =
         JointCalib::solve(*w_a1, calib_, arm_budget(jc_imu), rep_.joint, nullptr, &store_, &warm_a1a); // legacy via jc_imu(jc_legacyA)
     note_stage_("A1a-dw-dadiag", rep_.joint);
@@ -1842,7 +1832,7 @@ void CalibSessionRunner::solve_verify_commit_() {
   // time-half of the fused windows. Real-sensor junk modes (bias/thermal/
   // vibration absorbed into weakly-excited dofs) are time-correlated and
   // disagree between halves; a genuinely observable chain reproduces within
-  // its posteriors. This is the plan's IMU-intrinsic falsifier made a gate.
+  // its posteriors. This is the IMU-intrinsic falsifier made a gate.
   if (a_pre_gate && cfg_.a_gate_mode == 1) {
     // ---- Wald reduced-information gate DECIDES (flight-profile mode; the
     // split-half machinery below never runs). One widened warm evaluation
@@ -1876,21 +1866,22 @@ void CalibSessionRunner::solve_verify_commit_() {
     for (size_t i = 0; i < torder.size(); ++i)
       (i < mid ? h1 : h2).push_back((*w_a1)[torder[i]]);
     SharedCalib c1 = calib_, c2 = calib_;
-    // The CHAIN is judged with tg CONSTANT — held at the fused A1a nuisance estimate, the SAME
+    // The CHAIN is judged with tg CONSTANT -- held at the fused A1a nuisance estimate, the SAME
     // value in both halves. Per-half tg fitting stays out of this judge (a junk tg fits noise
-    // differently per half and drags each half's da/qA — measured on S1: 0.23 deg ext / 1.13 deg
+    // differently per half and drags each half's da/qA -- measured on S1: 0.23 deg ext / 1.13 deg
     // qA regression with per-half-tg halves), while holding it at ZERO on a rig with a real Tg
-    // contaminates the halves the other way (measured on T1 before A1a freed tg as nuisance:
-    // dqA 0.583 deg / worst z 1.65 vs 0.91 at Tg=0). tg gets its OWN half pair below.
+    // contaminates the halves the other way (measured: dqA 0.583 deg / worst z 1.65 vs 0.91 at
+    // Tg=0). tg gets its OWN half pair below.
     c1.imu.calib_tg = false;
     c2.imu.calib_tg = false;
     JointReport r1, r2;
     // The FALSIFIER runs at its calibrated legacy operating point: the
     // split-half bands/floors were tuned against the legacy two-path solver,
-    // and the P1 certificate shifts the halves' convergence enough to flip
-    // verdicts (measured v10: dqA 0.301 -> 0.491 on identical data, chain
-    // wrongly frozen). Diagnostic solves are 8-window bounded — correctness
-    // of the GATE outranks their wall clock. Production stages keep P1.
+    // and the certificate shifts the halves' convergence enough to flip
+    // verdicts (measured: dqA 0.301 -> 0.491 on identical data, chain
+    // wrongly frozen). Diagnostic solves are 8-window bounded -- correctness
+    // of the GATE outranks their wall clock. Production stages keep the
+    // newer machinery.
     JointConfig jc_half = cfg_.joint;
     jc_half.use_cert = false;
     jc_half.use_carry = false;
@@ -1901,13 +1892,13 @@ void CalibSessionRunner::solve_verify_commit_() {
     // The halves are independent programs (disjoint window subsets, separate
     // calib copies, separate reports); each solve's arithmetic is already
     // thread-count-invariant (fixed-range partition, worker-ordered
-    // reduction), so running them concurrently changes no bytes in either —
+    // reduction), so running them concurrently changes no bytes in either --
     // it removes a control-flow accident worth ~22 s at the host shape
-    // (wall = max(24.6, 22.1) instead of the sum, v12 ledger). GUARD: resolve
-    // every store slot on THIS thread first — PreintStore::ensure may resize
+    // (wall = max of the halves instead of the sum). GUARD: resolve
+    // every store slot on THIS thread first -- PreintStore::ensure may resize
     // by_uid, and the concurrent solves must only touch disjoint EXISTING
     // entries. Budgets are armed once, before launch, from the same instant
-    // (identical max_wall_s in both configs — order-independent).
+    // (identical max_wall_s in both configs -- order-independent).
     for (const WindowData &w : *w_a1)
       store_.ensure(w.uid);
     const JointConfig jc_h1 = arm_budget(jc_half), jc_h2 = arm_budget(jc_half);
@@ -1926,7 +1917,7 @@ void CalibSessionRunner::solve_verify_commit_() {
         return 0.0;
       };
       // Band per dof: sigma term (precision) OR signal-fraction term (the
-      // scale-free criterion — "the halves agree to a third of what they
+      // scale-free criterion -- "the halves agree to a third of what they
       // claim to measure"). Junk modes scatter at the size of their own
       // claimed signal and fail both. One judge, reused verbatim across the
       // frozen-tg pair and the tg-free re-judge below.
@@ -1970,29 +1961,28 @@ void CalibSessionRunner::solve_verify_commit_() {
       rep_.a_full_open = agree;
       // tg's OWN falsifier: a second half pair with tg free (the same freedom A1b would grant),
       // judged only on the tg elements. It runs when the chain certified (the tg unlock question)
-      // AND when it did not — the RETRY arbitration: the chain judge above CONDITIONS its halves
+      // AND when it did not -- the RETRY arbitration: the chain judge above CONDITIONS its halves
       // on tg = seed, and a rig with a REAL part-class Tg falsifies that conditioning (each
-      // tg-frozen half absorbs Tg*a_hat into its own da/qA through its own excitation geometry —
-      // measured on the T1 synthetic: worst z 1.27 vs 0.91 at Tg=0, chain wrongly frozen). The
-      // wald judge (mode 1) marginalizes the tg columns and does not have this failure; here the
-      // conditioning choice is arbitrated by tg's own falsifier: certify a REPRODUCIBLE Tg first,
-      // then re-judge the chain on the SAME tg-free halves (zero extra solves). A junk tg refuses
-      // at the tg pair and the legacy freeze stands byte-identically.
+      // tg-frozen half absorbs Tg*a_hat into its own da/qA through its own excitation geometry --
+      // measured on a Tg-bearing synthetic: worst z 1.27 vs 0.91 at Tg=0, chain wrongly frozen).
+      // The wald judge (mode 1) marginalizes the tg columns and does not have this failure; here
+      // the conditioning choice is arbitrated by tg's own falsifier: certify a REPRODUCIBLE Tg
+      // first, then re-judge the chain on the SAME tg-free halves (zero extra solves). A junk tg
+      // refuses at the tg pair and the legacy freeze stands byte-identically.
       if (calib_.tg_enabled) {
-        // The tg pair enters from the A0 point — A1b's OWN entry — not the A1a point the frozen
+        // The tg pair enters from the A0 point -- A1b's OWN entry -- not the A1a point the frozen
         // pair uses. The pair's question is "will A1b's answer reproduce?", so the halves must be
         // solved under A1b's conditions: A1a's dw/da-diag were solved with tg frozen at seed, so
         // on a rig with a real Tg they carry its absorption, and halves entered there park in
-        // scattered (qA, tg) basins (T1 measured: dqA 0.583-0.630 deg vs the ~0.3 band, tg
-        // conditioning-invariant — entry contamination, the same basin mechanism that moved A1b
+        // scattered (qA, tg) basins (measured: dqA 0.583-0.630 deg vs the ~0.3 band, invariant to
+        // the tg conditioning -- entry contamination, the same basin mechanism that moved A1b
         // itself from A1a-entry to A0-entry: 0.73 vs 0.57 deg).
         SharedCalib g1 = calib_a0, g2 = calib_a0;
         JointReport gr1, gr2;
-        // (Budget note, MEASURED: doubling the pair's outer budget moved nothing — dqA 0.325 ->
-        // 0.327 deg on the T1 synthetic, both halves at their per-half stationary points either
-        // way. The residual per-half qA spread is the documented flat valley at the per-half
-        // information level — an EXCITATION property, not a solver-budget one — so the pair keeps
-        // the stage budget.)
+        // (Budget note, measured: doubling the pair's outer budget moved nothing -- dqA 0.325 ->
+        // 0.327 deg, both halves at their per-half stationary points either way. The residual
+        // per-half qA spread is the documented flat valley at the per-half information level --
+        // an EXCITATION property, not a solver-budget one -- so the pair keeps the stage budget.)
         const JointConfig jc_g1 = arm_budget(jc_half), jc_g2 = arm_budget(jc_half);
         bool gok1 = false, gok2 = false;
         std::thread gth2([&] { gok2 = JointCalib::solve(h2, g2, jc_g2, gr2, nullptr, &store_); });
@@ -2003,15 +1993,15 @@ void CalibSessionRunner::solve_verify_commit_() {
         if (gok1 && gok2) {
           bool agree_tg = true;
           const Eigen::Map<const Eigen::Matrix<double, 9, 1>> t1(g1.imu.Tg.data()), t2(g2.imu.Tg.data()),
-              t0(calib_a0.imu.Tg.data()); // signal referenced to the pair's OWN entry (byte-equal to calib_'s seed tg today)
+              t0(calib_a0.imu.Tg.data()); // signal referenced to the pair's OWN entry (byte-equal to calib_'s seed tg)
           double worst_ztg = 0.0;
           int worst_ktg = 0;
           double worst_parts[4] = {0, 0, 0, 0}; // |d|, 3sig term, signal, band of the worst element
           // tg sigma term carries the MEASURED exported-Lambda under-dispersion (a_info_deflate,
-          // VARIANCE semantics — the same kappa the wald judge applies to the same exports): the
-          // tg columns ride the chain nuisance, and the raw 3-sigma band refused halves whose |d|
-          // sat INSIDE the kappa-corrected posterior (T1 measured: |d| 1.22e-4 vs 3*sqrt(2)*hypot
-          // = 1.32e-4). da/qA bands stay untouched — their calibration is the validated corpus's.
+          // VARIANCE semantics -- the same kappa the wald judge applies to the same exports): the
+          // tg columns ride the chain nuisance, and a raw 3-sigma band refuses halves whose |d|
+          // sits INSIDE the kappa-corrected posterior (measured: |d| 1.22e-4 vs 3*sqrt(2)*hypot
+          // = 1.32e-4). da/qA bands stay untouched -- their calibration is the validated corpus's.
           const double kap_sig = std::sqrt(std::max(1.0, cfg_.a_info_deflate));
           for (int k = 0; k < 9; ++k) {
             const std::string lab = "tg[" + std::to_string(k) + "]";
@@ -2043,7 +2033,7 @@ void CalibSessionRunner::solve_verify_commit_() {
           if (agree) {
             tg_open = agree_tg; // legacy path: chain certified, tg unlocks with it (or not)
           } else if (agree_tg) {
-            // RETRY: a reproducible Tg falsified the frozen-tg conditioning — re-judge the chain
+            // RETRY: a reproducible Tg falsified the frozen-tg conditioning -- re-judge the chain
             // on the tg-free A0-entered halves already solved above (A1b's own conditions;
             // signal/claim referenced to THEIR entry). Opens BOTH or NEITHER (tg may only open
             // with the chain).
@@ -2125,7 +2115,7 @@ void CalibSessionRunner::solve_verify_commit_() {
   }
 
   // ---- phase A1b: full accel chain (unlocked only), entered from the A0
-  // point — NOT the A1a point: da-diag + per-window biases have already
+  // point -- NOT the A1a point: da-diag + per-window biases have already
   // absorbed part of the misalignment signal there, parking q_AtoI in a
   // shallower basin (measured on the synthetic suite: 0.73 deg from A1a vs
   // 0.57 deg from A0). A1a remains the split-half midpoint and the
@@ -2147,7 +2137,7 @@ void CalibSessionRunner::solve_verify_commit_() {
       calib_ = calib_a1a; // best-effort stage: the A1a point stands
       calib_.imu.calib_RAtoI = false;
       calib_.imu.calib_tg = false;
-      calib_.imu.Tg = calib_postboot.imu.Tg; // calib_a1a carries A1a's nuisance tg — revert with the flag
+      calib_.imu.Tg = calib_postboot.imu.Tg; // calib_a1a carries A1a's nuisance tg -- revert with the flag
       rep_.a_full_open = false;
     }
   }
@@ -2155,7 +2145,7 @@ void CalibSessionRunner::solve_verify_commit_() {
   // certified, tg's own falsifier certified, and A1b accepted (every closed path froze it above).
   rep_.tg_open = calib_.imu.calib_tg;
 
-  // ---- phase B (S5): staged camera-intrinsic refinement AFTER temporal/IMU ----
+  // ---- phase B: staged camera-intrinsic refinement AFTER temporal/IMU ----
   if (cfg_.cam_mode > 0) {
     // Radial-coverage gate for k3/k4 (fraction of obs beyond 0.7 * r_max), decided PER CAMERA: it
     // asks whether THIS camera actually saw its own image corners, and one camera reaching them
@@ -2186,8 +2176,8 @@ void CalibSessionRunner::solve_verify_commit_() {
       }
       // C1 (quadrant-coverage center gate): cx/cy separate from distortion only when the data
       // BRACKETS the center -- with a quadrant starved, the center walks into a self-consistent
-      // basin and commits (the v5 wander: cy +2.9 px shipped). Freeze cx/cy at seed through the
-      // same prior-sigma mechanism as k3/k4; the D2 frozen-dof exclusion keeps the cam block
+      // basin and commits (measured: cy +2.9 px shipped). Freeze cx/cy at seed through the
+      // same prior-sigma mechanism as k3/k4; the frozen-dof exclusion keeps the cam block
       // committable with the frozen pair shipping seed values.
       const double minq = (n_all[(size_t)c] > 0.0)
                               ? std::min(std::min(nq[0], nq[1]), std::min(nq[2], nq[3])) / n_all[(size_t)c]
@@ -2223,8 +2213,8 @@ void CalibSessionRunner::solve_verify_commit_() {
     // joint polish redistributes the residue. Inside the block, the pinhole row
     // and the radial polynomial correlate hard (|rho(fx,k1)| ~ 0.9 on
     // equidistant), so each alternation round solves (a) pinhole+k1/k2 with
-    // k3/k4 frozen, then (b) distortion-only with the pinhole row frozen —
-    // block-coordinate descent inside the camera block (operator directive).
+    // k3/k4 frozen, then (b) distortion-only with the pinhole row frozen --
+    // block-coordinate descent inside the camera block.
     {
       const bool f_dw = calib_.imu.calib_dw, f_da = calib_.imu.calib_da, f_qa = calib_.imu.calib_RAtoI;
       std::vector<char> f_ext, f_td;
@@ -2261,9 +2251,8 @@ void CalibSessionRunner::solve_verify_commit_() {
         // block-coordinate overshoot). One pinhole-only solve (all k frozen)
         // settles the row that carries the absolute acceptance gates before
         // the joint polish arbitrates. Skippable per profile (cam_settle):
-        // P0 measured it merit-flat alongside round 2, and the alt-rounds A/B
-        // showed round 2 to be a byte-level no-op — the settle A/B decides
-        // whether it earns its ~9 s the same way.
+        // measured merit-flat alongside round 2 on the host shape -- a
+        // profile's own byte-level A/B decides whether it earns its ~9 s.
         if (cfg_.cam_settle) {
           JointConfig jp = jc;
           for (auto &v : jp.cam_prior_vec)
@@ -2273,7 +2262,7 @@ void CalibSessionRunner::solve_verify_commit_() {
           note_stage_("B1-settle", repBp);
         }
       } else {
-        JointReport repB1; // monolithic fallback (pre-directive behavior)
+        JointReport repB1; // monolithic fallback (alternation disabled)
         JointCalib::solve(*w_b, calib_, arm_budget(jc), repB1, &carry, &store_);
         note_stage_("B1-mono", repB1);
       }
@@ -2320,7 +2309,7 @@ void CalibSessionRunner::solve_verify_commit_() {
   SharedCalib out = calib_;
   // The revert point in the SAME layout as `out`: the values a block ships if it
   // does NOT commit. Flags are copied from `out` (a closed accel gate can freeze
-  // calib_RAtoI mid-solve, so calib_postboot's own free-set may differ) — only
+  // calib_RAtoI mid-solve, so calib_postboot's own free-set may differ) -- only
   // the VALUES come from the seed.
   SharedCalib ref = calib_postboot;
   ref.imu.calib_dw = out.imu.calib_dw;
@@ -2346,7 +2335,7 @@ void CalibSessionRunner::solve_verify_commit_() {
       BlockCommit bc;
       bc.name = b.name;
       bc.cam = b.cam;
-      // Movement off the seed, in LOCAL (tangent) coordinates — the same units
+      // Movement off the seed, in LOCAL (tangent) coordinates -- the same units
       // the posterior sigma lives in, so |delta|/sigma is dimensionless.
       Eigen::VectorXd d = Eigen::VectorXd::Zero(b.lsize);
       if (b.is_quat) {
@@ -2363,7 +2352,7 @@ void CalibSessionRunner::solve_verify_commit_() {
         const double spost = rep_.joint.sigma(off + k);
         // An information-frozen dof has sigma_post ~= sigma_prior by
         // construction (data info ~0 vs 1/eps^2 prior): counting it pins
-        // worst_ratio at ~commit_sigma_factor and the block can NEVER commit —
+        // worst_ratio at ~commit_sigma_factor and the block can NEVER commit --
         // the k3/k4 freeze-vs-commit deadlock. Frozen dofs ship their seed
         // value inside a committed block by design.
         if (sprior > frozen_eps) {
@@ -2375,7 +2364,7 @@ void CalibSessionRunner::solve_verify_commit_() {
       }
       const auto ceil_it = cfg_.commit_abs_ceiling.find(b.name);
       bc.ceiling_ok = (ceil_it == cfg_.commit_abs_ceiling.end()) || (bc.worst_sigma <= ceil_it->second);
-      // A block that the solve never moved off its seed has NOT been estimated —
+      // A block that the solve never moved off its seed has NOT been estimated --
       // its tight posterior only says "the data would have constrained it well",
       // not "the data determined it". Claiming it would ship the seed as a
       // calibration (and a writeback would then overwrite the system-of-record's
@@ -2387,7 +2376,7 @@ void CalibSessionRunner::solve_verify_commit_() {
     }
   }
   // Atomic pair: q_ItoC and td move jointly in the solve (omega-coupled), so a
-  // mixed state (new rotation, seed td) can be worse than either endpoint —
+  // mixed state (new rotation, seed td) can be worse than either endpoint --
   // they commit together or revert together.
   // The pair is PER CAMERA: cam 0's rotation is coupled to cam 0's time offset, and to nothing on
   // cam 1 -- they are different physical quantities that happen to share a name.
@@ -2410,7 +2399,7 @@ void CalibSessionRunner::solve_verify_commit_() {
   }
   // Atomic pair: when the full accel chain was unlocked (A1b), da and q_AtoI
   // were estimated JOINTLY and are strongly coupled (the off-diagonals and the
-  // accel-frame rotation trade against each other) — shipping one with the
+  // accel-frame rotation trade against each other) -- shipping one with the
   // seed value of the other is a mixed state neither solve nor split-half
   // validated. When the chain is frozen, q_AtoI has no block and da(diag)
   // commits alone against its seed-consistent frozen complement.
@@ -2434,8 +2423,8 @@ void CalibSessionRunner::solve_verify_commit_() {
       dst.imu.da = src.imu.da;
     else if (name == "q_AtoI")
       dst.imu.q_AtoI = src.imu.q_AtoI;
-    else if (name == "tg") // shared block (cam = -1): without this arm a REFUSED tg fell through the
-      dst.imu.Tg = src.imu.Tg; // per-camera guard below and SHIPPED its solved value (T2/T3 falsifier)
+    else if (name == "tg") // shared block (cam = -1): a refused tg must revert HERE, not fall
+      dst.imu.Tg = src.imu.Tg; // through the per-camera guard below and ship its solved value
     else if (cam < 0 || (size_t)cam >= dst.cams.size())
       return; // a per-camera block with no camera is a layout bug, not a revert
     else if (name == "q_ItoC")
@@ -2456,7 +2445,7 @@ void CalibSessionRunner::solve_verify_commit_() {
 
   // ---- unified holdout sweep ----
   // Candidates: [0] post-bootstrap seed, [1] fully-solved point, [2] committed
-  // MIXTURE when blocks reverted (the mixture is what actually ships — commit
+  // MIXTURE when blocks reverted (the mixture is what actually ships -- commit
   // decisions couple blocks, so it must beat the seed itself), then
   // leave-one-out variants per committed block (accuracy attribution). A
   // window where ANY candidate fails to re-seed/solve is dropped for ALL
@@ -2478,7 +2467,7 @@ void CalibSessionRunner::solve_verify_commit_() {
       }
   std::vector<double> csum(cand.size(), 0.0);
   int n_hold = 0, n_drop = 0;
-  StageEvidence vev; // P0: verify-sweep aggregate (seed+BA per holdout x candidate)
+  StageEvidence vev; // verify-sweep aggregate (seed+BA per holdout x candidate)
   vev.label = "verify-sweep";
   // The (holdout x candidate) evaluations are independent: each takes its own
   // WindowData + SharedCalib copies. Parallelized over the flattened job list
@@ -2561,7 +2550,7 @@ void CalibSessionRunner::solve_verify_commit_() {
   rep_.evidence.push_back(std::move(vev));
   if (n_hold == 0) {
     // silence here is not success: with zero evaluable holdout windows NOTHING
-    // was verified — refuse instead of committing blind
+    // was verified -- refuse instead of committing blind
     rep_.committed = calib_postboot;
     enter_(RunnerState::ABORT, "VERIFY impossible: no held-out window evaluable");
     return;
@@ -2571,7 +2560,7 @@ void CalibSessionRunner::solve_verify_commit_() {
   rep_.verify_improve = (csum[0] > 0.0) ? 1.0 - csum[1] / csum[0] : -1.0;
   rep_.holdout_cost_mixture = csum[i_mix];
   rep_.mixture_improve = (csum[0] > 0.0) ? 1.0 - csum[i_mix] / csum[0] : -1.0;
-  // Small-n honesty floors: a +5% aggregate on ONE window is weak evidence —
+  // Small-n honesty floors: a +5% aggregate on ONE window is weak evidence --
   // the required improvement rises as n_hold shrinks (the profile answer to a
   // starved session is MORE holdouts via min_holdout, not a softer gate).
   const double req_improve =
@@ -2612,7 +2601,7 @@ void CalibSessionRunner::solve_verify_commit_() {
     for (const auto &bc : rep_.blocks)
       (bc.committed ? yes : no).push_back(bc.label());
     // Blocks with no free parameters at all (frozen IMU chain, cam_mode 0) never appear in the
-    // layout — they are seed passengers too, and a writeback must know that. The IMU chain is
+    // layout -- they are seed passengers too, and a writeback must know that. The IMU chain is
     // asked once; the camera blocks are asked once PER CAMERA, because a block can be free on one
     // camera and absent on another. tr is ALWAYS in this list: the readout is HAL3 hardware
     // truth, never estimated, so camN_t_readout ships as a passenger for every camera.

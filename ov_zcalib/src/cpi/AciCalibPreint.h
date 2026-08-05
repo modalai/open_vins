@@ -18,9 +18,9 @@
  * Conventions are OpenVINS/JPL throughout (see ov_zcalib/README.md). The rotation
  * bias/parameter Jacobians are accumulated in the LEFT (end-frame) convention
  *   DeltaR(p) = Exp(J_theta * dp) * DeltaR(p_lin)
- * with the exact per-step increment R_step*(J + Jr(-w dt)*M_w*dt) (the J_r flavor is
- * pinned by the FD oracle in test_aci3_fd; see the async bridge for the precedent),
- * and converted to the Factor_ImuCPIv1 right/START-frame convention at emit time.
+ * with the exact per-step increment R_step*(J + Jr(-w dt)*M_w*dt) (the J_r flavor
+ * is pinned by the FD oracle in test_aci3_fd), and converted to the
+ * Factor_ImuCPIv1 right/START-frame convention at emit time.
  *
  * This module is self-contained: it links ov_core only (quat_ops); it neither
  * includes nor links anything from ov_msckf (zero filter-path coupling).
@@ -86,8 +86,8 @@ struct AciPreintResult {
   Eigen::Matrix3d H_b = Eigen::Matrix3d::Zero();
   Eigen::Matrix3d H_a = Eigen::Matrix3d::Zero();
   /// d(theta)/d(ba): identically ZERO unless the model carries Tg (ba reaches the rotation
-  /// through Mw_ba = -Dw*Tg*Ma_ba, the D12 coupling). Consumed by the factor's tg branch only,
-  /// so the legacy (Tg-off) arithmetic never touches it.
+  /// through Mw_ba = -Dw*Tg*Ma_ba). Consumed by the factor's tg branch only, so the legacy
+  /// (Tg-off) arithmetic never touches it.
   Eigen::Matrix3d H_q = Eigen::Matrix3d::Zero();
   // ACI3 intrinsic columns (3 x n_pi each; n_pi = model.num_params())
   Eigen::Matrix<double, 3, Eigen::Dynamic> Jq_pi;
@@ -127,7 +127,7 @@ public:
 
   /**
    * @brief All clone intervals of a window in ONE chronological two-pointer
-   *        sweep — BIT-IDENTICAL to calling integrate() per interval.
+   *        sweep -- BIT-IDENTICAL to calling integrate() per interval.
    *
    * integrate() rescans the window's full IMU vector from index 0 and reserves
    * a full-size boundary-clamped copy for EVERY interval (O(N*S) comparisons +
@@ -143,7 +143,7 @@ public:
    * @param clone_times strictly the window's clone stamps (>= 2)
    * @param out resized to clone_times.size()-1; out[k] covers [ct[k], ct[k+1]]
    * @param skip_cov true skips the covariance propagation entirely (P15 stays
-   *        at its default) — EXACT for consumers that never read P15 (the
+   *        at its default) -- EXACT for consumers that never read P15 (the
    *        linear seeder): the mean/Jacobian recursions do not depend on P.
    * @return false if ANY interval fails (same per-interval conditions as
    *         integrate(); partial results in `out` are then meaningless)

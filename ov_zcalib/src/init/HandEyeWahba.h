@@ -13,7 +13,7 @@
  *      theta_C = R_ItoC * theta_I,      theta_X = Log({}^{X2}_{X1}R).
  * theta_I comes from gyro-only preintegration over the td-shifted frame
  * interval (per-step exp(-w_hat dt), midpoint samples, boundary-interpolated
- * — the AciCalibPreint stepping). The solve alternates
+ * -- the AciCalibPreint stepping). The solve alternates
  *   (1) Wahba/Markley SVD for R_ItoC on unit log pairs (magnitude-weighted,
  *       reflection-corrected, sigma_min/sigma_max axis-diversity gate),
  *   (2) closed-form gyro-bias update via d(theta_I)/d(bg) = +dt*I (first
@@ -62,7 +62,7 @@ struct HandEyeConfig {
   bool estimate_bg = true;
   /// Physical sanity bound on the estimated |bg| [rad/s]. On close-range
   /// translation-heavy scenes the closed-form bias step soaks the DC of the
-  /// rotation-only epipolar bias (observed 0.21 rad/s on the kalibr sample —
+  /// rotation-only epipolar bias (observed 0.21 rad/s on the kalibr sample --
   /// absurd for any MEMS gyro); beyond this the solve REDOES the alternation
   /// with bg frozen at the seed (a 0-bias error costs ~0.3% of theta_I, and
   /// the per-window BA estimates bias as a state regardless).

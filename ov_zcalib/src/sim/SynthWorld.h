@@ -3,7 +3,7 @@
  * Copyright (C) 2025-2026 Joao Leonardo Silva Cotta
  *
  * ov_zcalib test library: synthetic targetless world shared by the front-end /
- * session gates (test_calib_e2e keeps its own frozen copy — do not merge).
+ * session gates (test_calib_e2e keeps its own frozen copy -- do not merge).
  * Generates raw IMU (intrinsic-model-inverted + biases), pixel tracks with
  * bearings, harvest-ready WindowData WITHOUT truth seeds (the production
  * LinearSeed path is the unit under test), and live-style RawImu/FrameObs
@@ -68,7 +68,7 @@ struct Trajectory {
     const double up = std::min(1.0, (t - excite_t0) / ramp);
     const double dn = std::min(1.0, (excite_t1 - t) / ramp);
     // C1 smoothstep: a piecewise-LINEAR ramp has impulsive env-dotdot at the
-    // knees, i.e. true-accel spikes the IMU sampling cannot represent — the
+    // knees, i.e. true-accel spikes the IMU sampling cannot represent -- the
     // preintegration then disagrees with the projected geometry by design.
     const double u = std::min(up, dn);
     const double s = u * u * (3.0 - 2.0 * u);
@@ -151,7 +151,7 @@ inline std::vector<Eigen::Vector3d> make_cloud(int n, unsigned seed) {
 /**
  * @brief Harvest-ready window (bearings filled, NO truth seeds).
  * Clone times are laid down at the truth td (i.e. td_ref = truth td) unless
- * td_ref_override is given — pass the SEED td to exercise the temporal
+ * td_ref_override is given -- pass the SEED td to exercise the temporal
  * transport exactly like production.
  */
 inline WindowData make_window(const Truth &tr, double t_start, double dur, double fps, double imu_hz, unsigned seed,
@@ -229,7 +229,7 @@ inline void make_streams(const Truth &tr, const Trajectory &tj, const StreamOpti
     // PRODUCER convention (same as the server ingest / log feeder): the stamp IS the frame's
     // center-row mid-exposure instant. The sim world is global-shutter (tr = 0) and samples the
     // trajectory at the optical instant tc, so the stamp is tc itself; exposure_s rides along as
-    // provenance only (the retired SOF back-shift existed for the harvester's +exp/2, now gone).
+    // provenance only and is never re-applied downstream.
     fo.timestamp = tc;
     fo.exposure_s = (float)so.exposure_s;
     fo.temp_c = (float)(so.temp_c0 + so.temp_slope * tc);

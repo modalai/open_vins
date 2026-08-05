@@ -9,7 +9,7 @@
  * unroll carries JS/JV recursions and the joint LS solves [v0, g, ba, {p_f}]
  * with a physical-scale Tikhonov prior on ba (sigma ~0.05 m/s^2) that keeps
  * short/degenerate windows well-posed. Leaving ba out costs ~0.5*|ba|*T^2 of
- * position drift (0.1+ m at 3 s) — the dominant seed error. The gyro bias
+ * position drift (0.1+ m at 3 s) -- the dominant seed error. The gyro bias
  * stays FIXED at the bootstrap value: it is already hand-eye-estimated, and
  * freeing it here couples into gravity on short windows.
  *
@@ -151,14 +151,14 @@ bool LinearSeed::seed_window(WindowData &win, const SharedCalib &calib, const Ei
   std::vector<Eigen::Matrix3d> JS(N, Eigen::Matrix3d::Zero()), JV(N, Eigen::Matrix3d::Zero()); // d(S,V)/d(ba)
   std::vector<double> T(N, 0.0);
   {
-    // R3 [BIT-EXACT]: one two-pointer chain sweep with the covariance propagation skipped.
-    // This seeder consumes ONLY {q_KtoK1, alpha, beta, dt, H_a, H_b} — never P15 — and the
-    // chain's mean/Jacobian recursions are P-independent (the documented skip_cov contract),
-    // while the legacy per-interval integrate() rescanned the window's whole IMU array AND
-    // propagated the full 15x15 covariance (~6.7k flops/sample, the dominant per-sample term)
-    // into an output nothing here reads. Chain-vs-integrate() bit-parity is pinned by
-    // test_preint_chain (incl. the skip_cov mean-field pin); OV_ZCALIB_SEED_AUDIT re-proves
-    // both properties on every live window (dual-compute + bitwise memcmp of the mean fields);
+    // BIT-EXACT chain sweep with the covariance propagation skipped: this seeder consumes
+    // ONLY {q_KtoK1, alpha, beta, dt, H_a, H_b} -- never P15 -- and the chain's mean/Jacobian
+    // recursions are P-independent (the documented skip_cov contract), while the legacy
+    // per-interval integrate() rescanned the window's whole IMU array AND propagated the full
+    // 15x15 covariance (~6.7k flops/sample, the dominant per-sample term) into an output
+    // nothing here reads. Chain-vs-integrate() bit-parity is pinned by test_preint_chain
+    // (incl. the skip_cov mean-field pin); OV_ZCALIB_SEED_AUDIT re-proves both properties on
+    // every live window (dual-compute + bitwise memcmp of the mean fields);
     // OV_ZCALIB_SEED_LEGACY forces the per-interval integrate() loop (replay byte-parity
     // kill-switch). The kinematic recursion below is untouched: integration of interval k
     // depends only on (imu, clone_times, model, bg_eff), not on the recursion state, so
@@ -411,7 +411,7 @@ bool LinearSeed::seed_window(WindowData &win, const SharedCalib &calib, const Ei
     // uncalibrated accel chain must leave that much kinematic drift in the
     // linear solution, and a fixed gate structurally rejects long windows on
     // exactly the factory-fresh rigs the calibrator exists for. Envelope
-    // admissions are flagged for the session's post-A0 probation re-check —
+    // admissions are flagged for the session's post-A0 probation re-check --
     // geometry failures (FOE-degenerate triangulation, blur) blow far past
     // the envelope and stay rejected.
     const double Twin = (N > 0) ? T[N - 1] : 0.0;

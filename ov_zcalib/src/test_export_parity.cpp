@@ -2,11 +2,11 @@
  * OpenVINS: An Open Platform for Visual-Inertial Research
  * Copyright (C) 2025-2026 Joao Leonardo Silva Cotta
  *
- * ov_zcalib export-on-accept byte-contract gates (t7 / dossier R4):
+ * ov_zcalib export-on-accept (eoa) byte-contract gates:
  *
  *  W1  Deferred export == inline export, kept-A (warm) shape: an eval that ran
  *      cost-only and was accepted is re-entered at its UNCHANGED optimum with
- *      the entry-faithful context (WindowBA state_at) — Lambda/g/qn must be
+ *      the entry-faithful context (WindowBA state_at) -- Lambda/g/qn must be
  *      BYTE-EQUAL to the export the legacy path computed inline. Run twice:
  *      persistent graph (PreintStore slot, the production path) and the
  *      call-local graph (pc = nullptr).
@@ -15,7 +15,7 @@
  *  W3  free_dim == Lambda.rows() (the duel-validity dimension witness). A
  *      calib-column-free qn-only stats path was tried and MEASURED not
  *      byte-equal (-ffast-math SIMD head-peel vs H's leading dimension), so
- *      cert stages keep inline path-A exports — J2 pins that composition.
+ *      cert stages keep inline path-A exports -- J2 pins that composition.
  *  J1-J3  JointCalib::solve ON vs OFF (export_on_accept) byte parity of the
  *      shipped posterior (calib values, Lambda, sigma, merit) AND of the duel/
  *      cold evidence counters, across the three arbitration regimes: legacy
@@ -220,7 +220,7 @@ static std::vector<double> calib_bits(const SharedCalib &c) {
 int main() {
   Truth tr = make_truth();
 
-  // one rich window (the e2e suite's proven shape — weaker/shorter windows sit
+  // one rich window (the e2e suite's proven shape -- weaker/shorter windows sit
   // at the undamped-PD margin and die at entry even under legacy); uid arms
   // the production PreintStore path
   WindowData w = make_window(tr, 0.3, 3.0, 20.0, 800.0, 11);
@@ -286,17 +286,15 @@ int main() {
     //     exporting call's Lambda dimension (the duel-validity checks read it)
     CHECK(ri.free_dim == (int)ri.Lambda.rows(), "W3 pc=%d: free_dim %d != Lambda.rows %d", use_pc, ri.free_dim, (int)ri.Lambda.rows());
 
-    // (h) W4 qn-only forensic probe (the measurement behind the cert-stage
-    // inline-export decision, re-verified live): freeze EVERY calibration
-    // block so free_blocks() is empty, and re-enter the SAME linearization
-    // point — the export then forms H WITHOUT the kept columns (nk=0), which
-    // IS the "qn-only fast path" candidate (H_zz/g_z alone, calibration
-    // columns never formed). Mathematically its q_n equals the full export's
-    // exactly; in BITS it need not: the smaller leading dimension re-peels
-    // the SIMD accumulations under -ffast-math. EVIDENCE print, not a
-    // contract — the eoa design does not depend on the inequality, it
-    // depends on never RISKING it (the certificate consumes only full-export
-    // bits). A compiler bump could legitimately close the gap.
+    // (h) W4 qn-only forensic probe (the measurement behind keeping cert-stage
+    // exports inline, re-verified live): freeze every calibration block
+    // (free_blocks() empty) and re-enter the SAME linearization point -- the
+    // export forms H without kept columns (nk=0), i.e. the "qn-only fast
+    // path" candidate. Its q_n equals the full export's mathematically but
+    // need not in BITS: the smaller leading dimension re-peels SIMD
+    // accumulations under -ffast-math. EVIDENCE print, not a contract -- eoa
+    // never risks the inequality (the certificate consumes only full-export
+    // bits); a compiler bump could legitimately close the gap.
     {
       SharedCalib cf = c2;
       cf.imu.calib_dw = cf.imu.calib_da = cf.imu.calib_RAtoI = false;
@@ -360,7 +358,7 @@ int main() {
     CHECK(off.rep.evaluation_passes == on.rep.evaluation_passes && off.rep.accepted_passes == on.rep.accepted_passes,
           "%s: pass counts differ (%d/%d vs %d/%d)", tag, on.rep.accepted_passes, on.rep.evaluation_passes, off.rep.accepted_passes,
           off.rep.evaluation_passes);
-    // R4 evidence-counter contract: arbitration inputs and order unchanged
+    // Evidence-counter contract: arbitration inputs and their order unchanged
     CHECK(off.rep.warm_evals == on.rep.warm_evals && off.rep.cold_evals == on.rep.cold_evals &&
               off.rep.cold_first == on.rep.cold_first && off.rep.cold_warmfail == on.rep.cold_warmfail &&
               off.rep.cold_jump == on.rep.cold_jump && off.rep.cold_strand == on.rep.cold_strand &&
@@ -402,7 +400,7 @@ int main() {
     cfg.fused_iters = 1;
     check_pair("J3 fused", run_joint(c, cfg, false), run_joint(c, cfg, true));
   }
-  { // J4: duel_on_accept composition — eoa SELF-DISARMS (the deferred-duel
+  { // J4: duel_on_accept composition -- eoa SELF-DISARMS (the deferred-duel
     // fold is incremental: legacy's accepted linearization carries the duel
     // LOSER's export in its rounding, unreproducible without exporting the
     // loser). ON must equal OFF because BOTH run legacy inline exports.

@@ -41,12 +41,12 @@ Factor_ImuAci3::Factor_ImuAci3(const AciPreintResult &meas, const ImuIntrinsicMo
 
   // sqrt information (identical construction to Factor_ImuCPIv1).
   // PARITY CONTRACT: this body must stay VERBATIM in this constructor. Moving
-  // it into a helper changed its codegen context under -ffast-math and shifted
-  // sqrtI by 1 ulp (measured 2026-07-11: deterministic +1-iteration trajectory
-  // divergence entering at A0 vs the pre-P3 binary, propagating to a 1-ulp
-  // committed-YAML delta). The preint cache therefore COPIES these members out
-  // of a constructed factor (WindowBA) instead of recomputing them elsewhere —
-  // cache bytes equal ctor bytes by construction, never by re-derivation.
+  // it into a helper changes its codegen context under -ffast-math and shifts
+  // sqrtI by 1 ulp (measured: a deterministic +1-iteration trajectory
+  // divergence entering at A0, propagating to a 1-ulp committed-YAML delta).
+  // The preint cache therefore COPIES these members out of a constructed
+  // factor (WindowBA) instead of recomputing them elsewhere -- cache bytes
+  // equal ctor bytes by construction, never by re-derivation.
   Eigen::MatrixXd I = Eigen::MatrixXd::Identity(15, 15);
   Eigen::MatrixXd information = m.P15.llt().solve(I);
   Eigen::LLT<Eigen::MatrixXd> lltOfI(information);
@@ -88,8 +88,8 @@ Factor_ImuAci3::Factor_ImuAci3(const AciPreintResult &meas, const ImuIntrinsicMo
 
 bool Factor_ImuAci3::Evaluate(double const *const *parameters, double *residuals, double **jacobians) const {
   // Dispatch FIRST, so the legacy body below is the LITERAL pre-tg function under the same
-  // codegen context (-ffast-math parity: measured 2026-07-13, in-body branching alone reflowed
-  // the vectorizer and drifted the down-leg corpus in the 4th decimal).
+  // codegen context (-ffast-math parity: in-body branching alone measurably reflowed the
+  // vectorizer and drifted a validation corpus in the 4th decimal).
   if (tg_on)
     return evaluate_tg_(parameters, residuals, jacobians);
 
@@ -217,8 +217,8 @@ bool Factor_ImuAci3::Evaluate(double const *const *parameters, double *residuals
 // ---- Tg-enabled evaluation (n_pi = 24; parameter block [14] = tg9 in Matrix3d storage order).
 // A SEPARATE function on purpose: the legacy body above must keep its exact emitted code (see the
 // dispatch note), and this path is new arithmetic with no parity contract to honor. Structure
-// mirrors the legacy body with dpi widened to 24 and the D12 ba->rotation coupling (H_q) applied
-// to the theta correction and its ba-block Jacobian.
+// mirrors the legacy body with dpi widened to 24 and the Tg-induced ba->rotation coupling (H_q)
+// applied to the theta correction and its ba-block Jacobian.
 bool Factor_ImuAci3::evaluate_tg_(double const *const *parameters, double *residuals, double **jacobians) const {
 
   // ---- states ----
@@ -243,7 +243,7 @@ bool Factor_ImuAci3::evaluate_tg_(double const *const *parameters, double *resid
   dpi.segment<3>(12) = 2.0 * ov_core::quat_multiply(qA_now, ov_core::Inv(qA_lin)).head<3>();
   {
     // One pi convention end-to-end: mixing() enumerates the tg columns in Matrix3d
-    // STORAGE (column-major) order — the very order of the Tg.data() parameter block —
+    // STORAGE (column-major) order -- the very order of the Tg.data() parameter block --
     // so the delta is a straight 9-vector subtraction and the Jacobian block below is a
     // straight column copy. No boundary permutation exists to get wrong.
     const Eigen::Map<const Eigen::Matrix<double, 9, 1>> tg_now(parameters[14]);
@@ -254,7 +254,7 @@ bool Factor_ImuAci3::evaluate_tg_(double const *const *parameters, double *resid
   Eigen::Vector3d dbw = b_w1 - bg_lin;
   Eigen::Vector3d dba = b_a1 - ba_lin;
 
-  // ---- first-order corrected measurement (bias + ACI3 intrinsic columns + D12 H_q) ----
+  // ---- first-order corrected measurement (bias + ACI3 intrinsic columns + Tg's H_q) ----
   Eigen::Vector3d th_corr = m.J_q * dbw + m.H_q * dba + m.Jq_pi * dpi;
   Eigen::Vector4d q_b;
   q_b.head<3>() = 0.5 * th_corr;
@@ -288,7 +288,7 @@ bool Factor_ImuAci3::evaluate_tg_(double const *const *parameters, double *resid
                            q_1_to_2.head<3>() * q_meas_plus.head<3>().transpose());
   Jc.block<3, 3>(0, 15) = q_res_plus(3) * eye + ov_core::skew_x(q_res_plus.head<3>());
   Jc.block<3, 3>(0, 3) = Lq * m.J_q;
-  Jc.block<3, 3>(0, 9) = Lq * m.H_q; // D12: ba reaches the rotation through Tg
+  Jc.block<3, 3>(0, 9) = Lq * m.H_q; // ba reaches the rotation through Tg (H_q)
   Jc.block<3, 3>(3, 3) = -eye;
   Jc.block<3, 3>(3, 18) = eye;
   Jc.block<3, 3>(6, 0) = ov_core::skew_x(R_1 * (v_2 - v_1 + gravity * m.dt));

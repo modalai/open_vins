@@ -50,7 +50,7 @@ struct CamCalib {
   double td = 0.0; ///< camera-IMU time offset (this camera's own; they are NOT equal across cams)
   /// Rolling-shutter readout time [s], full frame top to bottom (0 on a global-shutter camera).
   /// A HARDWARE fact (HAL3 ANDROID_SENSOR_ROLLING_SHUTTER_SKEW), sourced from the estimator
-  /// config's camN_readout_time_s — NEVER estimated. The reprojection transport consumes it as a
+  /// config's camN_readout_time_s -- NEVER estimated. The reprojection transport consumes it as a
   /// fixed constant: each observation's centered row time (v/h - 0.5)*tr folds into the factor's
   /// dt_ref at construction (see WindowBA.cpp).
   double tr = 0.0;
@@ -63,7 +63,7 @@ struct CamCalib {
   /// Declared shutter, from the chain's cam_N_shutter. A GLOBAL-shutter camera exposes every row at
   /// the same instant: it has no readout time, so tr is forced to 0 for any camera that is not
   /// rolling. There is deliberately no free-flag for tr: the readout is hardware truth, and a
-  /// "calibrated" readout aliases into td (D10 class) while calibrating away a number the sensor
+  /// "calibrated" readout aliases into td while calibrating away a number the sensor
   /// already told us.
   bool rolling = false;
   bool free_ext = true; ///< extrinsics q_ItoC, p_IinC
@@ -78,7 +78,7 @@ struct SharedCalib {
   ImuIntrinsicModel imu; ///< dw / da / q_AtoI / Tg values + subset flags double as free-flags
   /// SESSION-level Tg column switch. When set, every preintegration in the session carries the
   /// 24-column intrinsic layout (dw6|da6|thA3|tg9) and the window graphs are built with the tg
-  /// parameter block — the per-STAGE imu.calib_tg flag then only decides whether the block is in
+  /// parameter block -- the per-STAGE imu.calib_tg flag then only decides whether the block is in
   /// free_blocks() or held constant, exactly the block-constancy doctrine dw/da/thA follow. This
   /// split keeps the column width stable across stages (persistent window graphs cannot change a
   /// factor's parameter list in place) and keeps tg-off sessions BYTE-IDENTICAL to the validated
@@ -123,8 +123,8 @@ struct SharedCalib {
       v.push_back({imu.da.data(), 6, 6, false, "da", -1});
     if (imu.calib_RAtoI)
       v.push_back({imu.q_AtoI.data(), 4, 3, true, "q_AtoI", -1});
-    // Matrix3d STORAGE order (column-major) — ONE pi convention end-to-end since the
-    // factor-boundary permutation was removed: mixing() enumerates the tg columns in the very
+    // Matrix3d STORAGE order (column-major) -- ONE pi convention end-to-end, with no
+    // factor-boundary permutation: mixing() enumerates the tg columns in the very
     // order of this Tg.data() block (see ImuIntrinsicModel::mixing / Factor_ImuAci3::evaluate_tg_).
     // Everything outside the factor (priors, caps, split bands, record, writeback) is
     // per-element symmetric, so storage order is safe here.
@@ -157,7 +157,7 @@ struct CloneObs {
   Eigen::Vector2d uv = Eigen::Vector2d::Zero();
   /// CENTERED row fraction (v/h - 0.5) in [-0.5, 0.5]: 0 = image center, the row the frame stamp
   /// anchors (producers stamp HAL3 SOF + (readout + exposure)/2). Rolling-shutter row time is
-  /// u_frac * tr — matching the filter's centered convention (UpdaterHelper v/h - 0.5).
+  /// u_frac * tr -- matching the filter's centered convention (UpdaterHelper v/h - 0.5).
   double u_frac = 0.0;
   /// Which camera saw it -- i.e. which CamCalib block this residual reprojects through. A track
   /// never crosses cameras (ov_core hands out feature ids from one atomic counter, and the rigs
@@ -183,24 +183,24 @@ struct WindowData {
   size_t num_feats = 0;
   double pix_sigma = 1.0;
   /// Session-unique id assigned by the harvester at assembly (monotone from 1;
-  /// 0 = directly-built window, never cached). Survives every copy — the
+  /// 0 = directly-built window, never cached). Survives every copy -- the
   /// PreintStore entry index (see PreintCache.h).
   std::uint32_t uid = 0;
-  /// Temporal reference at which clone_times were laid down (harvest time), PER CAMERA — each
+  /// Temporal reference at which clone_times were laid down (harvest time), PER CAMERA -- each
   /// camera has its own time offset, so each has its own linearization point. The reprojection
-  /// transport applies Delta = dt_ref + (td[c] - td_ref[c]) — the TOTAL shift since harvest, NOT
+  /// transport applies Delta = dt_ref + (td[c] - td_ref[c]) -- the TOTAL shift since harvest, NOT
   /// the shift since the last outer relinearization (using the current td as the reference zeroes
-  /// the value transport forever: the false-stationary-point bug).
+  /// the value transport forever: the false-stationary-point failure mode).
   ///
   /// A clone is stamped at a per-FRAME instant (the producer's center-row mid-exposure stamp
   /// + td_seed) which already CONTAINS td_seed, so td is transported as a DEVIATION from it. The
   /// stamp contains no per-ROW term: each observation's centered row time u_frac * tr is a KNOWN
   /// constant (tr is the fixed HAL3 readout, never estimated) and folds into the factor's dt_ref
-  /// at construction — the historical tr_ref machinery (D10) is gone with the tr parameter.
+  /// at construction; tr is not a parameter, so it needs no reference bookkeeping of its own.
   ///
   /// Defaults to ONE camera at a zero reference, so a hand-built single-camera window (the sim
   /// harness, the unit tests) is valid on construction. Indexed by CloneObs::cam, which defaults to
-  /// 0 to match — an empty vector here would be an out-of-bounds read on the first residual.
+  /// 0 to match -- an empty vector here would be an out-of-bounds read on the first residual.
   std::vector<double> td_ref{0.0};
   /// Optional nuisance seeds (window frame), provided by the harvester/bootstrap
   /// (in production the Dong-Si linear initializer fills these; the sim harness
@@ -221,21 +221,22 @@ struct WindowSolveReport {
   Eigen::VectorXd gred;   ///< matching reduced gradient
   // wall-clock split of this call (solver-time program instrumentation)
   double t_preint = 0.0, t_inner = 0.0, t_export = 0.0;
-  // P1 stationarity-certificate evidence (see JointCalib): inner_converged is
+  // Stationarity-certificate evidence (see JointCalib): inner_converged is
   // TRUE only for genuine stationarity exits (ftol/ptol/gradient/max-damping/
-  // TR-collapse) — iteration-cap and wall-cap exits are NOT converged; qn is
+  // TR-collapse) -- iteration-cap and wall-cap exits are NOT converged; qn is
   // the nuisance Newton decrement of the export linearization.
   bool inner_converged = false;
   /// True iff the wall-clock hang guard (not iterations/tolerances) ended the
-  /// inner solve: the iterate is then LOAD-COUPLED — not replay-deterministic —
+  /// inner solve: the iterate is then LOAD-COUPLED -- not replay-deterministic --
   /// and the session evidence table flags the whole run as tainted for A/Bs.
   bool time_stopped = false;
   double qn = 0.0;
   double gn_inf = 0.0;
-  /// Veto-dossier diagnostics (print-only, never consumed by solver logic):
-  /// the export's nuisance-LDLT smallest pivot and dimension, and the number
-  /// of landmark directions the R6 spectral elimination rank-clamped. Post-R6
-  /// a failing export means genuine nav-level rank loss — the veto is earned.
+  /// Veto diagnostics (print-only, never consumed by solver logic): the
+  /// export's nuisance-LDLT smallest pivot and dimension, and the number of
+  /// landmark directions the export's spectral elimination rank-clamped. With
+  /// rank clamping in place a failing export means genuine nav-level rank
+  /// loss -- the veto is earned.
   double export_min_pivot = 0.0;
   int export_nuis_dim = 0;
   int export_clamped = 0;
@@ -246,16 +247,16 @@ struct WindowSolveReport {
   /// calls the two are equal by construction (Lambda is built over the same
   /// free_blocks() layout).
   int free_dim = 0;
-  // P3 preint cache evidence: whether this call reused the window's cached
+  // Preint cache evidence: whether this call reused the window's cached
   // preintegration, and the IMU-factor construction time (whitener build /
-  // fetch) — a cost that previously fell UNTIMED between t_preint and t_inner.
+  // fetch), timed separately from t_preint and t_inner.
   bool preint_hit = false;
   double t_factor = 0.0;
 };
 
 /// Per-window nuisance state carried ACROSS outer iterations (VarPro warm
 /// start). Cold inner solves from the original seeds make the summed window
-/// cost discontinuous in p (inner-solver hysteresis) — the outer loop's
+/// cost discontinuous in p (inner-solver hysteresis) -- the outer loop's
 /// monotonicity guard then rejects noise, not steps. Warm starts make the
 /// reduced cost continuous and cut inner iterations several-fold.
 struct WindowWarmState {
@@ -273,13 +274,13 @@ public:
    *        constant), then (optionally) free them and export the reduced information.
    * @param warm optional in/out nuisance cache (see WindowWarmState)
    * @param pc optional preintegration cache entry for THIS window (PreintCache.h):
-   *        value-keyed on the exact (pi, noise-pi) bytes — a hit reuses the stored
+   *        value-keyed on the exact (pi, noise-pi) bytes -- a hit reuses the stored
    *        preintegration + whitener (bit-identical to recomputation), a miss
    *        refills the entry. nullptr = legacy per-call recomputation.
    * @param state_at export-on-accept re-entry: AFTER the entry state (warm/seeds)
    *        has pinned the reprojection transport linearization (w_clone/v_clone)
-   *        and the gauge anchors — exactly as the evaluation that produced this
-   *        optimum did — override the solve state to *state_at and (with
+   *        and the gauge anchors -- exactly as the evaluation that produced this
+   *        optimum did -- override the solve state to *state_at and (with
    *        max_iters=0) export there. This is what makes the deferred accept-time
    *        export byte-equal to the legacy inline eval export. Pass max_iters=0
    *        with it: no inner iterations run (a Solve(0) would only pay a wasted

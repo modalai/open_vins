@@ -8,35 +8,27 @@
  *   estimator_config.yaml  what the FILTER believes at boot and refines ONLINE.
  *   ov_zcalib.yaml          what the CALIBRATOR is GIVEN versus what it must EARN.
  *
- * This is a PRE-WARM to VIO, not VIO: it runs once, offline-in-the-loop, and its whole
- * purpose is to hand the filter a hot start. Sharing one file would force one set of
- * answers onto two different questions -- the filter WANTS a full prior on every state
- * (that is what a filter is), while the calibrator must be told as little as possible
- * about the very quantities it is supposed to determine, or it will simply reproduce
- * what it was told. Hence the seeding policy below is the load-bearing part of this file.
- *
- * SEEDING IS NOT A MATTER OF TASTE -- IT WAS MEASURED. One recorded D0014 session
- * (2026-07-12) scored across the whole matrix, everything else held fixed:
+ * The calibrator is a one-shot pre-warm for VIO. A filter wants a full prior on every
+ * state; a calibrator told the answer will simply reproduce the answer. The seeding
+ * policy is therefore the load-bearing part of this file, and its defaults are
+ * MEASURED: one recorded reference-rig session scored across the full seed matrix,
+ * everything else held fixed:
  *
  *   seed cam intrinsics   VERIFY 62.2%          per-unit factory cal; always right
  *   + seed imu intrinsics VERIFY 62.2 -> 73.3%  KEEP. starts the accel/gyro chain at the
- *                                               truth instead of identity, and makes an
- *                                               unmoved block ship the FACTORY value
- *                                               rather than an uncalibrated identity
+ *                                               truth, and an unmoved block then ships
+ *                                               the FACTORY value, not identity
  *   + seed R_ItoC         byte-identical NO-OP  the hand-eye bootstrap re-solves the
- *                                               rotation from scratch and overwrites the
- *                                               seed. (Reassuring: blind hand-eye lands
- *                                               on the same rotation.)
+ *                                               rotation from scratch (and lands on the
+ *                                               same one blind)
  *   + seed p_IinC         VERIFY 73.3 -> 48.6%  HARMFUL. the chain's lever arm is a
- *                                               MECHANICAL NOMINAL (~35 mm off on this
- *                                               rig) and its prior drags the solve toward
- *                                               a value that is simply wrong.
+ *                                               MECHANICAL NOMINAL (~35 mm off) whose
+ *                                               prior drags the solve toward it
  *   + seed td             VERIFY      -> 28.3%  HARMFUL. the shipped td is not per-unit.
  *
- * So the defaults here are: seed the INTRINSICS (per-unit factory data the rig actually
- * knows), earn the EXTRINSICS and the TIME OFFSET blind. That is not doctrine, it is the
- * measurement -- and this file exists so an operator can re-run the experiment on a
- * different rig rather than take our word for it.
+ * Defaults: seed the INTRINSICS (per-unit factory data the rig actually knows), earn
+ * the EXTRINSICS and the TIME OFFSET blind. This file exists so the experiment can be
+ * re-run on a different rig rather than taken on faith.
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -71,7 +63,7 @@ struct SeedPolicy {
   /// (the SeedOverride doctrine): "earn the dw/da/qA chain blind" must not silently zero the
   /// g-sensitivity the chain measured; with the seed discarded, |Tg|*g rides as a real gyro
   /// term for the shared dw block to absorb. The value is an INIT (estimate_tg earns it) --
-  /// kalibr's own per-session Tg scatters at the size of the value (measured 2026-07-13).
+  /// kalibr's own per-session Tg estimates scatter at the size of the value itself.
   bool tg = true;
 };
 
@@ -81,7 +73,7 @@ struct EstimatePolicy {
   bool imu_intrinsics = true; ///< false => seed AND FREEZE: skips A1a/A1b entirely (~30% faster solve)
   int cam_intrinsics = 0;     ///< 0 fixed | 1 refine (tight priors) | 2 full (weak priors, gated)
   /// Estimate Tg (gyro g-sensitivity). EARNED per unit: the rig's own kalibr sessions scatter
-  /// beyond |Tg| between runs (measured 2026-07-13), so no chain value deserves seed authority.
+  /// beyond |Tg| between runs, so no chain value deserves seed authority.
   /// Unlocks only through the A1b excitation gate + split-half/Wald falsifier; requires an
   /// estimable IMU chain (a frozen factory chain freezes tg with it).
   bool tg = true;
