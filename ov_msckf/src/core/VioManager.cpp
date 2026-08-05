@@ -654,14 +654,7 @@ void VioManager::feed_measurement_simulation(double timestamp, const std::vector
     }
   }
 
-  // If we do not have VIO initialization, then return an error
-  if (!is_initialized_vio) {
-    PRINT_ERROR(RED "[SIM]: your vio system should already be initialized before simulating features!!!\n" RESET);
-    PRINT_ERROR(RED "[SIM]: initialize your system first before calling feed_measurement_simulation()!!!!\n" RESET);
-    std::exit(EXIT_FAILURE);
-  }
-
-  // Call on our propagate and update function
+  // Build the (image-free) message the update path consumes; also what initialization queues
   // Simulation is either all sync, or single camera...
   ov_core::CameraData message;
   message.timestamp = timestamp;
@@ -672,6 +665,21 @@ void VioManager::feed_measurement_simulation(double timestamp, const std::vector
     message.images.push_back(cv::Mat::zeros(cv::Size(width, height), CV_8UC1));
     message.masks.push_back(cv::Mat::zeros(cv::Size(width, height), CV_8UC1));
   }
+
+  // If we do not have VIO initialization, TRY to initialize -- the same path the image feed
+  // takes (try_to_initialize consumes only the timestamp; the initializer itself works from the
+  // feature database TrackSIM just fed and the propagator's IMU history). An observation-stream
+  // replay (voxl-vins-lab --session: recorded post-tracking obs, no images, no tracker) starts
+  // from a cold filter exactly like a live boot, so the legacy exit() here would make the whole
+  // filter-math replay tier impossible rather than guard anything: with a real initializer
+  // attached there is nothing unsafe about initializing from simulated/recorded features.
+  if (!is_initialized_vio) {
+    is_initialized_vio = try_to_initialize(message);
+    if (!is_initialized_vio)
+      return;
+  }
+
+  // Call on our propagate and update function
   do_feature_propagate_update(message);
 }
 
