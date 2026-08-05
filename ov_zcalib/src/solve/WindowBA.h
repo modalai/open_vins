@@ -228,6 +228,13 @@ struct WindowSolveReport {
   bool time_stopped = false;
   double qn = 0.0;
   double gn_inf = 0.0;
+  /// Veto-dossier diagnostics (print-only, never consumed by solver logic):
+  /// the export's nuisance-LDLT smallest pivot and dimension, and the number
+  /// of landmark directions the R6 spectral elimination rank-clamped. Post-R6
+  /// a failing export means genuine nav-level rank loss — the veto is earned.
+  double export_min_pivot = 0.0;
+  int export_nuis_dim = 0;
+  int export_clamped = 0;
   /// Local dim of the calibration free-block layout THIS call solved under
   /// (set on every successful call, export or eval-only). The fusion's
   /// dimension-consistency checks read this instead of Lambda.rows():

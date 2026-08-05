@@ -176,6 +176,14 @@ public:
     double nuis_decrement = 0.0;
     double land_decrement = 0.0;
     double nuis_grad_inf = 0.0;
+    // Diagnostics only (veto dossier): the nuisance LDLT's smallest pivot and
+    // dimension. NaN pivot = factorization itself failed. Never consumed by
+    // solver logic; excluded from the export-audit memcmp by name.
+    double nuis_min_pivot = 0.0;
+    int nuis_dim = 0;
+    /// landmark directions rank-clamped by the spectral elimination (R6):
+    /// the window's degenerate-landmark load. Diagnostic only.
+    int clamped_dirs = 0;
   };
   // NOTE (export-on-accept, t7): a "qn-only" variant of this export (empty keep
   // set, calibration columns never formed) was built and MEASURED as NOT
