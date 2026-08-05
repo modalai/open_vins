@@ -23,6 +23,8 @@
  */
 
 #include <cstdio>
+#include <cstring>
+#include <thread>
 
 #include "core/CalibSessionRunner.h"
 #include "sim/SynthWorld.h"
@@ -207,18 +209,25 @@ static std::string slurp(const std::string &p) {
   return s;
 }
 
-int main() {
+int main(int argc, char **argv) {
+  // ---- developer iteration affordances (results IDENTICAL by contract) ----
+  // S-block selection: pass any of S1 S2 S3 S4 to run just those (default: all). Blocks own
+  // their records; S2 replays S1's record, so selecting S2 runs S1 too. Lets a fix to one
+  // block iterate in ~1/4 of the suite wall instead of re-paying every world.
+  auto want = [&](const char *b) {
+    if (argc <= 1)
+      return true;
+    for (int i = 1; i < argc; ++i)
+      if (std::strcmp(argv[i], b) == 0)
+        return true;
+    return false;
+  };
+  const bool s2 = want("S2");
+  const bool s1 = want("S1") || s2;
+
   synth::Truth tr = synth::make_truth();
   const std::string rec = "/tmp/ov_zcalib_session_e2e.bin";
   const std::string rec_deg = "/tmp/ov_zcalib_session_deg.bin";
-
-  // 6 s quiet head (settle), excitation [6, 120]; bootstrap ~[6, 20+], collection after
-  // S1 = the DESIGNED rich-excitation case: real-log dynamics (pump 0.35 m @ 3.1 rad/s,
-  // std|a_m| ~2.4 m/s^2) so the accel-chain unlock question is really asked. The legacy
-  // 0.37 m/s^2 shape now honestly REFUSES under the arbiter's split-half judge (its
-  // per-half qA basin is wider than the agreement band there) — that refusal world is
-  // tg_e2e's T2/T3 territory; S1 must be the certify world.
-  write_session_record(tr, rec, 120.0, 6.0, 118.0, 4242, false, nullptr, 0.35);
 
   SessionConfig cfg;
   cfg.harvester.pix_sigma = 0.5;
@@ -226,8 +235,24 @@ int main() {
   cfg.verbose = true;
   cfg.joint.verbose = false;
   cfg.cam_mode = 0; // S1/S2/S3 are the frozen temporal/IMU gates; S4 below gates the camera path
+  // Window pool at the machine width: serial == parallel BIT-IDENTICAL (fixed-range partition,
+  // worker-ordered fold — see ov_init::zbft_sfm::ParallelExecutor), so this is pure wall-clock.
+  // NO wall budgets anywhere in the tests: solve_budget_s stays 0 and the only time limit is the
+  // 60 s inner hang guard that must never bind — a binding budget couples machine load into the
+  // iterate and makes a determinism suite flake under load.
+  cfg.joint.num_threads = std::max(4u, std::thread::hardware_concurrency());
+
+  // 6 s quiet head (settle), excitation [6, 120]; bootstrap ~[6, 20+], collection after
+  // S1 = the DESIGNED rich-excitation case: real-log dynamics (pump 0.35 m @ 3.1 rad/s,
+  // std|a_m| ~2.4 m/s^2) so the accel-chain unlock question is really asked. The legacy
+  // 0.37 m/s^2 shape now honestly REFUSES under the arbiter's split-half judge (its
+  // per-half qA basin is wider than the agreement band there) — that refusal world is
+  // tg_e2e's T2/T3 territory; S1 must be the certify world.
+  if (s1)
+    write_session_record(tr, rec, 120.0, 6.0, 118.0, 4242, false, nullptr, 0.35);
 
   // ---------------- S1: full session, replay path ----------------
+  if (s1) {
   SessionReport rep;
   CHECK(CalibSessionRunner::run_replay(rec, cfg, rep), "S1: replay failed to open");
   CHECK(rep.final_state == RunnerState::DONE, "S1: session ended in %d (%s)", (int)rep.final_state, rep.abort_reason.c_str());
@@ -271,9 +296,10 @@ int main() {
   for (auto &b : rep.blocks)
     if (b.name == "q_ItoC" || b.name == "td" || b.name == "dw")
       CHECK(b.committed, "S1: block %s not committed (ratio %.2f)", b.name.c_str(), b.worst_ratio);
+  }
 
   // ---------------- S2: determinism (two replays -> byte-identical YAML) ----------------
-  {
+  if (s2) {
     const std::string y1 = slurp(cfg.out_yaml);
     SessionConfig cfg2 = cfg;
     cfg2.out_yaml = "/tmp/ov_zcalib_session_e2e_2.yaml";
@@ -290,7 +316,7 @@ int main() {
   }
 
   // ---------------- S3: degenerate single-axis session ----------------
-  {
+  if (want("S3")) {
     write_session_record(tr, rec_deg, 90.0, 6.0, 88.0, 777, /*single_axis*/ true);
     SessionConfig cfgd = cfg;
     cfgd.out_yaml = "/tmp/ov_zcalib_session_deg.yaml";
@@ -316,7 +342,7 @@ int main() {
   }
 
   // ---------------- S4: staged camera-intrinsic refinement (cam_mode=1) ----------------
-  {
+  if (want("S4")) {
     synth::Truth trc = synth::make_truth();
     trc.cam << 450, 452, 320, 240, -0.020, 0.005, 0.0002, -0.0001; // real radtan distortion
     Eigen::Matrix<double, 8, 1> seed_cam;
