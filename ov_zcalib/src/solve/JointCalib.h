@@ -126,6 +126,45 @@ struct JointConfig {
   /// whose different B entry costs +38 s downstream — polish only the stage
   /// whose output feeds B (A1b-full), not the gate-validated interior stages.
   int fused_polish_accepts = 0;
+  /// Export-on-accept (t7 / dossier R4): window evaluations run COST-ONLY —
+  /// no reduced-information export — and after a candidate is ACCEPTED on
+  /// merit, ONE export pass produces the (Lambda, g, qn) the outer consumes,
+  /// at the unchanged kept optima. Rejected-pass exports were write-only
+  /// dead state (measured: export ~21% of window thread-CPU x ~41-45% of
+  /// passes rejected), and duel LOSERS exported too when only the winner's
+  /// bytes could ever be folded. Two sources at accept, both legacy bits:
+  ///   * cert-on stages keep path A's INLINE export (the P1 certificate
+  ///     consumes wrA.qn before the accept decision, and a calib-column-free
+  ///     "qn-only" statistic was MEASURED 1-ulp off — removing the kept
+  ///     columns changes H's leading dimension, the SIMD head-peel under
+  ///     -ffast-math reassociates, H_zz drifts ~1 ulp and q_n ~1e-10 rel;
+  ///     see Problem::ExportReducedInformation's note. q_n feeds thresholded
+  ///     duel arbitration, so it must be the export's exact bits). Kept-A
+  ///     windows there REUSE the stored eval export; the eoa savings on
+  ///     cert stages are the path-B and duel-loser exports.
+  ///   * everything else re-enters via WindowBA state_at: transport
+  ///     linearization w_clone/v_clone and gauge anchors re-pinned from the
+  ///     KEPT path's entry context (warm strand for kept-A, the window's
+  ///     [possibly re-seeded] seeds for kept-B), state overridden to the
+  ///     kept optimum, zero inner iterations — byte-equal to the inline
+  ///     export legacy computed at eval time (unit-pinned: W1/W2 in
+  ///     test_export_parity).
+  /// Arbitration inputs and order are UNCHANGED: costs, duels, counters and
+  /// the accepted-point linearization are byte-identical ON vs OFF (within-
+  /// binary replay parity on the oracle front + down-flight records; see the
+  /// t7 branch derivation). Named residual: a window whose UNDAMPED export
+  /// system is non-PD at an eval is discovered by legacy AT the eval (okA/okB
+  /// false -> duel/dead/veto) but by eoa only at the accept-time export on
+  /// non-cert paths — the window then dies at the accepted point (loud
+  /// warning) and the accepted merit is re-derived over the survivors in
+  /// legacy accumulation order. Not observed on either oracle record.
+  /// COMPOSITION: duel_on_accept DISARMS this flag (legacy inline exports
+  /// run) — the deferred-duel fold is incremental (Lsum += d_L - L on a
+  /// winner), so legacy's accepted linearization carries the LOSER's export
+  /// in its rounding; a rebuilt direct sum is last-ulp different, and exact
+  /// parity would need the loser exported too — the very work eoa elides.
+  /// J4 in test_export_parity pins the composition.
+  bool export_on_accept = true;
   double stop_step_winf = 0.01;  ///< ||dp/prior_sigma||_inf below this = stable step
   double stop_merit_rel = 3e-4;  ///< relative merit change below this = stable
   double stop_lambda_max = 1e-2; ///< lambda must be at/below this (not climbing a wall)

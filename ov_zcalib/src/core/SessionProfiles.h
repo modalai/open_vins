@@ -128,6 +128,13 @@ inline void apply_flight_overlay(SessionConfig &cfg, bool set_cam_mode0) {
   cfg.select_K = 10;
   cfg.solve_budget_s = 20.0;
   cfg.commit_attribution = false; // LOBO solves off the flight budget
+  // W0 (permanent home; the server-side interim pin retires at the flip): thin/flight
+  // shapes keep SPLIT-HALF authority. The voxl base grants wald mode-1 for the HOST
+  // shape only; the measured thin-shape discordant pair (split froze dqA 0.762 deg
+  // while wald under-read it) plus the W1 kappa-contamination finding keep mode 2
+  // here — split-half DECIDES, wald verdicts log, the paired campaign accumulates —
+  // until the H1 junk-injection study re-pins the corrected sizing per shape.
+  cfg.a_gate_mode = 2;
   if (set_cam_mode0)
     cfg.cam_mode = 0;
 }

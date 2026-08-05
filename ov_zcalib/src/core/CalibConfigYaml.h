@@ -66,6 +66,12 @@ struct SeedPolicy {
   bool extrinsic_position = false; ///< HARMFUL: the chain's lever arm is a mechanical nominal
   bool time_offset = false;        ///< HARMFUL: the shipped td is not a per-unit value
   bool readout_time = true;        ///< tr: hardware fact (HAL3 sensor mode), not a guess
+  /// Tg (g-sensitivity) chain seed -- its OWN axis, deliberately decoupled from imu_intrinsics
+  /// (the SeedOverride doctrine): "earn the dw/da/qA chain blind" must not silently zero the
+  /// g-sensitivity the chain measured; with the seed discarded, |Tg|*g rides as a real gyro
+  /// term for the shared dw block to absorb. The value is an INIT (estimate_tg earns it) --
+  /// kalibr's own per-session Tg scatters at the size of the value (measured 2026-07-13).
+  bool tg = true;
 };
 
 /// What the session may ESTIMATE and COMMIT. A block that is seeded but NOT estimated
@@ -143,6 +149,7 @@ inline bool load_calib_profile(const std::string &path, CalibProfile &out) {
   parser->parse_config("seed_extrinsic_position", out.seed.extrinsic_position, false);
   parser->parse_config("seed_time_offset", out.seed.time_offset, false);
   parser->parse_config("seed_readout_time", out.seed.readout_time, false);
+  parser->parse_config("seed_tg", out.seed.tg, false);
 
   // ---- estimation policy: what it may EARN and COMMIT ----
   parser->parse_config("estimate_imu_intrinsics", out.estimate.imu_intrinsics, false);
@@ -167,6 +174,10 @@ inline bool load_calib_profile(const std::string &path, CalibProfile &out) {
   parser->parse_config("max_clones", out.session.harvester.max_clones, false);
   parser->parse_config("max_track_len", out.session.harvester.max_track_len, false);
   parser->parse_config("select_k", out.session.select_K, false);
+  parser->parse_config("stage_select", out.session.stage_select, false);
+  parser->parse_config("select_k_a0", out.session.select_K_a0, false);
+  parser->parse_config("select_k_a1", out.session.select_K_a1, false);
+  parser->parse_config("select_k_b", out.session.select_K_b, false);
   parser->parse_config("min_holdout", out.session.min_holdout, false);
 
   // ---- commit gates (advanced) ----

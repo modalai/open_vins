@@ -98,6 +98,20 @@ struct SessionConfig {
   // SOLVE / S5 camera staging
   int select_K = 18;
   double select_overlap_penalty = 0.5;
+  /// Task 8: stage-specific D-optimal subsets over the retained reservoir.
+  /// SELECTION-SIDE ONLY: admission fingerprints and reservoir retention are
+  /// parity-frozen (WindowScorer untouched); holdouts never enter any set
+  /// (thermal_bin excludes them). OFF = the single master selection feeds
+  /// every stage — byte-identical legacy path.
+  bool stage_select = false;
+  int select_K_a0 = 0; ///< A0 (ext/td/tr) budget; 0 = select_K
+  int select_K_a1 = 0; ///< A1a/A1b + accel/tg gates budget; 0 = select_K (keep >= a_full_min_windows)
+  int select_K_b = 0;  ///< phase-B budget; 0 = select_K
+  double stage_feat_gain = 1.0; ///< weight of the stage feature Gram vs the Fisher sub-block
+  /// Fall back to the master set for the A1 family when S_A1's time-halves are
+  /// direction-starved (the split/wald machinery quarters BY TIME; a
+  /// direction-optimal subset clustered in time would fail a certifiable chain).
+  bool stage_a1_balance_guard = true;
   /// Session-wide SOLVE budget [s] (0 = unlimited). One deadline shared by
   /// EVERY staged JointCalib call (A0/A1a/split-halves/A1b/B passes): each call
   /// receives the remaining time as its max_wall_s (floored so late stages
@@ -114,6 +128,11 @@ struct SessionConfig {
   /// refinement-hurt detector stays quiet.
   int cam_mode = 1;
   double k34_radial_gate = 0.12; ///< min fraction of obs beyond 0.7*r_max to free k3/k4
+  /// C1 (center gate): min per-quadrant fraction of this camera's fused observations, quadrants
+  /// taken about the current (cx, cy). Below it the data never brackets the center and cx/cy walk
+  /// into self-consistent junk (the v5 wander: cy +2.9 px COMMITTED); freeze them at seed via the
+  /// k3/k4 sigma mechanism -- D2 exclusion keeps the block committable with frozen dofs at seed.
+  double cam_center_quadrant_gate = 0.10;
   Eigen::Matrix<double, 8, 1> cam_refine_prior = (Eigen::Matrix<double, 8, 1>() << 2, 2, 2, 2, 0.01, 0.01, 1e-9, 1e-9).finished();
   Eigen::Matrix<double, 8, 1> cam_full_prior = (Eigen::Matrix<double, 8, 1>() << 20, 20, 20, 20, 0.1, 0.1, 1e-9, 1e-9).finished();
   /// Camera-block coordinate alternation inside phase B (operator directive):
@@ -179,11 +198,14 @@ struct SessionConfig {
                                       ///< the accuracy CLAIM (~0.3%); tighter floors freeze chains whose halves
                                       ///< agree 8x better than the suite's own documented da valley tolerance
   double a_split_qa_floor_deg = 0.1;  ///< band floor for the q_AtoI angle
-  /// Band floor for tg dofs [(rad/s)/(m/s^2)]: agreement demanded only above the part-class noise
-  /// floor. ICM-class elements sit at ~1e-4-5e-4 and kalibr's own per-session estimates scatter
-  /// +/-5e-4 BETWEEN sessions; two halves of ONE session claiming a real Tg must reproduce it
-  /// tighter than that, so the floor sits at the low end of the physical scale.
-  double a_split_tg_floor = 1e-4;
+  /// Band floor for tg dofs [(rad/s)/(m/s^2)]: agreement is demanded at the scale of the accuracy
+  /// CLAIM — the a_split_da_floor doctrine — i.e. 0.3x the MEASURED 4e-4 part class (D0014 chain
+  /// 0.22 dps/g), the per-element bound the recovery gate and the commit ceiling ship. The old
+  /// 1e-4 sat below the claim and let the falsifier's own noise adjudicate: measured on the T1
+  /// synthetic (real all-9-distinct part-class Tg), the halves' worst |d| held at 1.1-1.2e-4 from
+  /// 8 to 12 windows/half — inside the claim, refused by the floor. Kalibr's BETWEEN-session
+  /// scatter (+/-5e-4) stays 4x above this floor: scatter-class junk still refuses.
+  double a_split_tg_floor = 1.2e-4;
   /// Signal-fraction term of the agreement band: halves also agree when their
   /// disagreement is below this fraction of the SIGNAL they claim (deviation
   /// from the frozen A1a value). Scale-free falsifier: exported posteriors are
@@ -203,7 +225,12 @@ struct SessionConfig {
   double a_wald_thresh_scale = 1.0;
   double a_qa_phys_ceiling_deg = 2.0;  ///< fused-step ceiling (vs 0.776 deg die misalignment + ICM cross-axis spec class)
   double a_da_off_phys_ceiling = 0.02;
-  double a_tg_phys_ceiling = 5e-4;     ///< fused-step ceiling for tg elements (ICM-class |Tg| spec ceiling)
+  /// Fused-step ceiling for tg elements. ANCHORED TO THE MEASURED PART CLASS, not the datasheet
+  /// typ: the D0014 chain carries |Tg| ~ 4e-4 (0.22 dps/g) and kalibr's own per-session estimates
+  /// scatter +/-5e-4 -- a blind (zero-seeded) session recovering the REAL value implies a fused
+  /// step of ~4-6e-4, which the old 5e-4 ceiling refused as "unphysical" (measured: front log
+  /// refused at 5.9e-4). 3x the part class = 1.5e-3: junk basins still hit it, physics does not.
+  double a_tg_phys_ceiling = 1.5e-3;
   // Identifiability gates (diagnostics with AUTHORITY; previously computed-but-unused)
   double xcorr_min_peak = 0.6;      ///< normalized xcorr peak floor: a flat correlation ridge
                                     ///< (near-constant |w|) yields a noisy td seed that must not pass
@@ -241,8 +268,12 @@ struct SessionConfig {
   /// Absolute posterior ceilings [local units] per block: commit additionally
   /// requires sigma_post <= ceiling on every non-frozen dof. This ties the
   /// commit rule to the acceptance targets (the 3x-prior rule alone admits
-  /// sigmas 3-5x looser than the flight acceptance numbers).
-  std::map<std::string, double> commit_abs_ceiling = {{"q_ItoC", 1.7e-3}, {"p_IinC", 2.5e-3}, {"td", 2.5e-4}, {"tg", 1.0e-4}};
+  /// sigmas 3-5x looser than the flight acceptance numbers). tg's ceiling is the
+  /// CLAIM scale — 0.3x the measured 4e-4 part class, the same 1.2e-4 the split
+  /// floor demands agreement at (a_split_tg_floor doctrine): a pair certified at
+  /// claim-scale agreement must not then be refused for claim-scale precision
+  /// (the old 1.0e-4 pin predated the floor re-pin and sat below the claim).
+  std::map<std::string, double> commit_abs_ceiling = {{"q_ItoC", 1.7e-3}, {"p_IinC", 2.5e-3}, {"td", 2.5e-4}, {"tg", 1.2e-4}};
   /// q_ItoC and td commit/revert TOGETHER: they move jointly in the solve, and
   /// a mixed state (new rotation, seed td) can be worse than either endpoint.
   bool commit_atomic_rot_td = true;
@@ -255,6 +286,13 @@ struct SessionConfig {
   /// falsifier; costs a few extra held-out window solves).
   bool commit_attribution = true;
   bool free_tr = false;              ///< estimate rolling-shutter readout
+  /// C3 tr gates (rolling cams). Row-coverage floor: std of observed u_frac over the fused set
+  /// must clear this before tr stays free (uniform rows = 0.289; below it, tr aliases td and the
+  /// session would earn a junk readout while biasing td -- the D10 mechanism, refused up front).
+  double tr_row_cov_floor = 0.20;
+  /// td-aliasing ceiling at commit: |rho(td,tr)| from the joint posterior above this refuses the
+  /// tr commit (the pair is one dof wearing two names; ship the seed, keep td honest).
+  double tr_td_corr_ceiling = 0.95;
   /// Estimate Tg (gyro g-sensitivity, 9 dof). EARNED, never trusted from a chain: the rig's own
   /// kalibr sessions scatter beyond the value's magnitude (measured 2026-07-13, |Tg(D1)-Tg(F3)|
   /// at the size of Tg itself), so a seed is an init and the session must certify its own
@@ -326,6 +364,10 @@ struct SessionReport {
   // solve
   int windows_fused = 0;
   double min_eig_whitened = 0.0;
+  // Task 8 stage-specific selection (0/false when stage_select is off)
+  int windows_a0 = 0, windows_a1 = 0, windows_b = 0;
+  double min_eig_a0 = 0.0, min_eig_a1 = 0.0, min_eig_b = 0.0;
+  bool stage_a1_fallback = false; ///< balance guard reverted the A1 family to the master set
   // accel-chain excitation gate telemetry (A1b decision)
   double accel_att_spread_deg = 0.0; ///< max pairwise angle between window gravity dirs
   double accel_dyn_ms2 = 0.0;        ///< mean within-window std of |a_m|
@@ -334,9 +376,25 @@ struct SessionReport {
   // pre-gate never admitted the question)
   enum class AccelGateVerdict { PRE_CLOSED, SPLIT_CONSISTENT, SPLIT_INCONSISTENT, SPLIT_FAILED, WALD_CONSISTENT, WALD_INCONSISTENT, WALD_UNOBSERVABLE };
   AccelGateVerdict a_wald_verdict = AccelGateVerdict::PRE_CLOSED;
+  /// tg's OWN gate verdict. Mode 1: the wald tg-subspace judge (runs only when the chain
+  /// certifies). Split modes: the tg half pair — which also runs when the frozen-tg chain judge
+  /// REFUSED, because a certified-reproducible Tg falsifies that judge's tg=seed conditioning and
+  /// arbitrates a re-judge on the tg-free halves. PRE_CLOSED = the question was never admitted
+  /// (accel pre-gate closed, no solve, or the session does not estimate tg). A CONSISTENT verdict
+  /// with tg_open=false means tg reproduced but the chain never certified (tg opens only WITH it).
+  AccelGateVerdict tg_gate_verdict = AccelGateVerdict::PRE_CLOSED;
+  bool tg_open = false; ///< tg unlocked WITH the chain and survived A1b (the commit machinery still gates the block)
   int a_wald_r = 0;                  ///< observable gate-subspace dimension (of 6)
   double a_wald_T = 0.0;             ///< correlated Wald statistic (chi^2_r under H0)
   double a_wald_x12 = 0.0, a_wald_x21 = 0.0; ///< cross-prediction excesses
+  /// Cross-prediction thresholds AT THE RUN CONFIG. X12/X21 are kappa-free, but their
+  /// Satterthwaite thresholds are exactly proportional to kap_eff * a_wald_thresh_scale
+  /// (AC = kap_eff * A*(A1^-1+A2^-1): gfac scales, nu is invariant) — recorded so the MC
+  /// harness can re-size the rule offline across (floor, scale) cells without re-solving.
+  double a_wald_xthr1 = 0.0, a_wald_xthr2 = 0.0;
+  /// Fused-step physical magnitudes (the phys-ceiling inputs). Config-invariant across
+  /// (kappa, thresh_scale): the offline re-sizer needs them to replay the ceiling branch.
+  double a_wald_jqa_deg = 0.0, a_wald_jda = 0.0;
   double a_wald_min_eig = 0.0;       ///< min-half whitened eig along the weakest joint direction
   double a_wald_dqa_deg = 0.0;       ///< implied half-disagreement rotation angle
   double a_wald_dda_off = 0.0;       ///< implied half-disagreement max |da_offdiag|
@@ -453,6 +511,13 @@ private:
   /// tg must freeze tg alone, never veto the chain. budget_left_s <= 0 => safe abstention.
   SessionReport::AccelGateVerdict wald_accel_gate_(const std::vector<WindowData> &fused, std::vector<WindowWarmState> &warm,
                                                    double budget_left_s, SessionReport::AccelGateVerdict *tg_verdict = nullptr);
+  /// Task 8 stage selection: greedy D-optimal (WindowScorer::select_logdet)
+  /// over blkdiag( Lw[dof_idx,dof_idx], stage_feat_gain * g g^T ) per
+  /// candidate. Deterministic (fixed candidate order, no RNG). Empty result =
+  /// caller falls back to the master set.
+  std::vector<int> select_stage_(const char *tag, const std::vector<Eigen::MatrixXd> &Lw,
+                                 const std::vector<std::pair<double, double>> &spans, const std::vector<int> &dof_idx,
+                                 const std::vector<Eigen::VectorXd> &feat, int K, double *min_eig_out) const;
 
   SessionConfig cfg_;
   SessionSeed seed0_;    ///< pre-bootstrap seed (the record-header seed)

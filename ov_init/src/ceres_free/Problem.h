@@ -177,6 +177,16 @@ public:
     double land_decrement = 0.0;
     double nuis_grad_inf = 0.0;
   };
+  // NOTE (export-on-accept, t7): a "qn-only" variant of this export (empty keep
+  // set, calibration columns never formed) was built and MEASURED as NOT
+  // byte-equal to the full export's ExportStats: removing the kept columns
+  // changes H's leading dimension (692 vs 722 on the probe window), the column
+  // base alignment mod 32 bytes changes with it, and under -ffast-math the
+  // SIMD head-peeling reassociates the accumulations — H_zz drifts ~1 ulp
+  // (3784/262144 entries, median 4e-16 rel) and q_n follows (~1e-10 rel).
+  // q_n feeds thresholded duel arbitration, so cert-consuming evaluations keep
+  // the full export instead (see ov_zcalib JointCalib). Do not resurrect the
+  // qn-only path without solving the emitted-loop parity problem first.
   bool ExportReducedInformation(const std::vector<double *> &blocks, Eigen::MatrixXd &Lambda, Eigen::VectorXd &gred,
                                 const SolverOptions &options, ExportStats *stats = nullptr);
 

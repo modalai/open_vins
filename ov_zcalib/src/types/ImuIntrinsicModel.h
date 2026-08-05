@@ -14,7 +14,7 @@
  *
  * with Dw, Da UPPER-triangular (inverse scale/misalignment, Dw = Tw^-1), packed
  * column-wise as [d11, d12, d22, d13, d23, d33], and Tg the 9-parameter
- * g-sensitivity (row-major), OFF by default. Calibration groups are individually
+ * g-sensitivity (pi columns in Matrix3d storage order, end-to-end), OFF by default. Calibration groups are individually
  * selectable (kalibr-style subsets); the RSS 2020 over-parameterization rule is
  * structural here: R_GtoI is never a parameter (exactly one gyro/accel frame
  * rotation may be free, and this model fixes the gyro one).
@@ -120,9 +120,14 @@ public:
         M_w.col(off_dw() + k) = ut_basis(k) * s;
     }
     if (calib_tg) {
+      // ONE pi convention end-to-end (ov_zcalib): tg column k differentiates w.r.t.
+      // Tg.data()[k], i.e. Matrix3d STORAGE (column-major) order — the same order the
+      // solver's parameter block hands the factor. The oracle module enumerated
+      // row-major and reconciled with a permutation at the factor boundary; that seam
+      // is exactly where index bugs breed, so here the enumeration IS the storage.
       for (int k = 0; k < 9; ++k) {
         Eigen::Matrix3d Ek = Eigen::Matrix3d::Zero();
-        Ek(k / 3, k % 3) = 1.0;
+        Ek(k % 3, k / 3) = 1.0;
         M_w.col(off_tg() + k) = -Dw * (Ek * a_hat);
       }
     }

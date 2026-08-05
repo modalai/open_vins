@@ -18,6 +18,7 @@
 #include <cmath>
 #include <cstdio>
 #include <limits>
+#include <map>
 
 #include "../utils/YamlWriteback.h"
 #include "ceres_free/Parallel.h"
@@ -1127,10 +1128,13 @@ SessionReport::AccelGateVerdict CalibSessionRunner::wald_accel_gate_(const std::
     return cfg_.a_wald_thresh_scale * gfac * q;
   };
   const double X12 = 0.5 * d.dot(A1 * d), X21 = 0.5 * d.dot(A2 * d);
+  const double xt1 = xthr(A1), xt2 = xthr(A2);
   if (write_rep) {
     rep_.a_wald_T = T;
     rep_.a_wald_x12 = X12;
     rep_.a_wald_x21 = X21;
+    rep_.a_wald_xthr1 = xt1;
+    rep_.a_wald_xthr2 = xt2;
   }
   // ---- physical deadband / ceiling in PHYSICAL units ----
   const Eigen::VectorXd dp = wg.asDiagonal() * (P * d); // half-disagreement, physical
@@ -1160,6 +1164,10 @@ SessionReport::AccelGateVerdict CalibSessionRunner::wald_accel_gate_(const std::
       jda = std::max(jda, std::abs(pJ(a)));
   }
   const double jqa_deg = std::sqrt(jqa2) * 180.0 / M_PI;
+  if (write_rep) {
+    rep_.a_wald_jqa_deg = jqa_deg;
+    rep_.a_wald_jda = jda;
+  }
   // ---- decision order (design #1) ----
   if (jqa_deg > cfg_.a_qa_phys_ceiling_deg || jda > cfg_.a_da_off_phys_ceiling || jtg > cfg_.a_tg_phys_ceiling) {
     if (cfg_.verbose)
@@ -1176,12 +1184,12 @@ SessionReport::AccelGateVerdict CalibSessionRunner::wald_accel_gate_(const std::
       std::printf("[session] wald %s gate: UNOBSERVABLE r=%d/%d (agreement cannot certify unobserved directions)\n", tag, r, m);
     return V::WALD_UNOBSERVABLE;
   }
-  const bool stat_fail = (T > Tthr) || (X12 > xthr(A1)) || (X21 > xthr(A2));
+  const bool stat_fail = (T > Tthr) || (X12 > xt1) || (X21 > xt2);
   if (stat_fail) {
     const bool deadband = dda <= cfg_.a_split_da_floor && dqa_deg <= cfg_.a_split_qa_floor_deg && dtg <= cfg_.a_split_tg_floor;
     if (cfg_.verbose)
       std::printf("[session] wald %s gate: T=%.1f/%.1f X=%.1f/%.1f (thr %.1f/%.1f) kap=%.1f df=%d dqA %.3f deg dda %.4f -> %s\n", tag, T,
-                  Tthr, X12, X21, xthr(A1), xthr(A2), kap_eff, kdf, dqa_deg, dda,
+                  Tthr, X12, X21, xt1, xt2, kap_eff, kdf, dqa_deg, dda,
                   deadband ? "CONSISTENT (deadband: physically irrelevant)" : "INCONSISTENT");
     return deadband ? V::WALD_CONSISTENT : V::WALD_INCONSISTENT;
   }
@@ -1249,6 +1257,33 @@ CalibSessionRunner::CollectStatus CalibSessionRunner::collect_status() {
   const bool enough = (st.n_fusable >= cfg_.select_K) && (st.n_holdout >= std::max(1, cfg_.min_holdout));
   st.ready = enough && (cfg_.collect_min_eig > 0.0) && (st.min_eig >= cfg_.collect_min_eig);
   return st;
+}
+
+std::vector<int> CalibSessionRunner::select_stage_(const char *tag, const std::vector<Eigen::MatrixXd> &Lw,
+                                                   const std::vector<std::pair<double, double>> &spans,
+                                                   const std::vector<int> &dof_idx,
+                                                   const std::vector<Eigen::VectorXd> &feat, int K,
+                                                   double *min_eig_out) const {
+  const int nf = feat.empty() ? 0 : (int)feat[0].size();
+  const int m = (int)dof_idx.size() + nf;
+  std::vector<Eigen::MatrixXd> Ls(Lw.size());
+  for (size_t c = 0; c < Lw.size(); ++c) {
+    Eigen::MatrixXd M = Eigen::MatrixXd::Zero(m, m);
+    for (size_t r = 0; r < dof_idx.size(); ++r)
+      for (size_t q = 0; q < dof_idx.size(); ++q)
+        M((int)r, (int)q) = Lw[c](dof_idx[r], dof_idx[q]);
+    if (nf > 0)
+      M.bottomRightCorner(nf, nf) = cfg_.stage_feat_gain * feat[c] * feat[c].transpose();
+    Ls[c] = std::move(M);
+  }
+  double me = 0.0;
+  std::vector<int> sel = WindowScorer::select_logdet(Ls, spans, K, cfg_.select_overlap_penalty, &me);
+  if (min_eig_out)
+    *min_eig_out = me;
+  if (cfg_.verbose)
+    std::printf("[session] stage-select %s: %d/%d windows (dofs %d + feat %d, whitened min-eig %.2e)\n", tag, (int)sel.size(),
+                (int)Lw.size(), (int)dof_idx.size(), nf, me);
+  return sel;
 }
 
 void CalibSessionRunner::solve_verify_commit_() {
@@ -1432,6 +1467,172 @@ void CalibSessionRunner::solve_verify_commit_() {
   // Read BEFORE A0, which frees/refreezes the flags internally.
   const bool imu_chain_free = calib_.imu.calib_dw || calib_.imu.calib_da || calib_.imu.calib_RAtoI || calib_.imu.calib_tg;
 
+  // ---- Task 8: stage-specific D-optimal subsets (selection-side only) ----
+  // Same candidate pool + whitened one-pass information as the master
+  // selection above (which keeps the abort floor and is the fallback set);
+  // per-stage objectives are defined in the plan header. Stage sets only
+  // re-route which windows each stage SOLVES.
+  std::vector<WindowData> fused_a0, fused_a1, fused_b;
+  std::vector<int> slot_a0, slot_a1, slot_b;
+  std::vector<WindowData> *w_a0 = &fused, *w_a1 = &fused, *w_b = &fused;
+  if (cfg_.stage_select) {
+    std::vector<int> idx_a0, idx_a1, idx_b;
+    {
+      int off = 0;
+      for (auto &b : calib_.free_blocks()) {
+        const bool sA0 = (b.name == "q_ItoC" || b.name == "p_IinC" || b.name == "td" || b.name == "tr");
+        const bool sA1 = (b.name == "dw" || b.name == "da" || b.name == "q_AtoI" || b.name == "tg");
+        const bool sB = (b.name == "cam" || b.name == "tr");
+        for (int k = 0; k < b.lsize; ++k) {
+          if (sA0) idx_a0.push_back(off + k);
+          if (sA1) idx_a1.push_back(off + k);
+          if (sB) idx_b.push_back(off + k);
+        }
+        off += b.lsize;
+      }
+    }
+    const int N = (int)Lw.size();
+    int n_tr = 0;
+    for (const CamCalib &kc : calib_.cams)
+      n_tr += kc.free_tr ? 1 : 0;
+    // gravity-direction convention: SET-level rule mirroring the accel gate
+    // (seeded and mean directions have opposite sign conventions; never mix)
+    int n_gseed = 0;
+    for (int i = 0; i < N; ++i) {
+      const WindowData &w = slots_[cand_slot[i]];
+      const double gn = w.has_seeds ? w.seed_grav.norm() : 0.0;
+      if (std::isfinite(gn) && gn > 5.0 && gn < 15.0)
+        n_gseed++;
+    }
+    const bool use_seed_dir = (n_gseed >= 2);
+    std::vector<Eigen::VectorXd> fA0(N), fA1(N), fB(N);
+    for (int i = 0; i < N; ++i) {
+      const WindowData &w = slots_[cand_slot[i]];
+      const Eigen::Matrix<double, 12, 1> nfp =
+          scorer_->meta(cand_slot[i]).fingerprint.cwiseQuotient(cfg_.scorer.fp_scale);
+      Eigen::VectorXd g0 = Eigen::VectorXd::Zero(4 + 2 * n_tr);
+      g0.head<4>() << nfp(0), nfp(1), nfp(2), nfp(6);
+      // A1: specific-force direction x magnitude (gate formulas, :1539-1564)
+      Eigen::Vector3d m3 = Eigen::Vector3d::Zero();
+      double s1 = 0.0, s2 = 0.0;
+      for (const RawImu &s : w.imu) {
+        m3 += s.am;
+        const double a = s.am.norm();
+        s1 += a;
+        s2 += a * a;
+      }
+      const int nimu = (int)w.imu.size();
+      Eigen::Vector3d ghat = Eigen::Vector3d::Zero();
+      double dyn = 0.0;
+      if (nimu >= 2) {
+        s1 /= nimu;
+        dyn = std::sqrt(std::max(0.0, s2 / nimu - s1 * s1));
+        if (use_seed_dir) {
+          const double gn = w.has_seeds ? w.seed_grav.norm() : 0.0;
+          if (std::isfinite(gn) && gn > 5.0 && gn < 15.0)
+            ghat = w.seed_grav / gn;
+        } else {
+          const double mn = (m3 / nimu).norm();
+          if (std::isfinite(mn) && mn > 5.0 && mn < 15.0)
+            ghat = m3 / (double)nimu / mn;
+        }
+      }
+      Eigen::VectorXd g1(4);
+      g1 << ghat, dyn / std::max(cfg_.a_full_dyn_gate, 1e-6);
+      // B: per-camera radial/quadrant fractions about the CURRENT center
+      // (identical geometry to the phase-B gate loop) + per-rolling-cam rows
+      Eigen::VectorXd gb = Eigen::VectorXd::Zero(5 * n_cams_ + 2 * n_tr);
+      int tri = 0;
+      for (int c = 0; c < n_cams_; ++c) {
+        const CamCalib &kc = calib_.cams[(size_t)c];
+        const double cx = kc.cam(2), cy = kc.cam(3);
+        const double r_max = std::hypot(std::max(cx, kc.img_w - cx), std::max(cy, kc.img_h - cy));
+        double n_all = 0, n_far = 0, nq[4] = {0, 0, 0, 0}, rs1 = 0, rs2 = 0;
+        for (const auto &cl : w.obs)
+          for (const CloneObs &o : cl) {
+            if (o.cam != c)
+              continue;
+            n_all += 1.0;
+            if (std::hypot(o.uv(0) - cx, o.uv(1) - cy) > 0.7 * r_max)
+              n_far += 1.0;
+            nq[(o.uv(0) >= cx ? 1 : 0) + (o.uv(1) >= cy ? 2 : 0)] += 1.0;
+            rs1 += o.u_frac;
+            rs2 += o.u_frac * o.u_frac;
+          }
+        if (n_all > 0) {
+          gb(5 * c + 0) = (n_far / n_all) / cfg_.k34_radial_gate;
+          for (int q = 0; q < 4; ++q)
+            gb(5 * c + 1 + q) = (nq[q] / n_all) / (4.0 * cfg_.cam_center_quadrant_gate);
+        }
+        if (kc.free_tr) {
+          const double rm = (n_all > 0) ? rs1 / n_all : 0.5;
+          const double rv = (n_all > 1) ? std::max(0.0, rs2 / n_all - rm * rm) : 0.0;
+          g0(4 + 2 * tri) = gb(5 * n_cams_ + 2 * tri) = (rm - 0.5) / 0.25;
+          g0(4 + 2 * tri + 1) = gb(5 * n_cams_ + 2 * tri + 1) = std::sqrt(rv) / 0.25;
+          ++tri;
+        }
+      }
+      fA0[i] = g0;
+      fA1[i] = g1;
+      fB[i] = gb;
+    }
+    const int Ka0 = cfg_.select_K_a0 > 0 ? cfg_.select_K_a0 : cfg_.select_K;
+    const int Ka1 = cfg_.select_K_a1 > 0 ? cfg_.select_K_a1 : cfg_.select_K;
+    const int Kb = cfg_.select_K_b > 0 ? cfg_.select_K_b : cfg_.select_K;
+    for (int i : select_stage_("A0", Lw, spans, idx_a0, fA0, Ka0, &rep_.min_eig_a0)) {
+      fused_a0.push_back(slots_[cand_slot[i]]);
+      slot_a0.push_back(cand_slot[i]);
+    }
+    if (!fused_a0.empty())
+      w_a0 = &fused_a0;
+    if (imu_chain_free) {
+      for (int i : select_stage_("A1", Lw, spans, idx_a1, fA1, Ka1, &rep_.min_eig_a1)) {
+        fused_a1.push_back(slots_[cand_slot[i]]);
+        slot_a1.push_back(cand_slot[i]);
+      }
+      if (!fused_a1.empty())
+        w_a1 = &fused_a1;
+    }
+    if (cfg_.cam_mode > 0) {
+      for (int i : select_stage_("B", Lw, spans, idx_b, fB, Kb, &rep_.min_eig_b)) {
+        fused_b.push_back(slots_[cand_slot[i]]);
+        slot_b.push_back(cand_slot[i]);
+      }
+      if (!fused_b.empty())
+        w_b = &fused_b;
+    }
+    rep_.windows_a0 = (int)w_a0->size();
+    rep_.windows_a1 = (int)w_a1->size();
+    rep_.windows_b = (int)w_b->size();
+  }
+
+  // ---- C3 (tr row-coverage gate) -- BEFORE A0, because free_tr is live from A0 on.
+  // With t(row) = t_stamp + td + tr*u, weak row spread gives corr(td,tr) ~ -0.9: the
+  // session cannot separate readout from time offset, would EARN a junk tr and lend
+  // its error to td (the D10 silent-bias mechanism, now refused up front). Demand
+  // real observed-row spread (uniform rows = std 0.289) or freeze tr at its seed.
+  for (size_t c = 0; c < calib_.cams.size(); ++c) {
+    CamCalib &kc = calib_.cams[c];
+    if (!kc.free_tr)
+      continue;
+    double s0 = 0, s1 = 0, s2 = 0;
+    for (const WindowData &w : *w_a0)
+      for (const auto &cl : w.obs)
+        for (const CloneObs &o : cl)
+          if (o.cam == (int)c) {
+            s0 += 1;
+            s1 += o.u_frac;
+            s2 += o.u_frac * o.u_frac;
+          }
+    const double ustd = s0 > 1 ? std::sqrt(std::max(0.0, s2 / s0 - (s1 / s0) * (s1 / s0))) : 0.0;
+    if (ustd < cfg_.tr_row_cov_floor) {
+      kc.free_tr = false;
+      std::printf("[session] cam %zu: tr FROZEN at seed -- fused row-coverage std %.3f < %.3f "
+                  "(uniform = 0.289; without row spread tr aliases td)\n",
+                  c, ustd, cfg_.tr_row_cov_floor);
+    }
+  }
+
   // ---- phase A0: extrinsics + td only (IMU intrinsics frozen) ----
   // The ext/td subset is strongly observable and well conditioned; entering the
   // full-p solve from ITS optimum avoids the stiff dw/da-coupled valley from a
@@ -1445,7 +1646,7 @@ void CalibSessionRunner::solve_verify_commit_() {
     calib_.imu.calib_dw = calib_.imu.calib_da = calib_.imu.calib_RAtoI = false;
     calib_.imu.calib_tg = false;
     JointReport repA0;
-    const bool okA0 = JointCalib::solve(fused, calib_, arm_budget(jc_legacyA), repA0, nullptr, &store_); // A-chain legacy invariant
+    const bool okA0 = JointCalib::solve(*w_a0, calib_, arm_budget(jc_legacyA), repA0, nullptr, &store_); // A-chain legacy invariant
     note_stage_("A0-ext-td", repA0);
     if (!okA0) {
       enter_(RunnerState::ABORT, "joint solve (ext/td stage) failed");
@@ -1474,28 +1675,104 @@ void CalibSessionRunner::solve_verify_commit_() {
   {
     LinearSeedConfig strict = cfg_.seed;
     strict.drift_budget_ms2 = 0.0;
-    for (int i = (int)fused.size() - 1; i >= 0; --i) {
-      const int slot = fused_slot[i];
-      if (slot < 0 || slot >= (int)probation_.size() || !probation_[slot])
-        continue;
-      LinearSeedReport prr;
-      const bool pass = LinearSeed::seed_window(fused[i], calib_, fused[i].seed_bg, prr, strict);
-      if (!pass) {
-        rep_.windows_probation_dropped++;
-        if (cfg_.verbose)
-          std::printf("[session] probation window (slot %d) DROPPED at post-A0 strict re-check: metric %.3f m ang %.1f mrad\n", slot,
-                      prr.mean_ang_resid * prr.median_depth, 1e3 * prr.mean_ang_resid);
-        fused.erase(fused.begin() + i);
-        fused_slot.erase(fused_slot.begin() + i);
-        slots_[slot].clone_times.clear(); // exclude from every downstream consumer
-      } else if (cfg_.verbose) {
-        std::printf("[session] probation window (slot %d) cleared at post-A0: metric %.3f m\n", slot, prr.mean_ang_resid * prr.median_depth);
+    std::vector<std::pair<std::vector<WindowData> *, std::vector<int> *>> sets = {{&fused, &fused_slot}};
+    if (cfg_.stage_select) {
+      if (w_a0 == &fused_a0) sets.push_back({&fused_a0, &slot_a0});
+      if (w_a1 == &fused_a1) sets.push_back({&fused_a1, &slot_a1});
+      if (w_b == &fused_b) sets.push_back({&fused_b, &slot_b});
+    }
+    std::map<int, bool> verdict; // slot -> strict re-seed pass (computed once)
+    for (auto &sp : sets) {
+      std::vector<WindowData> &vw = *sp.first;
+      std::vector<int> &vs = *sp.second;
+      for (int i = (int)vw.size() - 1; i >= 0; --i) {
+        const int slot = vs[i];
+        if (slot < 0 || slot >= (int)probation_.size() || !probation_[slot])
+          continue;
+        auto it = verdict.find(slot);
+        if (it == verdict.end()) {
+          LinearSeedReport prr;
+          const bool pass = LinearSeed::seed_window(vw[i], calib_, vw[i].seed_bg, prr, strict);
+          verdict[slot] = pass;
+          if (!pass) {
+            rep_.windows_probation_dropped++;
+            slots_[slot].clone_times.clear(); // exclude from every downstream consumer
+            if (cfg_.verbose)
+              std::printf("[session] probation window (slot %d) DROPPED at post-A0 strict re-check: metric %.3f m ang %.1f mrad\n",
+                          slot, prr.mean_ang_resid * prr.median_depth, 1e3 * prr.mean_ang_resid);
+          } else if (cfg_.verbose) {
+            std::printf("[session] probation window (slot %d) cleared at post-A0: metric %.3f m\n", slot,
+                        prr.mean_ang_resid * prr.median_depth);
+          }
+        } else if (it->second) {
+          LinearSeedReport prr; // identical inputs -> identical bytes: upgrade THIS copy's provenance too
+          LinearSeed::seed_window(vw[i], calib_, vw[i].seed_bg, prr, strict);
+        }
+        if (!verdict[slot]) {
+          vw.erase(vw.begin() + i);
+          vs.erase(vs.begin() + i);
+        }
       }
     }
     rep_.windows_fused = (int)fused.size();
-    if (fused.empty()) {
-      enter_(RunnerState::ABORT, "probation re-check emptied the fused set (geometry-failure windows only)");
+    if (fused.empty() || w_a0->empty() || (imu_chain_free && w_a1->empty()) || (cfg_.cam_mode > 0 && w_b->empty())) {
+      // OFF: every pointer aliases `fused`, and the legacy reason string is part of the
+      // parity surface (abort_reason ships in the report).
+      enter_(RunnerState::ABORT, cfg_.stage_select ? "probation re-check emptied a fused set (geometry-failure windows only)"
+                                                   : "probation re-check emptied the fused set (geometry-failure windows only)");
       return;
+    }
+    if (cfg_.stage_select) {
+      rep_.windows_a0 = (int)w_a0->size();
+      rep_.windows_a1 = (int)w_a1->size();
+      rep_.windows_b = (int)w_b->size();
+    }
+  }
+  // ---- S_A1 half-balance guard: the split/wald falsifiers slice BY TIME ----
+  if (cfg_.stage_select && cfg_.stage_a1_balance_guard && imu_chain_free && w_a1 == &fused_a1) {
+    std::vector<std::pair<double, Eigen::Vector3d>> tdir;
+    int n_gs = 0;
+    for (const WindowData &w : fused_a1) {
+      const double gn = w.has_seeds ? w.seed_grav.norm() : 0.0;
+      if (std::isfinite(gn) && gn > 5.0 && gn < 15.0)
+        n_gs++;
+    }
+    for (const WindowData &w : fused_a1) {
+      Eigen::Vector3d m3 = Eigen::Vector3d::Zero();
+      for (const RawImu &s : w.imu)
+        m3 += s.am;
+      Eigen::Vector3d d = Eigen::Vector3d::Zero();
+      if (n_gs >= 2) {
+        const double gn = w.has_seeds ? w.seed_grav.norm() : 0.0;
+        if (std::isfinite(gn) && gn > 5.0 && gn < 15.0)
+          d = w.seed_grav / gn;
+      } else if (!w.imu.empty()) {
+        const double mn = (m3 / (double)w.imu.size()).norm();
+        if (std::isfinite(mn) && mn > 5.0 && mn < 15.0)
+          d = m3 / (double)w.imu.size() / mn;
+      }
+      tdir.push_back({w.clone_times.empty() ? 0.0 : w.clone_times.front(), d});
+    }
+    std::sort(tdir.begin(), tdir.end(),
+              [](const auto &a, const auto &b) { return a.first < b.first; });
+    const size_t mid = tdir.size() / 2;
+    double spread[2] = {0.0, 0.0};
+    int nwin[2] = {(int)mid, (int)(tdir.size() - mid)};
+    for (int h = 0; h < 2; ++h) {
+      const size_t lo = h ? mid : 0, hi = h ? tdir.size() : mid;
+      for (size_t i = lo; i < hi; ++i)
+        for (size_t j = i + 1; j < hi; ++j)
+          if (tdir[i].second.norm() > 0.5 && tdir[j].second.norm() > 0.5)
+            spread[h] = std::max(spread[h],
+                                 std::acos(std::min(1.0, std::max(-1.0, tdir[i].second.dot(tdir[j].second)))) * 180.0 / M_PI);
+    }
+    if (std::min(nwin[0], nwin[1]) < 3 || std::min(spread[0], spread[1]) < 0.5 * cfg_.a_full_att_gate_deg) {
+      w_a1 = &fused;
+      rep_.stage_a1_fallback = true;
+      rep_.windows_a1 = (int)fused.size();
+      if (cfg_.verbose)
+        std::printf("[session] stage-select A1 GUARD: time-halves starved (n %d/%d, spread %.0f/%.0f deg) — master set\n",
+                    nwin[0], nwin[1], spread[0], spread[1]);
     }
   }
   // ---- accel-chain excitation gate (decides A1b BEFORE any accel dof moves) ----
@@ -1512,7 +1789,7 @@ void CalibSessionRunner::solve_verify_commit_() {
     std::vector<Eigen::Vector3d> gseed, gmean;
     double dyn_sum = 0.0;
     int dyn_n = 0;
-    for (const WindowData &w : fused) {
+    for (const WindowData &w : *w_a1) {
       Eigen::Vector3d m = Eigen::Vector3d::Zero();
       double s1 = 0.0, s2 = 0.0;
       for (const RawImu &s : w.imu) {
@@ -1545,10 +1822,10 @@ void CalibSessionRunner::solve_verify_commit_() {
   // below and at A1b entry. tg may only open WITH the accel chain, never instead of it.
   bool tg_open = false;
   const bool a_pre_gate = (rep_.accel_att_spread_deg >= cfg_.a_full_att_gate_deg) && (rep_.accel_dyn_ms2 >= cfg_.a_full_dyn_gate) &&
-                          ((int)fused.size() >= cfg_.a_full_min_windows) && calib_.imu.calib_da && calib_.imu.calib_RAtoI;
+                          ((int)w_a1->size() >= cfg_.a_full_min_windows) && calib_.imu.calib_da && calib_.imu.calib_RAtoI;
   if (cfg_.verbose && calib_.imu.calib_da)
     std::printf("[session] accel excitation: attitude spread %.1f deg, dynamics %.2f m/s^2, %d windows -> full-chain pre-gate %s\n",
-                rep_.accel_att_spread_deg, rep_.accel_dyn_ms2, (int)fused.size(), a_pre_gate ? "open (split-half decides)" : "CLOSED");
+                rep_.accel_att_spread_deg, rep_.accel_dyn_ms2, (int)w_a1->size(), a_pre_gate ? "open (split-half decides)" : "CLOSED");
 
   // ---- A-chain short circuit: nothing to unlock ----
   // The A1 stages exist ONLY to estimate the IMU intrinsic chain. When every IMU
@@ -1575,18 +1852,30 @@ void CalibSessionRunner::solve_verify_commit_() {
   std::vector<WindowWarmState> warm_a1a; // the Wald gate's linearization states (accepted-point optima)
   if (imu_chain_free) {
     const bool f_qa = calib_.imu.calib_RAtoI;
-    const bool f_tg_a1a = calib_.imu.calib_tg;
     calib_.imu.calib_RAtoI = false;
-    calib_.imu.calib_tg = false; // tg unlocks only through the A1b full-chain gate, like q_AtoI
+    // tg stays FREE through A1a as a NUISANCE (session flag; a frozen chain never gets here with
+    // tg on). Its COMMIT still unlocks only through the A1b gate — the gate-closure paths below
+    // revert both the flag AND the value to seed. Why not frozen "like q_AtoI": conditioning the
+    // dw/da-diag stage on tg = seed(0) is a MODEL statement the data can falsify — on a rig with
+    // a real part-class Tg the stage absorbs Tg*a_hat into dw/da-diag, and every downstream judge
+    // inherits the contaminated entry (T1 measured: frozen-judge dqA 0.583 deg / worst z 1.65 vs
+    // 0.91 at Tg=0; entry-decontamination via A0-entered halves halves the scatter but loses the
+    // anchor). A Tg~0 rig fits ~0 under the 1e-3 prior — harmless by construction.
     const bool okA1a =
-        JointCalib::solve(fused, calib_, arm_budget(jc_imu), rep_.joint, nullptr, &store_, &warm_a1a); // legacy via jc_imu(jc_legacyA)
+        JointCalib::solve(*w_a1, calib_, arm_budget(jc_imu), rep_.joint, nullptr, &store_, &warm_a1a); // legacy via jc_imu(jc_legacyA)
     note_stage_("A1a-dw-dadiag", rep_.joint);
     if (!okA1a) {
       enter_(RunnerState::ABORT, "joint solve failed");
       return;
     }
     calib_.imu.calib_RAtoI = f_qa;
-    calib_.imu.calib_tg = f_tg_a1a;
+    if (cfg_.verbose && calib_.imu.calib_tg) {
+      const Eigen::Map<const Eigen::Matrix<double, 9, 1>> tv(calib_.imu.Tg.data());
+      std::printf("[session] A1a tg (nuisance): |Tg| %.3f deg/s @1g, el(storage):", calib_.imu.Tg.rowwise().norm().maxCoeff() * 9.81 * 180.0 / M_PI);
+      for (int k = 0; k < 9; ++k)
+        std::printf(" %+.2e", tv(k));
+      std::printf("\n");
+    }
   }
 
   // ---- A1b unlock: SPLIT-HALF consistency from the A1a point ----
@@ -1604,8 +1893,10 @@ void CalibSessionRunner::solve_verify_commit_() {
             ? cfg_.solve_budget_s - std::chrono::duration<double>(std::chrono::steady_clock::now() - t_solve0).count()
             : 1e9;
     SessionReport::AccelGateVerdict tg_v = SessionReport::AccelGateVerdict::WALD_UNOBSERVABLE;
-    rep_.a_wald_verdict = wald_accel_gate_(fused, warm_a1a, budget_left, &tg_v);
+    rep_.a_wald_verdict = wald_accel_gate_(*w_a1, warm_a1a, budget_left, &tg_v);
     rep_.a_full_open = (rep_.a_wald_verdict == SessionReport::AccelGateVerdict::WALD_CONSISTENT);
+    if (calib_.tg_enabled)
+      rep_.tg_gate_verdict = tg_v;
     tg_open = rep_.a_full_open && calib_.tg_enabled && tg_v == SessionReport::AccelGateVerdict::WALD_CONSISTENT;
     if (cfg_.verbose && calib_.tg_enabled && rep_.a_full_open)
       std::printf("[session] tg gate: %s\n", tg_open ? "CONSISTENT (tg unlocked with the chain)"
@@ -1613,22 +1904,25 @@ void CalibSessionRunner::solve_verify_commit_() {
   } else if (a_pre_gate) {
     // fused is in D-optimal SELECTION order; the split must be by TIME so the
     // halves straddle the session's thermal/drift evolution (the junk mode).
-    std::vector<size_t> torder(fused.size());
+    std::vector<size_t> torder(w_a1->size());
     for (size_t i = 0; i < torder.size(); ++i)
       torder[i] = i;
     std::sort(torder.begin(), torder.end(), [&](size_t a, size_t b) {
-      const double ta = fused[a].clone_times.empty() ? 0.0 : fused[a].clone_times.front();
-      const double tb = fused[b].clone_times.empty() ? 0.0 : fused[b].clone_times.front();
+      const double ta = (*w_a1)[a].clone_times.empty() ? 0.0 : (*w_a1)[a].clone_times.front();
+      const double tb = (*w_a1)[b].clone_times.empty() ? 0.0 : (*w_a1)[b].clone_times.front();
       return ta < tb;
     });
     const size_t mid = torder.size() / 2;
     std::vector<WindowData> h1, h2;
     for (size_t i = 0; i < torder.size(); ++i)
-      (i < mid ? h1 : h2).push_back(fused[torder[i]]);
+      (i < mid ? h1 : h2).push_back((*w_a1)[torder[i]]);
     SharedCalib c1 = calib_, c2 = calib_;
-    // The CHAIN is judged with tg FROZEN: a junk tg (true Tg ~ 0 fits noise differently per
-    // half) drags each half's da/qA and fails a certifiable chain — measured on S1 (0.23 deg
-    // ext / 1.13 deg qA regression with contaminated halves). tg gets its OWN half pair below.
+    // The CHAIN is judged with tg CONSTANT — held at the fused A1a nuisance estimate, the SAME
+    // value in both halves. Per-half tg fitting stays out of this judge (a junk tg fits noise
+    // differently per half and drags each half's da/qA — measured on S1: 0.23 deg ext / 1.13 deg
+    // qA regression with per-half-tg halves), while holding it at ZERO on a rig with a real Tg
+    // contaminates the halves the other way (measured on T1 before A1a freed tg as nuisance:
+    // dqA 0.583 deg / worst z 1.65 vs 0.91 at Tg=0). tg gets its OWN half pair below.
     c1.imu.calib_tg = false;
     c2.imu.calib_tg = false;
     JointReport r1, r2;
@@ -1655,7 +1949,7 @@ void CalibSessionRunner::solve_verify_commit_() {
     // by_uid, and the concurrent solves must only touch disjoint EXISTING
     // entries. Budgets are armed once, before launch, from the same instant
     // (identical max_wall_s in both configs — order-independent).
-    for (const WindowData &w : fused)
+    for (const WindowData &w : *w_a1)
       store_.ensure(w.uid);
     const JointConfig jc_h1 = arm_budget(jc_half), jc_h2 = arm_budget(jc_half);
     bool ok1 = false, ok2 = false;
@@ -1675,40 +1969,71 @@ void CalibSessionRunner::solve_verify_commit_() {
       // Band per dof: sigma term (precision) OR signal-fraction term (the
       // scale-free criterion — "the halves agree to a third of what they
       // claim to measure"). Junk modes scatter at the size of their own
-      // claimed signal and fail both.
-      bool agree = true;
-      double worst_z = 0.0;
-      for (int k = 0; k < 6; ++k) {
-        const std::string lab = "da[" + std::to_string(k) + "]";
-        const double signal = std::max(std::abs(c1.imu.da(k) - calib_.imu.da(k)), std::abs(c2.imu.da(k) - calib_.imu.da(k)));
-        const double band = std::max({cfg_.a_split_da_floor, cfg_.a_split_sigma_k * std::hypot(sig_of(r1, lab), sig_of(r2, lab)),
-                                      cfg_.a_split_signal_frac * signal});
-        const double z = std::abs(c1.imu.da(k) - c2.imu.da(k)) / band;
-        worst_z = std::max(worst_z, z);
-        agree = agree && (z <= 1.0);
-      }
-      double sq = 0.0;
-      for (int k = 0; k < 3; ++k) {
-        const std::string lab = "q_AtoI[" + std::to_string(k) + "]";
-        sq = std::max(sq, std::hypot(sig_of(r1, lab), sig_of(r2, lab)));
-      }
+      // claimed signal and fail both. One judge, reused verbatim across the
+      // frozen-tg pair and the tg-free re-judge below.
       auto qangle = [](const Eigen::Vector4d &qa, const Eigen::Vector4d &qb) {
         return 2.0 * ov_core::quat_multiply(qa, ov_core::Inv(qb)).head<3>().norm() * 180.0 / M_PI;
       };
-      const double dqa = qangle(c1.imu.q_AtoI, c2.imu.q_AtoI);
-      const double qa_signal = std::max(qangle(c1.imu.q_AtoI, calib_.imu.q_AtoI), qangle(c2.imu.q_AtoI, calib_.imu.q_AtoI));
-      const double qa_band = std::max({cfg_.a_split_qa_floor_deg, cfg_.a_split_sigma_k * sq * 180.0 / M_PI,
-                                       cfg_.a_split_signal_frac * qa_signal});
-      worst_z = std::max(worst_z, dqa / qa_band);
-      agree = agree && (dqa <= qa_band);
+      struct ChainJudge {
+        bool agree = false;
+        double worst_z = 0.0, dqa = 0.0, qa_signal = 0.0, qa_band = 0.0;
+      };
+      auto judge_chain = [&](const SharedCalib &h1c, const SharedCalib &h2c, const JointReport &hr1, const JointReport &hr2,
+                             const SharedCalib &ref) {
+        ChainJudge j;
+        j.agree = true;
+        for (int k = 0; k < 6; ++k) {
+          const std::string lab = "da[" + std::to_string(k) + "]";
+          const double signal = std::max(std::abs(h1c.imu.da(k) - ref.imu.da(k)), std::abs(h2c.imu.da(k) - ref.imu.da(k)));
+          const double band = std::max({cfg_.a_split_da_floor, cfg_.a_split_sigma_k * std::hypot(sig_of(hr1, lab), sig_of(hr2, lab)),
+                                        cfg_.a_split_signal_frac * signal});
+          const double z = std::abs(h1c.imu.da(k) - h2c.imu.da(k)) / band;
+          j.worst_z = std::max(j.worst_z, z);
+          j.agree = j.agree && (z <= 1.0);
+        }
+        double sq = 0.0;
+        for (int k = 0; k < 3; ++k) {
+          const std::string lab = "q_AtoI[" + std::to_string(k) + "]";
+          sq = std::max(sq, std::hypot(sig_of(hr1, lab), sig_of(hr2, lab)));
+        }
+        j.dqa = qangle(h1c.imu.q_AtoI, h2c.imu.q_AtoI);
+        j.qa_signal = std::max(qangle(h1c.imu.q_AtoI, ref.imu.q_AtoI), qangle(h2c.imu.q_AtoI, ref.imu.q_AtoI));
+        j.qa_band = std::max({cfg_.a_split_qa_floor_deg, cfg_.a_split_sigma_k * sq * 180.0 / M_PI,
+                              cfg_.a_split_signal_frac * j.qa_signal});
+        j.worst_z = std::max(j.worst_z, j.dqa / j.qa_band);
+        j.agree = j.agree && (j.dqa <= j.qa_band);
+        return j;
+      };
+      ChainJudge jf = judge_chain(c1, c2, r1, r2, calib_); // the frozen-tg pair (the legacy judge, A1a-referenced)
+      bool agree = jf.agree;
+      bool rejudged = false;
+      ChainJudge jr; // the tg-free re-judge (retry arbitration; stats reported when it runs)
       rep_.a_full_open = agree;
       // tg's OWN falsifier: a second half pair with tg free (the same freedom A1b would grant),
-      // judged only on the tg elements — and only when the chain itself certified (A1b will not
-      // run otherwise). A real g-sensitivity reproduces between halves; a junk fit scatters at
-      // the size of its own claimed signal and fails signal_frac.
-      if (agree && calib_.tg_enabled) {
-        SharedCalib g1 = calib_, g2 = calib_;
+      // judged only on the tg elements. It runs when the chain certified (the tg unlock question)
+      // AND when it did not — the RETRY arbitration: the chain judge above CONDITIONS its halves
+      // on tg = seed, and a rig with a REAL part-class Tg falsifies that conditioning (each
+      // tg-frozen half absorbs Tg*a_hat into its own da/qA through its own excitation geometry —
+      // measured on the T1 synthetic: worst z 1.27 vs 0.91 at Tg=0, chain wrongly frozen). The
+      // wald judge (mode 1) marginalizes the tg columns and does not have this failure; here the
+      // conditioning choice is arbitrated by tg's own falsifier: certify a REPRODUCIBLE Tg first,
+      // then re-judge the chain on the SAME tg-free halves (zero extra solves). A junk tg refuses
+      // at the tg pair and the legacy freeze stands byte-identically.
+      if (calib_.tg_enabled) {
+        // The tg pair enters from the A0 point — A1b's OWN entry — not the A1a point the frozen
+        // pair uses. The pair's question is "will A1b's answer reproduce?", so the halves must be
+        // solved under A1b's conditions: A1a's dw/da-diag were solved with tg frozen at seed, so
+        // on a rig with a real Tg they carry its absorption, and halves entered there park in
+        // scattered (qA, tg) basins (T1 measured: dqA 0.583-0.630 deg vs the ~0.3 band, tg
+        // conditioning-invariant — entry contamination, the same basin mechanism that moved A1b
+        // itself from A1a-entry to A0-entry: 0.73 vs 0.57 deg).
+        SharedCalib g1 = calib_a0, g2 = calib_a0;
         JointReport gr1, gr2;
+        // (Budget note, MEASURED: doubling the pair's outer budget moved nothing — dqA 0.325 ->
+        // 0.327 deg on the T1 synthetic, both halves at their per-half stationary points either
+        // way. The residual per-half qA spread is the documented flat valley at the per-half
+        // information level — an EXCITATION property, not a solver-budget one — so the pair keeps
+        // the stage budget.)
         const JointConfig jc_g1 = arm_budget(jc_half), jc_g2 = arm_budget(jc_half);
         bool gok1 = false, gok2 = false;
         std::thread gth2([&] { gok2 = JointCalib::solve(h2, g2, jc_g2, gr2, nullptr, &store_); });
@@ -1719,30 +2044,83 @@ void CalibSessionRunner::solve_verify_commit_() {
         if (gok1 && gok2) {
           bool agree_tg = true;
           const Eigen::Map<const Eigen::Matrix<double, 9, 1>> t1(g1.imu.Tg.data()), t2(g2.imu.Tg.data()),
-              t0(calib_.imu.Tg.data());
+              t0(calib_a0.imu.Tg.data()); // signal referenced to the pair's OWN entry (byte-equal to calib_'s seed tg today)
           double worst_ztg = 0.0;
+          int worst_ktg = 0;
+          double worst_parts[4] = {0, 0, 0, 0}; // |d|, 3sig term, signal, band of the worst element
+          // tg sigma term carries the MEASURED exported-Lambda under-dispersion (a_info_deflate,
+          // VARIANCE semantics — the same kappa the wald judge applies to the same exports): the
+          // tg columns ride the chain nuisance, and the raw 3-sigma band refused halves whose |d|
+          // sat INSIDE the kappa-corrected posterior (T1 measured: |d| 1.22e-4 vs 3*sqrt(2)*hypot
+          // = 1.32e-4). da/qA bands stay untouched — their calibration is the validated corpus's.
+          const double kap_sig = std::sqrt(std::max(1.0, cfg_.a_info_deflate));
           for (int k = 0; k < 9; ++k) {
             const std::string lab = "tg[" + std::to_string(k) + "]";
             const double signal = std::max(std::abs(t1(k) - t0(k)), std::abs(t2(k) - t0(k)));
-            const double band = std::max({cfg_.a_split_tg_floor, cfg_.a_split_sigma_k * std::hypot(sig_of(gr1, lab), sig_of(gr2, lab)),
-                                          cfg_.a_split_signal_frac * signal});
+            const double sig3 = cfg_.a_split_sigma_k * kap_sig * std::hypot(sig_of(gr1, lab), sig_of(gr2, lab));
+            const double band = std::max({cfg_.a_split_tg_floor, sig3, cfg_.a_split_signal_frac * signal});
             const double z = std::abs(t1(k) - t2(k)) / band;
-            worst_ztg = std::max(worst_ztg, z);
+            if (z > worst_ztg) {
+              worst_ztg = z;
+              worst_ktg = k;
+              worst_parts[0] = std::abs(t1(k) - t2(k));
+              worst_parts[1] = sig3;
+              worst_parts[2] = signal;
+              worst_parts[3] = band;
+            }
             agree_tg = agree_tg && (z <= 1.0);
           }
-          tg_open = agree_tg;
+          if (cfg_.verbose) { // which element carried the verdict, and which band term bound it
+            std::printf("[session] split-half tg worst element [%d]: |d| %.2e vs band %.2e (floor %.1e | 3*sqrt(kap)*sig %.2e | %.2f*signal %.2e)\n",
+                        worst_ktg, worst_parts[0], worst_parts[3], cfg_.a_split_tg_floor, worst_parts[1],
+                        cfg_.a_split_signal_frac, cfg_.a_split_signal_frac * worst_parts[2]);
+            std::printf("[session] split-half tg halves: |Tg1| %.3f |Tg2| %.3f deg/s @1g; half qA-from-entry %.3f / %.3f deg\n",
+                        g1.imu.Tg.rowwise().norm().maxCoeff() * 9.81 * 180.0 / M_PI,
+                        g2.imu.Tg.rowwise().norm().maxCoeff() * 9.81 * 180.0 / M_PI,
+                        qangle(g1.imu.q_AtoI, calib_a0.imu.q_AtoI), qangle(g2.imu.q_AtoI, calib_a0.imu.q_AtoI));
+          }
+          rep_.tg_gate_verdict =
+              agree_tg ? SessionReport::AccelGateVerdict::SPLIT_CONSISTENT : SessionReport::AccelGateVerdict::SPLIT_INCONSISTENT;
+          if (agree) {
+            tg_open = agree_tg; // legacy path: chain certified, tg unlocks with it (or not)
+          } else if (agree_tg) {
+            // RETRY: a reproducible Tg falsified the frozen-tg conditioning — re-judge the chain
+            // on the tg-free A0-entered halves already solved above (A1b's own conditions;
+            // signal/claim referenced to THEIR entry). Opens BOTH or NEITHER (tg may only open
+            // with the chain).
+            rejudged = true;
+            jr = judge_chain(g1, g2, gr1, gr2, calib_a0);
+            if (jr.agree) {
+              agree = true;
+              rep_.a_full_open = true;
+              tg_open = true;
+            }
+          }
           if (cfg_.verbose)
             std::printf("[session] split-half tg: worst z %.2f -> %s\n", worst_ztg,
-                        tg_open ? "CONSISTENT (tg unlocks with the chain)" : "not certified (tg stays at its seed)");
-        } else if (cfg_.verbose) {
-          std::printf("[session] split-half tg: half-solve failed -> tg stays at its seed\n");
+                        agree_tg ? (tg_open ? "CONSISTENT (tg unlocks with the chain)" : "CONSISTENT, but the chain did not certify -> tg stays at its seed")
+                                 : "not certified (tg stays at its seed)");
+        } else {
+          rep_.tg_gate_verdict = SessionReport::AccelGateVerdict::SPLIT_FAILED;
+          if (cfg_.verbose)
+            std::printf("[session] split-half tg: half-solve failed -> tg stays at its seed\n");
         }
       }
       rep_.a_wald_verdict =
           agree ? SessionReport::AccelGateVerdict::SPLIT_CONSISTENT : SessionReport::AccelGateVerdict::SPLIT_INCONSISTENT;
-      if (cfg_.verbose)
-        std::printf("[session] split-half accel chain: dqA %.3f deg (signal %.3f, band %.3f), worst z %.2f -> %s\n", dqa, qa_signal,
-                    qa_band, worst_z, agree ? "CONSISTENT (A1b unlocked)" : "INCONSISTENT (chain frozen at A1a)");
+      if (cfg_.verbose) {
+        std::printf("[session] split-half accel chain (tg-frozen judge): dqA %.3f deg (signal %.3f, band %.3f), worst z %.2f -> %s "
+                    "[half qA-from-entry %.3f / %.3f deg]\n",
+                    jf.dqa, jf.qa_signal, jf.qa_band, jf.worst_z,
+                    jf.agree ? "CONSISTENT (A1b unlocked)"
+                             : (rejudged ? "INCONSISTENT (conditioning suspect: real tg certified)" : "INCONSISTENT (chain frozen at A1a)"),
+                    qangle(c1.imu.q_AtoI, calib_.imu.q_AtoI), qangle(c2.imu.q_AtoI, calib_.imu.q_AtoI));
+        if (rejudged)
+          std::printf("[session] split-half accel chain RE-JUDGED on the tg-free halves: dqA %.3f deg (signal %.3f, band %.3f), "
+                      "worst z %.2f -> %s\n",
+                      jr.dqa, jr.qa_signal, jr.qa_band, jr.worst_z,
+                      jr.agree ? "CONSISTENT (A1b + tg unlocked)" : "INCONSISTENT (chain frozen at A1a; tg stays at its seed)");
+      }
     } else {
       rep_.a_wald_verdict = SessionReport::AccelGateVerdict::SPLIT_FAILED;
       if (cfg_.verbose)
@@ -1755,25 +2133,36 @@ void CalibSessionRunner::solve_verify_commit_() {
           cfg_.solve_budget_s > 0.0
               ? cfg_.solve_budget_s - std::chrono::duration<double>(std::chrono::steady_clock::now() - t_solve0).count()
               : 1e9;
-      const auto shadow = wald_accel_gate_(fused, warm_a1a, budget_left);
-      if (cfg_.verbose)
-        std::printf("[session] wald gate SHADOW verdict: %s (split-half decided %s)\n",
-                    shadow == SessionReport::AccelGateVerdict::WALD_CONSISTENT     ? "CONSISTENT"
-                    : shadow == SessionReport::AccelGateVerdict::WALD_INCONSISTENT ? "INCONSISTENT"
-                                                                                   : "UNOBSERVABLE",
+      SessionReport::AccelGateVerdict sh_tg = SessionReport::AccelGateVerdict::WALD_UNOBSERVABLE;
+      const auto shadow = wald_accel_gate_(*w_a1, warm_a1a, budget_left, calib_.tg_enabled ? &sh_tg : nullptr);
+      if (cfg_.verbose) {
+        auto vn = [](SessionReport::AccelGateVerdict v) {
+          return v == SessionReport::AccelGateVerdict::WALD_CONSISTENT     ? "CONSISTENT"
+                 : v == SessionReport::AccelGateVerdict::WALD_INCONSISTENT ? "INCONSISTENT"
+                                                                           : "UNOBSERVABLE";
+        };
+        std::printf("[session] wald gate SHADOW verdict: %s (split-half decided %s)\n", vn(shadow),
                     rep_.a_full_open ? "CONSISTENT" : "INCONSISTENT");
+        if (calib_.tg_enabled)
+          std::printf("[session] wald tg SHADOW verdict: %s (split-half tg decided %s)\n", vn(sh_tg),
+                      tg_open ? "CONSISTENT" : "not certified");
+      }
     }
   }
 
   // Gate closed: q_AtoI AND tg stay at the seed for the REST of the session (phase B re-solves
   // the full vector and must not silently reopen them; commit/writeback ship the seed values
   // exactly like the --no-imu-intrinsics ablation). A chain that opened WITHOUT a certified tg
-  // freezes tg alone.
+  // freezes tg alone. tg's VALUE reverts with its flag: A1a estimated it as a nuisance, and an
+  // uncertified nuisance estimate must not ride into phase B / the commit walk as a "seed"
+  // passenger (it would ship OUTSIDE committed_blocks).
   if (!rep_.a_full_open) {
     calib_.imu.calib_RAtoI = false;
     calib_.imu.calib_tg = false;
+    calib_.imu.Tg = calib_postboot.imu.Tg;
   } else if (!tg_open) {
     calib_.imu.calib_tg = false;
+    calib_.imu.Tg = calib_postboot.imu.Tg;
   }
 
   // ---- phase A1b: full accel chain (unlocked only), entered from the A0
@@ -1786,12 +2175,12 @@ void CalibSessionRunner::solve_verify_commit_() {
     SharedCalib calib_a1a = calib_;
     calib_ = calib_a0; // restores session flags, INCLUDING calib_tg -- re-apply the tg verdict
     if (!tg_open)
-      calib_.imu.calib_tg = false;
+      calib_.imu.calib_tg = false; // calib_a0's tg VALUE is the seed already (A0 never solves tg)
     JointReport repA1b;
     JointConfig jcA1b = jc_legacyA;
     if (cfg_.p4)
       jcA1b.fused_polish_accepts = 2; // close the capped-trajectory residual at the stage that feeds B
-    const bool okA1b = JointCalib::solve(fused, calib_, arm_budget(jcA1b), repA1b, nullptr, &store_); // A-chain legacy invariant
+    const bool okA1b = JointCalib::solve(*w_a1, calib_, arm_budget(jcA1b), repA1b, nullptr, &store_); // A-chain legacy invariant
     note_stage_("A1b-full", repA1b);
     if (okA1b) {
       rep_.joint = repA1b;
@@ -1799,9 +2188,13 @@ void CalibSessionRunner::solve_verify_commit_() {
       calib_ = calib_a1a; // best-effort stage: the A1a point stands
       calib_.imu.calib_RAtoI = false;
       calib_.imu.calib_tg = false;
+      calib_.imu.Tg = calib_postboot.imu.Tg; // calib_a1a carries A1a's nuisance tg — revert with the flag
       rep_.a_full_open = false;
     }
   }
+  // tg's final unlock state, ONE authority: the flag can only survive to here when the chain
+  // certified, tg's own falsifier certified, and A1b accepted (every closed path froze it above).
+  rep_.tg_open = calib_.imu.calib_tg;
 
   // ---- phase B (S5): staged camera-intrinsic refinement AFTER temporal/IMU ----
   if (cfg_.cam_mode > 0) {
@@ -1816,7 +2209,8 @@ void CalibSessionRunner::solve_verify_commit_() {
       const CamCalib &kc = calib_.cams[(size_t)c];
       const double cx = kc.cam(2), cy = kc.cam(3);
       const double r_max = std::hypot(std::max(cx, kc.img_w - cx), std::max(cy, kc.img_h - cy));
-      for (const WindowData &w : fused)
+      double nq[4] = {0, 0, 0, 0};
+      for (const WindowData &w : *w_b)
         for (const auto &obs : w.obs)
           for (const auto &o : obs) {
             if (o.cam != c)
@@ -1824,15 +2218,30 @@ void CalibSessionRunner::solve_verify_commit_() {
             n_all[(size_t)c] += 1.0;
             if (std::hypot(o.uv(0) - cx, o.uv(1) - cy) > 0.7 * r_max)
               n_far[(size_t)c] += 1.0;
+            nq[(o.uv(0) >= cx ? 1 : 0) + (o.uv(1) >= cy ? 2 : 0)] += 1.0;
           }
       const bool k34_free = (n_all[(size_t)c] > 0.0) && (n_far[(size_t)c] / n_all[(size_t)c] >= cfg_.k34_radial_gate);
       if (k34_free) {
         jc.cam_prior_vec[(size_t)c](6) = jc.cam_prior_vec[(size_t)c](4); // open k3/k4 at the k1/k2 scale
         jc.cam_prior_vec[(size_t)c](7) = jc.cam_prior_vec[(size_t)c](5);
       }
+      // C1 (quadrant-coverage center gate): cx/cy separate from distortion only when the data
+      // BRACKETS the center -- with a quadrant starved, the center walks into a self-consistent
+      // basin and commits (the v5 wander: cy +2.9 px shipped). Freeze cx/cy at seed through the
+      // same prior-sigma mechanism as k3/k4; the D2 frozen-dof exclusion keeps the cam block
+      // committable with the frozen pair shipping seed values.
+      const double minq = (n_all[(size_t)c] > 0.0)
+                              ? std::min(std::min(nq[0], nq[1]), std::min(nq[2], nq[3])) / n_all[(size_t)c]
+                              : 0.0;
+      const bool center_free = minq >= cfg_.cam_center_quadrant_gate;
+      if (!center_free && cfg_.cam_mode > 0) {
+        jc.cam_prior_vec[(size_t)c](2) = 1e-9;
+        jc.cam_prior_vec[(size_t)c](3) = 1e-9;
+      }
       if (cfg_.verbose)
-        std::printf("[session] phase B cam %d: cam_mode=%d, radial coverage %.1f%% -> k3/k4 %s\n", c, cfg_.cam_mode,
-                    100.0 * n_far[(size_t)c] / std::max(n_all[(size_t)c], 1.0), k34_free ? "FREE" : "frozen");
+        std::printf("[session] phase B cam %d: cam_mode=%d, radial coverage %.1f%% -> k3/k4 %s; quadrant min %.1f%% -> cx/cy %s\n",
+                    c, cfg_.cam_mode, 100.0 * n_far[(size_t)c] / std::max(n_all[(size_t)c], 1.0), k34_free ? "FREE" : "frozen",
+                    100.0 * minq, center_free ? "FREE" : "frozen (center not bracketed)");
     }
     // the A-stage accel staging governs the joint polish too (gate-closed da
     // off-diagonals must not silently reopen inside the full vector)
@@ -1874,13 +2283,13 @@ void CalibSessionRunner::solve_verify_commit_() {
           for (auto &v : ja.cam_prior_vec)
             v(6) = v(7) = 1e-9;
           JointReport repBa;
-          JointCalib::solve(fused, calib_, arm_budget(ja), repBa, &carry, &store_); // best-effort; the joint pass below is the arbiter
+          JointCalib::solve(*w_b, calib_, arm_budget(ja), repBa, &carry, &store_); // best-effort; the joint pass below is the arbiter
           note_stage_("B1a-pin-r" + std::to_string(round + 1), repBa);
           JointConfig jb = jc; // (b) distortion only; pinhole row frozen (k3/k4 per coverage gate)
           for (auto &v : jb.cam_prior_vec)
             v.head<4>().setConstant(1e-9);
           JointReport repBb;
-          JointCalib::solve(fused, calib_, arm_budget(jb), repBb, &carry, &store_);
+          JointCalib::solve(*w_b, calib_, arm_budget(jb), repBb, &carry, &store_);
           note_stage_("B1b-dist-r" + std::to_string(round + 1), repBb);
           if (cfg_.verbose)
             for (int c = 0; c < n_cams_; ++c) {
@@ -1902,12 +2311,12 @@ void CalibSessionRunner::solve_verify_commit_() {
           for (auto &v : jp.cam_prior_vec)
             v.tail<4>().setConstant(1e-9);
           JointReport repBp;
-          JointCalib::solve(fused, calib_, arm_budget(jp), repBp, &carry, &store_);
+          JointCalib::solve(*w_b, calib_, arm_budget(jp), repBp, &carry, &store_);
           note_stage_("B1-settle", repBp);
         }
       } else {
         JointReport repB1; // monolithic fallback (pre-directive behavior)
-        JointCalib::solve(fused, calib_, arm_budget(jc), repB1, &carry, &store_);
+        JointCalib::solve(*w_b, calib_, arm_budget(jc), repB1, &carry, &store_);
         note_stage_("B1-mono", repB1);
       }
       calib_.imu.calib_dw = f_dw;
@@ -1922,7 +2331,7 @@ void CalibSessionRunner::solve_verify_commit_() {
     // B-2: joint polish with the camera block open
     JointConfig jb2 = jc;
     jb2.cert_open_imu = cfg_.b2_cert; // qn-policing replaces plateau/anchor (profile-gated A/B)
-    const bool okB = JointCalib::solve(fused, calib_, arm_budget(jb2), repB, &carry, &store_);
+    const bool okB = JointCalib::solve(*w_b, calib_, arm_budget(jb2), repB, &carry, &store_);
     note_stage_("B2-polish", repB);
     // refinement-hurt detector: accept only if no cam dof of ANY camera moved > 3 prior-sigma.
     // Rig-wide, because a broken intrinsic aliases into ext/td and poisons the shared trajectory --
@@ -2057,6 +2466,33 @@ void CalibSessionRunner::solve_verify_commit_() {
             std::printf("[session] cam %d tr REFUSED on physics: %.4f ms outside (0, %.2f ms]\n", b.cam, 1e3 * kc.tr,
                         1e3 * frame_dt);
         }
+        // C3b (td-aliasing guard): even past the row-coverage gate the joint solve can
+        // park in a td/tr trade. rho from the joint posterior over THIS camera's (td, tr):
+        // |rho| at ~1 means the data never separated readout from time offset -- the pair
+        // is one degree of freedom wearing two names. Ship the seed, keep td honest.
+        if (bc.committed && rep_.joint.Lambda.size() > 0) {
+          int off_td = -1, off_tr = -1, o2 = 0;
+          for (auto &fb : calib_.free_blocks()) {
+            if (fb.cam == b.cam && fb.name == "td")
+              off_td = o2;
+            if (fb.cam == b.cam && fb.name == "tr")
+              off_tr = o2;
+            o2 += fb.lsize;
+          }
+          if (off_td >= 0 && off_tr >= 0 && o2 == rep_.joint.Lambda.rows()) {
+            const Eigen::MatrixXd Cov =
+                rep_.joint.Lambda.ldlt().solve(Eigen::MatrixXd::Identity(rep_.joint.Lambda.rows(), rep_.joint.Lambda.cols()));
+            const double rho =
+                Cov(off_td, off_tr) / std::sqrt(std::max(1e-30, Cov(off_td, off_td) * Cov(off_tr, off_tr)));
+            if (std::abs(rho) > cfg_.tr_td_corr_ceiling) {
+              bc.committed = false;
+              if (cfg_.verbose)
+                std::printf("[session] cam %d tr REFUSED on td-aliasing: |rho(td,tr)| %.3f > %.2f "
+                            "(row coverage did not separate them)\n",
+                            b.cam, std::abs(rho), cfg_.tr_td_corr_ceiling);
+            }
+          }
+        }
       }
       rep_.blocks.push_back(bc);
       off += b.lsize;
@@ -2110,6 +2546,8 @@ void CalibSessionRunner::solve_verify_commit_() {
       dst.imu.da = src.imu.da;
     else if (name == "q_AtoI")
       dst.imu.q_AtoI = src.imu.q_AtoI;
+    else if (name == "tg") // shared block (cam = -1): without this arm a REFUSED tg fell through the
+      dst.imu.Tg = src.imu.Tg; // per-camera guard below and SHIPPED its solved value (T2/T3 falsifier)
     else if (cam < 0 || (size_t)cam >= dst.cams.size())
       return; // a per-camera block with no camera is a layout bug, not a revert
     else if (name == "q_ItoC")
@@ -2291,7 +2729,7 @@ void CalibSessionRunner::solve_verify_commit_() {
     // layout — they are seed passengers too, and a writeback must know that. The IMU chain is
     // asked once; the camera blocks are asked once PER CAMERA, because a block can be free on one
     // camera and absent on another (a global-shutter camera has no tr to estimate at all).
-    for (const char *nm : {"dw", "da", "q_AtoI"}) {
+    for (const char *nm : {"dw", "da", "q_AtoI", "tg"}) {
       bool present = false;
       for (const auto &bc : rep_.blocks)
         present = present || (bc.cam < 0 && bc.name == nm);

@@ -80,6 +80,8 @@ int main(int argc, char **argv) {
   int cam_settle_ovr = -1, b2_cert_ovr = -1, a_candidate_ovr = -1, a_gate_mode_ovr = -1, p4_ovr = -1;
   double conv_tol_ovr = -1.0;
   int max_clones_ovr = -1, max_track_ovr = -1, a_carry_ovr = -1, fused_iters_ovr = -1, duel_accept_ovr = -1, threads_ovr = -1;
+  int stage_select_ovr = -1, k_a0_ovr = -1, k_a1_ovr = -1, k_b_ovr = -1;
+  int eoa_ovr = -1; // --export-on-accept {0|1}: forensic within-binary A/B of the deferred-export mechanism
   int cam_mode = 1; // refine by default (plan decision); --cam-mode 0 pins the existing intrinsics
   double tr_seed = 0.0, max_sec = 0.0, grav_mag = 9.80665;
   // vcc mechanical seed for --voxl (RPY_parent_to_child intrinsic-XYZ [deg], T_child_wrt_parent [m])
@@ -194,6 +196,14 @@ int main(int argc, char **argv) {
       window_iters_ovr = std::atoi(argv[++i]);
     else if (arg("--select-k") && i + 1 < argc)
       select_k_ovr = std::atoi(argv[++i]);
+    else if (arg("--stage-select"))
+      stage_select_ovr = 1;
+    else if (arg("--select-k-a0") && i + 1 < argc)
+      k_a0_ovr = std::atoi(argv[++i]);
+    else if (arg("--select-k-a1") && i + 1 < argc)
+      k_a1_ovr = std::atoi(argv[++i]);
+    else if (arg("--select-k-b") && i + 1 < argc)
+      k_b_ovr = std::atoi(argv[++i]);
     else if (arg("--max-window-s") && i + 1 < argc)
       max_window_ovr = std::atof(argv[++i]);
     else if (arg("--cam-alt-rounds") && i + 1 < argc)
@@ -220,6 +230,8 @@ int main(int argc, char **argv) {
       fused_iters_ovr = std::atoi(argv[++i]);
     else if (arg("--duel-accept"))
       duel_accept_ovr = 1;
+    else if (arg("--export-on-accept") && i + 1 < argc)
+      eoa_ovr = std::atoi(argv[++i]); // forensic A/B: 0 = legacy inline exports (byte-parity instrument)
     else if (arg("--threads") && i + 1 < argc)
       threads_ovr = std::atoi(argv[++i]); // window-pool width: results are thread-count-invariant (fixed-range partition, worker-ordered fold)
     else if (arg("--max-clones") && i + 1 < argc)
@@ -249,6 +261,14 @@ int main(int argc, char **argv) {
       c.joint.window_max_iters = window_iters_ovr;
     if (select_k_ovr > 0)
       c.select_K = select_k_ovr;
+    if (stage_select_ovr >= 0)
+      c.stage_select = true;
+    if (k_a0_ovr > 0)
+      c.select_K_a0 = k_a0_ovr;
+    if (k_a1_ovr > 0)
+      c.select_K_a1 = k_a1_ovr;
+    if (k_b_ovr > 0)
+      c.select_K_b = k_b_ovr;
     if (max_window_ovr > 0.0)
       c.harvester.max_window_s = max_window_ovr;
     if (cam_alt_ovr >= 0)
@@ -279,6 +299,8 @@ int main(int argc, char **argv) {
       c.joint.fused_iters = fused_iters_ovr;
     if (duel_accept_ovr >= 0)
       c.joint.duel_on_accept = true;
+    if (eoa_ovr >= 0)
+      c.joint.export_on_accept = (eoa_ovr != 0);
     if (threads_ovr > 0)
       c.joint.num_threads = threads_ovr;
     if (outer_iters_ovr > 0 || window_iters_ovr > 0 || select_k_ovr > 0 || max_window_ovr > 0.0 || cam_alt_ovr >= 0 ||
