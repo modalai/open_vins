@@ -34,7 +34,7 @@
 #include "utils/print.h"
 #include "utils/quat_ops.h"
 
-#include <boost/math/distributions/chi_squared.hpp>
+#include "utils/chi_square/chi_squared_quantile_table_0_95.h"
 #include <map>
 
 using namespace ov_core;
@@ -683,9 +683,9 @@ bool StateHelper::initialize(std::shared_ptr<State> state, std::shared_ptr<Type>
   Eigen::MatrixXd S = Hup * P_up * Hup.transpose() + Rup;
   double chi2 = resup.dot(S.llt().solve(resup));
 
-  // Get what our threshold should be
-  boost::math::chi_squared chi_squared_dist(res.rows());
-  double chi2_check = boost::math::quantile(chi_squared_dist, 0.95);
+  // Threshold from the baked quantile table (bit-identical to the boost::math values;
+  // this call sat on the delayed-init path and re-solved the quantile every landmark)
+  double chi2_check = ov_core::chi_squared_quantile_0_95((int)res.rows());
   if (chi2 > chi_2_mult * chi2_check) {
     return false;
   }

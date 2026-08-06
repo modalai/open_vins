@@ -26,7 +26,6 @@
 #include <Eigen/StdVector>
 #include <algorithm>
 #include <atomic>
-#include <boost/filesystem.hpp>
 #include <fstream>
 #include <functional>
 #include <limits>
@@ -46,6 +45,7 @@
 #include "VioManagerOptions.h"
 #include "state/Propagator.h"     // Propagator::Snapshot nested type (VioManager::Snapshot)
 #include "track/TrackBase.h"      // TrackBase::FrontendState nested type (VioManager::Snapshot)
+#include "utils/ChronoProf.h"     // ProfTime members (rT1..rT7)
 
 namespace ov_core {
 struct ImuData;
@@ -451,7 +451,7 @@ protected:
 
   // Timing statistic file and variables
   std::ofstream of_statistics;
-  boost::posix_time::ptime rT1, rT2, rT3, rT4, rT5, rT6, rT7;
+  ov_core::ProfTime rT1, rT2, rT3, rT4, rT5, rT6, rT7;
 
   // Track how much distance we have traveled
   double timelastupdate = -1;

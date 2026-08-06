@@ -22,6 +22,8 @@
 
 #include "SimulatorInit.h"
 
+#include <unistd.h> // sleep() -- used to arrive transitively via boost headers
+
 #include "cam/CamBase.h"
 #include "cam/CamEqui.h"
 #include "cam/CamRadtan.h"

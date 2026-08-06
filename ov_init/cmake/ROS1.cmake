@@ -89,7 +89,7 @@ add_library(ov_init_lib SHARED ${LIBRARY_SOURCES} ${LIBRARY_HEADERS})
 # See this stackoverflow answer: https://stackoverflow.com/a/11217008/7718197
 if (NOT catkin_FOUND OR NOT ENABLE_ROS)
     message(STATUS "MANUALLY LINKING TO OV_CORE LIBRARY....")
-    include_directories(${CMAKE_SOURCE_DIR}/../ov_core/src/)
+    include_directories(${CMAKE_CURRENT_SOURCE_DIR}/../ov_core/src/)
     target_link_libraries(ov_init_lib ov_core_lib)
 endif ()
 

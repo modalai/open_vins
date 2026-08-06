@@ -66,9 +66,9 @@ add_library(ov_msckf_lib SHARED ${LIBRARY_SOURCES} ${LIBRARY_HEADERS})
 if (NOT catkin_FOUND OR NOT ENABLE_ROS)
 
     message(STATUS "MANUALLY LINKING TO OV_CORE LIBRARY....")
-    include_directories(${CMAKE_SOURCE_DIR}/../ov_core/src/)
+    include_directories(${CMAKE_CURRENT_SOURCE_DIR}/../ov_core/src/)
     target_link_libraries(ov_msckf_lib ov_core_lib)
-    include_directories(${CMAKE_SOURCE_DIR}/../ov_init/src/)
+    include_directories(${CMAKE_CURRENT_SOURCE_DIR}/../ov_init/src/)
     target_link_libraries(ov_msckf_lib ov_init_lib)
 
 endif ()

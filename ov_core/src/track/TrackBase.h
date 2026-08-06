@@ -32,7 +32,6 @@
 #include <unordered_map>
 #include <vector>
 
-#include <boost/date_time/posix_time/posix_time.hpp>
 #include <opencv2/core/core.hpp>
 #include <opencv2/highgui/highgui.hpp>
 #include <opencv2/opencv.hpp>
@@ -41,6 +40,7 @@
 #include <CL/cl.h>
 #endif
 
+#include "utils/ChronoProf.h"
 #include "utils/colors.h"
 #include "utils/print.h"
 #include "utils/sensor_data.h"
@@ -262,7 +262,7 @@ protected:
   std::atomic<size_t> currid;
 
   // Timing variables (most children use these...)
-  boost::posix_time::ptime rT1, rT2, rT3, rT4, rT5, rT6, rT7;
+  ProfTime rT1, rT2, rT3, rT4, rT5, rT6, rT7;
 };
 
 } // namespace ov_core

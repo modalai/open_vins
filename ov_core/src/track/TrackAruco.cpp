@@ -60,7 +60,7 @@ void TrackAruco::feed_new_camera(const CameraData &message) {
 void TrackAruco::perform_tracking(double timestamp, const cv::Mat &imgin, size_t cam_id, const cv::Mat &maskin) {
 
   // Start timing
-  rT1 = boost::posix_time::microsec_clock::local_time();
+  rT1 = prof_now();
 
   // Lock this data feed for this camera
   std::lock_guard<std::mutex> lck(mtx_feeds.at(cam_id));
@@ -100,7 +100,7 @@ void TrackAruco::perform_tracking(double timestamp, const cv::Mat &imgin, size_t
 #else
   cv::aruco::detectMarkers(img0, aruco_dict, corners[cam_id], ids_aruco[cam_id], aruco_params, rejects[cam_id]);
 #endif
-  rT2 = boost::posix_time::microsec_clock::local_time();
+  rT2 = prof_now();
 
   //===================================================================================
   //===================================================================================
@@ -163,13 +163,13 @@ void TrackAruco::perform_tracking(double timestamp, const cv::Mat &imgin, size_t
     ids_last[cam_id] = ids_new;
     pts_last[cam_id] = pts_new;
   }
-  rT3 = boost::posix_time::microsec_clock::local_time();
+  rT3 = prof_now();
 
   // Timing information
-  PRINT_ALL("[TIME-ARUCO]: %.4f seconds for detection\n", (rT2 - rT1).total_microseconds() * 1e-6);
-  PRINT_ALL("[TIME-ARUCO]: %.4f seconds for feature DB update (%d features)\n", (rT3 - rT2).total_microseconds() * 1e-6,
+  PRINT_ALL("[TIME-ARUCO]: %.4f seconds for detection\n", prof_s(rT1, rT2));
+  PRINT_ALL("[TIME-ARUCO]: %.4f seconds for feature DB update (%d features)\n", prof_s(rT2, rT3),
             (int)ids_new.size());
-  PRINT_ALL("[TIME-ARUCO]: %.4f seconds for total\n", (rT3 - rT1).total_microseconds() * 1e-6);
+  PRINT_ALL("[TIME-ARUCO]: %.4f seconds for total\n", prof_s(rT1, rT3));
 }
 
 void TrackAruco::display_active(cv::Mat &img_out, int r1, int g1, int b1, int r2, int g2, int b2, std::string overlay) {

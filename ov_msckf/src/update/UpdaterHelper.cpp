@@ -97,6 +97,9 @@ void UpdaterHelper::get_feature_jacobian_representation(std::shared_ptr<State> s
   double dt_camoff_anc_lin = (state->_options.do_calib_camera_timeoffset
       ? state->cam_imu_dt_delta_fej(feature.anchor_cam_id) : state->cam_imu_dt_delta(feature.anchor_cam_id)) + dt_epoch_anc;
 
+  // RS row-anchor convention (rs_convention: top 0.0 / center 0.5 / bottom 1.0)
+  const double rs_row_anchor = state->_options.rs_row_anchor;
+
   // Rolling shutter readout for anchor camera (map is populated for every camera at construction;
   // id >= 0 iff this camera's readout is an ESTIMATED state -- declared rolling under calib)
   std::shared_ptr<Vec> readout_anc = state->_calib_camera_readout.at(feature.anchor_cam_id);
@@ -145,7 +148,7 @@ void UpdaterHelper::get_feature_jacobian_representation(std::shared_ptr<State> s
         const auto &anc_uvs = feature.uvs.at(feature.anchor_cam_id);
         double v_pixel_anc = (double)anc_uvs.at(anc_idx)(1);
         double inv_img_h_anc = 1.0 / (double)state->_cam_intrinsics_cameras.at(feature.anchor_cam_id)->h();
-        v_frac_anc = v_pixel_anc * inv_img_h_anc - 0.5;
+        v_frac_anc = v_pixel_anc * inv_img_h_anc - rs_row_anchor;
       }
     }
 
@@ -429,6 +432,9 @@ void UpdaterHelper::get_feature_jacobian_full(std::shared_ptr<State> state, Upda
   // for them; their current values are still applied to the poses above/below
   const bool dt_rs_cols_active = !state->dt_calib_degenerate();
 
+  // RS row-anchor convention (rs_convention: top 0.0 / center 0.5 / bottom 1.0)
+  const double rs_row_anchor = state->_options.rs_row_anchor;
+
   // Calculate the position of this feature in the global frame
   // If anchored, then we need to calculate the position of the feature in the global
   Eigen::Vector3d p_FinG = feature.p_FinG;
@@ -454,7 +460,7 @@ void UpdaterHelper::get_feature_jacobian_full(std::shared_ptr<State> state, Upda
         const auto &anc_uvs = feature.uvs.at(feature.anchor_cam_id);
         double v_pixel_anc = (double)anc_uvs.at(anc_idx)(1);
         double inv_img_h_anc = 1.0 / (double)state->_cam_intrinsics_cameras.at(feature.anchor_cam_id)->h();
-        dt_total_anc += (v_pixel_anc * inv_img_h_anc - 0.5) * t_readout_anc;
+        dt_total_anc += (v_pixel_anc * inv_img_h_anc - rs_row_anchor) * t_readout_anc;
       }
     }
     if (std::abs(dt_total_anc) > 1e-10) {
@@ -593,7 +599,7 @@ void UpdaterHelper::get_feature_jacobian_full(std::shared_ptr<State> state, Upda
           }
         }
         if (rs_on_value) {
-          dt_total += (v_pixel * inv_img_h - 0.5) * t_readout;
+          dt_total += (v_pixel * inv_img_h - rs_row_anchor) * t_readout;
         }
         if (bridge != nullptr) {
           // EXACT composition of the clone pose over the known residual, with the first-order
@@ -654,7 +660,7 @@ void UpdaterHelper::get_feature_jacobian_full(std::shared_ptr<State> state, Upda
         if (need_obs_terms) {
           double dt_total_fej = dt_camoff_lin + ((bridge == nullptr) ? dt_epoch : 0.0);
           if (rs_on_linearization) {
-            dt_total_fej += (v_pixel * inv_img_h - 0.5) * t_readout_lin;
+            dt_total_fej += (v_pixel * inv_img_h - rs_row_anchor) * t_readout_lin;
           }
           if (bridge != nullptr) {
             const Eigen::Matrix3d R_clone_fej = R_GtoIi;
@@ -749,7 +755,7 @@ void UpdaterHelper::get_feature_jacobian_full(std::shared_ptr<State> state, Upda
       // Derivative of measurement in respect to rolling shutter readout time
       // (column skipped when the window motion is degenerate or this clone has no kinematics)
       if (readout_hx_col >= 0 && dt_rs_cols_active && have_clone_kin) {
-        double v_frac = v_pixel * inv_img_h - 0.5;
+        double v_frac = v_pixel * inv_img_h - rs_row_anchor;
         Eigen::Vector3d dpfI_dtrd = -(skew_x(w_col) * p_FinIi + R_GtoIi * v_col) * v_frac;
         H_x.block(2 * c, readout_hx_col, 2, 1).noalias() += dz_dpfc * R_ItoC * dpfI_dtrd;
       }

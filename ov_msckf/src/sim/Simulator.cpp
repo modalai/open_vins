@@ -22,6 +22,8 @@
 
 #include "Simulator.h"
 
+#include <unistd.h> // sleep() -- used to arrive transitively via boost headers
+
 #include <limits>
 
 #include "cam/CamBase.h"

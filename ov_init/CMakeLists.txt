@@ -12,7 +12,10 @@ if (NOT OpenCV_FOUND)
         find_package(OpenCV 4 REQUIRED)
     endif ()
 endif ()
-find_package(Boost REQUIRED COMPONENTS system filesystem thread date_time)
+# Boost is OPTIONAL: the estimator core is boost-free (ChronoProf/FsLite/chi2 table/
+# SpscRing in ov_core/src/utils). Only the ROS visualizer builds still touch it;
+# ${Boost_LIBRARIES}/${Boost_INCLUDE_DIRS} expand empty when absent.
+find_package(Boost QUIET COMPONENTS system filesystem thread date_time)
 # Ceres-free initialization backend (ov_init::zbft_sfm). ON by default: the dynamic initializer's MLE
 # refinement + covariance recovery use the in-tree lock-free RT solver instead of Ceres, and CERES IS
 # NOT REQUIRED OR LINKED. Declared here (before find_package) so the default build never pulls Ceres.
@@ -25,7 +28,7 @@ else ()
     find_package(Ceres REQUIRED)
     message(STATUS "ov_init: Ceres MLE fallback | CERES: " ${Ceres_VERSION})
 endif ()
-message(STATUS "OPENCV: " ${OpenCV_VERSION} " | BOOST: " ${Boost_VERSION})
+message(STATUS "OPENCV: " ${OpenCV_VERSION})
 
 # check if we have our python libs files (will search for python3 then python2 installs)
 # sudo apt-get install python-matplotlib python-numpy python-dev

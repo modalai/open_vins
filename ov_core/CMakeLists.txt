@@ -11,8 +11,11 @@ if (NOT OpenCV_FOUND)
         find_package(OpenCV 4 REQUIRED)
     endif ()
 endif ()
-find_package(Boost REQUIRED COMPONENTS system filesystem thread date_time)
-message(STATUS "OPENCV: " ${OpenCV_VERSION} " | BOOST: " ${Boost_VERSION})
+# Boost is OPTIONAL: the estimator core is boost-free (ChronoProf/FsLite/chi2 table/
+# SpscRing in ov_core/src/utils). Only the ROS visualizer builds still touch it;
+# ${Boost_LIBRARIES}/${Boost_INCLUDE_DIRS} expand empty when absent.
+find_package(Boost QUIET COMPONENTS system filesystem thread date_time)
+message(STATUS "OPENCV: " ${OpenCV_VERSION})
 
 # If we will compile with aruco support
 option(ENABLE_ARUCO_TAGS "Enable or disable aruco tag (disable if no contrib modules)" ON)
@@ -40,6 +43,7 @@ endif()
 # https://cmake.org/cmake/help/v3.10/module/FindPythonLibs.html
 find_package(PythonLibs QUIET)
 option(DISABLE_MATPLOTLIB "Disable or enable matplotlib plot scripts in ov_eval" OFF)
+set(DISABLE_MATPLOTLIB ON) # host-python headers leaked into the aarch64 build; nothing includes matplotlibcpp.h
 if (PYTHONLIBS_FOUND AND NOT DISABLE_MATPLOTLIB)
     add_definitions(-DHAVE_PYTHONLIBS=1)
     message(STATUS "PYTHON VERSION: " ${PYTHONLIBS_VERSION_STRING})
