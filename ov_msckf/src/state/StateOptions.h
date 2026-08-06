@@ -76,6 +76,18 @@ struct StateOptions {
   /// Analytic IMU-bias columns from the preintegration bridge (see VioManagerOptions)
   bool epoch_bridge_bias_cols = true;
 
+  /// Rolling-shutter row-anchor convention: which image row the frame stamp refers to. Row v
+  /// samples at stamp + (v/h - rs_row_anchor) * readout. Parsed from "rs_convention":
+  ///   top    (anchor 0.0) -- stamp is the raw HAL3 SOF (top row, start of readout). The
+  ///                          pre-flip system convention; replays of that era's recordings
+  ///                          use it to reproduce their trajectories.
+  ///   center (anchor 0.5) -- stamp is the center-row mid-exposure instant (the default;
+  ///                          the producer anchors stamps to match, see frame_timestamp_s)
+  ///   bottom (anchor 1.0) -- stamp refers to the last row (producers that stamp end-of-frame)
+  /// The stamp producer derives its anchoring from this SAME key, so stamps and filter model
+  /// cannot disagree.
+  double rs_row_anchor = 0.5;
+
   /// Freeze dt/readout Jacobian columns while the window motion is degenerate for temporal
   /// calibration (MVIS degenerate motions: static / constant velocity / slow pure rotation).
   /// Opt-in (default off): rigs enable it explicitly in their estimator config.
@@ -157,6 +169,25 @@ struct StateOptions {
         PRINT_ERROR(RED "calib_cam_readout_init_sigma must be positive (got %.6f)\n" RESET, calib_cam_readout_init_sigma);
         std::exit(EXIT_FAILURE);
       }
+      std::string rs_convention_str = "center";
+      parser->parse_config("rs_convention", rs_convention_str, false);
+      if (rs_convention_str == "top") {
+        rs_row_anchor = 0.0;
+      } else if (rs_convention_str == "center") {
+        rs_row_anchor = 0.5;
+      } else if (rs_convention_str == "bottom") {
+        rs_row_anchor = 1.0;
+      } else {
+        PRINT_ERROR(RED "invalid rs_convention: '%s'\n" RESET, rs_convention_str.c_str());
+        PRINT_ERROR(RED "please select a valid convention: top, center, bottom\n" RESET);
+        if (rs_convention_str.empty()) {
+          // The classic cause of an EMPTY read: a ':' inside the key's TRAILING comment --
+          // cv::FileStorage splits there and the node parses as a map. Own-line comments are safe.
+          PRINT_ERROR(RED "an empty value usually means a ':' in the key's trailing comment "
+                          "(cv::FileStorage splits on it); move the comment to its own line\n" RESET);
+        }
+        std::exit(EXIT_FAILURE);
+      }
       parser->parse_config("dt_calib_gate", dt_calib_gate, false);
       parser->parse_config("dt_calib_gate_min_omega", dt_calib_gate_min_omega, false);
       parser->parse_config("dt_calib_gate_min_vel_spread", dt_calib_gate_min_vel_spread, false);
@@ -208,6 +239,8 @@ struct StateOptions {
     PRINT_DEBUG("  - cam_imu_dt_ref_camid: %d\n", cam_imu_dt_ref_camid);
     PRINT_DEBUG("  - calib_cam_readout: %d\n", do_calib_camera_readout);
     PRINT_DEBUG("  - calib_cam_readout_init_sigma: %.4f\n", calib_cam_readout_init_sigma);
+    PRINT_DEBUG("  - rs_convention: %s (row anchor %.1f)\n",
+                rs_row_anchor == 0.0 ? "top" : (rs_row_anchor == 1.0 ? "bottom" : "center"), rs_row_anchor);
     PRINT_DEBUG("  - calib_imu_intrinsics: %d\n", do_calib_imu_intrinsics);
     PRINT_DEBUG("  - calib_imu_g_sensitivity: %d\n", do_calib_imu_g_sensitivity);
     PRINT_DEBUG("  - imu_model: %d\n", imu_model);

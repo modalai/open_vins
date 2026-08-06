@@ -151,9 +151,6 @@ protected:
   /// Time window (seconds) to keep IMU measurements beyond the oldest needed time
   double _prop_window = 0.10;
 
-  /// Chi squared 95th percentile table (lookup would be size of residual)
-  std::map<int, double> chi_squared_table;
-
   /// Our history of IMU messages (time, angular, linear)
   std::vector<ov_core::ImuData> imu_data;
 

@@ -34,9 +34,10 @@
 #include "utils/print.h"
 #include "utils/quat_ops.h"
 
-#include <boost/date_time/posix_time/posix_time.hpp>
-#include <boost/math/distributions/chi_squared.hpp>
 #include <cmath>
+
+#include "utils/ChronoProf.h"
+#include "utils/chi_square/chi_squared_quantile_table_0_95.h"
 
 using namespace ov_core;
 using namespace ov_type;
@@ -52,12 +53,8 @@ UpdaterSLAM::UpdaterSLAM(UpdaterOptions &options_slam, UpdaterOptions &options_a
   // Save our feature initializer
   initializer_feat = std::shared_ptr<ov_core::FeatureInitializer>(new ov_core::FeatureInitializer(feat_init_options));
 
-  // Initialize the chi squared test table with confidence level 0.95
-  // https://github.com/KumarRobotics/msckf_vio/blob/050c50defa5a7fd9a04c1eed5687b405f02919b5/src/msckf_vio.cpp#L215-L221
-  for (int i = 1; i < 500; i++) {
-    boost::math::chi_squared chi_squared_dist(i);
-    chi_squared_table[i] = boost::math::quantile(chi_squared_dist, 0.95);
-  }
+  // Chi-squared 0.95 gating thresholds come from the baked table
+  // (utils/chi_square/, bit-identical to the boost::math values this used to compute here)
 }
 
 void UpdaterSLAM::delayed_init(std::shared_ptr<State> state, std::vector<std::shared_ptr<Feature>> &feature_vec) {
@@ -67,8 +64,8 @@ void UpdaterSLAM::delayed_init(std::shared_ptr<State> state, std::vector<std::sh
     return;
 
   // Start timing
-  boost::posix_time::ptime rT0, rT1, rT2, rT3;
-  rT0 = boost::posix_time::microsec_clock::local_time();
+  ov_core::ProfTime rT0, rT1, rT2, rT3;
+  rT0 = ov_core::prof_now();
 
   // 0. Get all timestamps our clones are at (and thus valid measurement times)
   std::vector<double> clonetimes;
@@ -97,9 +94,11 @@ void UpdaterSLAM::delayed_init(std::shared_ptr<State> state, std::vector<std::sh
       it0++;
     }
   }
-  rT1 = boost::posix_time::microsec_clock::local_time();
+  rT1 = ov_core::prof_now();
 
   // 2. Create vector of cloned *CAMERA* poses at each of our clone timesteps
+  // RS row-anchor convention (rs_convention: top 0.0 / center 0.5 / bottom 1.0)
+  const double rs_row_anchor = state->_options.rs_row_anchor;
   std::unordered_map<size_t, std::unordered_map<double, FeatureInitializer::ClonePose>> clones_cam;
   for (const auto &clone_calib : state->_calib_IMUtoCAM) {
 
@@ -180,7 +179,7 @@ void UpdaterSLAM::delayed_init(std::shared_ptr<State> state, std::vector<std::sh
           if (clones_cam_rs.at(cam_id).find(clone_time) == clones_cam_rs.at(cam_id).end()) continue;
           if (state->_clones_kinematics.find(clone_time) == state->_clones_kinematics.end()) continue;
           double v_pixel = (double)(*it1)->uvs.at(cam_id).at(m)(1);
-          double dt_rs = (v_pixel * inv_img_h - 0.5) * t_readout;
+          double dt_rs = (v_pixel * inv_img_h - rs_row_anchor) * t_readout;
           if (std::abs(dt_rs) < 1e-10) continue;
           // Recover IMU pose from camera pose (undo camera transform)
           Eigen::Matrix3d R_GtoCi = clones_cam_rs.at(cam_id).at(clone_time).Rot();
@@ -234,7 +233,7 @@ void UpdaterSLAM::delayed_init(std::shared_ptr<State> state, std::vector<std::sh
     }
     it1++;
   }
-  rT2 = boost::posix_time::microsec_clock::local_time();
+  rT2 = ov_core::prof_now();
 
   // 4. Compute linear system for each feature, nullspace project, and reject
   auto it2 = feature_vec.begin();
@@ -332,14 +331,14 @@ void UpdaterSLAM::delayed_init(std::shared_ptr<State> state, std::vector<std::sh
       it2 = feature_vec.erase(it2);
     }
   }
-  rT3 = boost::posix_time::microsec_clock::local_time();
+  rT3 = ov_core::prof_now();
 
   // Debug print timing information
   if (!feature_vec.empty()) {
-    PRINT_ALL("[SLAM-DELAY]: %.4f seconds to clean\n", (rT1 - rT0).total_microseconds() * 1e-6);
-    PRINT_ALL("[SLAM-DELAY]: %.4f seconds to triangulate\n", (rT2 - rT1).total_microseconds() * 1e-6);
-    PRINT_ALL("[SLAM-DELAY]: %.4f seconds initialize (%d features)\n", (rT3 - rT2).total_microseconds() * 1e-6, (int)feature_vec.size());
-    PRINT_ALL("[SLAM-DELAY]: %.4f seconds total\n", (rT3 - rT1).total_microseconds() * 1e-6);
+    PRINT_ALL("[SLAM-DELAY]: %.4f seconds to clean\n", ov_core::prof_s(rT0, rT1));
+    PRINT_ALL("[SLAM-DELAY]: %.4f seconds to triangulate\n", ov_core::prof_s(rT1, rT2));
+    PRINT_ALL("[SLAM-DELAY]: %.4f seconds initialize (%d features)\n", ov_core::prof_s(rT2, rT3), (int)feature_vec.size());
+    PRINT_ALL("[SLAM-DELAY]: %.4f seconds total\n", ov_core::prof_s(rT1, rT3));
   }
 }
 
@@ -350,8 +349,8 @@ void UpdaterSLAM::update(std::shared_ptr<State> state, std::vector<std::shared_p
     return;
 
   // Start timing
-  boost::posix_time::ptime rT0, rT1, rT2, rT3;
-  rT0 = boost::posix_time::microsec_clock::local_time();
+  ov_core::ProfTime rT0, rT1, rT2, rT3;
+  rT0 = ov_core::prof_now();
 
   // 0. Get all timestamps our clones are at (and thus valid measurement times)
   std::vector<double> clonetimes;
@@ -388,7 +387,7 @@ void UpdaterSLAM::update(std::shared_ptr<State> state, std::vector<std::shared_p
       it0++;
     }
   }
-  rT1 = boost::posix_time::microsec_clock::local_time();
+  rT1 = ov_core::prof_now();
 
   // Calculate the max possible measurement size
   size_t max_meas_size = 0;
@@ -491,14 +490,8 @@ void UpdaterSLAM::update(std::shared_ptr<State> state, std::vector<std::shared_p
     double chi2 = res.dot(S.llt().solve(res));
 
     // Get our threshold (we precompute up to 500 but handle the case that it is more)
-    double chi2_check;
-    if (res.rows() < 500) {
-      chi2_check = chi_squared_table[res.rows()];
-    } else {
-      boost::math::chi_squared chi_squared_dist(res.rows());
-      chi2_check = boost::math::quantile(chi_squared_dist, 0.95);
-      PRINT_WARNING(YELLOW "chi2_check over the residual limit - %d\n" RESET, (int)res.rows());
-    }
+    // Threshold from the baked quantile table (full reachable dof range; no runtime solve)
+    double chi2_check = ov_core::chi_squared_quantile_0_95((int)res.rows());
 
     // Check if we should delete or not
     double chi2_multipler =
@@ -544,7 +537,7 @@ void UpdaterSLAM::update(std::shared_ptr<State> state, std::vector<std::shared_p
     ct_meas += res.rows();
     it2++;
   }
-  rT2 = boost::posix_time::microsec_clock::local_time();
+  rT2 = ov_core::prof_now();
 
   // We have appended all features to our Hx_big, res_big
   // Delete it so we do not reuse information
@@ -564,14 +557,14 @@ void UpdaterSLAM::update(std::shared_ptr<State> state, std::vector<std::shared_p
 
   // 5. With all good SLAM features update the state
   StateHelper::EKFUpdate(state, Hx_order_big, Hx_big, res_big, R_big);
-  rT3 = boost::posix_time::microsec_clock::local_time();
+  rT3 = ov_core::prof_now();
 
   // Debug print timing information
-  PRINT_ALL("[SLAM-UP]: %.4f seconds to clean\n", (rT1 - rT0).total_microseconds() * 1e-6);
-  PRINT_ALL("[SLAM-UP]: %.4f seconds creating linear system\n", (rT2 - rT1).total_microseconds() * 1e-6);
-  PRINT_ALL("[SLAM-UP]: %.4f seconds to update (%d feats of %d size)\n", (rT3 - rT2).total_microseconds() * 1e-6, (int)feature_vec.size(),
+  PRINT_ALL("[SLAM-UP]: %.4f seconds to clean\n", ov_core::prof_s(rT0, rT1));
+  PRINT_ALL("[SLAM-UP]: %.4f seconds creating linear system\n", ov_core::prof_s(rT1, rT2));
+  PRINT_ALL("[SLAM-UP]: %.4f seconds to update (%d feats of %d size)\n", ov_core::prof_s(rT2, rT3), (int)feature_vec.size(),
             (int)Hx_big.rows());
-  PRINT_ALL("[SLAM-UP]: %.4f seconds total\n", (rT3 - rT1).total_microseconds() * 1e-6);
+  PRINT_ALL("[SLAM-UP]: %.4f seconds total\n", ov_core::prof_s(rT1, rT3));
 }
 
 void UpdaterSLAM::change_anchors(std::shared_ptr<State> state) {

@@ -24,9 +24,10 @@
 #define OPENCV_YAML_PARSER_H
 
 #include <Eigen/Eigen>
-#include <boost/filesystem.hpp>
 #include <memory>
 #include <opencv2/opencv.hpp>
+
+#include "FsLite.h"
 
 #if ROS_AVAILABLE == 1
 #include <ros/ros.h>
@@ -66,11 +67,11 @@ public:
   explicit YamlParser(const std::string &config_path, bool fail_if_not_found = true) : config_path_(config_path) {
 
     // Check if file exists
-    if (!fail_if_not_found && !boost::filesystem::exists(config_path)) {
+    if (!fail_if_not_found && !ov_core::fs_exists(config_path)) {
       config = nullptr;
       return;
     }
-    if (!boost::filesystem::exists(config_path)) {
+    if (!ov_core::fs_exists(config_path)) {
       PRINT_ERROR(RED "unable to open the configuration file!\n%s\n" RESET, config_path.c_str());
       std::exit(EXIT_FAILURE);
     }

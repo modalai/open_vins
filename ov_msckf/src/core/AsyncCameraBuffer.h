@@ -51,7 +51,7 @@
 #include <memory>
 #include <vector>
 
-#include <boost/lockfree/spsc_queue.hpp>
+#include "utils/LockFreeSpsc.h"
 
 #include "utils/sensor_data.h"
 
@@ -130,7 +130,7 @@ protected:
   /// Per-camera stream: SPSC ring + producer-written meta (single-writer atomics)
   struct Stream {
     explicit Stream(size_t capacity) : ring(capacity) {}
-    boost::lockfree::spsc_queue<ov_core::CameraData> ring;
+    ov_core::SpscRing<ov_core::CameraData> ring;
     std::atomic<double> last_enqueued_ts{-1.0}; // newest frame timestamp pushed (camera clock)
     std::atomic<double> last_push_mono{-1.0};   // monotonic push time (staleness)
     std::atomic<double> ema_period{-1.0};       // EMA of the frame period (producer-side)

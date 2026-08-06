@@ -35,6 +35,7 @@
 #include "feat/FeatureDatabase.h"
 #include "types/IMU.h"
 #include "types/Landmark.h"
+#include "utils/ChronoProf.h"
 #include "utils/colors.h"
 #include "utils/print.h"
 #include "utils/quat_ops.h"
@@ -84,7 +85,7 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
                                     std::unordered_map<size_t, std::shared_ptr<ov_type::Landmark>> &_features_SLAM) {
 
   // Get the newest and oldest timestamps we will try to initialize between!
-  auto rT1 = boost::posix_time::microsec_clock::local_time();
+  auto rT1 = ov_core::prof_now();
   double newest_cam_time = -1;
   for (auto const &feat : _db->get_internal_data()) {
     for (auto const &camtimepair : feat.second->timestamps) {
@@ -287,7 +288,7 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
   //    features_bearings.insert({feat->featid, bearing});
   //    features_index.insert({feat->featid, (int)features_index.size()});
   //  }
-  auto rT2 = boost::posix_time::microsec_clock::local_time();
+  auto rT2 = ov_core::prof_now();
 
   // ======================================================
   // ======================================================
@@ -478,7 +479,7 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
       }
     }
   }
-  auto rT3 = boost::posix_time::microsec_clock::local_time();
+  auto rT3 = ov_core::prof_now();
 
   // ======================================================
   // ======================================================
@@ -618,7 +619,7 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
                   gravity_inI0(0) / gravity_inI0.norm(), gravity_inI0(1) / gravity_inI0.norm(), gravity_inI0(2) / gravity_inI0.norm());
     return false;
   }
-  auto rT4 = boost::posix_time::microsec_clock::local_time();
+  auto rT4 = ov_core::prof_now();
 
   // ======================================================
   // ======================================================
@@ -1132,14 +1133,14 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
   assert(ceres_vars_ori.size() == ceres_vars_vel.size());
   assert(ceres_vars_ori.size() == ceres_vars_bias_a.size());
   assert(ceres_vars_ori.size() == ceres_vars_pos.size());
-  auto rT5 = boost::posix_time::microsec_clock::local_time();
+  auto rT5 = ov_core::prof_now();
 
   // Optimize the graph
 #ifdef USE_CERES_FREE_INIT
   ov_init::zbft_sfm::SolverSummary summary = problem.Solve(options);
   PRINT_INFO("[init-d]: %d iterations | %zu states, %zu feats (%zu valid) | cost %.4e => %.4e\n", summary.iterations,
              map_states.size(), map_features.size(), count_valid_features, summary.initial_cost, summary.final_cost);
-  auto rT6 = boost::posix_time::microsec_clock::local_time();
+  auto rT6 = ov_core::prof_now();
   timestamp = newest_cam_time;
   if (params.init_dyn_mle_max_iter != 0 && !summary.converged) {
     PRINT_WARNING(YELLOW "[init-d]: opt failed: %s!\n" RESET, summary.message.c_str());
@@ -1318,7 +1319,7 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
   PRINT_INFO("[init-d]: %d iterations | %zu states, %zu feats (%zu valid) | %d param and %d res | cost %.4e => %.4e\n",
              (int)summary.iterations.size(), map_states.size(), map_features.size(), count_valid_features, summary.num_parameters,
              summary.num_residuals, summary.initial_cost, summary.final_cost);
-  auto rT6 = boost::posix_time::microsec_clock::local_time();
+  auto rT6 = ov_core::prof_now();
 
   // Return if we have failed!
   timestamp = newest_cam_time;
@@ -1564,14 +1565,14 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
   _imu->set_fej(x);
 
   // Debug timing information about how long it took to initialize!!
-  auto rT7 = boost::posix_time::microsec_clock::local_time();
-  PRINT_DEBUG("[TIME]: %.4f sec for prelim tests\n", (rT2 - rT1).total_microseconds() * 1e-6);
-  PRINT_DEBUG("[TIME]: %.4f sec for linsys setup\n", (rT3 - rT2).total_microseconds() * 1e-6);
-  PRINT_DEBUG("[TIME]: %.4f sec for linsys\n", (rT4 - rT3).total_microseconds() * 1e-6);
-  PRINT_DEBUG("[TIME]: %.4f sec for ceres-free opt setup\n", (rT5 - rT4).total_microseconds() * 1e-6);
-  PRINT_DEBUG("[TIME]: %.4f sec for ceres-free opt\n", (rT6 - rT5).total_microseconds() * 1e-6);
-  PRINT_DEBUG("[TIME]: %.4f sec for ceres-free covariance\n", (rT7 - rT6).total_microseconds() * 1e-6);
-  PRINT_DEBUG("[TIME]: %.4f sec total for initialization\n", (rT7 - rT1).total_microseconds() * 1e-6);
+  auto rT7 = ov_core::prof_now();
+  PRINT_DEBUG("[TIME]: %.4f sec for prelim tests\n", ov_core::prof_s(rT1, rT2));
+  PRINT_DEBUG("[TIME]: %.4f sec for linsys setup\n", ov_core::prof_s(rT2, rT3));
+  PRINT_DEBUG("[TIME]: %.4f sec for linsys\n", ov_core::prof_s(rT3, rT4));
+  PRINT_DEBUG("[TIME]: %.4f sec for ceres-free opt setup\n", ov_core::prof_s(rT4, rT5));
+  PRINT_DEBUG("[TIME]: %.4f sec for ceres-free opt\n", ov_core::prof_s(rT5, rT6));
+  PRINT_DEBUG("[TIME]: %.4f sec for ceres-free covariance\n", ov_core::prof_s(rT6, rT7));
+  PRINT_DEBUG("[TIME]: %.4f sec total for initialization\n", ov_core::prof_s(rT1, rT7));
   free_state_memory();
   return true;
 }

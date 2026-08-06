@@ -106,9 +106,6 @@ protected:
 
   /// Feature initializer class object
   std::shared_ptr<ov_core::FeatureInitializer> initializer_feat;
-
-  /// Chi squared 95th percentile table (lookup would be size of residual)
-  std::map<int, double> chi_squared_table;
 };
 
 } // namespace ov_msckf

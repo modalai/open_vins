@@ -84,7 +84,7 @@ void TrackOCL::feed_new_camera(const CameraData &message)
     // Preprocessing steps that we do not parallelize
     // NOTE: DO NOT PARALLELIZE THESE!
     // NOTE: These seem to be much slower if you parallelize them...
-    rT1 = boost::posix_time::microsec_clock::local_time();
+    rT1 = prof_now();
 
     size_t num_images = message.images.size();
 
@@ -175,7 +175,7 @@ void TrackOCL::feed_monocular(const CameraData &message, size_t msg_id)
     int cam_width  = std::get<0>(dims);
     int cam_height = std::get<1>(dims);
     
-    rT2 = boost::posix_time::microsec_clock::local_time();
+    rT2 = prof_now();
     int64_t t2 = _apps_time_monotonic_ns();
     // If we didn't have any successful tracks last time, just extract this time
     // This also handles, the tracking initalization on the first call to this extractor
@@ -201,7 +201,7 @@ void TrackOCL::feed_monocular(const CameraData &message, size_t msg_id)
     auto ids_left_old = ids_last[cam_id];
 
     perform_detection_monocular(img_buf_prev_[cam_id], img_mask_last[cam_id], pts_left_old, ids_left_old, cam_id);
-    rT3 = boost::posix_time::microsec_clock::local_time();
+    rT3 = prof_now();
     int64_t t3 = _apps_time_monotonic_ns();
 
     // Our return success masks, and predicted new features
@@ -212,7 +212,7 @@ void TrackOCL::feed_monocular(const CameraData &message, size_t msg_id)
     perform_matching(img_buf_prev_[cam_id], img_buf_next_[cam_id], pts_left_old, pts_left_new, cam_id, cam_id, mask_ll);
     assert(pts_left_new.size() == ids_left_old.size());
     int64_t t4 = _apps_time_monotonic_ns();
-    rT4 = boost::posix_time::microsec_clock::local_time();
+    rT4 = prof_now();
 
     // If any of our mask is empty, that means we didn't have enough to do ransac, so just return
     if (mask_ll.empty())
@@ -266,7 +266,7 @@ void TrackOCL::feed_monocular(const CameraData &message, size_t msg_id)
         ids_last[cam_id] = good_ids_left;
     }
     int64_t t5 = _apps_time_monotonic_ns();
-    rT5 = boost::posix_time::microsec_clock::local_time();
+    rT5 = prof_now();
 
     // Timing prints in milliseconds
     auto dt = [](int64_t a, int64_t b){ return double(b - a) / 1e6; };
@@ -307,7 +307,7 @@ void TrackOCL::feed_stereo(const CameraData &message, size_t msg_id_left, size_t
     // frame against itself -> 0.000 disparity (stuck in ZUPT). feed_monocular() relies on
     // the same feed_new_camera() upload; mirror that behavior here.
     
-    rT2 = boost::posix_time::microsec_clock::local_time();
+    rT2 = prof_now();
     int64_t t2 = _apps_time_monotonic_ns();
 
     if (pts_last[cam_id_left].empty() && pts_last[cam_id_right].empty()) {
@@ -338,7 +338,7 @@ void TrackOCL::feed_stereo(const CameraData &message, size_t msg_id_left, size_t
     perform_detection_stereo(img_buf_prev_[cam_id_left], img_buf_prev_[cam_id_right], 
                              img_mask_last[cam_id_left], img_mask_last[cam_id_right],
                              cam_id_left, cam_id_right, pts_left_old, pts_right_old, ids_left_old, ids_right_old);
-    rT3 = boost::posix_time::microsec_clock::local_time();
+    rT3 = prof_now();
 
     // Our return success masks, and predicted new features
     std::vector<uchar> mask_ll, mask_rr;
@@ -348,14 +348,14 @@ void TrackOCL::feed_stereo(const CameraData &message, size_t msg_id_left, size_t
     perform_matching(img_buf_prev_[cam_id_left], img_buf_next_[cam_id_left], pts_left_old, pts_left_new, cam_id_left, cam_id_left, mask_ll);
     perform_matching(img_buf_prev_[cam_id_right], img_buf_next_[cam_id_right], pts_right_old, pts_right_new, cam_id_right, cam_id_right, mask_rr);
 
-    rT4 = boost::posix_time::microsec_clock::local_time();
+    rT4 = prof_now();
 
     // left to right matching
     // TODO: we should probably still do this to reject outliers
     // TODO: maybe we should collect all tracks that are in both frames and make they pass this?
     // std::vector<uchar> mask_lr;
     // perform_matching(imgpyr_left, imgpyr_right, pts_left_new, pts_right_new, cam_id_left, cam_id_right, mask_lr);
-    rT5 = boost::posix_time::microsec_clock::local_time();
+    rT5 = prof_now();
 
     // If any of our masks are empty, that means we didn't have enough to do ransac, so just return
     if (mask_ll.empty() && mask_rr.empty()) {
@@ -449,17 +449,17 @@ void TrackOCL::feed_stereo(const CameraData &message, size_t msg_id_left, size_t
         ids_last[cam_id_left] = good_ids_left;
         ids_last[cam_id_right] = good_ids_right;
     }
-    rT6 = boost::posix_time::microsec_clock::local_time();
+    rT6 = prof_now();
 
     //  // Timing information
-    PRINT_ALL("[TIME-KLT]: %.4f seconds for pyramid\n", (rT2 - rT1).total_microseconds() * 1e-6);
-    PRINT_ALL("[TIME-KLT]: %.4f seconds for detection (%d detected)\n", (rT3 - rT2).total_microseconds() * 1e-6,
+    PRINT_ALL("[TIME-KLT]: %.4f seconds for pyramid\n", prof_s(rT1, rT2));
+    PRINT_ALL("[TIME-KLT]: %.4f seconds for detection (%d detected)\n", prof_s(rT2, rT3),
                 (int)pts_last[cam_id_left].size() - pts_before_detect);
-    PRINT_ALL("[TIME-KLT]: %.4f seconds for temporal klt\n", (rT4 - rT3).total_microseconds() * 1e-6);
-    PRINT_ALL("[TIME-KLT]: %.4f seconds for stereo klt\n", (rT5 - rT4).total_microseconds() * 1e-6);
-    PRINT_ALL("[TIME-KLT]: %.4f seconds for feature DB update (%d features)\n", (rT6 - rT5).total_microseconds() * 1e-6,
+    PRINT_ALL("[TIME-KLT]: %.4f seconds for temporal klt\n", prof_s(rT3, rT4));
+    PRINT_ALL("[TIME-KLT]: %.4f seconds for stereo klt\n", prof_s(rT4, rT5));
+    PRINT_ALL("[TIME-KLT]: %.4f seconds for feature DB update (%d features)\n", prof_s(rT5, rT6),
                 (int)good_left.size());
-    PRINT_ALL("[TIME-KLT]: %.4f seconds for total\n", (rT6 - rT1).total_microseconds() * 1e-6);
+    PRINT_ALL("[TIME-KLT]: %.4f seconds for total\n", prof_s(rT1, rT6));
 }
 
 void TrackOCL::perform_detection_monocular(modal_flow::BufferId& buf_id, const cv::Mat &mask0,
