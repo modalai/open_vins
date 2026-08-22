@@ -91,14 +91,30 @@ VioManager::VioManager(VioManagerOptions &params_) : thread_init_running(false),
   // deployed estimator_config.yaml (missing the async block, epoch_mode defaulting to false)
   // looks like, and it dead-reckons into a health auto-reset loop on hardware.
   if (params.state_options.num_cameras >= 2 && !params.use_stereo && !params.epoch_mode) {
-    PRINT_WARNING(RED "=======================================================================\n" RESET);
-    PRINT_WARNING(RED "VioManager(): %d UNSYNCED cameras with epoch_mode DISABLED!\n" RESET, params.state_options.num_cameras);
-    PRINT_WARNING(RED "Per-frame cloning divides the clone window across cameras: SLAM features\n" RESET);
-    PRINT_WARNING(RED "cannot reach max-track length and MSCKF triangulation loses its baseline.\n" RESET);
-    PRINT_WARNING(RED "Set epoch_mode: true (async rigs) or use_stereo: true (synced pairs).\n" RESET);
-    PRINT_WARNING(RED "If you DID set it, the DEPLOYED estimator_config.yaml is an older file\n" RESET);
-    PRINT_WARNING(RED "that lacks the async block -- regenerate the on-target config.\n" RESET);
-    PRINT_WARNING(RED "=======================================================================\n" RESET);
+    if (params.cams_trigger_synced) {
+      // Declared hardware-trigger-synced: every camera exposes off the same trigger, so all of
+      // them land on the same clone and per-frame cloning keeps the FULL window baseline. This
+      // is the correct configuration for such a rig, not a drift -- say so in green so it is not
+      // mistaken for the red banner below.
+      PRINT_INFO(GREEN "=======================================================================\n" RESET);
+      PRINT_INFO(GREEN "VioManager(): %d cameras declared HARDWARE FRAME-SYNCED (cam_sync trigger).\n" RESET,
+                 params.state_options.num_cameras);
+      PRINT_INFO(GREEN "Per-frame cloning is correct here -- one trigger, one clone, full window.\n" RESET);
+      PRINT_INFO(GREEN "NOTE: the sync covers the FRAME TRIGGER only; EXPOSURE IS NOT INCLUDED.\n" RESET);
+      PRINT_INFO(GREEN "Each camera runs its own AE, so their center-row mid-exposure stamps still\n" RESET);
+      PRINT_INFO(GREEN "differ; that residual rides on the per-camera timeshift_cam_imu, not here.\n" RESET);
+      PRINT_INFO(GREEN "=======================================================================\n" RESET);
+    } else {
+      PRINT_WARNING(RED "=======================================================================\n" RESET);
+      PRINT_WARNING(RED "VioManager(): %d UNSYNCED cameras with epoch_mode DISABLED!\n" RESET, params.state_options.num_cameras);
+      PRINT_WARNING(RED "Per-frame cloning divides the clone window across cameras: SLAM features\n" RESET);
+      PRINT_WARNING(RED "cannot reach max-track length and MSCKF triangulation loses its baseline.\n" RESET);
+      PRINT_WARNING(RED "Set epoch_mode: true (async rigs), use_stereo: true (synced pairs), or\n" RESET);
+      PRINT_WARNING(RED "cam_sync: \"trigger\" if the cameras really do share a hardware trigger.\n" RESET);
+      PRINT_WARNING(RED "If you DID set it, the DEPLOYED estimator_config.yaml is an older file\n" RESET);
+      PRINT_WARNING(RED "that lacks the async block -- regenerate the on-target config.\n" RESET);
+      PRINT_WARNING(RED "=======================================================================\n" RESET);
+    }
   }
 
   // Create the state!!
@@ -230,20 +246,6 @@ VioManager::VioManager(VioManagerOptions &params_) : thread_init_running(false),
       auto track_ocl = std::make_shared<TrackOCL>(state->_cam_intrinsics_cameras, init_max_features,
                                                   state->_options.max_aruco_features, params.use_stereo,
                                                   params.fast_threshold, params.grid_x, params.grid_y, params.min_px_dist);
-      // Bind the ZNCC epipolar-band stereo matcher whenever stereo is on and
-      // the calibration has been packed by VoxlConfigure. It is the only
-      // stereo-projection path in TrackOCL; without it, stereo features stay
-      // mono-only.
-      PRINT_DEBUG("[VioManager] stereo: use_stereo=%d  calib_valid=%d\n",
-                  (int)params.use_stereo, (int)params.stereo_calib_valid);
-      if (params.use_stereo && params.stereo_calib_valid) {
-        track_ocl->enable_zncc_stereo_matcher(params.stereo_calib,
-                                              params.stereo_z_min,
-                                              params.stereo_z_max);
-      } else if (params.use_stereo) {
-        fprintf(stderr, "[VioManager] stereo requested but stereo_calib not "
-                        "populated; stereo features will stay mono-only\n");
-      }
       trackFEATS = std::static_pointer_cast<TrackBase>(track_ocl);
 #endif
     } else {
