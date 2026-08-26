@@ -24,6 +24,7 @@
 
 #include <chrono>
 #include <thread>
+#include <unordered_map>
 
 #include "feat/Feature.h"
 #include "feat/FeatureDatabase.h"
@@ -49,6 +50,7 @@
 #include "state/Propagator.h"
 #include "state/State.h"
 #include "state/StateHelper.h"
+#include "update/RejectStats.h"
 #include "update/UpdaterMSCKF.h"
 #include "update/UpdaterSLAM.h"
 #include "update/UpdaterZeroVelocity.h"
@@ -1098,7 +1100,15 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
   }
   feats_slam_UPDATE = feats_slam_UPDATE_TEMP;
   rT5 = ov_core::prof_now();
-  updaterSLAM->delayed_init(state, feats_slam_DELAYED);
+  // DIAGNOSTIC ONLY: hand delayed_init a featid->matcher-confidence lookup (see UpdaterSLAM.h) so
+  // its reinit log can report whether a bad depth came from a confident-but-wrong match or an
+  // unconfident one. Reached through the TrackBase interface -- stereo_confidence_map() is empty
+  // for trackers that don't produce stereo matches, in which case delayed_init just logs "no data".
+  std::unordered_map<size_t, StereoMatchConfidence> stereo_conf_for_diag;
+  for (const auto &kv : trackFEATS->stereo_confidence_map()) {
+    stereo_conf_for_diag[kv.first] = StereoMatchConfidence{kv.second.peak_zncc, kv.second.margin, kv.second.lr_err};
+  }
+  updaterSLAM->delayed_init(state, feats_slam_DELAYED, &stereo_conf_for_diag);
   rT6 = ov_core::prof_now();
 
   //===================================================================================

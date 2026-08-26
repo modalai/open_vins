@@ -139,8 +139,19 @@ void AsyncCameraBuffer::drain(double newest_imu_time, const DtMaxFn &dt_max_for_
       if (last_ts < 0) {
         continue; // never alive
       }
-      if (last_ts >= t_head) {
-        continue; // its >= t_head frame is in flight into the ring; we will see it next drain
+      if (last_ts > t_head) {
+        continue; // this camera has only LATER frames; no bit-equal partner for t_head is coming,
+                  // so releasing the head now cannot orphan a same-timestamp mate.
+      }
+      if (last_ts == t_head) {
+        // The mate's SAME-timestamp frame is already in this stream's ring but was not staged this
+        // drain (it landed just after the staging step -- the "split across iterations" case). HOLD
+        // one drain so it stages and BUNDLES with the head, instead of releasing the head unpaired
+        // (feed_new_camera drops single-cam frames in stereo mode -> [HEALTH] Dropped camera frame).
+        // Bounded: next drain pops it (push publishes last_enqueued_ts only AFTER the ring push, so
+        // last_ts==t_head guarantees the frame is present). Restores the CameraQueueFusion re-pair fix.
+        counter_held_pair.fetch_add(1, std::memory_order_relaxed);
+        return;
       }
       const double last_mono = s.last_push_mono.load(std::memory_order_acquire);
       double period = s.ema_period.load(std::memory_order_relaxed);

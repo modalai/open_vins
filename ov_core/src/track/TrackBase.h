@@ -32,6 +32,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include <Eigen/Eigen>
 #include <opencv2/core/core.hpp>
 #include <opencv2/highgui/highgui.hpp>
 #include <opencv2/opencv.hpp>
@@ -163,14 +164,34 @@ public:
   virtual cl_context get_ocl_context() const { return nullptr; }
 #endif
 
+  // --- optional capabilities implemented by GPU-backed trackers (default no-ops), analogous to
+  //     get_ocl_context() above. They let VioManager / the server use these features through the
+  //     TrackBase interface WITHOUT depending on the concrete tracker type (e.g. TrackOCL). ---
+
+  /// IMU-aided KLT seeding: forward gyro samples / bias / per-camera IMU->camera rotation so the
+  /// tracker can seed nextPts with the IMU-predicted inter-frame rotation. No-op unless supported.
+  virtual void feed_imu(double t, double gx, double gy, double gz) { (void)t; (void)gx; (void)gy; (void)gz; }
+  virtual void set_gyro_bias(double bx, double by, double bz) { (void)bx; (void)by; (void)bz; }
+  virtual void set_cam_imu_rotation(size_t cam_id, const Eigen::Matrix3d &R_ItoC) { (void)cam_id; (void)R_ItoC; }
+
+  /// Per-feature stereo-match confidence (for reinit diagnostics). Empty on trackers that don't
+  /// produce stereo matches; a matching tracker overrides stereo_confidence_map().
+  struct StereoConfidence {
+    float peak_zncc;  // forward peak ZNCC, in [-1, 1]
+    float margin;     // peak - runner_up; uniqueness signal
+    float lr_err;     // px residual of right->left round-trip
+  };
+  virtual const std::unordered_map<size_t, StereoConfidence> &stereo_confidence_map() const {
+    static const std::unordered_map<size_t, StereoConfidence> empty;
+    return empty;
+  }
+
   // --- Frontend state snapshot/restore (replay harness rewind/branch) --------------------------
   // Captures the CPU-side last-frame tracking state so a restored State can continue tracking.
-  // The struct is polymorphic so a tracker COULD extend it with extra CPU state; today no
-  // tracker does -- TrackOCL's only extra CPU-side member (stereo_confidence_) has no consumers
-  // yet and is left un-captured; add the override when that wiring lands. The GPU-resident
-  // previous-frame pyramid is NOT captured here (it is not host-visible); the harness rebuilds
-  // it by re-feeding the snapshot frame's image through feed_new_camera() before restoring this
-  // CPU state on top.
+  // Polymorphic: a GPU tracker (TrackOCL) extends FrontendState with its extra CPU state and
+  // overrides capture/restore. The GPU-resident previous-frame pyramid is NOT captured here (it
+  // is not host-visible); the harness rebuilds it by re-feeding the snapshot frame's image
+  // through feed_new_camera() before restoring this CPU state on top.
 
   /// Base CPU frontend state common to all trackers. Derive to add tracker-specific fields.
   struct FrontendState {

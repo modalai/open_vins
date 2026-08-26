@@ -23,6 +23,7 @@
 #include "UpdaterSLAM.h"
 
 #include "UpdaterHelper.h"
+#include "RejectStats.h"
 
 #include "feat/Feature.h"
 #include "feat/FeatureInitializer.h"
@@ -35,6 +36,8 @@
 #include "utils/quat_ops.h"
 
 #include <cmath>
+#include <iterator>
+#include <set>
 
 #include "utils/ChronoProf.h"
 #include "utils/chi_square/chi_squared_quantile_table_0_95.h"
@@ -57,7 +60,8 @@ UpdaterSLAM::UpdaterSLAM(UpdaterOptions &options_slam, UpdaterOptions &options_a
   // (utils/chi_square/, bit-identical to the boost::math values this used to compute here)
 }
 
-void UpdaterSLAM::delayed_init(std::shared_ptr<State> state, std::vector<std::shared_ptr<Feature>> &feature_vec) {
+void UpdaterSLAM::delayed_init(std::shared_ptr<State> state, std::vector<std::shared_ptr<Feature>> &feature_vec,
+                               const std::unordered_map<size_t, StereoMatchConfidence> *stereo_confidence) {
 
   // Return if no features
   if (feature_vec.empty())
@@ -156,6 +160,7 @@ void UpdaterSLAM::delayed_init(std::shared_ptr<State> state, std::vector<std::sh
   }
 
   // 3. Try to triangulate all MSCKF or new SLAM features that have measurements
+  RejectCounters rc; // DIAGNOSTIC: stereo-vs-mono gate-level reject accounting
   auto it1 = feature_vec.begin();
   while (it1 != feature_vec.end()) {
 
@@ -211,22 +216,41 @@ void UpdaterSLAM::delayed_init(std::shared_ptr<State> state, std::vector<std::sh
       clones_for_tri = &clones_cam_rs;
     }
 
+    // DIAGNOSTIC: feature is "stereo" this update if observed in >1 camera.
+    bool is_stereo = (*it1)->timestamps.size() > 1;
+    if (is_stereo) rc.s_n++; else rc.m_n++;
+
     // Triangulate the feature and remove if it fails
+    FeatureInitializer::FailReason tri_reason = FeatureInitializer::FailReason::NONE;
     bool success_tri = true;
     if (initializer_feat->config().triangulate_1d) {
       success_tri = initializer_feat->single_triangulation_1d(*it1, *clones_for_tri);
     } else {
-      success_tri = initializer_feat->single_triangulation(*it1, *clones_for_tri);
+      success_tri = initializer_feat->single_triangulation(*it1, *clones_for_tri, &tri_reason);
     }
 
     // Gauss-newton refine the feature
+    FeatureInitializer::FailReason gn_reason = FeatureInitializer::FailReason::NONE;
     bool success_refine = true;
     if (initializer_feat->config().refine_features) {
-      success_refine = initializer_feat->single_gaussnewton(*it1, *clones_for_tri);
+      success_refine = initializer_feat->single_gaussnewton(*it1, *clones_for_tri, &gn_reason);
     }
 
     // Remove the feature if not a success
     if (!success_tri || !success_refine) {
+      if (kEnableRejectDiag) {
+        using FR = FeatureInitializer::FailReason;
+        FR r = (!success_tri) ? tri_reason : gn_reason;
+        switch (r) {
+          case FR::TRI_COND:    is_stereo ? rc.s_tri_cond++  : rc.m_tri_cond++;  break;
+          case FR::TRI_DEPTH:   is_stereo ? rc.s_tri_depth++ : rc.m_tri_depth++; break;
+          case FR::TRI_NAN:     is_stereo ? rc.s_tri_nan++   : rc.m_tri_nan++;   break;
+          case FR::GN_BASELINE: is_stereo ? rc.s_gn_base++   : rc.m_gn_base++;   break;
+          case FR::GN_DEPTH:    is_stereo ? rc.s_gn_depth++  : rc.m_gn_depth++;  break;
+          case FR::GN_NAN:      is_stereo ? rc.s_gn_nan++    : rc.m_gn_nan++;     break;
+          default: break;
+        }
+      }
       (*it1)->to_delete = true;
       it1 = feature_vec.erase(it1);
       continue;
@@ -235,17 +259,19 @@ void UpdaterSLAM::delayed_init(std::shared_ptr<State> state, std::vector<std::sh
   }
   rT2 = ov_core::prof_now();
 
-  // 4. Compute linear system for each feature, nullspace project, and reject
-  auto it2 = feature_vec.begin();
-  while (it2 != feature_vec.end()) {
-
-    // Convert our feature into our current format
+  // 4. Compute linear system for each feature, nullspace project, and reject.
+  // try_init() builds the linear system for an ALREADY-TRIANGULATED feature `f`
+  // (f.p_FinA / f.anchor_cam_id set) and attempts the delayed SLAM init; on success
+  // it inserts the landmark into the state and returns true. Factored into a lambda
+  // so stereo->mono graceful degrade can call it a second time on the
+  // mono-stripped feature when the stereo form fails the chi2 gate.
+  auto try_init = [&](ov_core::Feature &f) -> bool {
     UpdaterHelper::UpdaterHelperFeature feat;
-    feat.featid = (*it2)->featid;
-    feat.uvs = (*it2)->uvs;
-    feat.uvs_norm = (*it2)->uvs_norm;
-    feat.timestamps = (*it2)->timestamps;
-    feat.quality = (*it2)->quality;
+    feat.featid = f.featid;
+    feat.uvs = f.uvs;
+    feat.uvs_norm = f.uvs_norm;
+    feat.timestamps = f.timestamps;
+    feat.quality = f.quality;
 
     // If we are using single inverse depth, then it is equivalent to using the msckf inverse depth
     auto feat_rep =
@@ -257,13 +283,13 @@ void UpdaterSLAM::delayed_init(std::shared_ptr<State> state, std::vector<std::sh
 
     // Save the position and its fej value
     if (LandmarkRepresentation::is_relative_representation(feat.feat_representation)) {
-      feat.anchor_cam_id = (*it2)->anchor_cam_id;
-      feat.anchor_clone_timestamp = (*it2)->anchor_clone_timestamp;
-      feat.p_FinA = (*it2)->p_FinA;
-      feat.p_FinA_fej = (*it2)->p_FinA;
+      feat.anchor_cam_id = f.anchor_cam_id;
+      feat.anchor_clone_timestamp = f.anchor_clone_timestamp;
+      feat.p_FinA = f.p_FinA;
+      feat.p_FinA_fej = f.p_FinA;
     } else {
-      feat.p_FinG = (*it2)->p_FinG;
-      feat.p_FinG_fej = (*it2)->p_FinG;
+      feat.p_FinG = f.p_FinG;
+      feat.p_FinG_fej = f.p_FinG;
     }
 
     // Our return values (feature jacobian, state jacobian, residual, and order of state jacobian)
@@ -302,7 +328,7 @@ void UpdaterSLAM::delayed_init(std::shared_ptr<State> state, std::vector<std::sh
     auto landmark = std::make_shared<Landmark>(landmark_size);
     landmark->_featid = feat.featid;
     landmark->_feat_representation = feat_rep;
-    landmark->_unique_camera_id = (*it2)->anchor_cam_id;
+    landmark->_unique_camera_id = f.anchor_cam_id;
     if (LandmarkRepresentation::is_relative_representation(feat.feat_representation)) {
       landmark->_anchor_cam_id = feat.anchor_cam_id;
       landmark->_anchor_clone_timestamp = feat.anchor_clone_timestamp;
@@ -314,24 +340,139 @@ void UpdaterSLAM::delayed_init(std::shared_ptr<State> state, std::vector<std::sh
     }
     landmark->_quality = feat.quality;
 
-    // Measurement noise matrix
-    double sigma_pix_sq =
-        ((int)feat.featid < state->_options.max_aruco_features) ? _options_aruco.sigma_pix_sq : _options_slam.sigma_pix_sq;
+    // Per-feature measurement noise: stereo (multi-cam) uses the larger stereo sigma.
+    bool is_aruco = (int)feat.featid < state->_options.max_aruco_features;
+    bool is_stereo = feat.timestamps.size() > 1;
+    double sigma_pix_sq = is_aruco ? _options_aruco.sigma_pix_sq
+                                   : (is_stereo ? _options_slam.sigma_pix_sq_stereo : _options_slam.sigma_pix_sq);
     Eigen::MatrixXd R = sigma_pix_sq * Eigen::MatrixXd::Identity(res.rows(), res.rows());
-
-    // Try to initialize, delete new pointer if we failed
-    double chi2_multipler =
-        ((int)feat.featid < state->_options.max_aruco_features) ? _options_aruco.chi2_multipler : _options_slam.chi2_multipler;
+    double chi2_multipler = is_aruco ? _options_aruco.chi2_multipler : _options_slam.chi2_multipler;
     if (StateHelper::initialize(state, landmark, Hx_order, H_x, H_f, R, res, chi2_multipler)) {
-      state->_features_SLAM.insert({(*it2)->featid, landmark});
-      (*it2)->to_delete = true;
-      it2++;
-    } else {
-      (*it2)->to_delete = true;
-      it2 = feature_vec.erase(it2);
+      state->_features_SLAM.insert({f.featid, landmark});
+
+      // DIAGNOSTIC: confirm/refute whether "landmarked too close" flicker traces to a
+      // feature being marginalized then re-triangulated from a thin/short-baseline
+      // observation set. See RejectStats.h ReinitEvent for details.
+      if (kEnableReinitDiag) {
+        std::set<double> distinct_ts;
+        int n_obs = 0;
+        for (auto const &pair : f.timestamps) {
+          n_obs += (int)pair.second.size();
+          for (double t : pair.second)
+            distinct_ts.insert(t);
+        }
+        ReinitEvent ev;
+        ev.meas_ts = state->_timestamp;
+        ev.featid = f.featid;
+        ev.is_stereo = is_stereo;
+        ev.is_reinit = reinit_mark_and_check(f.featid);
+        ev.n_cams = (int)f.timestamps.size();
+        ev.n_obs = n_obs;
+        ev.n_distinct_ts = (int)distinct_ts.size();
+        ev.time_span_s = distinct_ts.empty() ? 0.0 : (*distinct_ts.rbegin() - *distinct_ts.begin());
+        ev.depth_anchor = f.p_FinA(2);
+
+        // For the single-instant 2-cam stereo case: recompute the SAME baseline vector
+        // FeatureInitializer used (anchor pose vs. the other camera's pose, both read
+        // straight from clones_cam) to check whether the triangulation actually saw the
+        // true known extrinsic separation, or something anomalous (a pose/lookup bug).
+        if (ev.n_cams == 2 && ev.n_distinct_ts == 1) {
+          try {
+            double t0 = *distinct_ts.begin();
+            size_t other_cam = ((int)f.timestamps.begin()->first == f.anchor_cam_id) ? std::next(f.timestamps.begin())->first
+                                                                                      : f.timestamps.begin()->first;
+            FeatureInitializer::ClonePose anchor_pose = clones_cam.at(f.anchor_cam_id).at(f.anchor_clone_timestamp);
+            FeatureInitializer::ClonePose other_pose = clones_cam.at(other_cam).at(t0);
+            Eigen::Vector3d p_CiinA = anchor_pose.Rot() * (other_pose.pos() - anchor_pose.pos());
+            ev.baseline_norm = p_CiinA.norm();
+          } catch (const std::exception &e) {
+            ev.baseline_norm = -1.0;
+          }
+        }
+
+        // Matcher's own confidence for this feature's L/R correspondence, if VioManager
+        // supplied one (see UpdaterSLAM.h delayed_init doc). Left at ReinitEvent's "no
+        // data" sentinel defaults if unavailable.
+        if (stereo_confidence != nullptr) {
+          auto it_conf = stereo_confidence->find(f.featid);
+          if (it_conf != stereo_confidence->end()) {
+            ev.peak_zncc = it_conf->second.peak_zncc;
+            ev.margin = it_conf->second.margin;
+            ev.lr_err = it_conf->second.lr_err;
+          }
+        }
+
+        log_reinit_event(ev);
+      }
+
+      return true;
     }
+    return false;
+  };
+
+  // build_mono: strip a feature to its anchor camera's observations and re-triangulate
+  // as mono. Returns the mono Feature (p_FinA set) or nullptr if it cannot triangulate
+  // (e.g. no parallax during hover). Used by the stereo->mono chi2-fail demote below.
+  auto build_mono = [&](ov_core::Feature &f) -> std::shared_ptr<ov_core::Feature> {
+    auto mono = std::make_shared<ov_core::Feature>(f); // deep copy of the feature
+    int anchor = f.anchor_cam_id;                      // the cam with most obs (set in loop 1)
+    // remove EVERY camera's observations except the anchor's
+    for (auto mit = mono->timestamps.begin(); mit != mono->timestamps.end();) {
+      if ((int)mit->first != anchor) {
+        mono->uvs.erase(mit->first);
+        mono->uvs_norm.erase(mit->first);
+        mit = mono->timestamps.erase(mit);
+      } else {
+        ++mit;
+      }
+    }
+    // re-triangulate the now single-camera (temporal) track
+    bool ok = mono->timestamps.count(anchor) && mono->timestamps.at(anchor).size() >= 2 &&
+              initializer_feat->single_triangulation(mono, clones_cam) &&
+              (!initializer_feat->config().refine_features || initializer_feat->single_gaussnewton(mono, clones_cam));
+    return ok ? mono : nullptr;
+  };
+  auto mark_demoted = [&](size_t featid) {
+    auto lm = state->_features_SLAM.find(featid);
+    if (lm != state->_features_SLAM.end())
+      lm->second->demoted_to_mono = true; // keep it mono for life (see UpdaterSLAM::update)
+  };
+
+  auto it2 = feature_vec.begin();
+  while (it2 != feature_vec.end()) {
+    bool was_stereo = (*it2)->timestamps.size() > 1;
+    bool inserted = try_init(**it2);
+    bool demoted = false;
+
+    // stereo->mono graceful degrade on chi2 failure. Retry a failed
+    // stereo feature using only the anchor camera's observations so its monocular
+    // value isn't discarded; flag it so the update path keeps it mono for life.
+    if (!inserted && was_stereo && kEnableStereoToMonoDemote) {
+      auto mono = build_mono(**it2);
+      if (mono && try_init(*mono)) { inserted = true; demoted = true; mark_demoted((*it2)->featid); }
+    }
+
+    if (kEnableRejectDiag) {
+      if (inserted) {
+        if (demoted)         { if (was_stereo) rc.s_demote++; else rc.m_demote++; }
+        else if (was_stereo) rc.s_accept++;
+        else rc.m_accept++;
+      } else {
+        if (was_stereo) rc.s_chi2++;
+        else rc.m_chi2++;
+      }
+    }
+    (*it2)->to_delete = true;
+    if (inserted)
+      it2++;
+    else
+      it2 = feature_vec.erase(it2);
   }
   rT3 = ov_core::prof_now();
+
+  // DIAGNOSTIC: per-update gate-reject accounting (state ts for yaw align).
+  if (kEnableRejectDiag)
+    log_reject_stats(state->_timestamp, "SLAM_INIT", rc);
 
   // Debug print timing information
   if (!feature_vec.empty()) {
@@ -410,6 +551,7 @@ void UpdaterSLAM::update(std::shared_ptr<State> state, std::vector<std::shared_p
   size_t ct_meas = 0;
 
   // 4. Compute linear system for each feature, nullspace project, and reject
+  RejectCounters rc; // DIAGNOSTIC: stereo-vs-mono chi2 reject accounting (existing SLAM feats)
   auto it2 = feature_vec.begin();
   while (it2 != feature_vec.end()) {
 
@@ -427,6 +569,20 @@ void UpdaterSLAM::update(std::shared_ptr<State> state, std::vector<std::shared_p
     feat.uvs_norm = (*it2)->uvs_norm;
     feat.timestamps = (*it2)->timestamps;
     feat.quality = (*it2)->quality;
+    // a landmark admitted via stereo->mono graceful degrade must keep
+    // using ONLY its anchor camera; otherwise we'd re-impose the failing stereo
+    // constraint here and evict it. Strip the non-anchor cameras' observations.
+    if (kEnableStereoToMonoDemote && landmark->demoted_to_mono) {
+      for (auto mit = feat.timestamps.begin(); mit != feat.timestamps.end();) {
+        if ((int)mit->first != landmark->_anchor_cam_id) {
+          feat.uvs.erase(mit->first);
+          feat.uvs_norm.erase(mit->first);
+          mit = feat.timestamps.erase(mit);
+        } else {
+          ++mit;
+        }
+      }
+    }
     // If we are using single inverse depth, then it is equivalent to using the msckf inverse depth
     feat.feat_representation = landmark->_feat_representation;
     if (landmark->_feat_representation == LandmarkRepresentation::Representation::ANCHORED_INVERSE_DEPTH_SINGLE) {
@@ -484,8 +640,12 @@ void UpdaterSLAM::update(std::shared_ptr<State> state, std::vector<std::shared_p
     // Chi2 distance check
     Eigen::MatrixXd P_marg = StateHelper::get_marginal_covariance(state, Hxf_order);
     Eigen::MatrixXd S = H_xf * P_marg * H_xf.transpose();
-    double sigma_pix_sq =
-        ((int)feat.featid < state->_options.max_aruco_features) ? _options_aruco.sigma_pix_sq : _options_slam.sigma_pix_sq;
+    // Per-feature measurement noise: stereo (multi-cam) features use a larger
+    // sigma than mono. sigma_pix_sq is reused below for this feature's R_big block.
+    bool is_aruco = (int)feat.featid < state->_options.max_aruco_features;
+    bool is_stereo = feat.timestamps.size() > 1;
+    double sigma_pix_sq = is_aruco ? _options_aruco.sigma_pix_sq
+                                   : (is_stereo ? _options_slam.sigma_pix_sq_stereo : _options_slam.sigma_pix_sq);
     S.diagonal() += sigma_pix_sq * Eigen::VectorXd::Ones(S.rows());
     double chi2 = res.dot(S.llt().solve(res));
 
@@ -494,9 +654,9 @@ void UpdaterSLAM::update(std::shared_ptr<State> state, std::vector<std::shared_p
     double chi2_check = ov_core::chi_squared_quantile_0_95((int)res.rows());
 
     // Check if we should delete or not
-    double chi2_multipler =
-        ((int)feat.featid < state->_options.max_aruco_features) ? _options_aruco.chi2_multipler : _options_slam.chi2_multipler;
+    double chi2_multipler = is_aruco ? _options_aruco.chi2_multipler : _options_slam.chi2_multipler;
     if (chi2 > chi2_multipler * chi2_check) {
+      if (kEnableRejectDiag) { if (is_stereo) rc.s_chi2++; else rc.m_chi2++; }
       if ((int)feat.featid < state->_options.max_aruco_features) {
         PRINT_WARNING(YELLOW "[SLAM-UP]: rejecting aruco tag %d for chi2 thresh (%.3f > %.3f)\n" RESET, (int)feat.featid, chi2,
                       chi2_multipler * chi2_check);
@@ -507,6 +667,7 @@ void UpdaterSLAM::update(std::shared_ptr<State> state, std::vector<std::shared_p
       it2 = feature_vec.erase(it2);
       continue;
     }
+    if (kEnableRejectDiag) { if (is_stereo) rc.s_accept++; else rc.m_accept++; }
 
     // Debug print when we are going to update the aruco tags
     if ((int)feat.featid < state->_options.max_aruco_features) {
@@ -538,6 +699,10 @@ void UpdaterSLAM::update(std::shared_ptr<State> state, std::vector<std::shared_p
     it2++;
   }
   rT2 = ov_core::prof_now();
+
+  // DIAGNOSTIC: per-update chi2-reject accounting for existing SLAM features.
+  if (kEnableRejectDiag)
+    log_reject_stats(state->_timestamp, "SLAM_UPD", rc);
 
   // We have appended all features to our Hx_big, res_big
   // Delete it so we do not reuse information

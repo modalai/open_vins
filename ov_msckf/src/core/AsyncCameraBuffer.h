@@ -121,6 +121,9 @@ public:
   uint64_t count_drop_full() const { return counter_drop_full.load(std::memory_order_relaxed); }
   uint64_t count_drop_late() const { return counter_drop_late.load(std::memory_order_relaxed); }
   uint64_t count_drop_bogus() const { return counter_drop_bogus.load(std::memory_order_relaxed); }
+  /// Times the merge held the head one drain to bundle a same-timestamp mate that was in-flight
+  /// (should track the stereo pair rate; a nonzero, growing value = the re-pair fix is active).
+  uint64_t count_held_pair() const { return counter_held_pair.load(std::memory_order_relaxed); }
   /// @}
 
 protected:
@@ -149,6 +152,7 @@ protected:
 
   std::atomic<uint64_t> counter_pushed{0}, counter_released{0}, counter_bundled{0};
   std::atomic<uint64_t> counter_drop_full{0}, counter_drop_late{0}, counter_drop_bogus{0};
+  std::atomic<uint64_t> counter_held_pair{0};
 };
 
 } // namespace ov_msckf

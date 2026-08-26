@@ -23,6 +23,7 @@
 #include "UpdaterMSCKF.h"
 
 #include "UpdaterHelper.h"
+#include "RejectStats.h"
 
 #include "feat/Feature.h"
 #include "feat/FeatureInitializer.h"
@@ -153,6 +154,7 @@ void UpdaterMSCKF::update(std::shared_ptr<State> state, std::vector<std::shared_
   }
 
   // 3. Try to triangulate all MSCKF or new SLAM features that have measurements
+  RejectCounters rc; // DIAGNOSTIC: stereo-vs-mono gate-level reject accounting
   auto it1 = feature_vec.begin();
   while (it1 != feature_vec.end()) {
 
@@ -208,22 +210,41 @@ void UpdaterMSCKF::update(std::shared_ptr<State> state, std::vector<std::shared_
       clones_for_tri = &clones_cam_rs;
     }
 
+    // DIAGNOSTIC: feature is "stereo" this update if observed in >1 camera.
+    bool is_stereo = (*it1)->timestamps.size() > 1;
+    if (is_stereo) rc.s_n++; else rc.m_n++;
+
     // Triangulate the feature and remove if it fails
+    FeatureInitializer::FailReason tri_reason = FeatureInitializer::FailReason::NONE;
     bool success_tri = true;
     if (initializer_feat->config().triangulate_1d) {
       success_tri = initializer_feat->single_triangulation_1d(*it1, *clones_for_tri);
     } else {
-      success_tri = initializer_feat->single_triangulation(*it1, *clones_for_tri);
+      success_tri = initializer_feat->single_triangulation(*it1, *clones_for_tri, &tri_reason);
     }
 
     // Gauss-newton refine the feature
+    FeatureInitializer::FailReason gn_reason = FeatureInitializer::FailReason::NONE;
     bool success_refine = true;
     if (initializer_feat->config().refine_features) {
-      success_refine = initializer_feat->single_gaussnewton(*it1, *clones_for_tri);
+      success_refine = initializer_feat->single_gaussnewton(*it1, *clones_for_tri, &gn_reason);
     }
 
     // Remove the feature if not a success
     if (!success_tri || !success_refine) {
+      if (kEnableRejectDiag) {
+        using FR = FeatureInitializer::FailReason;
+        FR r = (!success_tri) ? tri_reason : gn_reason;
+        switch (r) {
+          case FR::TRI_COND:    is_stereo ? rc.s_tri_cond++  : rc.m_tri_cond++;  break;
+          case FR::TRI_DEPTH:   is_stereo ? rc.s_tri_depth++ : rc.m_tri_depth++; break;
+          case FR::TRI_NAN:     is_stereo ? rc.s_tri_nan++   : rc.m_tri_nan++;   break;
+          case FR::GN_BASELINE: is_stereo ? rc.s_gn_base++   : rc.m_gn_base++;   break;
+          case FR::GN_DEPTH:    is_stereo ? rc.s_gn_depth++  : rc.m_gn_depth++;  break;
+          case FR::GN_NAN:      is_stereo ? rc.s_gn_nan++    : rc.m_gn_nan++;     break;
+          default: break; // 1d path or unclassified
+        }
+      }
       (*it1)->to_delete = true;
       it1 = feature_vec.erase(it1);
       continue;
@@ -296,9 +317,15 @@ void UpdaterMSCKF::update(std::shared_ptr<State> state, std::vector<std::shared_
     UpdaterHelper::nullspace_project_inplace(H_f, H_x, res);
 
     /// Chi2 distance check
+    // Per-feature measurement noise: a feature seen in >1 camera (stereo) is
+    // weighted with a larger sigma than a mono feature, because cross-camera ZNCC
+    // matches are noisier than same-camera KLT temporal tracks. sigma_pix_sq_stereo
+    // falls back to sigma_pix_sq when no stereo value is configured.
+    bool is_stereo = feat.timestamps.size() > 1;
+    double sigma2_f = is_stereo ? _options.sigma_pix_sq_stereo : _options.sigma_pix_sq;
     Eigen::MatrixXd P_marg = StateHelper::get_marginal_covariance(state, Hx_order);
     Eigen::MatrixXd S = H_x * P_marg * H_x.transpose();
-    S.diagonal() += _options.sigma_pix_sq * Eigen::VectorXd::Ones(S.rows());
+    S.diagonal() += sigma2_f * Eigen::VectorXd::Ones(S.rows());
     double chi2 = res.dot(S.llt().solve(res));
 
     // Threshold from the baked quantile table (full reachable dof range; no runtime solve)
@@ -306,6 +333,7 @@ void UpdaterMSCKF::update(std::shared_ptr<State> state, std::vector<std::shared_
 
     // Check if we should delete or not
     if (chi2 > _options.chi2_multipler * chi2_check) {
+      if (kEnableRejectDiag) { if (is_stereo) rc.s_chi2++; else rc.m_chi2++; }
       (*it2)->to_delete = true;
       it2 = feature_vec.erase(it2);
       // PRINT_DEBUG("featid = %d\n", feat.featid);
@@ -315,6 +343,15 @@ void UpdaterMSCKF::update(std::shared_ptr<State> state, std::vector<std::shared_
       // PRINT_DEBUG(ss.str().c_str());
       continue;
     }
+    if (kEnableRejectDiag) { if (is_stereo) rc.s_accept++; else rc.m_accept++; }
+
+    // Whiten this feature's rows by 1/sigma_f so the stacked system has isotropic
+    // unit noise. Required because the global measurement compression and the EKF
+    // update below assume R = I. For a mono feature (sigma2_f == sigma_pix_sq) this
+    // is identical to the previous R = sigma_pix_sq * I formulation.
+    double inv_sigma_f = 1.0 / std::sqrt(sigma2_f);
+    H_x *= inv_sigma_f;
+    res *= inv_sigma_f;
 
     // We are good!!! Append to our large H vector
     size_t ct_hx = 0;
@@ -339,6 +376,11 @@ void UpdaterMSCKF::update(std::shared_ptr<State> state, std::vector<std::shared_
   }
   rT3 = ov_core::prof_now();
 
+  // DIAGNOSTIC: emit per-update gate-reject accounting (state ts for yaw align).
+  if (kEnableRejectDiag) {
+    log_reject_stats(state->_timestamp, "MSCKF", rc);
+  }
+
   // We have appended all features to our Hx_big, res_big
   // Delete it so we do not reuse information
   for (size_t f = 0; f < feature_vec.size(); f++) {
@@ -361,8 +403,9 @@ void UpdaterMSCKF::update(std::shared_ptr<State> state, std::vector<std::shared_
   }
   rT4 = ov_core::prof_now();
 
-  // Our noise is isotropic, so make it here after our compression
-  Eigen::MatrixXd R_big = _options.sigma_pix_sq * Eigen::MatrixXd::Identity(res_big.rows(), res_big.rows());
+  // Each feature's rows were whitened by 1/sigma_f above (per-feature stereo/mono
+  // noise), so the stacked & compressed system already has unit isotropic noise.
+  Eigen::MatrixXd R_big = Eigen::MatrixXd::Identity(res_big.rows(), res_big.rows());
 
   // 6. With all good features update the state
   StateHelper::EKFUpdate(state, Hx_order_big, Hx_big, res_big, R_big);
