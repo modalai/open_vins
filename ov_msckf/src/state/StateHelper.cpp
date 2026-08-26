@@ -34,7 +34,7 @@
 #include "utils/print.h"
 #include "utils/quat_ops.h"
 
-#include "utils/chi_square/chi_squared_quantile_table_0_95.h"
+#include <boost/math/distributions/chi_squared.hpp>
 #include <map>
 
 using namespace ov_core;
