@@ -340,11 +340,9 @@ void UpdaterSLAM::delayed_init(std::shared_ptr<State> state, std::vector<std::sh
     }
     landmark->_quality = feat.quality;
 
-    // Per-feature measurement noise: stereo (multi-cam) uses the larger stereo sigma.
     bool is_aruco = (int)feat.featid < state->_options.max_aruco_features;
-    bool is_stereo = feat.timestamps.size() > 1;
-    double sigma_pix_sq = is_aruco ? _options_aruco.sigma_pix_sq
-                                   : (is_stereo ? _options_slam.sigma_pix_sq_stereo : _options_slam.sigma_pix_sq);
+    bool is_stereo = feat.timestamps.size() > 1; // for the reject-diag accounting below
+    double sigma_pix_sq = is_aruco ? _options_aruco.sigma_pix_sq : _options_slam.sigma_pix_sq;
     Eigen::MatrixXd R = sigma_pix_sq * Eigen::MatrixXd::Identity(res.rows(), res.rows());
     double chi2_multipler = is_aruco ? _options_aruco.chi2_multipler : _options_slam.chi2_multipler;
     if (StateHelper::initialize(state, landmark, Hx_order, H_x, H_f, R, res, chi2_multipler)) {
@@ -640,12 +638,10 @@ void UpdaterSLAM::update(std::shared_ptr<State> state, std::vector<std::shared_p
     // Chi2 distance check
     Eigen::MatrixXd P_marg = StateHelper::get_marginal_covariance(state, Hxf_order);
     Eigen::MatrixXd S = H_xf * P_marg * H_xf.transpose();
-    // Per-feature measurement noise: stereo (multi-cam) features use a larger
-    // sigma than mono. sigma_pix_sq is reused below for this feature's R_big block.
+    // sigma_pix_sq is reused below for this feature's R_big block.
     bool is_aruco = (int)feat.featid < state->_options.max_aruco_features;
-    bool is_stereo = feat.timestamps.size() > 1;
-    double sigma_pix_sq = is_aruco ? _options_aruco.sigma_pix_sq
-                                   : (is_stereo ? _options_slam.sigma_pix_sq_stereo : _options_slam.sigma_pix_sq);
+    bool is_stereo = feat.timestamps.size() > 1; // for the reject-diag accounting below
+    double sigma_pix_sq = is_aruco ? _options_aruco.sigma_pix_sq : _options_slam.sigma_pix_sq;
     S.diagonal() += sigma_pix_sq * Eigen::VectorXd::Ones(S.rows());
     double chi2 = res.dot(S.llt().solve(res));
 

@@ -56,7 +56,7 @@ int test_feed_all = 0;
 // seed changes. So: OFF build = baseline tracking with "what prediction would
 // do" logged; ON build = prediction applied with realized reduction logged.
 // ============================================================================
-static constexpr bool kImuAidedSeeding = true;
+static constexpr bool kImuAidedSeeding = false;
 
 // ============================================================================
 // A/B TOGGLE: stereo front-end scheme. Flip + rebuild to compare empirically.

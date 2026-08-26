@@ -317,12 +317,8 @@ void UpdaterMSCKF::update(std::shared_ptr<State> state, std::vector<std::shared_
     UpdaterHelper::nullspace_project_inplace(H_f, H_x, res);
 
     /// Chi2 distance check
-    // Per-feature measurement noise: a feature seen in >1 camera (stereo) is
-    // weighted with a larger sigma than a mono feature, because cross-camera ZNCC
-    // matches are noisier than same-camera KLT temporal tracks. sigma_pix_sq_stereo
-    // falls back to sigma_pix_sq when no stereo value is configured.
-    bool is_stereo = feat.timestamps.size() > 1;
-    double sigma2_f = is_stereo ? _options.sigma_pix_sq_stereo : _options.sigma_pix_sq;
+    bool is_stereo = feat.timestamps.size() > 1; // for the reject-diag accounting below
+    double sigma2_f = _options.sigma_pix_sq;
     Eigen::MatrixXd P_marg = StateHelper::get_marginal_covariance(state, Hx_order);
     Eigen::MatrixXd S = H_x * P_marg * H_x.transpose();
     S.diagonal() += sigma2_f * Eigen::VectorXd::Ones(S.rows());
