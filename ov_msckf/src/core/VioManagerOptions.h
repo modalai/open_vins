@@ -34,16 +34,17 @@
 // builds do not have it: gate on header presence, mirroring ov_core's optional-OpenCL handling
 // (TrackOCL is only compiled when OpenCL/modal_flow exist). All TUs in a given environment agree
 // on this macro, so the struct layout stays consistent within every build.
+//
+// This keys on the OpenCL manager header TrackOCL itself needs -- NOT on StereoMatcher.hpp.
+// The ZNCC stereo matcher was removed from this tree, and libmodal-flow releases that ship
+// ManagerCL without StereoMatcher must still build the GPU tracker.
 #if defined(__has_include)
-#if __has_include(<modal_flow/StereoMatcher.hpp>)
+#if __has_include(<modal_flow/ocl/ManagerCL.hpp>)
 #define OV_HAVE_MODAL_FLOW 1
 #endif
 #endif
 #ifndef OV_HAVE_MODAL_FLOW
 #define OV_HAVE_MODAL_FLOW 0
-#endif
-#if OV_HAVE_MODAL_FLOW
-#include <modal_flow/StereoMatcher.hpp>
 #endif
 
 #include "state/StateOptions.h"
@@ -137,6 +138,21 @@ struct VioManagerOptions {
       parser->parse_config("dt_slam_delay", dt_slam_delay);
       parser->parse_config("try_zupt", try_zupt);
       parser->parse_config("epoch_mode", epoch_mode, false);
+      {
+        // Rig declaration, parsed as a string so the config names the hardware rather than
+        // carrying a bare bool. Unknown values are a hard error: a typo here would silently
+        // downgrade a synced rig back to the drift warning.
+        std::string cam_sync = "";
+        parser->parse_config("cam_sync", cam_sync, false);
+        if (cam_sync == "trigger") {
+          cams_trigger_synced = true;
+        } else if (cam_sync == "none" || cam_sync.empty()) {
+          cams_trigger_synced = false;
+        } else {
+          PRINT_ERROR(RED "VioManagerOptions(): cam_sync must be \"trigger\" or \"none\", got \"%s\"\n" RESET, cam_sync.c_str());
+          std::exit(EXIT_FAILURE);
+        }
+      }
       parser->parse_config("epoch_bind_factor", epoch_bind_factor, false);
       parser->parse_config("epoch_bridge_bias_cols", epoch_bridge_bias_cols, false);
       parser->parse_config("async_ring_size", async_ring_size, false);
@@ -242,6 +258,18 @@ struct VioManagerOptions {
 
   /// Rotation from accelerometer to the "IMU" gyroscope frame frame
   Eigen::Matrix<double, 4, 1> q_GYROtoIMU;
+
+  /// Rig-level frame-trigger declaration (`cam_sync`), naming what the HARDWARE does:
+  ///   "trigger" -> every tracking camera exposes off ONE shared hardware trigger
+  ///   "none"    -> each camera free-runs on its own cadence (the default)
+  /// This is a statement about the rig, not a tuning knob. It only decides whether the
+  /// multi-camera cloning guard treats a per-frame-cloning config as correct or as drift.
+  ///
+  /// The sync it declares covers the FRAME TRIGGER ONLY -- exposure is NOT included. Each
+  /// camera runs its own auto-exposure, so their center-row mid-exposure stamps still differ
+  /// by 0.5*(exp_i - exp_j); that residual is carried per camera by timeshift_cam_imu, never
+  /// by this flag. Do not read "trigger" as "the cameras share one timestamp".
+  bool cams_trigger_synced = false;
 
   /// Epoch-anchored cloning: clones are created only at REFERENCE-camera frame times; other
   /// cameras' frames snap onto the previous epoch clone (known residual enters the measurement
@@ -552,21 +580,6 @@ struct VioManagerOptions {
 
   // If we should use GPU to run tracking functions
   bool use_gpu = false;
-
-  // Session-static stereo calibration packed for libmodal-flow. Populated by
-  // VoxlConfigure (intrinsics + composed extrinsic) and marked valid once the
-  // full pack is filled in. VioManager passes it into TrackOCL via
-  // enable_zncc_stereo_matcher at startup.
-#if OV_HAVE_MODAL_FLOW
-  modal_flow::StereoCalib stereo_calib{};
-#endif
-  bool                    stereo_calib_valid = false;
-
-  // Depth-sweep bounds for the epipolar search. Defaults cover near-touch
-  // (0.10 m) out to effectively infinity (100 m) for a small-baseline rig.
-  // Operator-settable in voxl-open-vins-server.conf if desired.
-  float                   stereo_z_min = 0.10f;
-  float                   stereo_z_max = 100.0f;
 
   /// If should extract aruco tags and estimate them
   bool use_aruco = true;
