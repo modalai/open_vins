@@ -7,7 +7,7 @@
 # init/ (bootstrap), sim/ (synthetic worlds), utils/ (record/writeback/feeders),
 # core/ (session runner), solve/ + window/ (calib-specific, no upstream analog),
 # run_calibrate.cpp entrypoint, test_*.cpp at src root.
-cmake_minimum_required(VERSION 3.3)
+cmake_minimum_required(VERSION 3.5)
 project(ov_zcalib)
 
 find_package(Eigen3 REQUIRED)
