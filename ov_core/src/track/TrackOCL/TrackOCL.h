@@ -69,7 +69,7 @@ namespace ov_core
       }
 
       // Create and set detector
-      auto det = std::make_unique<modal_flow::ocl::DetectorCL>(dev_, 3);
+      auto det = std::make_unique<modal_flow::ocl::DetectorCL>(dev_, /*arc_length=*/10);
       mgr_.set_detector(std::move(det));
 
       // create and set tracker
