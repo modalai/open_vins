@@ -352,6 +352,10 @@ namespace ov_core
     // widening was not needed and only lowered the uniqueness margin (wider search -> more
     // near-duplicate peaks). Widen again only if a genuine R_lr tilt is confirmed off-curve.
     int   stereo_band_px_    = 2;
+    // Reverse (round-trip) window of the ZNCC matcher, px of disparity around the forward
+    // match's depth. 0 = re-sweep the whole z band. 12 px: on D0008-V6 log0000 the local check
+    // agreed with the global one on all but <=1 of ~115 accepts/frame at ~30 % less cold cost.
+    float stereo_rev_window_px_ = 12.0f;
 
     void accumulate_stereo_reject_(int pass, float peak, float margin, float lr,
                                    bool matcher_status, bool right_oob);
