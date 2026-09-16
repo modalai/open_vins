@@ -55,7 +55,13 @@ public:
       prompt = "oscillate rotation about the weak gyro axis (" + weak + ")";
     else if (weak.rfind("da", 0) == 0)
       prompt = "slow tilt sweeps re-orienting gravity (" + weak + ")";
-    else if (weak.rfind("td", 0) == 0)
+    else if (weak.rfind("tg[", 0) == 0) {
+      // Tg is column-major: one column couples a force axis into all gyros.
+      const int k = std::stoi(weak.substr(3));
+      const char axis = "XYZ"[std::min(2, std::max(0, k / 3))];
+      prompt = std::string("vary acceleration along IMU ") + axis +
+               " while changing tilt; mix translation and rotation at different rates, keep nearby features visible (Tg weak)";
+    } else if (weak.rfind("td", 0) == 0)
       prompt = "increase angular rate (time offset weak)";
     else if (weak.rfind("p_IinC", 0) == 0)
       prompt = "sharp rotation bursts about two axes (lever arm weak)";

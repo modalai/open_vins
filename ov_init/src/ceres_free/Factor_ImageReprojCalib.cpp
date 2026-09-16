@@ -70,15 +70,21 @@ bool Factor_ImageReprojCalib::Evaluate(double const *const *parameters, double *
   // (constructing per call heap-allocates and rebuilds the OpenCV matrices,
   // measurable at ~1e4-1e5 evaluations per solve); needed only when Jacobians
   // are requested, so cost-only evaluations skip set_value entirely.
-  static thread_local Eigen::MatrixXd H_dz_dzn, H_dz_dzeta;
+  Eigen::Matrix2d H_dz_dzn;
+  Eigen::Matrix<double, 2, 8> H_dz_dzeta;
   if (jacobians) {
-    static thread_local ov_core::CamEqui cam_eq(0, 0);
-    static thread_local ov_core::CamRadtan cam_rt(0, 0);
-    ov_core::CamBase &cam = is_fisheye ? static_cast<ov_core::CamBase &>(cam_eq) : static_cast<ov_core::CamBase &>(cam_rt);
-    cam.set_value(camera_vals);
-    cam.compute_distort_jacobian(uv_norm, H_dz_dzn, H_dz_dzeta);
+    if (is_fisheye) {
+      static thread_local ov_core::CamEqui cam(0, 0);
+      static thread_local Eigen::MatrixXd Jn, Jc;
+      cam.set_value(camera_vals);
+      cam.compute_distort_jacobian(uv_norm, Jn, Jc);
+      H_dz_dzn = Jn;
+      if (jacobians[5]) H_dz_dzeta = Jc;
+    } else {
+      radtan_jacobian_double(camera_vals, uv_norm, H_dz_dzn, jacobians[5] ? &H_dz_dzeta : nullptr);
+    }
     H_dz_dzn = sqrtQ_gate * H_dz_dzn;
-    H_dz_dzeta = sqrtQ_gate * H_dz_dzeta;
+    if (jacobians[5]) H_dz_dzeta = sqrtQ_gate * H_dz_dzeta;
   }
 
   // Compute residual (see upstream notes on sign convention)

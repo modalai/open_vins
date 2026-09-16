@@ -30,6 +30,11 @@ using namespace ov_zcalib;
 bool JointCalib::solve(const std::vector<WindowData> &windows, SharedCalib &calib, const JointConfig &cfg, JointReport &rep,
                        JointWarmCarry *carry, PreintStore *store, std::vector<WindowWarmState> *warm_out) {
 
+  if (cfg.max_wall_s < 0.0) { // session deadline already exhausted
+    rep.hit_wall_budget = true;
+    return false;
+  }
+
   const auto t_entry = std::chrono::steady_clock::now();
   auto elapsed_s = [&]() { return std::chrono::duration<double>(std::chrono::steady_clock::now() - t_entry).count(); };
 

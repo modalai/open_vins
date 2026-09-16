@@ -50,7 +50,7 @@ struct WindowGraph {
   std::vector<CostFunction *> owned;
   std::vector<Factor_ImuAci3 *> imu_f;
   std::vector<Factor_ReprojTd *> rp_f;
-  std::vector<int> rp_clone;
+  std::vector<int> rp_clone, rp_cam;
   Factor_PriorQuatJPL *pq = nullptr;
   Factor_PriorEuclid *pp = nullptr, *pbg = nullptr, *pba = nullptr;
   PreintKey factor_key;
@@ -414,9 +414,11 @@ bool WindowBA::solve_and_export(const WindowData &win, SharedCalib &calib, bool 
         // factor's dt_ref beside the frame-merge offset.
         auto *f = new Factor_ReprojTd(o.uv, win.pix_sigma, calib.cams[c].fisheye, w_k, v[k], win.td_ref[c],
                                       o.dt_ref + o.u_frac * kc.tr);
+        f->prepare_transport(kc.td);
         G.owned.push_back(f);
         G.rp_f.push_back(f);
         G.rp_clone.push_back(k);
+        G.rp_cam.push_back((int)c);
         problem.AddResidualBlock(f, &G.cauchy,
                                  {q[k].data(), p[k].data(), feats[o.feat_id].data(), kc.q_ItoC.data(), kc.p_IinC.data(),
                                   kc.cam.data(), &kc.td});
@@ -427,6 +429,7 @@ bool WindowBA::solve_and_export(const WindowData &win, SharedCalib &calib, bool 
       const int k = G.rp_clone[i];
       G.rp_f[i]->w_clone = (k == 0) ? pre[0].w_end : pre[k - 1].w_end;
       G.rp_f[i]->v_clone = v[k];
+      G.rp_f[i]->prepare_transport(G.calib.cams[(size_t)G.rp_cam[i]].td);
     }
   }
   // Gauge priors: first pose + first biases (window-frame gauge; NO calibration

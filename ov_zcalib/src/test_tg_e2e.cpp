@@ -45,7 +45,13 @@
 #include "core/CalibSessionRunner.h"
 #include "sim/SynthWorld.h"
 
+#include <unistd.h>
+
 using namespace ov_zcalib;
+
+static std::string tmp_file(const char *name) {
+  return "/tmp/" + std::to_string((long)::getpid()) + "_" + name;
+}
 
 static int failures = 0;
 #define CHECK(cond, ...)                                                                                                                   \
@@ -242,6 +248,8 @@ static const BlockCommit *find_block(const SessionReport &rep, const char *name)
 static const char *verdict_name(SessionReport::AccelGateVerdict v) {
   using V = SessionReport::AccelGateVerdict;
   switch (v) {
+  case V::PRECISION_WEAK:
+    return "PRECISION_WEAK";
   case V::PRE_CLOSED:
     return "PRE_CLOSED";
   case V::SPLIT_CONSISTENT:
@@ -270,7 +278,20 @@ static void chain_errors(const SessionReport &rep, const synth::Truth &tr, doubl
   eqa_deg = 2.0 * ov_core::quat_multiply(rep.committed.imu.q_AtoI, ov_core::Inv(tr.imu.q_AtoI)).head<3>().norm() * 180.0 / M_PI;
 }
 
-int main() {
+int main(int argc, char **argv) {
+  for (int i = 1; i < argc; ++i) {
+    const std::string name = argv[i];
+    if (name != "T0" && name != "T1" && name != "T1b" && name != "T2" && name != "T3") {
+      std::fprintf(stderr, "unknown case %s (T0, T1, T1b, T2, T3)\n", argv[i]);
+      return 2;
+    }
+  }
+  auto want = [&](const char *name) {
+    if (argc == 1) return true;
+    for (int i = 1; i < argc; ++i)
+      if (std::string(argv[i]) == name) return true;
+    return false;
+  };
   const double G = 9.81, R2D = 180.0 / M_PI;
   // ICM-part-class truth Tg (a measured production chain carries ~0.22 deg/s
   // @1g): all 9 elements DISTINCT so a transposed/permuted recovery cannot
@@ -310,10 +331,10 @@ int main() {
     CHECK(worst_a < 1e-9, "T0: accel inverse map broken (%.2e)", worst_a);
   }
 
-  const std::string rec_tg = "/tmp/ov_zcalib_tg_e2e.bin";
-  const std::string rec_0 = "/tmp/ov_zcalib_tg_e2e_base.bin";
-  const std::string rec_hv = "/tmp/ov_zcalib_tg_e2e_hover.bin";
-  const std::string rec_1x = "/tmp/ov_zcalib_tg_e2e_1axis.bin";
+  const std::string rec_tg = tmp_file("ov_zcalib_tg_e2e.bin");
+  const std::string rec_0 = tmp_file("ov_zcalib_tg_e2e_base.bin");
+  const std::string rec_hv = tmp_file("ov_zcalib_tg_e2e_hover.bin");
+  const std::string rec_1x = tmp_file("ov_zcalib_tg_e2e_1axis.bin");
 
   // ---------------- T1: recovery on the rich 6-axis world ----------------
   // The tg falsifier judges HALF-agreement against the 1e-4 floor; at a
@@ -324,13 +345,17 @@ int main() {
   const double t1_dur = 240.0;
   const int t1_select_k = 32;
   double edw_tg = 0, eda_tg = 0, eqa_tg = 0;
-  {
+  if (want("T1") || want("T1b")) {
     synth::Truth tr = synth::make_truth();
     tr.imu.Tg = Tg_true;
     write_tg_record(tr, rec_tg, t1_dur, World::RICH, 4242);
+  }
+  if (want("T1")) {
+    synth::Truth tr = synth::make_truth();
+    tr.imu.Tg = Tg_true;
     SessionConfig c1 = cfg;
     c1.select_K = t1_select_k;
-    c1.out_yaml = "/tmp/ov_zcalib_tg_e2e.yaml";
+    c1.out_yaml = tmp_file("ov_zcalib_tg_e2e.yaml");
     SessionReport rep;
     CHECK(CalibSessionRunner::run_replay(rec_tg, c1, rep), "T1: replay failed to open");
     CHECK(rep.final_state == RunnerState::DONE, "T1: session ended in %d (%s)", (int)rep.final_state, rep.abort_reason.c_str());
@@ -384,12 +409,12 @@ int main() {
   }
 
   // ---------------- T1 baseline: SAME world, Tg = 0 ----------------
-  {
+  if (want("T1")) {
     synth::Truth tr0 = synth::make_truth(); // Tg stays zero
     write_tg_record(tr0, rec_0, t1_dur, World::RICH, 4242); // same duration/shape as T1 or "not worse" compares different worlds
     SessionConfig c0 = cfg;
     c0.select_K = t1_select_k;
-    c0.out_yaml = "/tmp/ov_zcalib_tg_e2e_base.yaml";
+    c0.out_yaml = tmp_file("ov_zcalib_tg_e2e_base.yaml");
     c0.verbose = false;
     SessionReport rep0;
     CHECK(CalibSessionRunner::run_replay(rec_0, c0, rep0), "T1-base: replay failed to open");
@@ -414,12 +439,14 @@ int main() {
   // the BLOCK (here: an impossible sigma ceiling). The refused value must revert to the seed
   // BYTES in the shipped calib -- a solved Tg once shipped while the ledger said SEED; the
   // revert_block tg arm pins that leak class closed.
-  {
+  if (want("T1b")) {
     SessionConfig c1b = cfg;
     c1b.select_K = t1_select_k;
     c1b.verbose = false;
-    c1b.out_yaml = "/tmp/ov_zcalib_tg_e2e_t1b.yaml";
+    c1b.out_yaml = tmp_file("ov_zcalib_tg_e2e_t1b.yaml");
     c1b.commit_abs_ceiling["tg"] = 1e-9; // no real posterior passes: force the walk refusal
+    // Exercise the downstream refusal, not the new early precision screen.
+    c1b.tg_precision_screen = false;
     SessionReport rep;
     CHECK(CalibSessionRunner::run_replay(rec_tg, c1b, rep), "T1b: replay failed to open");
     CHECK(rep.final_state == RunnerState::DONE, "T1b: session ended in %d (%s)", (int)rep.final_state, rep.abort_reason.c_str());
@@ -432,12 +459,12 @@ int main() {
   }
 
   // ---------------- T2: hover / constant-a_hat refusal ----------------
-  {
+  if (want("T2")) {
     synth::Truth tr = synth::make_truth();
     tr.imu.Tg = Tg_true; // the WORLD has g-sensitivity; the session has no way to see it
     write_tg_record(tr, rec_hv, 90.0, World::HOVER, 777);
     SessionConfig c2 = cfg;
-    c2.out_yaml = "/tmp/ov_zcalib_tg_e2e_hover.yaml";
+    c2.out_yaml = tmp_file("ov_zcalib_tg_e2e_hover.yaml");
     c2.verbose = false;
     SessionReport rep;
     CHECK(CalibSessionRunner::run_replay(rec_hv, c2, rep), "T2: replay failed to open");
@@ -451,12 +478,12 @@ int main() {
   }
 
   // ---------------- T3: one-axis rotation about gravity ----------------
-  {
+  if (want("T3")) {
     synth::Truth tr = synth::make_truth();
     tr.imu.Tg = Tg_true; // real Tg, but a_hat is constant: Tg*a_hat == a bias
     write_tg_record(tr, rec_1x, 90.0, World::SINGLE_AXIS, 778);
     SessionConfig c3 = cfg;
-    c3.out_yaml = "/tmp/ov_zcalib_tg_e2e_1axis.yaml";
+    c3.out_yaml = tmp_file("ov_zcalib_tg_e2e_1axis.yaml");
     c3.verbose = true;
     SessionReport rep;
     CHECK(CalibSessionRunner::run_replay(rec_1x, c3, rep), "T3: replay failed to open");
@@ -485,6 +512,12 @@ int main() {
   std::remove(rec_hv.c_str());
   std::remove(rec_1x.c_str());
   if (failures == 0) {
+    if (argc > 1) {
+      std::printf("[PASS] tg e2e: T0 and requested cases");
+      for (int i = 1; i < argc; ++i) std::printf(" %s", argv[i]);
+      std::printf("\n");
+      return 0;
+    }
     std::printf("[PASS] tg e2e: T1 part-class recovery (median at claim, all within 1.5x, |Tg| within 10%%, chain not degraded), "
                 "T1b walk-refusal seed bytes, T2 hover refusal (seed bytes), T3 one-axis abstention (no commit, seed bytes)\n");
     return 0;

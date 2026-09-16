@@ -325,6 +325,7 @@ static void test_reproj_fd(bool fisheye, bool with_transport) {
   const double dt_ref = with_transport ? 2.0e-3 * (0.37 - 0.5) : 0.0; // row 0.37 of a tr=2 ms frame
   const double Delta = dt_ref + (td - 1.0e-3);
   Factor_ReprojTd f(uv, 1.0, fisheye, w_clone, v_clone, /*td_lin=*/1.0e-3, dt_ref);
+  f.prepare_transport(td); // FD on td must also exercise the off-stamp fallback
 
   double *params[7] = {q_GtoI.data(), p_IinG.data(), p_FinG.data(), q_ItoC.data(), p_IinC.data(), cam.data(), &td};
   const int gsize[7] = {4, 3, 3, 4, 3, 8, 1};

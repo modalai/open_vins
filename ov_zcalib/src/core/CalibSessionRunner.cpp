@@ -11,6 +11,7 @@
  */
 
 #include "CalibSessionRunner.h"
+#include "../solve/CameraRefinement.h"
 
 #include <chrono>
 #include <thread>
@@ -175,7 +176,7 @@ void CalibSessionRunner::feed_frame(const FrameObs &f) {
     // cap: the retro value lives in the FRESHEST span; keeping the oldest would
     // hand a long bootstrap its stalest minute and drop the motion that finally
     // passed the gate.
-    if (cfg_.retro_harvest) {
+    if (cfg_.retro_harvest || cfg_.bootstrap_epipolar) {
       if ((int)boot_frames_.size() >= 4000)
         boot_frames_.pop_front();
       boot_frames_.push_back(f);
@@ -208,8 +209,10 @@ void CalibSessionRunner::feed_frame(const FrameObs &f) {
         if (!rr.ok) {
           ++boot_relrot_[c];
         } else {
-          const double tm0 = prev.timestamp + 0.5 * (double)prev.exposure_s;
-          const double tm1 = f.timestamp + 0.5 * (double)f.exposure_s;
+          // Ingest already centers FrameObs.timestamp at mid-exposure.
+          // Adding exposure/2 here would bias both bootstrap time estimates.
+          const double tm0 = prev.timestamp;
+          const double tm1 = f.timestamp;
           HandEyePair hp;
           hp.t0 = tm0;
           hp.t1 = tm1;
@@ -328,7 +331,9 @@ void CalibSessionRunner::try_bootstrap_(double now) {
       primary = c;
 
   std::vector<TimeOffsetResult> xr_all((size_t)n_cams_);
+  std::vector<XcorrCurve> xrc_all((size_t)n_cams_); ///< the curves behind xr_all (diagnostics; see SessionReport)
   std::vector<HandEyeResult> he_all((size_t)n_cams_);
+  std::vector<EpipolarTimeResult> epi_all((size_t)n_cams_);
   std::vector<char> xr_cert((size_t)n_cams_, 0); ///< accepted via the robust certificate (not the raw floor)
   Eigen::Vector3d bg_shared = bg0_;
   for (size_t pass = 0; pass < 2; ++pass) {
@@ -339,19 +344,12 @@ void CalibSessionRunner::try_bootstrap_(double now) {
 
       // The cross-correlation is on rotation-RATE magnitude, which is invariant to R_ItoC -- so
       // each camera recovers its own td without needing its extrinsic first.
-      TimeOffsetResult xr = TimeOffsetInit::solve(rates_[(size_t)c], boot_imu_, cfg_.td_search_s, 0.002);
+      TimeOffsetResult xr =
+          TimeOffsetInit::solve(rates_[(size_t)c], boot_imu_, cfg_.td_search_s, 0.002, &xrc_all[(size_t)c]);
       const bool sharp_ok = xr.peak_sharpness >= cfg_.xcorr_min_sharpness;
       const bool fast_ok = xr.ok && !xr.at_bound && xr.peak_corr >= cfg_.xcorr_min_peak && sharp_ok;
-      // ROBUST CERTIFICATE -- a moderate peak whose LOCATION is reproducible identifies td exactly
-      // as well as a tall one: the seed contract is only +/- td_fine_range (the hand-eye fine
-      // sweep re-solves td by re-preintegration). Broadband pair noise (blur-slipped KLT tracks,
-      // RS shear at rate reversals) depresses rho without moving the argmax; the FLAT ridge the
-      // floor exists to reject cannot pass this -- its split halves land on different lags and its
-      // trim buys nothing. Conditions: one Hampel trim clears the SAME floor while keeping >= 70%
-      // of the evidence weight without moving the argmax, and both split halves independently
-      // reproduce the lag (each showing a real ridge of its own). Measured need: a real session
-      // pinned at peak 0.51-0.57 with a stable argmax for minutes -- a td a single-number floor
-      // can never accept, although the fine sweep resolves it cleanly.
+      // Interleaved samples can share motion bias; this gate checks coarse
+      // peak repeatability. Temporal/geometric checks follow below.
       const bool cert_ok = xr.ok && !xr.at_bound && sharp_ok && !fast_ok && xr.trim_consistent &&
                            xr.peak_trimmed >= cfg_.xcorr_min_peak && xr.trim_retention >= 0.70 &&
                            xr.td_split_delta >= 0.0 && xr.td_split_delta <= cfg_.handeye.td_fine_range &&
@@ -393,6 +391,29 @@ void CalibSessionRunner::try_bootstrap_(double now) {
           enter_(RunnerState::ABORT, "bootstrap timeout: hand-eye rejected (axis diversity)");
         return;
       }
+      const bool temporal_ok = xr.temporally_consistent(cfg_.handeye.td_fine_range);
+      EpipolarTimeResult &ep = epi_all[(size_t)c];
+      if ((!temporal_ok || he.td_at_bound) && cfg_.bootstrap_epipolar) {
+        ep = EpipolarTimeInit::solve(boot_frames_, boot_imu_, seed0_.calib.cams[(size_t)c], c, he,
+                                     cfg_.td_search_s, cfg_.handeye.td_fine_range);
+        if (cfg_.verbose)
+          std::printf("[session] bootstrap cam %d geometric time: xcorr %+.3f ms, temporal split %.3f ms -> %+.3f ms, sigma %.3f ms, geometry split %.3f ms, %d pairs, %.3f s %s\n",
+                      c, 1e3 * xr.td, 1e3 * xr.temporal_split_delta, 1e3 * ep.td, 1e3 * ep.sigma_td,
+                      1e3 * ep.split_delta, ep.pairs, ep.wall_s, ep.ok ? "ACCEPT" : "WAIT");
+        if (ep.ok) {
+          he.td = ep.td;
+          he.q_ItoC = ep.q_ItoC;
+          he.td_at_bound = false;
+        }
+      }
+      // Sparse geometry permits a provisional interior hand-eye seed so
+      // collection can start. A supported but inconsistent fit remains a veto.
+      const bool provisional = !temporal_ok && !ep.ok && ep.attempted && !ep.has_support();
+      if (!temporal_ok && !ep.ok && !provisional) {
+        if (now - boot_t0_ > cfg_.bootstrap_timeout_s)
+          enter_(RunnerState::ABORT, "bootstrap timeout: time offset inconsistent across motion intervals; vary rotation and translation independently");
+        return;
+      }
       if (he.td_at_bound) {
         // fine-td refinement pinned at the sweep edge: the refined td is not a
         // maximum, keep accumulating pairs instead of seeding downstream with it
@@ -400,6 +421,9 @@ void CalibSessionRunner::try_bootstrap_(double now) {
           enter_(RunnerState::ABORT, "bootstrap timeout: hand-eye td refinement pinned at sweep bound");
         return;
       }
+      if (provisional && cfg_.verbose)
+        std::printf("[session] bootstrap cam %d: sparse geometry (%d pairs); provisional hand-eye time seed, final joint gates remain required\n",
+                    c, ep.pairs);
       xr_all[(size_t)c] = xr;
       he_all[(size_t)c] = he;
       if (is_primary)
@@ -408,7 +432,12 @@ void CalibSessionRunner::try_bootstrap_(double now) {
   }
 
   rep_.xcorr = xr_all;
+  rep_.xcorr_curve = std::move(xrc_all);
+  rep_.xcorr_certified.assign(xr_cert.begin(), xr_cert.end());
+  rep_.xcorr_min_peak = cfg_.xcorr_min_peak;
+  rep_.td_fine_range_s = cfg_.handeye.td_fine_range;
   rep_.handeye = he_all;
+  rep_.epipolar_time = std::move(epi_all);
   for (int c : active) {
     calib_.cams[(size_t)c].q_ItoC = he_all[(size_t)c].q_ItoC;
     calib_.cams[(size_t)c].td = he_all[(size_t)c].td;
@@ -505,9 +534,9 @@ void CalibSessionRunner::try_bootstrap_(double now) {
       std::printf("[session] retroactive harvest: %zu bootstrap frames / %zu imu replayed (%d decimated to the declared "
                   "rate), %d windows closed\n",
                   nf, ni, decimated, replayed);
-    boot_frames_.clear();
-    boot_frames_.shrink_to_fit();
   }
+  boot_frames_.clear();
+  boot_frames_.shrink_to_fit();
   enter_(RunnerState::COLLECT, "bootstrap complete; begin guided collection");
 }
 
@@ -1303,7 +1332,7 @@ void CalibSessionRunner::solve_verify_commit_() {
     if (cfg_.solve_budget_s > 0.0) {
       const double left =
           cfg_.solve_budget_s - std::chrono::duration<double>(std::chrono::steady_clock::now() - t_solve0).count();
-      j.max_wall_s = std::max(5.0, left);
+      j.max_wall_s = left > 0.0 ? left : -1.0; // exhausted, never a new per-stage allowance
     }
     return j;
   };
@@ -1827,6 +1856,32 @@ void CalibSessionRunner::solve_verify_commit_() {
     }
   }
 
+  // A1a holds qA and da off-diagonals, making this a conditional precision
+  // estimate. Skip Tg half-solves if even that estimate misses the commit
+  // threshold. Keep Tg as an A1a nuisance to avoid absorbing it into Dw.
+  bool tg_precision_ready = true;
+  if (calib_.tg_enabled && cfg_.tg_precision_screen) {
+    int count = 0;
+    const auto ceiling = cfg_.commit_abs_ceiling.find("tg");
+    for (size_t i = 0; i < rep_.joint.labels.size(); ++i) {
+      if (rep_.joint.labels[i].rfind("tg[", 0) != 0)
+        continue;
+      ++count;
+      const double sigma = rep_.joint.sigma((int)i);
+      rep_.tg_conditional_sigma = std::max(rep_.tg_conditional_sigma, sigma);
+      tg_precision_ready = tg_precision_ready &&
+          (cfg_.commit_sigma_factor * sigma < rep_.joint.prior_sigma_vec((int)i)) &&
+          (ceiling == cfg_.commit_abs_ceiling.end() || sigma <= ceiling->second);
+    }
+    tg_precision_ready = tg_precision_ready && count == 9;
+    if (!tg_precision_ready && cfg_.a_gate_mode != 1) {
+      rep_.tg_gate_verdict = SessionReport::AccelGateVerdict::PRECISION_WEAK;
+      if (cfg_.verbose)
+        std::printf("[session] tg precision screen: conditional sigma %.2e misses commit precision; skip tg half-pair, collect independent force/rotation excitation\n",
+                    rep_.tg_conditional_sigma);
+    }
+  }
+
   // ---- A1b unlock: SPLIT-HALF consistency from the A1a point ----
   // The full accel chain is solved independently on the first and second
   // time-half of the fused windows. Real-sensor junk modes (bias/thermal/
@@ -1901,14 +1956,28 @@ void CalibSessionRunner::solve_verify_commit_() {
     // (identical max_wall_s in both configs -- order-independent).
     for (const WindowData &w : *w_a1)
       store_.ensure(w.uid);
-    const JointConfig jc_h1 = arm_budget(jc_half), jc_h2 = arm_budget(jc_half);
+    auto solve_halves = [&](SharedCalib &left, SharedCalib &right, JointReport &rl, JointReport &rr,
+                            bool &okl, bool &okr) {
+      JointConfig jl = arm_budget(jc_half), jr = jl;
+      const int threads = std::max(1, jc_half.num_threads);
+      if (threads == 1) {
+        okl = JointCalib::solve(h1, left, jl, rl, nullptr, &store_);
+        okr = JointCalib::solve(h2, right, arm_budget(jc_half), rr, nullptr, &store_);
+      } else {
+        // Preserve the session's total worker allowance, including on a
+        // four-core target. Each half still folds windows in fixed order.
+        jl.num_threads = (threads + 1) / 2;
+        jr.num_threads = threads / 2;
+        std::thread worker([&] { okr = JointCalib::solve(h2, right, jr, rr, nullptr, &store_); });
+        okl = JointCalib::solve(h1, left, jl, rl, nullptr, &store_);
+        worker.join();
+      }
+    };
     bool ok1 = false, ok2 = false;
-    std::thread th2([&] { ok2 = JointCalib::solve(h2, c2, jc_h2, r2, nullptr, &store_); });
-    ok1 = JointCalib::solve(h1, c1, jc_h1, r1, nullptr, &store_);
-    th2.join();
+    solve_halves(c1, c2, r1, r2, ok1, ok2);
     note_stage_("A1b-half1", r1);
     note_stage_("A1b-half2", r2);
-    if (ok1 && ok2) {
+    if (ok1 && ok2 && !r1.hit_wall_budget && !r2.hit_wall_budget && !r1.time_stops && !r2.time_stops) {
       // per-dof posterior sigmas by label (band = k * rss + floor guards)
       auto sig_of = [](const JointReport &r, const std::string &lab) {
         for (size_t i = 0; i < r.labels.size(); ++i)
@@ -1969,7 +2038,7 @@ void CalibSessionRunner::solve_verify_commit_() {
       // the conditioning choice is arbitrated by tg's own falsifier: certify a REPRODUCIBLE Tg
       // first, then re-judge the chain on the SAME tg-free halves (zero extra solves). A junk tg
       // refuses at the tg pair and the legacy freeze stands byte-identically.
-      if (calib_.tg_enabled) {
+      if (calib_.tg_enabled && tg_precision_ready) {
         // The tg pair enters from the A0 point -- A1b's OWN entry -- not the A1a point the frozen
         // pair uses. The pair's question is "will A1b's answer reproduce?", so the halves must be
         // solved under A1b's conditions: A1a's dw/da-diag were solved with tg frozen at seed, so
@@ -1983,14 +2052,11 @@ void CalibSessionRunner::solve_verify_commit_() {
         // 0.327 deg, both halves at their per-half stationary points either way. The residual
         // per-half qA spread is the documented flat valley at the per-half information level --
         // an EXCITATION property, not a solver-budget one -- so the pair keeps the stage budget.)
-        const JointConfig jc_g1 = arm_budget(jc_half), jc_g2 = arm_budget(jc_half);
         bool gok1 = false, gok2 = false;
-        std::thread gth2([&] { gok2 = JointCalib::solve(h2, g2, jc_g2, gr2, nullptr, &store_); });
-        gok1 = JointCalib::solve(h1, g1, jc_g1, gr1, nullptr, &store_);
-        gth2.join();
+        solve_halves(g1, g2, gr1, gr2, gok1, gok2);
         note_stage_("A1b-tg-half1", gr1);
         note_stage_("A1b-tg-half2", gr2);
-        if (gok1 && gok2) {
+        if (gok1 && gok2 && !gr1.hit_wall_budget && !gr2.hit_wall_budget && !gr1.time_stops && !gr2.time_stops) {
           bool agree_tg = true;
           const Eigen::Map<const Eigen::Matrix<double, 9, 1>> t1(g1.imu.Tg.data()), t2(g2.imu.Tg.data()),
               t0(calib_a0.imu.Tg.data()); // signal referenced to the pair's OWN entry (byte-equal to calib_'s seed tg)
@@ -2052,7 +2118,7 @@ void CalibSessionRunner::solve_verify_commit_() {
         } else {
           rep_.tg_gate_verdict = SessionReport::AccelGateVerdict::SPLIT_FAILED;
           if (cfg_.verbose)
-            std::printf("[session] split-half tg: half-solve failed -> tg stays at its seed\n");
+            std::printf("[session] split-half tg: half-solve failed or truncated -> tg stays at its seed\n");
         }
       }
       rep_.a_wald_verdict =
@@ -2073,7 +2139,7 @@ void CalibSessionRunner::solve_verify_commit_() {
     } else {
       rep_.a_wald_verdict = SessionReport::AccelGateVerdict::SPLIT_FAILED;
       if (cfg_.verbose)
-        std::printf("[session] split-half accel chain: half-solve failed -> chain frozen at A1a\n");
+        std::printf("[session] split-half accel chain: half-solve failed or truncated -> chain frozen at A1a\n");
     }
     if (cfg_.a_gate_mode == 2) {
       // SHADOW: split-half decided above; the wald verdict is measured and
@@ -2169,11 +2235,6 @@ void CalibSessionRunner::solve_verify_commit_() {
               n_far[(size_t)c] += 1.0;
             nq[(o.uv(0) >= cx ? 1 : 0) + (o.uv(1) >= cy ? 2 : 0)] += 1.0;
           }
-      const bool k34_free = (n_all[(size_t)c] > 0.0) && (n_far[(size_t)c] / n_all[(size_t)c] >= cfg_.k34_radial_gate);
-      if (k34_free) {
-        jc.cam_prior_vec[(size_t)c](6) = jc.cam_prior_vec[(size_t)c](4); // open k3/k4 at the k1/k2 scale
-        jc.cam_prior_vec[(size_t)c](7) = jc.cam_prior_vec[(size_t)c](5);
-      }
       // C1 (quadrant-coverage center gate): cx/cy separate from distortion only when the data
       // BRACKETS the center -- with a quadrant starved, the center walks into a self-consistent
       // basin and commits (measured: cy +2.9 px shipped). Freeze cx/cy at seed through the
@@ -2183,14 +2244,19 @@ void CalibSessionRunner::solve_verify_commit_() {
                               ? std::min(std::min(nq[0], nq[1]), std::min(nq[2], nq[3])) / n_all[(size_t)c]
                               : 0.0;
       const bool center_free = minq >= cfg_.cam_center_quadrant_gate;
-      if (!center_free && cfg_.cam_mode > 0) {
-        jc.cam_prior_vec[(size_t)c](2) = 1e-9;
-        jc.cam_prior_vec[(size_t)c](3) = 1e-9;
-      }
+      jc.cam_prior_vec[(size_t)c] = camera_refinement_prior(
+          kc.fisheye, jc.cam_prior_vec[(size_t)c],
+          n_far[(size_t)c] / std::max(n_all[(size_t)c], 1.0), minq,
+          cfg_.k34_radial_gate, cfg_.cam_center_quadrant_gate,
+          cfg_.cam_mode == 1 ? cfg_.radtan_tangent_refine_sigma : cfg_.radtan_tangent_full_sigma);
+      if (n_all[(size_t)c] == 0.0)
+        jc.cam_prior_vec[(size_t)c].setConstant(1e-9);
       if (cfg_.verbose)
-        std::printf("[session] phase B cam %d: cam_mode=%d, radial coverage %.1f%% -> k3/k4 %s; quadrant min %.1f%% -> cx/cy %s\n",
-                    c, cfg_.cam_mode, 100.0 * n_far[(size_t)c] / std::max(n_all[(size_t)c], 1.0), k34_free ? "FREE" : "frozen",
-                    100.0 * minq, center_free ? "FREE" : "frozen (center not bracketed)");
+        std::printf("[session] phase B cam %d (%s): radial coverage %.1f%%, quadrant min %.1f%% -> %s %s, cx/cy %s\n",
+                    c, kc.fisheye ? "equidistant" : "radtan",
+                    100.0 * n_far[(size_t)c] / std::max(n_all[(size_t)c], 1.0), 100.0 * minq,
+                    kc.fisheye ? "k3/k4" : "p1/p2", jc.cam_prior_vec[(size_t)c](6) > 1e-8 ? "FREE" : "frozen",
+                    center_free ? "FREE" : "frozen (center not bracketed)");
     }
     // the A-stage accel staging governs the joint polish too (gate-closed da
     // off-diagonals must not silently reopen inside the full vector)
@@ -2216,18 +2282,21 @@ void CalibSessionRunner::solve_verify_commit_() {
     // k3/k4 frozen, then (b) distortion-only with the pinhole row frozen --
     // block-coordinate descent inside the camera block.
     {
-      const bool f_dw = calib_.imu.calib_dw, f_da = calib_.imu.calib_da, f_qa = calib_.imu.calib_RAtoI;
+      const bool f_dw = calib_.imu.calib_dw, f_da = calib_.imu.calib_da, f_qa = calib_.imu.calib_RAtoI,
+                 f_tg = calib_.imu.calib_tg;
       std::vector<char> f_ext, f_td;
       for (const CamCalib &kc : calib_.cams) {
         f_ext.push_back(kc.free_ext ? 1 : 0);
         f_td.push_back(kc.free_td ? 1 : 0);
       }
-      calib_.imu.calib_dw = calib_.imu.calib_da = calib_.imu.calib_RAtoI = false;
+      calib_.imu.calib_dw = calib_.imu.calib_da = calib_.imu.calib_RAtoI = calib_.imu.calib_tg = false;
       for (CamCalib &kc : calib_.cams)
         kc.free_ext = kc.free_td = false;
       if (cfg_.cam_alt_rounds > 0) {
         for (int round = 0; round < cfg_.cam_alt_rounds; ++round) {
-          JointConfig ja = jc; // (a) pinhole + k1/k2; k3/k4 frozen this half-step
+          // This temporary coordinate split is independent of the coverage
+          // gate: p1/p2 (radtan) or k3/k4 (equi) open in the distortion step.
+          JointConfig ja = jc; // (a) pinhole + k1/k2
           for (auto &v : ja.cam_prior_vec)
             v(6) = v(7) = 1e-9;
           JointReport repBa;
@@ -2269,6 +2338,7 @@ void CalibSessionRunner::solve_verify_commit_() {
       calib_.imu.calib_dw = f_dw;
       calib_.imu.calib_da = f_da;
       calib_.imu.calib_RAtoI = f_qa;
+      calib_.imu.calib_tg = f_tg;
       for (int c = 0; c < n_cams_; ++c) {
         calib_.cams[(size_t)c].free_ext = (f_ext[(size_t)c] != 0);
         calib_.cams[(size_t)c].free_td = (f_td[(size_t)c] != 0);
@@ -2277,8 +2347,34 @@ void CalibSessionRunner::solve_verify_commit_() {
     // B-2: joint polish with the camera block open
     JointConfig jb2 = jc;
     jb2.cert_open_imu = cfg_.b2_cert; // qn-policing replaces plateau/anchor (profile-gated A/B)
-    const bool okB = JointCalib::solve(*w_b, calib_, arm_budget(jb2), repB, &carry, &store_);
+    bool okB = JointCalib::solve(*w_b, calib_, arm_budget(jb2), repB, &carry, &store_);
     note_stage_("B2-polish", repB);
+    // A radtan refinement can constrain distortion while its metric focal
+    // length remains near-prior (common with one camera). Preserve that factory
+    // pair and re-fit the remaining parameters under the SAME precision bar.
+    // Never graft a few entries from a correlated, eight-parameter solution.
+    if (okB && cfg_.cam_mode == 1) {
+      bool refit = false;
+      for (int c = 0; c < n_cams_; ++c) {
+        if (calib_.cams[(size_t)c].fisheye)
+          continue;
+        CameraPrior sigma = CameraPrior::Constant(std::numeric_limits<double>::infinity());
+        for (size_t i = 0; i < repB.labels.size(); ++i)
+          for (int k = 0; k < 8; ++k)
+            if (repB.labels[i] == "cam@" + std::to_string(c) + "[" + std::to_string(k) + "]")
+              sigma(k) = repB.sigma((int)i);
+        refit |= freeze_unresolved_camera_pairs(sigma, cfg_.commit_sigma_factor,
+                    jc.cam_prior_vec[(size_t)c], calib_.cams[(size_t)c].cam, calib_phaseA.cams[(size_t)c].cam);
+      }
+      if (refit) {
+        jb2.cam_prior_vec = jc.cam_prior_vec;
+        JointReport reduced;
+        okB = JointCalib::solve(*w_b, calib_, arm_budget(jb2), reduced, nullptr, &store_);
+        note_stage_("B2-radtan-refit", reduced);
+        if (okB)
+          repB = std::move(reduced);
+      }
+    }
     // refinement-hurt detector: accept only if no cam dof of ANY camera moved > 3 prior-sigma.
     // Rig-wide, because a broken intrinsic aliases into ext/td and poisons the shared trajectory --
     // one camera going bad is enough to make the whole phase untrustworthy.
@@ -2328,7 +2424,6 @@ void CalibSessionRunner::solve_verify_commit_() {
   {
     auto layout = out.free_blocks();
     auto layout_ref = ref.free_blocks();
-    int off = 0;
     rep_.blocks.clear();
     for (size_t bi = 0; bi < layout.size(); ++bi) {
       auto &b = layout[bi];
@@ -2348,8 +2443,16 @@ void CalibSessionRunner::solve_verify_commit_() {
           d(k) = b.ptr[k] - layout_ref[bi].ptr[k];
       }
       for (int k = 0; k < b.lsize; ++k) {
-        const double sprior = rep_.joint.prior_sigma_vec(off + k);
-        const double spost = rep_.joint.sigma(off + k);
+        const std::string label = b.label() + "[" + std::to_string(k) + "]";
+        const auto pos = std::find(rep_.joint.labels.begin(), rep_.joint.labels.end(), label);
+        if (pos == rep_.joint.labels.end()) {
+          bc.worst_ratio = std::numeric_limits<double>::infinity();
+          bc.worst_sigma = std::numeric_limits<double>::infinity();
+          continue;
+        }
+        const int pi = (int)std::distance(rep_.joint.labels.begin(), pos);
+        const double sprior = rep_.joint.prior_sigma_vec(pi);
+        const double spost = rep_.joint.sigma(pi);
         // An information-frozen dof has sigma_post ~= sigma_prior by
         // construction (data info ~0 vs 1/eps^2 prior): counting it pins
         // worst_ratio at ~commit_sigma_factor and the block can NEVER commit --
@@ -2360,7 +2463,6 @@ void CalibSessionRunner::solve_verify_commit_() {
           bc.worst_sigma = std::max(bc.worst_sigma, spost);
           bc.moved_sigma = std::max(bc.moved_sigma, std::abs(d(k)) / std::max(spost, 1e-300));
         }
-        // (k continues; off advances after the block)
       }
       const auto ceil_it = cfg_.commit_abs_ceiling.find(b.name);
       bc.ceiling_ok = (ceil_it == cfg_.commit_abs_ceiling.end()) || (bc.worst_sigma <= ceil_it->second);
@@ -2372,7 +2474,6 @@ void CalibSessionRunner::solve_verify_commit_() {
       bc.not_estimated = (bc.moved_sigma < cfg_.commit_min_move_sigma);
       bc.committed = (bc.worst_ratio < 1.0) && bc.ceiling_ok && !bc.not_estimated;
       rep_.blocks.push_back(bc);
-      off += b.lsize;
     }
   }
   // Atomic pair: q_ItoC and td move jointly in the solve (omega-coupled), so a

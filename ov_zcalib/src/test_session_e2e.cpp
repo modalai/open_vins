@@ -31,7 +31,13 @@
 #include "core/CalibSessionRunner.h"
 #include "sim/SynthWorld.h"
 
+#include <unistd.h>
+
 using namespace ov_zcalib;
+
+static std::string tmp_file(const char *name) {
+  return "/tmp/" + std::to_string((long)::getpid()) + "_" + name;
+}
 
 static int failures = 0;
 #define CHECK(cond, ...)                                                                                                                   \
@@ -227,12 +233,12 @@ int main(int argc, char **argv) {
   const bool s1 = want("S1") || s2;
 
   synth::Truth tr = synth::make_truth();
-  const std::string rec = "/tmp/ov_zcalib_session_e2e.bin";
-  const std::string rec_deg = "/tmp/ov_zcalib_session_deg.bin";
+  const std::string rec = tmp_file("ov_zcalib_session_e2e.bin");
+  const std::string rec_deg = tmp_file("ov_zcalib_session_deg.bin");
 
   SessionConfig cfg;
   cfg.harvester.pix_sigma = 0.5;
-  cfg.out_yaml = "/tmp/ov_zcalib_session_e2e.yaml";
+  cfg.out_yaml = tmp_file("ov_zcalib_session_e2e.yaml");
   cfg.verbose = true;
   cfg.joint.verbose = false;
   cfg.cam_mode = 0; // S1/S2/S3 are the frozen temporal/IMU gates; S4 below gates the camera path
@@ -303,7 +309,7 @@ int main(int argc, char **argv) {
   if (s2) {
     const std::string y1 = slurp(cfg.out_yaml);
     SessionConfig cfg2 = cfg;
-    cfg2.out_yaml = "/tmp/ov_zcalib_session_e2e_2.yaml";
+    cfg2.out_yaml = tmp_file("ov_zcalib_session_e2e_2.yaml");
     // A stale yaml from a PREVIOUS run makes the byte-compare below pass vacuously when
     // replay #2 fails before writeback (measured to mask a real flake). Fresh file or nothing.
     std::remove(cfg2.out_yaml.c_str());
@@ -319,7 +325,7 @@ int main(int argc, char **argv) {
   if (want("S3")) {
     write_session_record(tr, rec_deg, 90.0, 6.0, 88.0, 777, /*single_axis*/ true);
     SessionConfig cfgd = cfg;
-    cfgd.out_yaml = "/tmp/ov_zcalib_session_deg.yaml";
+    cfgd.out_yaml = tmp_file("ov_zcalib_session_deg.yaml");
     cfgd.verbose = false;
     SessionReport repd;
     CHECK(CalibSessionRunner::run_replay(rec_deg, cfgd, repd), "S3: degenerate replay failed");
@@ -342,17 +348,22 @@ int main(int argc, char **argv) {
   }
 
   // ---------------- S4: staged camera-intrinsic refinement (cam_mode=1) ----------------
-  if (want("S4")) {
+  if (want("S4") || want("S4-tangent")) {
+    const bool perturb_tangent = argc > 1 && want("S4-tangent");
     synth::Truth trc = synth::make_truth();
     trc.cam << 450, 452, 320, 240, -0.020, 0.005, 0.0002, -0.0001; // real radtan distortion
     Eigen::Matrix<double, 8, 1> seed_cam;
     // existing-cal-grade seed error: ~1.5 px focal/center, k1/k2 off within the refine prior
     seed_cam << 451.5, 450.8, 321.0, 239.2, -0.016, 0.003, 0.0002, -0.0001;
-    const std::string rec_cam = "/tmp/ov_zcalib_session_cam.bin";
+    if (perturb_tangent) {
+      seed_cam(6) += 8e-4;
+      seed_cam(7) -= 6e-4;
+    }
+    const std::string rec_cam = perturb_tangent ? tmp_file("ov_zcalib_session_tangent.bin") : tmp_file("ov_zcalib_session_cam.bin");
     write_session_record(trc, rec_cam, 120.0, 6.0, 118.0, 4242, false, &seed_cam);
     SessionConfig cfgc = cfg;
     cfgc.cam_mode = 1; // refine (the production default)
-    cfgc.out_yaml = "/tmp/ov_zcalib_session_cam.yaml";
+    cfgc.out_yaml = perturb_tangent ? tmp_file("ov_zcalib_session_tangent.yaml") : tmp_file("ov_zcalib_session_cam.yaml");
     cfgc.verbose = false;
     SessionReport repc;
     CHECK(CalibSessionRunner::run_replay(rec_cam, cfgc, repc), "S4: cam-refine replay failed");
@@ -368,6 +379,12 @@ int main(int argc, char **argv) {
         cam_committed = b.committed;
     std::printf("[S4] cam block committed=%d  verify improve=%.1f%%\n", (int)cam_committed, 100.0 * repc.verify_improve);
     CHECK(cam_committed, "S4: cam block not committed");
+    if (perturb_tangent) {
+      std::printf("[S4-tangent] p1 error %+.2e -> %+.2e, p2 error %+.2e -> %+.2e\n",
+                  dseed(6), dcam(6), dseed(7), dcam(7));
+      CHECK(std::abs(dcam(6)) < 4e-4 && std::abs(dcam(7)) < 4e-4,
+            "S4-tangent: tangential recovery %.2e/%.2e", dcam(6), dcam(7));
+    }
     // Measured-honest bounds for ONE ~110 s single-camera session (focal/center
     // trade against metric depth; distortion is the strongest-recovered pair).
     // Every dof must also IMPROVE on its seed -- refine must never harm.
@@ -392,7 +409,9 @@ int main(int argc, char **argv) {
     const double er_c = 2.0 * ov_core::quat_multiply(repc.committed.cams[0].q_ItoC, ov_core::Inv(trc.q_ItoC)).head<3>().norm() * 180.0 / M_PI;
     const double et_c = std::abs(repc.committed.cams[0].td - trc.td) * 1e3;
     std::printf("[S4] ext_rot=%.3f deg td=%.3f ms under cam refine\n", er_c, et_c);
-    CHECK(er_c < 0.25 && et_c < 0.30, "S4: temporal/ext degraded under cam unlock (%.3f deg, %.3f ms)", er_c, et_c);
+    // Keep S4's original bound; the perturbed tangential seed has a separate fixture tolerance.
+    const double rotation_limit = perturb_tangent ? 0.30 : 0.25;
+    CHECK(er_c < rotation_limit && et_c < 0.30, "S4: temporal/ext degraded under cam unlock (%.3f deg, %.3f ms)", er_c, et_c);
     std::remove(rec_cam.c_str());
   }
 

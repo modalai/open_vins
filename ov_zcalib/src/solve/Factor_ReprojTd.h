@@ -63,6 +63,17 @@ public:
       mutable_parameter_block_sizes()->push_back(s);
   }
 
+  // Calibration and clone kinematics are fixed throughout a WindowBA solve.
+  // Hoist the SO(3) exponential out of its repeated residual/Jacobian calls.
+  // Read-only during Evaluate (including parallel evaluation); off-stamp calls
+  // use the exact original expression, so finite differences remain valid.
+  void prepare_transport(double td) {
+    prepared_delta_ = dt_ref + (td - td_lin);
+    prepared_w_ = w_clone;
+    prepared_dq_ = ov_core::rot_2_quat(ov_core::exp_so3(-w_clone * prepared_delta_));
+    prepared_ = true;
+  }
+
   bool Evaluate(double const *const *parameters, double *residuals, double **jacobians) const override {
     const double td = parameters[6][0];
     const double Delta = dt_ref + (td - td_lin);
@@ -71,7 +82,9 @@ public:
     // (JPL: R(dq) = exp_so3(-w*Delta), the same map the filter's updaters apply)
     Eigen::Map<const Eigen::Vector4d> q(parameters[0]);
     Eigen::Map<const Eigen::Vector3d> p(parameters[1]);
-    const Eigen::Vector4d dq = ov_core::rot_2_quat(ov_core::exp_so3(-w_clone * Delta));
+    const Eigen::Vector4d dq = prepared_ && Delta == prepared_delta_ && w_clone == prepared_w_
+                                   ? prepared_dq_
+                                   : ov_core::rot_2_quat(ov_core::exp_so3(-w_clone * Delta));
     Eigen::Vector4d q_t = ov_core::quat_multiply(dq, q);
     Eigen::Vector3d p_t = p + v_clone * Delta;
 
@@ -107,6 +120,12 @@ public:
     }
     return true;
   }
+
+private:
+  bool prepared_ = false;
+  double prepared_delta_ = 0.0;
+  Eigen::Vector3d prepared_w_ = Eigen::Vector3d::Zero();
+  Eigen::Vector4d prepared_dq_ = Eigen::Vector4d(0, 0, 0, 1);
 };
 
 } // namespace ov_zcalib
