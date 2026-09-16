@@ -172,7 +172,7 @@ struct JointConfig {
   /// parallel BIT-IDENTICAL (see ov_init::zbft_sfm::ParallelExecutor). <=1 runs
   /// inline (no threads created) -- the RT default for on-target flight profiles.
   int num_threads = 4;
-  /// Wall-clock budget for ONE solve() call [s]; 0 = unlimited. When exceeded
+  /// Wall-clock budget for ONE solve() call [s]; 0 = unlimited, <0 = skip. When exceeded
   /// the loop stops at the best accepted point (never mid-evaluation), so the
   /// report stays consistent. Flight profiles set this to meet the <=60 s
   /// session target (collection included).

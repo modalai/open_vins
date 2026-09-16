@@ -36,6 +36,7 @@
 #include "../init/HandEyeWahba.h"
 #include "../init/RelRotProcrustes.h"
 #include "../init/TimeOffsetInit.h"
+#include "../init/EpipolarTimeInit.h"
 #include "../utils/SessionRecord.h"
 #include "../solve/JointCalib.h"
 #include "../window/LinearSeed.h"
@@ -63,6 +64,7 @@ struct SessionConfig {
   int bootstrap_min_pairs = 150;
   double bootstrap_timeout_s = 90.0;
   double td_search_s = 0.08;
+  bool bootstrap_epipolar = true; ///< geometrically refine time-unstable xcorr seeds before harvest
   int min_pair_matches = 12;
   /// Evidence recency horizon [s] for the xcorr/hand-eye buffers (0 = whole session). The gate
   /// judges the operator's RECENT motion: an early bad stretch (AE settling, blur, the pick-up)
@@ -114,9 +116,9 @@ struct SessionConfig {
   bool stage_a1_balance_guard = true;
   /// Session-wide SOLVE budget [s] (0 = unlimited). One deadline shared by
   /// EVERY staged JointCalib call (A0/A1a/split-halves/A1b/B passes): each call
-  /// receives the remaining time as its max_wall_s (floored so late stages
-  /// still make progress). JointCalib stops at its best accepted point when
-  /// exceeded, so a tight budget degrades polish, never consistency. The
+  /// receives the remaining time as its max_wall_s; exhausted stages are skipped.
+  /// JointCalib stops between complete evaluation passes, so the final pass
+  /// can overrun the deadline. Truncated half-solves never certify a gate. The
   /// per-call joint.max_wall_s remains available but is overridden when this
   /// is set -- staging multiplied the call count, so only a shared deadline
   /// bounds the session (flight profiles set this to meet the <=60 s target).
@@ -127,6 +129,8 @@ struct SessionConfig {
   /// otherwise) and ship only if the block beats its prior 3x AND the
   /// refinement-hurt detector stays quiet.
   int cam_mode = 1;
+  double radtan_tangent_refine_sigma = 0.001; ///< p1/p2, independent of radial k1/k2 units
+  double radtan_tangent_full_sigma = 0.01;
   double k34_radial_gate = 0.12; ///< min fraction of obs beyond 0.7*r_max to free k3/k4
   /// C1 (center gate): min per-quadrant fraction of this camera's fused observations, quadrants
   /// taken about the current (cx, cy). Below it the data never brackets the center and cx/cy walk
@@ -291,6 +295,7 @@ struct SessionConfig {
   /// machinery + its ceiling.
   /// Requires an estimable IMU chain (a frozen factory chain freezes tg with it).
   bool free_tg = true;
+  bool tg_precision_screen = true; ///< skip split Tg solves when A1a conditional precision already misses commit
   std::string out_yaml = "ov_zcalib_result.yaml";
   bool verbose = true;
   /// Print the per-stage cost table ([evidence] lines) at the end of the
@@ -344,6 +349,14 @@ struct SessionReport {
   // bootstrap, per camera (each has its own hand-eye and its own time offset)
   std::vector<HandEyeResult> handeye;
   std::vector<TimeOffsetResult> xcorr;
+  std::vector<EpipolarTimeResult> epipolar_time;
+  /// Per camera: the coarse peak passed the trim/interleaved gate.
+  std::vector<char> xcorr_certified;
+  /// Effective coarse-peak floor and split tolerance for report consumers.
+  double xcorr_min_peak = 0.0;
+  double td_fine_range_s = 0.0;
+  /// Raw lag curves captured once at bootstrap (81 samples at default settings).
+  std::vector<XcorrCurve> xcorr_curve;
   // collection
   int windows_harvested = 0, windows_retained = 0, windows_holdout = 0, windows_rejected_seed = 0, windows_invalidated = 0;
   int windows_rejected_gate = 0; ///< pre-seed admission gates (parallax floor etc.)
@@ -365,7 +378,7 @@ struct SessionReport {
   bool a_full_open = false;          ///< full accel chain (da off-diag + q_AtoI) unlocked
   // Wald gate verdict + statistics (modes 1/2; PRE_CLOSED when the cheap
   // pre-gate never admitted the question)
-  enum class AccelGateVerdict { PRE_CLOSED, SPLIT_CONSISTENT, SPLIT_INCONSISTENT, SPLIT_FAILED, WALD_CONSISTENT, WALD_INCONSISTENT, WALD_UNOBSERVABLE };
+  enum class AccelGateVerdict { PRE_CLOSED, SPLIT_CONSISTENT, SPLIT_INCONSISTENT, SPLIT_FAILED, WALD_CONSISTENT, WALD_INCONSISTENT, WALD_UNOBSERVABLE, PRECISION_WEAK };
   AccelGateVerdict a_wald_verdict = AccelGateVerdict::PRE_CLOSED;
   /// tg's OWN gate verdict. Mode 1: the wald tg-subspace judge (runs only when the chain
   /// certifies). Split modes: the tg half pair -- which also runs when the frozen-tg chain judge
@@ -374,6 +387,7 @@ struct SessionReport {
   /// (accel pre-gate closed, no solve, or the session does not estimate tg). A CONSISTENT verdict
   /// with tg_open=false means tg reproduced but the chain never certified (tg opens only WITH it).
   AccelGateVerdict tg_gate_verdict = AccelGateVerdict::PRE_CLOSED;
+  double tg_conditional_sigma = 0.0; ///< optimistic A1a Tg sigma before the full-chain split solves
   bool tg_open = false; ///< tg unlocked WITH the chain and survived A1b (the commit machinery still gates the block)
   int a_wald_r = 0;                  ///< observable gate-subspace dimension (of 6)
   double a_wald_T = 0.0;             ///< correlated Wald statistic (chi^2_r under H0)

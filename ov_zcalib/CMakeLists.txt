@@ -41,7 +41,9 @@ set(OV_ZCALIB_LIB_SOURCES
         src/window/WindowHarvester.cpp
         src/window/WindowScorer.cpp
         src/init/HandEyeWahba.cpp
+        src/init/EpipolarTimeInit.cpp
         src/utils/SessionRecord.cpp
+        src/utils/ReportJson.cpp
         src/core/CalibSessionRunner.cpp
 )
 
@@ -67,6 +69,15 @@ install(TARGETS ov_zcalib_lib
 option(OV_ZCALIB_BUILD_TESTS "Build ov_zcalib test/oracle executables (dev/CI only)" ON)
 if (OV_ZCALIB_BUILD_TESTS AND NOT DISABLE_TRACK_KLT)
     enable_testing()
+    add_executable(zcalib_test_report_json src/test_report_json.cpp)
+    target_link_libraries(zcalib_test_report_json ov_zcalib_lib)
+    add_test(NAME zcalib_test_report_json COMMAND zcalib_test_report_json)
+    add_executable(zcalib_test_time_bootstrap src/test_time_bootstrap.cpp)
+    target_link_libraries(zcalib_test_time_bootstrap ov_zcalib_lib)
+    add_test(NAME zcalib_test_time_bootstrap COMMAND zcalib_test_time_bootstrap)
+    add_executable(zcalib_test_camera_refinement src/test_camera_refinement.cpp)
+    target_link_libraries(zcalib_test_camera_refinement ov_zcalib_lib)
+    add_test(NAME zcalib_test_camera_refinement COMMAND zcalib_test_camera_refinement)
     add_executable(zcalib_test_aci3_fd src/test_aci3_fd.cpp)
     target_link_libraries(zcalib_test_aci3_fd ov_zcalib_lib)
     add_test(NAME zcalib_test_aci3_fd COMMAND zcalib_test_aci3_fd)
@@ -85,6 +96,7 @@ if (OV_ZCALIB_BUILD_TESTS AND NOT DISABLE_TRACK_KLT)
     add_executable(zcalib_test_session_e2e src/test_session_e2e.cpp)
     target_link_libraries(zcalib_test_session_e2e ov_zcalib_lib)
     add_test(NAME zcalib_test_session_e2e COMMAND zcalib_test_session_e2e)
+    add_test(NAME zcalib_test_radtan_tangent COMMAND zcalib_test_session_e2e S4-tangent)
     add_executable(zcalib_test_tg_e2e src/test_tg_e2e.cpp)
     target_link_libraries(zcalib_test_tg_e2e ov_zcalib_lib)
     add_test(NAME zcalib_test_tg_e2e COMMAND zcalib_test_tg_e2e)

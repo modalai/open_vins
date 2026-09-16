@@ -179,6 +179,10 @@ inline bool load_calib_profile(const std::string &path, CalibProfile &out) {
   parser->parse_config("min_holdout", out.session.min_holdout, false);
 
   // ---- commit gates (advanced) ----
+  parser->parse_config("tg_precision_screen", out.session.tg_precision_screen, false);
+  parser->parse_config("bootstrap_epipolar", out.session.bootstrap_epipolar, false);
+  parser->parse_config("radtan_tangent_refine_sigma", out.session.radtan_tangent_refine_sigma, false);
+  parser->parse_config("radtan_tangent_full_sigma", out.session.radtan_tangent_full_sigma, false);
   parser->parse_config("commit_sigma_factor", out.session.commit_sigma_factor, false);
   parser->parse_config("verify_min_improve", out.session.verify_min_improve, false);
 

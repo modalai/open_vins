@@ -26,7 +26,7 @@ Two front doors, one engine:
 |---|---|
 | `src/core/` | session runner (SETTLE -> BOOTSTRAP -> COLLECT -> SOLVE -> VERIFY -> COMMIT), profiles, config schema |
 | `src/cpi/` | ACI^2 calibration preintegration (mean + 15x15 covariance + intrinsic columns) + value-keyed cache |
-| `src/init/` | bootstrap: relative-rotation model family, xcorr td seed, Markley-SVD hand-eye |
+| `src/init/` | bootstrap: relative-rotation models, coarse xcorr, hand-eye, geometric rotation/time refinement |
 | `src/solve/` | per-window micro-BA + reduced-information export, cross-window VarPro fusion (JointCalib), factors |
 | `src/types/` | shared calibration state, imu2 intrinsic model, kalibr chain conversion |
 | `src/utils/` | session record (kFormat 5), lock-free SPSC rings, voxl-logger feeder, atomic YAML writeback |
@@ -59,6 +59,16 @@ IMU-frame vectors into the camera frame, left-quaternion error, gravity
 
 ## Statistical honesty (the gates)
 
+- Raw xcorr keeps the `t_imu = t_cam + td` sign and is a coarse estimate.
+  First/last time intervals check for motion-dependent bias that adjacent
+  even/odd samples can share. Unstable correlation or a bounded hand-eye
+  fit invokes `EpipolarTimeInit` (`bootstrap_epipolar`, default ON): row-time
+  rotations, eliminated pair translation directions, conditional curvature,
+  and separate time-interval fits. It requires 40 pairs with 25 shared tracks
+  each. Insufficient support permits a provisional interior hand-eye seed;
+  a supported but inconsistent fit keeps collecting. Geometric acceptance
+  needs informative curvature and consistent interior estimates; its sigma
+  is conditional on the fixed gyro chain and local translation model.
 - Blind protocol on real rigs: per-unit facts (camera intrinsics, IMU noise)
   are seeded; extrinsics and `td` are earned — the platform chain is a
   printed reference, never a seed. The calibration weighting is the raw
@@ -68,11 +78,25 @@ IMU-frame vectors into the camera frame, left-quaternion error, gravity
   `zcalib_test_wald_mc`; junk-injection power study behind `--h1`).
 - Tg recovery arbiter: split-tg falsifier with retry arbitration and a
   commit-walk revert arm — a refused `Tg` can never ship its solved value
-  silently (`zcalib_test_tg_e2e`).
+  silently (`zcalib_test_tg_e2e`). An optimistic A1a precision screen skips
+  the additional Tg half-pair when even its conditional posterior misses
+  the existing commit threshold (`tg_precision_screen`, default ON).
+  This is a conservative local screen, not a global observability proof.
 - Commit rules: per-block 3-sigma with ceilings, atomic block pairing,
   committed-mixture re-verify, holdout VERIFY floor, camera-center
   quadrant-coverage gate. A block that cannot be earned ships its seed and
   the report says so.
+- Camera gates use each camera's distortion model. Equidistant `k3/k4`
+  need radial coverage; radtan `p1/p2` use center-bracketing coverage and
+  separate priors (`radtan_tangent_refine_sigma=0.001`, full-mode `0.01`).
+  In refine mode, weak parameter pairs return to the factory values before
+  one joint refit; the recomputed marginal posterior and normal holdout gates
+  decide whether the remaining correction can commit. A frozen pair's tight sigma comes
+  from the constraint and is not an accuracy claim.
+- The solve budget is one deadline across stages. No new solve starts after
+  it expires, and truncated split-half solves cannot certify consistency.
+  A running evaluation pass can finish beyond the deadline; verification
+  has its own reported time.
 - Export-on-accept: rejected-pass and duel-loser exports are dead state;
   the export runs once at the accepted optimum (ON == OFF byte parity,
   `zcalib_test_export_parity`). Export-failure doctrine: candidate-point
@@ -113,13 +137,17 @@ ov_zcalibrate --selftest                                # writeback smoke
 
 | target | pins |
 |---|---|
+| `zcalib_test_time_bootstrap` | both td signs, radtan/equi geometry, row times, clock/exposure invariance, weak motion and boundary rejection |
+| `zcalib_test_report_json` | non-finite values under fast-math, string escaping, and double round-trip precision |
 | `zcalib_test_aci3_fd` | every preintegration mean/factor column vs finite differences |
 | `zcalib_test_preint_chain` | chronological chain sweep + cache == recompute |
 | `zcalib_test_convention_ports` | sign/frame/ordering firewall gates |
 | `zcalib_test_frontend` | seeding, harvest, reservoir, selection + record round-trip |
 | `zcalib_test_calib_e2e` | truth-seeded recovery + Fisher-spectrum falsifier |
+| `zcalib_test_camera_refinement` | model-specific coverage, pair freezing, exhausted deadline, Tg guidance |
 | `zcalib_test_session_e2e` | no-truth production path; world blocks selectable by argv; byte-identical replays |
-| `zcalib_test_tg_e2e` | Tg earn/refuse/recovery oracle |
+| `zcalib_test_radtan_tangent` | single-camera radtan recovery from perturbed tangential coefficients |
+| `zcalib_test_tg_e2e` | Tg earn/refuse/recovery oracle; selectable `T1`, `T1b`, `T2`, `T3` cases |
 | `zcalib_test_wald_mc` | MC calibration of the Wald thresholds; `--h1` power study |
 | `zcalib_test_export_parity` | export-on-accept ON == OFF byte parity + veto-path fault injection |
 

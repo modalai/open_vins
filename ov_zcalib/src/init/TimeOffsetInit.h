@@ -14,45 +14,20 @@
  * compares the camera rate at t with the IMU rate at t + tau, and the argmax
  * IS the td seed directly.
  *
- * WHAT THE PEAK VALUE MAY AND MAY NOT VETO. The downstream contract is small:
- * the td seed must land inside the hand-eye fine sweep (+/- td_fine_range),
- * which re-solves td by re-preintegration anyway. The peak-corr floor exists
- * to reject a FLAT ridge (near-constant |w|), where the argmax is noise. A
- * LOW peak with a REPRODUCIBLE interior argmax is not that failure: broadband
- * pair noise (blur-slipped tracks, rolling-shutter shear at rate reversals)
- * depresses rho without moving the peak -- measured on a 60 fps rolling-shutter
- * unit: peak pinned at 0.51-0.57 with a stable argmax and sharpness ~1.5e2, a
- * perfectly usable td the raw floor alone rejects. So besides the raw peak,
- * solve() reports certificate evidence:
- *   - a quality-WEIGHTED correlation (the same per-pair trust the hand-eye
- *     uses; unweighted xcorr gives a blur-slipped pair a crisp pair's vote),
- *   - one Hampel trim-and-rescan at the found lag (retention and
- *     argmax-consistency reported, so a peak cannot be BOUGHT by discarding
- *     the data),
- *   - a split-half check (even/odd samples, so both halves span the whole
- *     session): two independent halves reproducing the same lag is a direct
- *     identifiability certificate, immune to the rho depression above.
- * The caller composes these into its acceptance rule; td itself is ALWAYS the
- * full-series refined argmax (the trim/split values are evidence, not the
- * estimate -- selection at the peak lag must not feed back into the peak).
+ * A high peak or agreement between even/odd samples does not establish clock
+ * accuracy: adjacent visual pairs can share translation and rolling-shutter
+ * bias. Weighted trimming and interleaved splits remain evidence about coarse
+ * peak repeatability. A separate unweighted first/last time split detects
+ * motion-dependent drift. The runner can geometrically refine that seed. If
+ * image support is too sparse, an interior hand-eye result remains a
+ * provisional start; it does not acquire a timing certificate from xcorr.
  *
- * WEIGHT SCOPE. The PRIMARY scan (peak_corr, td) is deliberately UNWEIGHTED and
- * bit-exact with the legacy gate: every log that passes the raw floor produces
- * the identical td seed it always did, so the validated replay corpus cannot
- * churn. Weights act ONLY inside the certificate evidence (trim + split-half),
- * i.e. only on sessions the legacy gate would have rejected anyway. Measured:
- * weighting the primary shifted a flight log's td seed by 139 us, a knife-edge
- * probation window flipped at post-A0, and the session walked from COMMIT to
- * ABORT -- seed-vintage churn the recovery path must never impose on healthy
- * sessions.
- *
- * The primary below is the VERBATIM legacy loop, not a w=1 call into the
- * subset scanner. Under -ffast-math "multiply by 1.0" is only value-exact per
- * operation -- a different CODE SHAPE reassociates/vectorizes differently, and
- * the low-bit td drift that costs is invisible at print precision yet measured
- * as an A1a pass-count change (12 -> 17) with 4th-decimal calibration churn.
- * Bit-exactness across binaries is a property of the EMITTED LOOP here, so the
- * emitted loop is kept literally identical.
+ * The primary scan remains unweighted, with the legacy arithmetic unchanged.
+ * Its td is always the full-series refined argmax; diagnostic trimming and
+ * splits do not move the raw peak. Geometry exports its own estimate instead
+ * of changing the sign or relabeling the correlation curve. Keep the primary
+ * loop separate: reassociation under fast-math can affect downstream window
+ * selection even when two formulations are mathematically equivalent.
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -81,7 +56,7 @@ struct CamRateSample {
 struct TimeOffsetResult {
   bool ok = false;
   double td = 0.0;             ///< seconds, t_imu = t_cam + td (full-series refined argmax)
-  double peak_corr = 0.0;      ///< weighted normalized xcorr at the peak (quality; 1 = perfect)
+  double peak_corr = 0.0;      ///< unweighted normalized xcorr at the peak (quality; 1 = perfect)
   double peak_sharpness = 0.0; ///< -d2(corr)/dtau2 at the peak (identifiability)
   bool at_bound = false;       ///< peak pinned at the search edge: widen the search
   // ---- robust-certificate evidence (computed only for a usable interior peak) ----
@@ -90,19 +65,37 @@ struct TimeOffsetResult {
   bool trim_consistent = false;///< trimmed argmax within 2 lag steps of the untrimmed one
   double td_split_delta = -1.0;///< |td(even half) - td(odd half)| [s]; negative = halves unusable
   double split_min_peak = 0.0; ///< the WEAKER half's peak (both halves must show a real ridge)
+  double temporal_split_delta = -1.0; ///< first/last time halves; adjacent samples are not independent evidence
+  double temporal_min_peak = 0.0;
+  bool temporally_consistent(double tolerance) const {
+    return temporal_split_delta >= 0.0 && temporal_split_delta <= tolerance && temporal_min_peak >= 0.36;
+  }
+};
+
+/// Optional copy of the full-series correlation scan; does not alter the estimate.
+struct XcorrCurve {
+  double search = 0.0; ///< lag search half-width [s]; lag_i = -search + i*step
+  double step = 0.0;   ///< lag grid step [s]
+  /// Unweighted normalized correlation per lag, from the FULL-SERIES scan.
+  /// A lag with fewer than 8 overlapping samples is left at the -2.0 sentinel
+  /// (plot it as a gap, never as a correlation of -2).
+  std::vector<double> corr;
 };
 
 class TimeOffsetInit {
 public:
   /**
-   * @brief Weighted normalized xcorr over a lag grid with linear IMU interpolation.
+   * @brief Normalized xcorr over a lag grid with linear IMU interpolation.
    * @param cam    camera rotation-rate samples (any spacing; gaps fine; weight 1 = legacy)
    * @param imu    raw IMU (only wm used; bias left in -- see header note)
    * @param search half-width of the lag search [s]
    * @param step   coarse lag step [s] (parabolic refine goes sub-step)
+   * @param curve  optional diagnostic export of the full-series correlation
+   *               curve; nullptr (the default) allocates nothing and leaves
+   *               every computed value bit-identical
    */
   static TimeOffsetResult solve(const std::vector<CamRateSample> &cam, const std::vector<RawImu> &imu, double search = 0.10,
-                                double step = 0.002) {
+                                double step = 0.002, XcorrCurve *curve = nullptr) {
     TimeOffsetResult out;
     if (cam.size() < 8 || imu.size() < 8 || !(search > 0.0) || !(step > 0.0))
       return out;
@@ -123,9 +116,8 @@ public:
 
     const int n_lags = (int)std::floor(2.0 * search / step) + 1;
 
-    // One scan over the lag grid for an index-subset of the samples. use_weights=false
-    // reproduces the legacy arithmetic bit for bit (the accumulation order is unchanged and
-    // w == 1.0 exactly); the certificate scans pass use_weights=true (see header).
+    // Subset scans: weighted for trim/interleaved diagnostics, unweighted for
+    // the first/last time intervals. The primary scan stays separate below.
     struct ScanOut {
       bool ok = false;
       int imax = 0;
@@ -237,6 +229,13 @@ public:
         score[li] = cov / std::sqrt(var_c * var_i);
       }
 
+      // Export before early returns so rejected scans retain their diagnostics.
+      if (curve != nullptr) {
+        curve->search = search;
+        curve->step = step;
+        curve->corr.assign(score.begin(), score.end());
+      }
+
       int imax = 0;
       for (int li = 1; li < n_lags; ++li)
         if (score[li] > score[imax])
@@ -345,6 +344,19 @@ public:
       if (sa.ok && sb.ok && !sa.at_bound && !sb.at_bound) {
         out.td_split_delta = std::abs(sa.td - sb.td);
         out.split_min_peak = std::min(sa.peak, sb.peak);
+      }
+    }
+    // Separate time intervals expose motion-dependent bias that interleaved
+    // samples can share. This diagnostic does not change the primary estimate.
+    {
+      const double cut = 0.5 * (cam.front().t_mid + cam.back().t_mid);
+      std::vector<int> early, late;
+      for (int k : all)
+        (cam[(size_t)k].t_mid < cut ? early : late).push_back(k);
+      const ScanOut a = scan(early, false), b = scan(late, false);
+      if (a.ok && b.ok && !a.at_bound && !b.at_bound) {
+        out.temporal_split_delta = std::abs(a.td - b.td);
+        out.temporal_min_peak = std::min(a.peak, b.peak);
       }
     }
     return out;

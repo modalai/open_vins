@@ -24,6 +24,30 @@
 
 namespace ov_init {
 
+// Fixed-size analytic radtan derivatives. No camera object, OpenCV matrix
+// update, or dynamic Eigen allocation is needed for an individual residual.
+// The 2x8 intrinsic Jacobian is optional: inner BA holds intrinsics constant.
+inline void radtan_jacobian_double(const Eigen::Matrix<double, 8, 1> &c, const Eigen::Vector2d &uv,
+                                  Eigen::Matrix2d &Jn, Eigen::Matrix<double, 2, 8> *Jc = nullptr) {
+  const double x = uv(0), y = uv(1), xx = x*x, yy = y*y, xy = x*y;
+  const double r2 = xx + yy, r4 = r2*r2;
+  const double rad = 1.0 + c(4)*r2 + c(5)*r4;
+  const double dr = 2.0*c(4) + 4.0*c(5)*r2;
+  const double cross = dr*xy + 2.0*c(6)*x + 2.0*c(7)*y;
+  Jn << c(0)*(rad + dr*xx + 2.0*c(6)*y + 6.0*c(7)*x), c(0)*cross,
+        c(1)*cross, c(1)*(rad + dr*yy + 6.0*c(6)*y + 2.0*c(7)*x);
+  if (Jc) {
+    Jc->setZero();
+    (*Jc)(0,0) = x*rad + 2.0*c(6)*xy + c(7)*(r2 + 2.0*xx);
+    (*Jc)(1,1) = y*rad + c(6)*(r2 + 2.0*yy) + 2.0*c(7)*xy;
+    (*Jc)(0,2) = (*Jc)(1,3) = 1.0;
+    (*Jc)(0,4) = c(0)*x*r2; (*Jc)(0,5) = c(0)*x*r4;
+    (*Jc)(1,4) = c(1)*y*r2; (*Jc)(1,5) = c(1)*y*r4;
+    (*Jc)(0,6) = 2.0*c(0)*xy; (*Jc)(0,7) = c(0)*(r2 + 2.0*xx);
+    (*Jc)(1,6) = c(1)*(r2 + 2.0*yy); (*Jc)(1,7) = 2.0*c(1)*xy;
+  }
+}
+
 /// Forward-distort a normalized image point at the given intrinsics
 /// [fx fy cx cy k1 k2 k3 k4] (equidistant when is_fisheye, radtan otherwise).
 inline Eigen::Vector2d distort_double(const Eigen::Matrix<double, 8, 1> &c, const Eigen::Vector2d &uv_norm, bool is_fisheye) {
