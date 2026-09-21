@@ -71,6 +71,17 @@ struct HandEyeConfig {
   double td_fine_step = 0.0002; ///< [s]
 };
 
+enum class HandEyeBiasStatus { NOT_SOLVED, FIXED_SEED, ESTIMATED, SANITY_FALLBACK };
+
+inline const char *handeye_bias_status_name(HandEyeBiasStatus status) {
+  switch (status) {
+  case HandEyeBiasStatus::FIXED_SEED: return "fixed_seed";
+  case HandEyeBiasStatus::ESTIMATED: return "estimated";
+  case HandEyeBiasStatus::SANITY_FALLBACK: return "sanity_fallback";
+  default: return "not_solved";
+  }
+}
+
 struct HandEyeResult {
   bool ok = false;
   Eigen::Vector4d q_ItoC = Eigen::Vector4d(0, 0, 0, 1); ///< JPL, quat_2_Rot(q) = R_ItoC
@@ -81,6 +92,13 @@ struct HandEyeResult {
   int pairs_used = 0;
   int pairs_trimmed = 0;
   bool td_at_bound = false;
+  HandEyeBiasStatus bg_status = HandEyeBiasStatus::NOT_SOLVED;
+  /// Initial alternating-fit update and its sanity limit, in the input gyro
+  /// stream's frame [rad/s]. The runner corrects that stream by Dw before
+  /// hand-eye, then maps bg back to raw; these guard diagnostics stay in the
+  /// corrected frame. Zero when no valid bias fit was attempted.
+  double bg_initial_delta_norm = 0.0;
+  double bg_sanity_limit = 0.0;
 };
 
 class HandEyeWahba {

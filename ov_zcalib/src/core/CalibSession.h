@@ -38,6 +38,9 @@ public:
       : L_(Eigen::MatrixXd::Zero(np, np)), prior_(prior_sigma), labels_(labels) {}
 
   void add_window_information(const Eigen::MatrixXd &Lambda_w) { L_ += Lambda_w; }
+  /// Replace the display's evidence after retention/thermal eligibility changes. A stream's
+  /// all-time sum contains discarded windows and must not guide the current retained solve.
+  void set_window_information(const Eigen::MatrixXd &Lambda) { L_ = Lambda; }
 
   /// Posterior/prior improvement per dof and the weakest whitened mode
   void progress(Eigen::VectorXd &improve, std::string &prompt) const {
@@ -62,9 +65,9 @@ public:
       prompt = std::string("vary acceleration along IMU ") + axis +
                " while changing tilt; mix translation and rotation at different rates, keep nearby features visible (Tg weak)";
     } else if (weak.rfind("td", 0) == 0)
-      prompt = "increase angular rate (time offset weak)";
+      prompt = "vary angular speed and rotation axis while keeping features tracked (time offset weak)";
     else if (weak.rfind("p_IinC", 0) == 0)
-      prompt = "sharp rotation bursts about two axes (lever arm weak)";
+      prompt = "controlled rotation sweeps about multiple axes with varied speed; slow down if tracks fall (lever arm weak)";
     else
       prompt = "keep varied 6-axis motion (" + weak + " weak)";
   }

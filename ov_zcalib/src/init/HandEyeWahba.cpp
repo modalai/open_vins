@@ -172,6 +172,10 @@ bool HandEyeWahba::solve(const std::vector<RawImu> &imu, const std::vector<HandE
   std::vector<PairEval> pe;
   HandEyeConfig cfg_eff = cfg;
   AltOut base = alternate(imu, pairs, td_seed, bg_seed, cfg_eff, &pe);
+  if (base.rmse >= 0.0 && cfg_eff.estimate_bg) {
+    out.bg_initial_delta_norm = (base.bg - bg_seed).norm();
+    out.bg_sanity_limit = cfg_eff.max_bg_sane;
+  }
   if (base.rmse >= 0.0 && cfg_eff.estimate_bg && (base.bg - bg_seed).norm() > cfg_eff.max_bg_sane) {
     // translation-bias soak: redo everything with the bias frozen at the seed
     cfg_eff.estimate_bg = false;
@@ -250,5 +254,7 @@ bool HandEyeWahba::solve(const std::vector<RawImu> &imu, const std::vector<HandE
   out.rmse_rad = best.rmse;
   out.axis_diversity = best.diversity;
   out.pairs_used = best.used;
+  out.bg_status = !cfg.estimate_bg ? HandEyeBiasStatus::FIXED_SEED
+                                 : (cfg_eff.estimate_bg ? HandEyeBiasStatus::ESTIMATED : HandEyeBiasStatus::SANITY_FALLBACK);
   return true;
 }

@@ -92,6 +92,11 @@ public:
   static bool seed_window(WindowData &win, const SharedCalib &calib, const Eigen::Vector3d &bg_boot, LinearSeedReport &rep);
   static bool seed_window(WindowData &win, const SharedCalib &calib, const Eigen::Vector3d &bg_boot, LinearSeedReport &rep,
                           const LinearSeedConfig &cfg);
+
+private:
+  friend struct LinearSeedBiasTestAccess;
+  static Eigen::Vector3d bias_presolve(const WindowData &win, const SharedCalib &calib,
+                                       const Eigen::Vector3d &bg0, int iters);
 };
 
 } // namespace ov_zcalib

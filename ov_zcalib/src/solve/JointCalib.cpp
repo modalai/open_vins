@@ -11,8 +11,10 @@
  */
 
 #include "JointCalib.h"
+#include "PosteriorChecks.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -30,6 +32,7 @@ using namespace ov_zcalib;
 bool JointCalib::solve(const std::vector<WindowData> &windows, SharedCalib &calib, const JointConfig &cfg, JointReport &rep,
                        JointWarmCarry *carry, PreintStore *store, std::vector<WindowWarmState> *warm_out) {
 
+  rep.ok = false;
   if (cfg.max_wall_s < 0.0) { // session deadline already exhausted
     rep.hit_wall_budget = true;
     return false;
@@ -37,11 +40,35 @@ bool JointCalib::solve(const std::vector<WindowData> &windows, SharedCalib &cali
 
   const auto t_entry = std::chrono::steady_clock::now();
   auto elapsed_s = [&]() { return std::chrono::duration<double>(std::chrono::steady_clock::now() - t_entry).count(); };
+  auto budget_elapsed_s = [&]() { return cfg.budget_clock ? cfg.budget_clock() : elapsed_s(); };
+  std::atomic<bool> budget_cancelled{false};
+  auto budget_expired = [&]() {
+    if (cfg.max_wall_s <= 0.0)
+      return false;
+    if (budget_cancelled.load(std::memory_order_relaxed))
+      return true;
+    if (budget_elapsed_s() >= cfg.max_wall_s) {
+      budget_cancelled.store(true, std::memory_order_relaxed);
+      return true;
+    }
+    return false;
+  };
 
   auto layout = calib.free_blocks();
   const int np = calib.local_dim();
   if (np == 0 || windows.empty())
     return false;
+
+  // A cold initializer may update bg/ba at each candidate calibration. Keep
+  // its starting state separate from the physical prior so warm/cold duels
+  // and outer merit comparisons use the same objective. An unseeded window
+  // has the same zero-bias prior as WindowBA's cold fallback.
+  std::vector<WindowBiasPrior> bias_priors(windows.size());
+  for (size_t wi = 0; wi < windows.size(); ++wi)
+    if (windows[wi].has_seeds) {
+      bias_priors[wi].bg = windows[wi].seed_bg;
+      bias_priors[wi].ba = windows[wi].seed_ba;
+    }
 
   // Freeze the noise linearization at fusion entry (weights must not chase p)
   calib.noise_lin = calib.imu;
@@ -50,27 +77,48 @@ bool JointCalib::solve(const std::vector<WindowData> &windows, SharedCalib &cali
   // stages ONLY under the identical noise_lin -- which freezes HERE, from the
   // entry imu values, not from the recording stage's exit (A1a/A1b move imu,
   // so their exit stamp matches the next entry while the whitener does not).
-  Eigen::Matrix<double, 16, 1> entry_noise;
-  entry_noise << calib.imu.dw, calib.imu.da, calib.imu.q_AtoI;
-  // Full-vector parameter stamp (33 doubles: ALL calib blocks, free or
+  Eigen::Matrix<double, 25, 1> entry_noise;
+  entry_noise << calib.imu.dw, calib.imu.da, calib.imu.q_AtoI,
+      Eigen::Map<const Eigen::Matrix<double, 9, 1>>(calib.imu.Tg.data());
+  // Full-vector parameter stamp (ALL calib blocks, free or
   // frozen). Window costs depend on the frozen blocks too, and the staged
   // calls free DIFFERENT subsets -- a free-subset stamp can never match across
   // a stage boundary and would demote every consume to jump duels. The full
   // vector matches exactly when the calib object is untouched between calls,
   // which is the condition under which carried costs are valid.
-  auto full_stamp = [&calib]() {
+  auto full_stamp = [&calib, &windows, &bias_priors]() {
     std::vector<double> s;
-    s.reserve(16 + 17 * calib.cams.size()); // 16 shared IMU dofs + 17 per camera
+    s.reserve(27 + 18 * calib.cams.size() + windows.size());
     auto push = [&s](const double *p, int n) { s.insert(s.end(), p, p + n); };
     push(calib.imu.dw.data(), 6);
     push(calib.imu.da.data(), 6);
     push(calib.imu.q_AtoI.data(), 4);
+    push(calib.imu.Tg.data(), 9);
+    s.push_back(calib.tg_enabled ? 1.0 : 0.0);
+    s.push_back(calib.grav_mag);
+    s.push_back(calib.bg_prior_sigma);
+    s.push_back(calib.ba_prior_sigma);
+    s.push_back(calib.noise.sigma_w);
+    s.push_back(calib.noise.sigma_wb);
+    s.push_back(calib.noise.sigma_a);
+    s.push_back(calib.noise.sigma_ab);
     for (const CamCalib &k : calib.cams) {
       push(k.q_ItoC.data(), 4);
       push(k.p_IinC.data(), 3);
       push(k.cam.data(), 8);
       s.push_back(k.td);
       s.push_back(k.tr);
+      s.push_back(k.reprojection_sigma_px);
+    }
+    // Both override and legacy fallback are objective data: carried costs and
+    // nuisance certificates cannot be compared after either is reweighted.
+    for (const WindowData &w : windows)
+      s.push_back(w.pix_sigma);
+    // Prior means/scales are objective data too, even when the calibration,
+    // free layout and measurement weights have not changed between calls.
+    for (const WindowBiasPrior &prior : bias_priors) {
+      push(prior.bg.data(), 3);
+      push(prior.ba.data(), 3);
     }
     return s;
   };
@@ -190,6 +238,10 @@ bool JointCalib::solve(const std::vector<WindowData> &windows, SharedCalib &cali
   Eigen::VectorXd accepted_g = Eigen::VectorXd::Zero(np);
   double prev_merit = std::numeric_limits<double>::infinity();
   std::vector<std::vector<double>> accepted_p = snapshot();
+  // No additional allocation in the legacy/unlimited path: alignment-sensitive
+  // builds must not have their window storage perturbed by an unused backup.
+  const auto entry_p = cfg.fused_schur ? accepted_p : std::vector<std::vector<double>>{};
+  int accepted_windows = 0;
 
   // Working copies + GUARDED two-path warm starts (strand/duel vocabulary:
   // see JointConfig). Warm-only carrying can strand -- LM from the previous
@@ -286,7 +338,7 @@ bool JointCalib::solve(const std::vector<WindowData> &windows, SharedCalib &cali
           break;
         }
     bool noise_match = true;
-    for (int k = 0; k < 16; ++k)
+    for (int k = 0; k < entry_noise.size(); ++k)
       if (carry->noise_stamp(k) != entry_noise(k)) { // bitwise: whitener identity
         noise_match = false;
         break;
@@ -434,12 +486,27 @@ bool JointCalib::solve(const std::vector<WindowData> &windows, SharedCalib &cali
   double pend_winf = 0.0, pend_pred = 0.0, pend_lambda = 0.0;
   bool pend_capped = false, have_pending = false;
   for (int pass = 0; pass < max_evals && accepted_steps < cfg.outer_iterations; ++pass) {
-    if (cfg.max_wall_s > 0.0 && elapsed_s() > cfg.max_wall_s) {
+    // A completed pass is the unit of information: starting one with only
+    // milliseconds left used to overrun by its entire warm/cold solve sweep.
+    // The first pass of a new stage uses the preceding stages' measured hint.
+    // Fused evals also reserve one full pass for their mandatory tight export.
+    const double pass_cost = std::max(cfg.budget_pass_hint_s, rep.max_pass_s);
+    const double reserve = (cfg.fused_schur ? 2.0 : 1.0) * 1.25 * pass_cost + 0.01;
+    if (cfg.max_wall_s > 0.0 && (budget_expired() || cfg.max_wall_s - budget_elapsed_s() <= reserve)) {
       rep.hit_wall_budget = true;
       if (cfg.verbose)
-        std::printf("[joint] wall budget %.1fs hit after %d passes -> stop at best accepted point\n", cfg.max_wall_s, pass);
+        std::printf("[joint] wall budget %.1fs: no room for a complete pass after %d passes -> keep complete accepted point\n",
+                    cfg.max_wall_s, pass);
       break;
     }
+    struct PassTimer {
+      std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+      double &maximum;
+      explicit PassTimer(double &m) : maximum(m) {}
+      ~PassTimer() {
+        maximum = std::max(maximum, std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count());
+      }
+    } pass_timer(rep.max_pass_s);
     // stop-confirmation pass: force one duel on every window whose accepted
     // q_n is material -- the fixed-order, deterministic cross-check that a
     // stable-looking outer point is not resting on under-converged nuisances
@@ -470,7 +537,7 @@ bool JointCalib::solve(const std::vector<WindowData> &windows, SharedCalib &cali
         s.tstop = 0;
         s.deferred_cause = 0;
         s.d_ran = s.d_ok = s.d_win = false;
-        if (dead[wi])
+        if (dead[wi] || budget_expired())
           return;
         s.attempted = true;
         // ---- path A (warm strand): solve from the accepted point's optimum ----
@@ -493,7 +560,8 @@ bool JointCalib::solve(const std::vector<WindowData> &windows, SharedCalib &cali
           // eoa savings there are the path-B/duel-loser exports. Dimension
           // consistency reads the layout dim, not the (absent) Lambda --
           // equal to Lambda.rows() whenever an export ran.
-          okA = WindowBA::solve_and_export(work[wi], calib, !eoa || cert_on || export_suspect[wi], wrA, itA, false, &wA, pslot[wi]) &&
+          okA = WindowBA::solve_and_export(work[wi], calib, !eoa || cert_on || export_suspect[wi], wrA, itA, false, &wA,
+                                           pslot[wi], nullptr, nullptr, &bias_priors[wi]) &&
                 wrA.free_dim == np;
           s.t_preint += wrA.t_preint;
           s.t_inner += wrA.t_inner;
@@ -537,6 +605,8 @@ bool JointCalib::solve(const std::vector<WindowData> &windows, SharedCalib &cali
         WindowSolveReport wrB;
         WindowWarmState wB; // invalid: forces the seed init inside the solve
         bool okB = false;
+        if (budget_expired())
+          return; // discard this entire candidate; never turn a skipped window into a dead one
         if (suspect && !defer) {
           snap_seeds(work[wi], s.seeds_pre); // path A's anchors of record (pre-re-seed)
           const auto t_s0 = std::chrono::steady_clock::now();
@@ -548,13 +618,15 @@ bool JointCalib::solve(const std::vector<WindowData> &windows, SharedCalib &cali
           // stages (the A1a/A1b IMU intrinsics) the windows were collected for.
           const bool seeded = LinearSeed::seed_window(work[wi], calib, work[wi].seed_bg, sr, cfg.seed);
           s.t_seed += std::chrono::duration<double>(std::chrono::steady_clock::now() - t_s0).count();
+          if (budget_expired())
+            return;
           if (seeded || work[wi].has_seeds) {
             // eoa: cost-only duel -- the loser's export was ALWAYS dead state,
             // and the winner's is deferred to the accept pass. q_n is not
             // consumed from path B pre-accept (the cert reads wrA.qn only;
             // the accepted point's q_n comes from the export pass).
             okB = WindowBA::solve_and_export(work[wi], calib, !eoa || export_suspect[wi], wrB, cfg.window_max_iters, false, &wB,
-                                             pslot[wi]) &&
+                                             pslot[wi], nullptr, nullptr, &bias_priors[wi]) &&
                   wrB.free_dim == np;
             s.t_preint += wrB.t_preint;
             s.t_inner += wrB.t_inner;
@@ -593,6 +665,10 @@ bool JointCalib::solve(const std::vector<WindowData> &windows, SharedCalib &cali
         }
       }
     });
+    if (budget_expired()) {
+      rep.hit_wall_budget = true;
+      break; // no reduction, no survivor-set edits, no accepted-state promotion
+    }
     std::fill(jump.begin(), jump.end(), 0); // entry/confirmation duels fire exactly once
     // ---- fixed-order reduction + failure semantics ----
     // A window that fails at an ACCEPTED point (incl. the entry point) is dead:
@@ -653,8 +729,10 @@ bool JointCalib::solve(const std::vector<WindowData> &windows, SharedCalib &cali
       cost_total += s.cost;
       rep.windows_used++;
     }
-    if (rep.windows_used == 0)
+    if (rep.windows_used == 0) {
+      restore(accepted_p); // best-effort staged callers must never inherit an unaccepted candidate
       return false;
+    }
     double merit = cost_total + prior_cost_now();
     if (!std::isfinite(merit))
       veto = true; // a NaN/inf evaluation must never be accepted (NaN defeats comparisons)
@@ -673,7 +751,7 @@ bool JointCalib::solve(const std::vector<WindowData> &windows, SharedCalib &cali
           {
             const int wi = order[k];
             EvalSlot &s = slots[wi];
-            if (!s.attempted || !s.ok || !s.deferred_cause || dead[wi])
+            if (!s.attempted || !s.ok || !s.deferred_cause || dead[wi] || budget_expired())
               return;
             s.d_ran = true;
             snap_seeds(work[wi], s.seeds_pre); // path A's anchors of record (pre-re-seed)
@@ -681,11 +759,12 @@ bool JointCalib::solve(const std::vector<WindowData> &windows, SharedCalib &cali
             LinearSeedReport sr;
             const bool seeded = LinearSeed::seed_window(work[wi], calib, work[wi].seed_bg, sr, cfg.seed);
             s.d_seed = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_s0).count();
-            if (!(seeded || work[wi].has_seeds))
+            if (!(seeded || work[wi].has_seeds) || budget_expired())
               return;
             WindowSolveReport wrB;
             WindowWarmState wB;
-            s.d_ok = WindowBA::solve_and_export(work[wi], calib, !eoa, wrB, cfg.window_max_iters, false, &wB, pslot[wi]) &&
+            s.d_ok = WindowBA::solve_and_export(work[wi], calib, !eoa, wrB, cfg.window_max_iters, false, &wB, pslot[wi],
+                                                nullptr, nullptr, &bias_priors[wi]) &&
                      wrB.free_dim == np;
             s.d_preint = wrB.t_preint;
             s.d_inner = wrB.t_inner;
@@ -703,6 +782,10 @@ bool JointCalib::solve(const std::vector<WindowData> &windows, SharedCalib &cali
             }
           }
         });
+        if (budget_expired()) {
+          rep.hit_wall_budget = true;
+          break;
+        }
         // serial fold: counters + incremental (Lsum, gsum, cost) updates
         for (size_t wi = 0; wi < work.size(); ++wi) {
           EvalSlot &s = slots[wi];
@@ -798,7 +881,7 @@ bool JointCalib::solve(const std::vector<WindowData> &windows, SharedCalib &cali
         {
           const int wi = order[k];
           EvalSlot &s = slots[wi];
-          if (dead[wi] || !s.attempted || !s.ok)
+          if (dead[wi] || !s.attempted || !s.ok || budget_expired())
             return;
           ExpSlot &e = ex[wi];
           e.ran = true;
@@ -823,7 +906,7 @@ bool JointCalib::solve(const std::vector<WindowData> &windows, SharedCalib &cali
           }
           WindowSolveReport wre;
           e.ok = WindowBA::solve_and_export(work[wi], calib, true, wre, /*max_iters=*/0, false, w0, pslot[wi],
-                                            /*state_at=*/&warm_cand[wi]) &&
+                                            /*state_at=*/&warm_cand[wi], nullptr, &bias_priors[wi]) &&
                  (int)wre.Lambda.rows() == np;
           e.min_pivot = wre.export_min_pivot;
           e.nn = wre.export_nuis_dim;
@@ -841,6 +924,10 @@ bool JointCalib::solve(const std::vector<WindowData> &windows, SharedCalib &cali
           }
         }
       });
+      if (budget_expired()) {
+        rep.hit_wall_budget = true;
+        break; // partial exports never replace the complete accepted information
+      }
       // OV_ZCALIB_EOA_FAIL_UID ("U" or "U:P"): forensic fault injection for
       // parity/veto-path tests -- fail window uid U's deferred export,
       // optionally only at pass P. Keyed on the uid so it stays deterministic
@@ -951,6 +1038,7 @@ bool JointCalib::solve(const std::vector<WindowData> &windows, SharedCalib &cali
       rejects_in_a_row = 0;
       prev_merit = merit;
       accepted_p = snapshot();
+      accepted_windows = rep.windows_used;
       // promote the accepted evaluation's nuisance optima to the warm baseline
       for (size_t wi = 0; wi < work.size(); ++wi)
         if (slots[wi].attempted && slots[wi].ok && !dead[wi]) {
@@ -972,6 +1060,7 @@ bool JointCalib::solve(const std::vector<WindowData> &windows, SharedCalib &cali
             snap_seeds(work[wi], seeds_acc[wi]);
         }
       lm_lambda = std::max(lm_lambda * 0.25, 1e-4);
+      bool stop_after_accept = false;
       // ---- early-stop: consecutive stable accepted steps + confirmation ----
       if (estop_on && have_pending) {
         const double actual = std::isfinite(merit_before) ? merit_before - merit : 0.0;
@@ -985,7 +1074,7 @@ bool JointCalib::solve(const std::vector<WindowData> &windows, SharedCalib &cali
             rep.stop_pass = pass;
             if (cfg.verbose)
               std::printf("[joint] early-stop CONFIRMED at pass %d (confirmation duels moved merit %.2e rel)\n", pass, rel);
-            break;
+            stop_after_accept = true;
           }
           stable_run = 0; // confirmation found real progress: keep iterating
         } else if (stable) {
@@ -1014,6 +1103,10 @@ bool JointCalib::solve(const std::vector<WindowData> &windows, SharedCalib &cali
       if (cfg.verbose)
         std::printf("[joint] pass %d: ACCEPT windows=%d merit=%.4e (data %.4e) lambda=%.1e\n", pass, rep.windows_used, merit, cost_total,
                     lm_lambda);
+      // The confirmation point's parameters/warm states were promoted above;
+      // its information must be promoted too before an early-stop may return.
+      if (stop_after_accept)
+        break;
       // ---- conv-stop: outer Newton decrement at the accepted point ----
       if (cfg.conv_stop && accepted_steps >= cfg.conv_min_accepts) {
         Eigen::LDLT<Eigen::MatrixXd> ldn(accepted_L);
@@ -1074,6 +1167,7 @@ bool JointCalib::solve(const std::vector<WindowData> &windows, SharedCalib &cali
   // report the last ACCEPTED point: its Lambda/sigma were evaluated exactly
   // there, and a trailing un-evaluated (or rejected) step must not ship
   restore(accepted_p);
+  rep.windows_used = accepted_windows;
   // ---- fused-eval finalize: capped evals carried the outer loop; the SHIPPED
   // linearization (commit gates read rep sigmas) must be commit-grade. One
   // tight pass at the accepted point from the accepted warm states, fixed-
@@ -1081,26 +1175,27 @@ bool JointCalib::solve(const std::vector<WindowData> &windows, SharedCalib &cali
   if (cfg.fused_schur && have_lin) {
     std::vector<Eigen::MatrixXd> Lf(work.size());
     std::vector<Eigen::VectorXd> gf(work.size());
+    std::vector<WindowSolveReport> final_reports(work.size());
+    std::vector<WindowWarmState> final_warm(work.size());
     std::vector<char> okf(work.size(), 0);
     pool.parallel_dynamic((int)work.size(), [&](int, int k) {
       {
         const int wi = order[k];
-        if (dead[wi] || !warm_acc[wi].valid)
+        if (dead[wi] || !warm_acc[wi].valid || budget_expired())
           return;
-        WindowSolveReport wrf;
+        // Rejected candidates and losing cold duels may have changed work's
+        // initialization/pose anchors. Tighten the ACCEPTED objective with
+        // those anchors and the solve's immutable physical bias prior.
+        force_seeds(seeds_acc[wi], work[wi]);
+        auto &wrf = final_reports[wi];
         WindowWarmState wf = warm_acc[wi];
-        if (WindowBA::solve_and_export(work[wi], calib, true, wrf, cfg.window_max_iters, false, &wf, pslot[wi]) &&
+        if (WindowBA::solve_and_export(work[wi], calib, true, wrf, cfg.window_max_iters, false, &wf, pslot[wi],
+                                        nullptr, nullptr, &bias_priors[wi]) &&
             (int)wrf.Lambda.rows() == np) {
           Lf[wi] = std::move(wrf.Lambda);
           gf[wi] = std::move(wrf.gred);
-          warm_acc[wi] = std::move(wf);
+          final_warm[wi] = std::move(wf);
           okf[wi] = 1;
-          rep.inner_iters_sum += wrf.iterations;
-          rep.t_preint_sum += wrf.t_preint;
-          rep.t_inner_sum += wrf.t_inner;
-          rep.t_export_sum += wrf.t_export;
-          rep.t_factor_sum += wrf.t_factor;
-          rep.time_stops += wrf.time_stopped ? 1 : 0;
         }
       }
     });
@@ -1109,11 +1204,35 @@ bool JointCalib::solve(const std::vector<WindowData> &windows, SharedCalib &cali
     int nfin = 0;
     for (size_t wi = 0; wi < work.size(); ++wi)
       if (okf[wi]) {
+        // Workers own one slot each; fold diagnostics in the same fixed order
+        // as the information. Updating rep inside the pool was a data race.
+        const auto &wrf = final_reports[wi];
+        rep.inner_iters_sum += wrf.iterations;
+        rep.t_preint_sum += wrf.t_preint;
+        rep.t_inner_sum += wrf.t_inner;
+        rep.t_export_sum += wrf.t_export;
+        rep.t_factor_sum += wrf.t_factor;
+        rep.time_stops += wrf.time_stopped ? 1 : 0;
         Lfin += Lf[wi];
         gfin += gf[wi];
         nfin++;
       }
-    if (nfin >= 1) {
+    if (nfin == accepted_windows && nfin > 0 && !budget_expired()) {
+      double finalized_cost = 0.0;
+      for (size_t wi = 0; wi < work.size(); ++wi)
+        if (okf[wi]) {
+          warm_acc[wi] = std::move(final_warm[wi]);
+          // Cost, convergence diagnostics and optional carry must describe
+          // the SAME tightened states as the information exported below.
+          // Leaving these at the last capped step reports stale convergence
+          // and pairs a carried final state with a different objective value.
+          cost_acc[wi] = final_reports[wi].cost_final;
+          qn_acc[wi] = final_reports[wi].qn;
+          // qn_ref is a historical certificate reference. A warm-only
+          // finalization does not establish the dual agreement to refresh it.
+          finalized_cost += cost_acc[wi];
+        }
+      prev_merit = finalized_cost + prior_cost_now();
       // fold the seed priors exactly as the accepted-pass reduction does
       int off = 0;
       for (size_t bi = 0; bi < layout.size(); ++bi) {
@@ -1129,9 +1248,21 @@ bool JointCalib::solve(const std::vector<WindowData> &windows, SharedCalib &cali
       accepted_g = gfin;
       if (cfg.verbose)
         std::printf("[joint] P4 finalize: %d windows tight at the accepted point\n", nfin);
+    } else {
+      // A capped posterior is not commit-grade, and dropping unfinished
+      // windows changes its objective. Let the session restore its previous
+      // stage instead of shipping either kind of incomplete information.
+      rep.hit_wall_budget = rep.hit_wall_budget || budget_expired();
+      have_lin = false;
+      restore(entry_p);
+      if (cfg.verbose)
+        std::printf("[joint] P4 finalize incomplete (%d/%d windows): stage discarded\n", nfin, accepted_windows);
     }
   }
-  if (warm_out)
+  // Validate before publishing warm states or a carry stamped as accepted.
+  if (have_lin && !posterior_sigmas(accepted_L, rep.sigma))
+    have_lin = false;
+  if (warm_out && have_lin)
     *warm_out = warm_acc; // == nuisance optima at accepted_p (promotion contract above)
   rep.windows_dead = (int)std::count(dead.begin(), dead.end(), (char)1);
   rep.wall_s = elapsed_s();
@@ -1169,11 +1300,6 @@ bool JointCalib::solve(const std::vector<WindowData> &windows, SharedCalib &cali
   if (!have_lin)
     return false; // nothing was ever accepted: no linearization, no posterior to ship
 
-  Eigen::LDLT<Eigen::MatrixXd> ldlt(accepted_L);
-  if (ldlt.info() != Eigen::Success)
-    return false;
-  const Eigen::MatrixXd Sigma = ldlt.solve(Eigen::MatrixXd::Identity(np, np));
-  rep.sigma = Sigma.diagonal().cwiseMax(0.0).cwiseSqrt();
   rep.Lambda = accepted_L;
   rep.ok = true;
   return true;

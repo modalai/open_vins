@@ -25,6 +25,7 @@
 #include "Factor_ImuAci3.h"
 #include "Factor_PriorDiag.h"
 #include "Factor_ReprojTd.h"
+#include "utils/NumericChecks.h"
 
 #include "utils/quat_ops.h"
 
@@ -53,6 +54,7 @@ struct WindowGraph {
   std::vector<int> rp_clone, rp_cam;
   Factor_PriorQuatJPL *pq = nullptr;
   Factor_PriorEuclid *pp = nullptr, *pbg = nullptr, *pba = nullptr;
+  double bg_prior_sigma = 0.0, ba_prior_sigma = 0.0;
   PreintKey factor_key;
   bool has_factor_key = false, built = false;
   ~WindowGraph() {
@@ -64,12 +66,95 @@ struct WindowGraph {
 
 
 
+bool WindowBA::make_evaluation_context(const WindowData &win, const SharedCalib &reference,
+                                      WindowEvaluationContext &context) {
+  context = WindowEvaluationContext();
+  if (win.clone_times.size() < 3)
+    return false;
+  if (win.has_seeds) {
+    if (win.seed_v.size() != win.clone_times.size() || win.seed_q.empty() || win.seed_p.empty())
+      return false;
+    context.bias_prior.bg = win.seed_bg;
+    context.bias_prior.ba = win.seed_ba;
+    context.q_anchor = win.seed_q.front();
+    context.p_anchor = win.seed_p.front();
+  }
+  ImuIntrinsicModel model = reference.imu;
+  model.calib_dw = model.calib_da = model.calib_RAtoI = true;
+  model.calib_tg = reference.tg_enabled;
+  std::vector<AciPreintResult> pre;
+  if (!AciCalibPreint::integrate_chain(win.imu, win.clone_times, model, Eigen::Vector3d::Zero(),
+                                     Eigen::Vector3d::Zero(), reference.noise, pre,
+                                     reference.noise_frozen ? &reference.noise_lin : nullptr))
+    return false;
+  for (const auto &measurement : pre) {
+    Factor_ImuAci3 factor(measurement, model, Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero());
+    for (Eigen::Index k = 0; k < factor.sqrtI.size(); ++k)
+      if (!finite_scalar(factor.sqrtI.data()[k]))
+        return false;
+    for (Eigen::Index k = 0; k < factor.sqrtI_grav_fold.size(); ++k)
+      if (!finite_scalar(factor.sqrtI_grav_fold.data()[k]))
+        return false;
+    context.imu_sqrt_info.push_back(factor.sqrtI);
+    context.imu_gravity_fold.push_back(factor.sqrtI_grav_fold);
+  }
+  return context.imu_sqrt_info.size() + 1 == win.clone_times.size();
+}
+
 bool WindowBA::solve_and_export(const WindowData &win, SharedCalib &calib, bool export_info, WindowSolveReport &rep, int max_iters,
-                                bool verbose, WindowWarmState *warm, WindowPreint *pc, const WindowWarmState *state_at) {
+                                bool verbose, WindowWarmState *warm, WindowPreint *pc, const WindowWarmState *state_at,
+                                const WindowEvaluationContext *evaluation, const WindowBiasPrior *bias_prior) {
 
   const int N = (int)win.clone_times.size();
   if (N < 3 || win.num_feats == 0)
     return false;
+  // Graph factors keep pointers into these arrays. Reject malformed input
+  // before a copy could resize registered storage or poison a cached graph.
+  const auto state_shape_matches = [&](const WindowWarmState &state) {
+    const size_t n = (size_t)N;
+    return state.q.size() == n && state.bg.size() == n && state.v.size() == n &&
+           state.ba.size() == n && state.p.size() == n && state.feats.size() == win.num_feats;
+  };
+  if ((warm && warm->valid && !state_shape_matches(*warm)) ||
+      (state_at && (!state_at->valid || !state_shape_matches(*state_at))) ||
+      (win.has_seeds && (win.seed_q.size() != (size_t)N || win.seed_v.size() != (size_t)N ||
+                         win.seed_p.size() != (size_t)N || win.seed_feats.size() != win.num_feats))) {
+    rep.ok = false;
+    return false;
+  }
+  if (evaluation) {
+    if (evaluation->imu_sqrt_info.size() != (size_t)(N - 1) ||
+        evaluation->imu_gravity_fold.size() != (size_t)(N - 1))
+      return false;
+    // Evaluation contexts belong to this comparison, not the production
+    // cache key. Never leave their weights in a persistent training graph.
+    pc = nullptr;
+  }
+
+  // Reject invalid weights before touching a persistent graph. Bit checks are
+  // intentional: -ffast-math may optimize away floating-point finite checks.
+  auto positive_finite = [](double value) {
+    std::uint64_t bits;
+    std::memcpy(&bits, &value, sizeof(bits));
+    return bits != 0 && (bits >> 63) == 0 &&
+           (bits & UINT64_C(0x7ff0000000000000)) != UINT64_C(0x7ff0000000000000);
+  };
+  auto pixel_sigma = [&win](const CamCalib &camera) {
+    return camera.reprojection_sigma_px == 0.0 ? win.pix_sigma : camera.reprojection_sigma_px;
+  };
+  for (const CamCalib &camera : calib.cams) {
+    std::uint64_t override_bits;
+    std::memcpy(&override_bits, &camera.reprojection_sigma_px, sizeof(override_bits));
+    if ((override_bits & UINT64_C(0x7fffffffffffffff)) != 0 && !positive_finite(camera.reprojection_sigma_px)) {
+      rep.ok = false;
+      return false;
+    }
+    const double sigma = pixel_sigma(camera);
+    if (!positive_finite(sigma) || !positive_finite(1.0 / sigma)) {
+      rep.ok = false;
+      return false;
+    }
+  }
 
   // ---- persistent graph acquisition (one uniform path; pc==nullptr gets a
   // call-local graph so admission/tests behave exactly like production) ----
@@ -84,6 +169,12 @@ bool WindowBA::solve_and_export(const WindowData &win, SharedCalib &calib, bool 
     Gp = local_g.get();
   }
   WindowGraph &G = *Gp;
+  if (G.built && (G.q.size() != (size_t)N || G.bg.size() != (size_t)N || G.v.size() != (size_t)N ||
+                  G.ba.size() != (size_t)N || G.p.size() != (size_t)N || G.feats.size() != win.num_feats ||
+                  G.calib.cams.size() != calib.cams.size())) {
+    rep.ok = false;
+    return false;
+  }
   if (!G.built) {
     G.q.assign(N, Eigen::Vector4d(0, 0, 0, 1));
     G.bg.assign(N, Eigen::Vector3d::Zero());
@@ -146,15 +237,12 @@ bool WindowBA::solve_and_export(const WindowData &win, SharedCalib &calib, bool 
     put(nmk.dw.data(), 6);
     put(nmk.da.data(), 6);
     put(nmk.q_AtoI.data(), 4);
-    // Tg joins the key when its columns exist: two calibrations differing only in Tg (or in
-    // whether the 24-column layout is on at all) must never collide in the store. tg_enabled
-    // itself is keyed as a slot so a 15-column entry can never serve a 24-column request.
-    if (calib.tg_enabled) {
-      put(calib.imu.Tg.data(), 9);
-      put(nmk.Tg.data(), 9);
-      const double on = 1.0;
-      put(&on, 1);
-    }
+    // Fixed Tg still changes the corrected IMU means and propagated noise.
+    // Key its values independently of whether Tg derivative columns are enabled.
+    put(calib.imu.Tg.data(), 9);
+    put(nmk.Tg.data(), 9);
+    const double tg_columns = calib.tg_enabled ? 1.0 : 0.0;
+    put(&tg_columns, 1);
     // Noise sigmas feed P15 (the whitener): session-constant today, but an
     // unkeyed dependence is a silent-wrong-reuse landmine -- key them.
     const double sig[4] = {calib.noise.sigma_w, calib.noise.sigma_wb, calib.noise.sigma_a, calib.noise.sigma_ab};
@@ -343,7 +431,10 @@ bool WindowBA::solve_and_export(const WindowData &win, SharedCalib &calib, bool 
   if (!G.built) {
     for (int k = 0; k + 1 < N; ++k) {
       Factor_ImuAci3 *f;
-      if (whit_hit) {
+      if (evaluation) {
+        f = new Factor_ImuAci3(pre[k], model_all, Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero(),
+                              evaluation->imu_sqrt_info[k], evaluation->imu_gravity_fold[k]);
+      } else if (whit_hit) {
         f = new Factor_ImuAci3(pre[k], model_all, Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero(), pc->W[k], pc->Wfold[k]);
       } else {
         f = new Factor_ImuAci3(pre[k], model_all, Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero());
@@ -397,9 +488,9 @@ bool WindowBA::solve_and_export(const WindowData &win, SharedCalib &calib, bool 
   }
   rep.t_factor = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_fac0).count();
   // Reprojection factors (clone kinematics from the preintegration endpoints).
-  // Structure is window-fixed; the kinematic transport linearization
-  // (w_clone, v_clone) tracks the CURRENT preint/state every call, exactly as
-  // the per-call construction did.
+  // Angular-rate transport uses the current preintegration endpoint.
+  // Translation uses the existing optimized clone velocity, so re-seeding
+  // cannot silently change the visual objective or omit its velocity column.
   if (!G.built) {
     for (int k = 0; k < N; ++k) {
       const Eigen::Vector3d w_k = (k == 0) ? pre[0].w_end : pre[k - 1].w_end;
@@ -412,7 +503,7 @@ bool WindowBA::solve_and_export(const WindowData &win, SharedCalib &calib, bool 
         // Rolling shutter enters HERE and only here: the centered row time u_frac * tr (tr = fixed
         // HAL3 readout, never a parameter) is a known constant of this observation, folded into the
         // factor's dt_ref beside the frame-merge offset.
-        auto *f = new Factor_ReprojTd(o.uv, win.pix_sigma, calib.cams[c].fisheye, w_k, v[k], win.td_ref[c],
+        auto *f = new Factor_ReprojTd(o.uv, pixel_sigma(kc), kc.fisheye, w_k, win.td_ref[c],
                                       o.dt_ref + o.u_frac * kc.tr);
         f->prepare_transport(kc.td);
         G.owned.push_back(f);
@@ -421,15 +512,26 @@ bool WindowBA::solve_and_export(const WindowData &win, SharedCalib &calib, bool 
         G.rp_cam.push_back((int)c);
         problem.AddResidualBlock(f, &G.cauchy,
                                  {q[k].data(), p[k].data(), feats[o.feat_id].data(), kc.q_ItoC.data(), kc.p_IinC.data(),
-                                  kc.cam.data(), &kc.td});
+                                  kc.cam.data(), &kc.td, v[k].data()});
       }
     }
   } else {
     for (size_t i = 0; i < G.rp_f.size(); ++i) {
       const int k = G.rp_clone[i];
+      const CamCalib &kc = G.calib.cams[(size_t)G.rp_cam[i]];
+      const double sigma = pixel_sigma(kc);
+      // The graph survives staged/replay reweighting. Rewrite the whitener in
+      // place, leaving all registered pointers and IMU preintegration intact.
+      // Identical weights retain their exact constructor-produced bytes.
+      auto &inner = G.rp_f[i]->inner;
+      if (inner.pix_sigma != sigma) {
+        inner.pix_sigma = sigma;
+        inner.sqrtQ = Eigen::Matrix2d::Identity();
+        inner.sqrtQ(0, 0) *= 1.0 / sigma;
+        inner.sqrtQ(1, 1) *= 1.0 / sigma;
+      }
       G.rp_f[i]->w_clone = (k == 0) ? pre[0].w_end : pre[k - 1].w_end;
-      G.rp_f[i]->v_clone = v[k];
-      G.rp_f[i]->prepare_transport(G.calib.cams[(size_t)G.rp_cam[i]].td);
+      G.rp_f[i]->prepare_transport(kc.td);
     }
   }
   // Gauge priors: first pose + first biases (window-frame gauge; NO calibration
@@ -439,20 +541,24 @@ bool WindowBA::solve_and_export(const WindowData &win, SharedCalib &calib, bool 
   // the exported (Lambda, g) then carries the seed, not the data, and the
   // fused optimum inherits it. Spec-sheet bias scales collapse the family to a
   // unique split (same role as the seeder's own ba Tikhonov).
-  // The bias-prior MEANS must be anchored at the window's (p-independent)
-  // seed values, NOT at the current state vector: under VarPro warm starts the
-  // state at construction is the PREVIOUS pass's optimum, and a prior centered
-  // there chases the estimate -- the gravity<->ba valley collapse this prior
-  // exists for silently disengages and da/qA drift along the valley floor.
-  const Eigen::Vector3d bg_anchor = win.has_seeds ? win.seed_bg : bg[0];
-  const Eigen::Vector3d ba_anchor = win.has_seeds ? win.seed_ba : ba[0];
-  const Eigen::Vector4d q_anchor = win.has_seeds ? win.seed_q[0] : q[0];
-  const Eigen::Vector3d p_anchor = win.has_seeds ? win.seed_p[0] : p[0];
+  // Initialization can change with calibration and with a cold-start duel.
+  // It must not move the physical prior between competing evaluations.
+  // JointCalib supplies its immutable entry-window means independently of
+  // those seeds; held-out comparisons supply their existing fixed context.
+  // Standalone callers retain the seed/fallback convention when no explicit
+  // prior is supplied. Never center the fusion prior on a warm optimum.
+  const WindowBiasPrior *physical_prior = evaluation ? &evaluation->bias_prior : bias_prior;
+  const Eigen::Vector3d bg_anchor = physical_prior ? physical_prior->bg : (win.has_seeds ? win.seed_bg : bg[0]);
+  const Eigen::Vector3d ba_anchor = physical_prior ? physical_prior->ba : (win.has_seeds ? win.seed_ba : ba[0]);
+  const Eigen::Vector4d q_anchor = evaluation ? evaluation->q_anchor : (win.has_seeds ? win.seed_q[0] : q[0]);
+  const Eigen::Vector3d p_anchor = evaluation ? evaluation->p_anchor : (win.has_seeds ? win.seed_p[0] : p[0]);
   if (!G.built) {
     G.pq = new Factor_PriorQuatJPL(q_anchor, Eigen::Vector3d::Constant(1e-4));
     G.pp = new Factor_PriorEuclid(p_anchor, Eigen::Vector3d::Constant(1e-4));
     G.pbg = new Factor_PriorEuclid(bg_anchor, Eigen::Vector3d::Constant(calib.bg_prior_sigma));
     G.pba = new Factor_PriorEuclid(ba_anchor, Eigen::Vector3d::Constant(calib.ba_prior_sigma));
+    G.bg_prior_sigma = calib.bg_prior_sigma;
+    G.ba_prior_sigma = calib.ba_prior_sigma;
     G.owned.insert(G.owned.end(), {G.pq, G.pp, G.pbg, G.pba});
     problem.AddResidualBlock(G.pq, nullptr, {q[0].data()});
     problem.AddResidualBlock(G.pp, nullptr, {p[0].data()});
@@ -464,16 +570,26 @@ bool WindowBA::solve_and_export(const WindowData &win, SharedCalib &calib, bool 
     G.pp->x0 = p_anchor;
     G.pbg->x0 = bg_anchor;
     G.pba->x0 = ba_anchor;
+    // A graph can survive an explicit prior reweighting. Refresh with the
+    // same constructor arithmetic as a fresh graph, retaining exact bytes
+    // when the physical prior scales have not changed.
+    if (G.bg_prior_sigma != calib.bg_prior_sigma) {
+      const Factor_PriorEuclid fresh(bg_anchor, Eigen::Vector3d::Constant(calib.bg_prior_sigma));
+      G.pbg->w = fresh.w;
+      G.bg_prior_sigma = calib.bg_prior_sigma;
+    }
+    if (G.ba_prior_sigma != calib.ba_prior_sigma) {
+      const Factor_PriorEuclid fresh(ba_anchor, Eigen::Vector3d::Constant(calib.ba_prior_sigma));
+      G.pba->w = fresh.w;
+      G.ba_prior_sigma = calib.ba_prior_sigma;
+    }
   }
 
   // ---- export-only state override (export-on-accept re-entry) ----
-  // Everything ABOVE ran from the ENTRY state (warm strand or cold seeds),
-  // exactly as the evaluation that produced this optimum did: the reprojection
-  // transport linearization (w_clone/v_clone) and the gauge anchors are now
-  // pinned at the evaluation's values. Only NOW load the kept optimum itself,
-  // so the (zero-iteration) export below linearizes at it. Overriding any
-  // earlier would move the transport linearization off the evaluation's and
-  // break the deferred-export == inline-export byte contract.
+  // Construct the same factors and gauge anchors as the accepted evaluation,
+  // then load its kept optimum for a zero-iteration export. Reprojection reads
+  // this state's velocity through the registered parameter block. The fixed
+  // angular-rate linearization and anchors remain those of the evaluation.
   if (state_at) {
     if (!state_at->valid || (int)state_at->q.size() != N || state_at->feats.size() != win.num_feats)
       return false; // a mis-shaped override would silently export a wrong point: fail loudly

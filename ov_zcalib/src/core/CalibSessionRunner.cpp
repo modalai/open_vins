@@ -11,13 +11,18 @@
  */
 
 #include "CalibSessionRunner.h"
+#include "WaldObservability.h"
+#include "Verification.h"
 #include "../solve/CameraRefinement.h"
 
 #include <chrono>
+#include <atomic>
 #include <thread>
 #include <algorithm>
 #include <cmath>
+#include <cerrno>
 #include <cstdio>
+#include <cstring>
 #include <limits>
 #include <map>
 
@@ -61,6 +66,9 @@ CalibSessionRunner::CalibSessionRunner(const SessionConfig &cfg, const SessionSe
   exp_n_.assign((size_t)n_cams_, 0);
   rep_ = SessionReport();
   rep_.committed = calib_;
+  rep_.camera_pixel_sigmas.reserve(calib_.cams.size());
+  for (const CamCalib &k : calib_.cams)
+    rep_.camera_pixel_sigmas.push_back(k.reprojection_sigma_px > 0.0 ? k.reprojection_sigma_px : cfg_.harvester.pix_sigma);
 }
 
 void CalibSessionRunner::enter_(RunnerState s, const char *why) {
@@ -123,7 +131,11 @@ void CalibSessionRunner::feed_imu(const RawImu &s) {
           still_gyro_sum_.setZero();
           still_gyro_n_ = 0;
         }
-        still_gyro_sum_ += s.wm;
+        // A stationary gyro contains both raw-frame bias and the seeded
+        // acceleration sensitivity. Only the former is a bias observation.
+        const Eigen::Vector3d a_hat = ov_core::quat_2_Rot(calib_.imu.q_AtoI) *
+                                       (ImuIntrinsicModel::ut(calib_.imu.da) * s.am);
+        still_gyro_sum_ += s.wm - calib_.imu.Tg * a_hat;
         ++still_gyro_n_;
         if (s.timestamp - still_since_ >= cfg_.settle_min_still_s && std::abs(temp_slope_()) <= cfg_.settle_max_temp_slope) {
           bg0_ = still_gyro_sum_ / std::max(still_gyro_n_, 1);
@@ -321,6 +333,23 @@ void CalibSessionRunner::try_bootstrap_(double now) {
     return; // xcorr + hand-eye per attempt; retry at 0.5 Hz, data timestamps only
   last_boot_try_ = now;
 
+  // Bootstrap rotations must use the same intrinsic model as the downstream
+  // preintegration. In this corrected stream the unknown constant bias is
+  // Dw*bg; convert it back to the raw sensor frame before seeding the windows.
+  // Keep boot_imu_ raw for retro-harvest and recording. Applying this affine
+  // correction once per attempt also lets every camera reuse the same data.
+  const Eigen::Matrix3d Dw = ImuIntrinsicModel::ut(calib_.imu.dw);
+  const Eigen::FullPivLU<Eigen::Matrix3d> gyro_map(Dw);
+  if (!gyro_map.isInvertible()) {
+    enter_(RunnerState::ABORT, "bootstrap IMU intrinsic seed has a singular gyro correction");
+    return;
+  }
+  const Eigen::Matrix3d TgA = calib_.imu.Tg * ov_core::quat_2_Rot(calib_.imu.q_AtoI) *
+                                 ImuIntrinsicModel::ut(calib_.imu.da);
+  std::vector<RawImu> corrected_imu = boot_imu_;
+  for (RawImu &sample : corrected_imu)
+    sample.wm = Dw * (sample.wm - TgA * sample.am);
+
   // The gyro bias belongs to the IMU, not to a camera: estimate it ONCE, on the best-conditioned
   // camera (the one with the most pairs), and hold every other camera's hand-eye at that value.
   // Letting each camera refit its own bg would let them disagree about a quantity there is only
@@ -335,7 +364,7 @@ void CalibSessionRunner::try_bootstrap_(double now) {
   std::vector<HandEyeResult> he_all((size_t)n_cams_);
   std::vector<EpipolarTimeResult> epi_all((size_t)n_cams_);
   std::vector<char> xr_cert((size_t)n_cams_, 0); ///< accepted via the robust certificate (not the raw floor)
-  Eigen::Vector3d bg_shared = bg0_;
+  Eigen::Vector3d bg_shared = Dw * bg0_;
   for (size_t pass = 0; pass < 2; ++pass) {
     for (int c : active) {
       const bool is_primary = (c == primary);
@@ -345,7 +374,7 @@ void CalibSessionRunner::try_bootstrap_(double now) {
       // The cross-correlation is on rotation-RATE magnitude, which is invariant to R_ItoC -- so
       // each camera recovers its own td without needing its extrinsic first.
       TimeOffsetResult xr =
-          TimeOffsetInit::solve(rates_[(size_t)c], boot_imu_, cfg_.td_search_s, 0.002, &xrc_all[(size_t)c]);
+          TimeOffsetInit::solve(rates_[(size_t)c], corrected_imu, cfg_.td_search_s, 0.002, &xrc_all[(size_t)c]);
       const bool sharp_ok = xr.peak_sharpness >= cfg_.xcorr_min_sharpness;
       const bool fast_ok = xr.ok && !xr.at_bound && xr.peak_corr >= cfg_.xcorr_min_peak && sharp_ok;
       // Interleaved samples can share motion bias; this gate checks coarse
@@ -386,7 +415,7 @@ void CalibSessionRunner::try_bootstrap_(double now) {
       HandEyeConfig hec = cfg_.handeye;
       hec.estimate_bg = is_primary && !have_baseline_; // SETTLE still baseline beats visual-pair bg
       HandEyeResult he;
-      if (!HandEyeWahba::solve(boot_imu_, pairs_[(size_t)c], xr.td, bg_shared, hec, he)) {
+      if (!HandEyeWahba::solve(corrected_imu, pairs_[(size_t)c], xr.td, bg_shared, hec, he)) {
         if (now - boot_t0_ > cfg_.bootstrap_timeout_s)
           enter_(RunnerState::ABORT, "bootstrap timeout: hand-eye rejected (axis diversity)");
         return;
@@ -394,7 +423,7 @@ void CalibSessionRunner::try_bootstrap_(double now) {
       const bool temporal_ok = xr.temporally_consistent(cfg_.handeye.td_fine_range);
       EpipolarTimeResult &ep = epi_all[(size_t)c];
       if ((!temporal_ok || he.td_at_bound) && cfg_.bootstrap_epipolar) {
-        ep = EpipolarTimeInit::solve(boot_frames_, boot_imu_, seed0_.calib.cams[(size_t)c], c, he,
+        ep = EpipolarTimeInit::solve(boot_frames_, corrected_imu, seed0_.calib.cams[(size_t)c], c, he,
                                      cfg_.td_search_s, cfg_.handeye.td_fine_range);
         if (cfg_.verbose)
           std::printf("[session] bootstrap cam %d geometric time: xcorr %+.3f ms, temporal split %.3f ms -> %+.3f ms, sigma %.3f ms, geometry split %.3f ms, %d pairs, %.3f s %s\n",
@@ -431,6 +460,8 @@ void CalibSessionRunner::try_bootstrap_(double now) {
     }
   }
 
+  for (int c : active)
+    he_all[(size_t)c].bg = gyro_map.solve(he_all[(size_t)c].bg);
   rep_.xcorr = xr_all;
   rep_.xcorr_curve = std::move(xrc_all);
   rep_.xcorr_certified.assign(xr_cert.begin(), xr_cert.end());
@@ -442,7 +473,7 @@ void CalibSessionRunner::try_bootstrap_(double now) {
     calib_.cams[(size_t)c].q_ItoC = he_all[(size_t)c].q_ItoC;
     calib_.cams[(size_t)c].td = he_all[(size_t)c].td;
   }
-  bg0_ = bg_shared;
+  bg0_ = gyro_map.solve(bg_shared);
   // No still baseline: per-window visual bias pre-solve carries the gyro bias,
   // the window bias prior widens to visual confidence, and the seed-admission
   // gate scales with the bootstrap's own residual level (the extrinsic seed
@@ -467,7 +498,13 @@ void CalibSessionRunner::try_bootstrap_(double now) {
                   c, (c == primary) ? " [bg source]" : "", he.rmse_rad, he.axis_diversity, 1e3 * he.td, he.pairs_used,
                   he.pairs_trimmed, xr_all[(size_t)c].peak_corr, xr_cert[(size_t)c] ? " (robust certificate)" : "");
     }
-    std::printf("[session] bootstrap: |bg|=%.4f (shared -- one IMU)\n", bg0_.norm());
+    const HandEyeResult &bias_source = he_all[(size_t)primary];
+    std::printf("[session] bootstrap: |bg|=%.4f (shared -- one IMU; %s)\n", bg0_.norm(),
+                have_baseline_ ? "still baseline" : handeye_bias_status_name(bias_source.bg_status));
+    if (bias_source.bg_status == HandEyeBiasStatus::SANITY_FALLBACK)
+      std::printf("[session] bootstrap bias fallback (cam %d): initial |delta_bg| %.5f > sanity limit %.5f rad/s "
+                  "in corrected gyro frame; retained the input seed\n",
+                  primary, bias_source.bg_initial_delta_norm, bias_source.bg_sanity_limit);
   }
   // harvester snapshot = post-bootstrap calibration (bearings, td_ref)
   harvester_.reset(new WindowHarvester(cfg_.harvester, calib_));
@@ -548,7 +585,7 @@ void CalibSessionRunner::handle_window_(WindowData &&w, const WindowMeta &m) {
   if (cfg_.min_window_parallax > 0.0 && m.fingerprint(9) < cfg_.min_window_parallax) {
     rep_.windows_rejected_gate++;
     if (cfg_.verbose)
-      std::printf("[session] window %d REJECTED by parallax floor: %.1f px < %.1f px\n", rep_.windows_harvested, m.fingerprint(9),
+      std::printf("[session] window %d REJECTED by parallax floor: %.6f rad < %.6f rad\n", rep_.windows_harvested, m.fingerprint(9),
                   cfg_.min_window_parallax);
     return;
   }
@@ -610,15 +647,14 @@ void CalibSessionRunner::handle_window_(WindowData &&w, const WindowMeta &m) {
   if (d.is_holdout)
     rep_.windows_holdout++;
   rep_.windows_retained = scorer_->size();
-  // display-only fusion + guided prompt (weakest whitened eigenpair)
-  if (display_ && !d.is_holdout && wr.Lambda.rows() == calib_.local_dim()) {
-    display_->add_window_information(wr.Lambda);
-    Eigen::VectorXd improve;
-    display_->progress(improve, rep_.prompt);
-    if (cfg_.verbose)
-      std::printf("[session] window %d retained (slot %d%s): seed %.1f mrad, prompt: %s\n", rep_.windows_harvested, d.slot,
-                  d.is_holdout ? ", holdout" : "", 1e3 * sr.mean_ang_resid, rep_.prompt.c_str());
-  }
+  // Rebuild the bounded display sum: an eviction must remove its old information, and a
+  // changed thermal bin must not leave another temperature's evidence in the motion prompt.
+  // No BA or D-optimal selection runs here; the existing one display eigensolve remains.
+  if (!d.is_holdout || d.evicted_slot >= 0)
+    refresh_collection_guidance_();
+  if (cfg_.verbose && display_ && !d.is_holdout)
+    std::printf("[session] window %d retained (slot %d): seed %.1f mrad, prompt: %s\n", rep_.windows_harvested, d.slot,
+                1e3 * sr.mean_ang_resid, rep_.prompt.c_str());
 }
 
 const SessionReport &CalibSessionRunner::finish() {
@@ -668,6 +704,7 @@ void CalibSessionRunner::note_stage_(const std::string &label, const JointReport
   e.windows = r.windows_used;
   e.dim_p = r.dim_p;
   e.wall_s = r.wall_s;
+  e.max_pass_s = r.max_pass_s;
   e.seed_s = r.t_seed_sum;
   e.preint_s = r.t_preint_sum;
   e.inner_s = r.t_inner_sum;
@@ -756,11 +793,24 @@ SessionReport::AccelGateVerdict CalibSessionRunner::wald_accel_gate_(const std::
   const auto t_g0 = std::chrono::steady_clock::now();
   rep_.a_wald_windows = (int)fused.size();
   rep_.a_wald_dropped = 0;
-  if (budget_left_s <= 0.0) {
+  double gate_reserve_s = 0.01;
+  for (const StageEvidence &stage : rep_.evidence)
+    gate_reserve_s = std::max(gate_reserve_s, 1.25 * stage.max_pass_s);
+  if (budget_left_s <= gate_reserve_s) {
     if (cfg_.verbose)
-      std::printf("[session] wald accel gate: UNOBSERVABLE (budget exhausted before the gate pass)\n");
+      std::printf("[session] wald accel gate: NOT_CERTIFIED (no budget for a complete gate pass)\n");
     return V::WALD_UNOBSERVABLE; // safe abstention, never unbudgeted work
   }
+  std::atomic<bool> gate_cancelled{false};
+  auto gate_expired = [&]() {
+    if (gate_cancelled.load(std::memory_order_relaxed))
+      return true;
+    if (std::chrono::duration<double>(std::chrono::steady_clock::now() - t_g0).count() >= budget_left_s) {
+      gate_cancelled.store(true, std::memory_order_relaxed);
+      return true;
+    }
+    return false;
+  };
   // Widened layout at the A1a point: calib_RAtoI temporarily true so
   // free_blocks() adds the 3 qA columns; noise re-frozen at the A1a point
   // exactly as a half/A1b solve entry would freeze it.
@@ -795,7 +845,7 @@ SessionReport::AccelGateVerdict CalibSessionRunner::wald_accel_gate_(const std::
   }
   // ---- ONE warm evaluation pass (parallel, disjoint slots, fixed-order reduce after) ----
   struct Slot {
-    bool ok = false;
+    bool ran = false, ok = false;
     double t0 = 0.0;
     Eigen::MatrixXd L;
     Eigen::VectorXd g;
@@ -810,19 +860,29 @@ SessionReport::AccelGateVerdict CalibSessionRunner::wald_accel_gate_(const std::
     for (int wi = b0; wi < b1; ++wi) {
       Slot &sl = slots[wi];
       sl.t0 = fused[wi].clone_times.empty() ? 0.0 : fused[wi].clone_times.front();
+      if (gate_expired())
+        break;
+      sl.ran = true;
       WindowWarmState wcopy = (wi < (int)warm.size()) ? warm[wi] : WindowWarmState{};
       SharedCalib ccopy = calib_; // per-worker copy: solve mutates nuisance-side scratch only, but keep it airtight
+      // A cold re-seed changes the starting point, not the physical prior that
+      // defined this window's training objective in JointCalib.
+      WindowBiasPrior bias_prior;
+      if (fused[wi].has_seeds) {
+        bias_prior.bg = fused[wi].seed_bg;
+        bias_prior.ba = fused[wi].seed_ba;
+      }
       bool ok = false;
       if (wcopy.valid) {
         ok = WindowBA::solve_and_export(fused[wi], ccopy, true, sl.wr, cfg_.joint.window_max_iters, false, &wcopy,
-                                        store_.ensure(fused[wi].uid));
+                                        store_.ensure(fused[wi].uid), nullptr, nullptr, &bias_prior);
       } else {
         LinearSeedReport sr;
         WindowData wd = fused[wi];
         const bool seeded = LinearSeed::seed_window(wd, ccopy, wd.seed_bg, sr, cfg_.seed);
-        if (seeded || wd.has_seeds)
+        if ((seeded || wd.has_seeds) && !gate_expired())
           ok = WindowBA::solve_and_export(wd, ccopy, true, sl.wr, cfg_.joint.window_max_iters, false, nullptr,
-                                          store_.ensure(wd.uid));
+                                          store_.ensure(wd.uid), nullptr, nullptr, &bias_prior);
       }
       if (ok && (int)sl.wr.Lambda.rows() == n) {
         sl.L = std::move(sl.wr.Lambda);
@@ -837,6 +897,7 @@ SessionReport::AccelGateVerdict CalibSessionRunner::wald_accel_gate_(const std::
   calib_.imu.calib_tg = sv_tg;
   calib_.noise_frozen = sv_nf;
   calib_.noise_lin = sv_nl;
+  const bool incomplete_gate = gate_expired();
   // ---- fixed-order reduction over time-sorted halves ----
   std::vector<size_t> order(fused.size());
   for (size_t i = 0; i < order.size(); ++i)
@@ -863,10 +924,12 @@ SessionReport::AccelGateVerdict CalibSessionRunner::wald_accel_gate_(const std::
   {
     JointReport jr;
     jr.evaluation_passes = 1;
-    jr.accepted_passes = 1;
+    jr.accepted_passes = incomplete_gate ? 0 : 1;
     jr.windows_used = nwin[0] + nwin[1];
     jr.dim_p = n;
     for (const Slot &sl : slots) {
+      if (!sl.ran)
+        continue;
       jr.t_preint_sum += sl.wr.t_preint;
       jr.t_inner_sum += sl.wr.t_inner;
       jr.t_export_sum += sl.wr.t_export;
@@ -876,11 +939,18 @@ SessionReport::AccelGateVerdict CalibSessionRunner::wald_accel_gate_(const std::
       jr.time_stops += sl.wr.time_stopped ? 1 : 0;
     }
     jr.wall_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_g0).count();
+    jr.max_pass_s = jr.wall_s;
+    jr.hit_wall_budget = incomplete_gate;
     note_stage_("A1b-wald", jr);
+  }
+  if (incomplete_gate) {
+    if (cfg_.verbose)
+      std::printf("[session] wald accel gate: NOT_CERTIFIED (deadline interrupted the complete gate pass)\n");
+    return V::WALD_UNOBSERVABLE; // surviving windows cannot certify the intended time halves
   }
   if (nwin[0] < 2 || nwin[1] < 2) {
     if (cfg_.verbose)
-      std::printf("[session] wald accel gate: UNOBSERVABLE (half starvation %d/%d)\n", nwin[0], nwin[1]);
+      std::printf("[session] wald accel gate: NOT_CERTIFIED (half starvation %d/%d)\n", nwin[0], nwin[1]);
     return V::WALD_UNOBSERVABLE;
   }
   // ---- the subspace judge: fold nuisances, Schur-marginalize, whiten, size, decide. Runs once
@@ -920,14 +990,11 @@ SessionReport::AccelGateVerdict CalibSessionRunner::wald_accel_gate_(const std::
       for (int b = 0; b < m; ++b)
         Lgg(a, b) = Lf[h](gidx[a], gidx[b]);
     }
-    Eigen::LDLT<Eigen::MatrixXd> ldl(Loo);
-    if (ldl.info() != Eigen::Success) {
+    if (!wald_marginalize(Lgg, Lgo, Loo, gg, go, Sh[h], ghat[h])) {
       if (cfg_.verbose)
-        std::printf("[session] wald %s gate: UNOBSERVABLE (nuisance LDLT failed, half %d)\n", tag, h + 1);
+        std::printf("[session] wald %s gate: NOT_CERTIFIED (nuisance LDLT failed, half %d)\n", tag, h + 1);
       return V::WALD_UNOBSERVABLE;
     }
-    Sh[h] = Lgg - Lgo * ldl.solve(Lgo.transpose());
-    ghat[h] = gg - Lgo * ldl.solve(go);
   }
   // ---- whitening ----
   Eigen::VectorXd wg(m);
@@ -973,12 +1040,13 @@ SessionReport::AccelGateVerdict CalibSessionRunner::wald_accel_gate_(const std::
       for (int b = 0; b < m; ++b)
         Lgg(a, b) = Lq(gidx[a], gidx[b]);
     }
-    Eigen::LDLT<Eigen::MatrixXd> ldl(Loo);
-    if (ldl.info() != Eigen::Success)
+    Eigen::MatrixXd marginal;
+    Eigen::VectorXd gradient;
+    if (!wald_marginalize(Lgg, Lgo, Loo, gg, go, marginal, gradient))
       return false;
-    Sq = wg.asDiagonal() * (Lgg - Lgo * ldl.solve(Lgo.transpose())) * wg.asDiagonal();
-    gq = wg.asDiagonal() * (gg - Lgo * ldl.solve(go));
-    return true;
+    Sq = wg.asDiagonal() * marginal * wg.asDiagonal();
+    gq = wg.asDiagonal() * gradient;
+    return wald_finite(Sq) && wald_finite(gq);
   };
   const double kap = cfg_.a_info_deflate;
   Eigen::MatrixXd St[2];
@@ -986,6 +1054,8 @@ SessionReport::AccelGateVerdict CalibSessionRunner::wald_accel_gate_(const std::
   for (int h = 0; h < 2; ++h) {
     St[h] = wg.asDiagonal() * Sh[h] * wg.asDiagonal();
     gt[h] = wg.asDiagonal() * ghat[h];
+    if (!wald_finite(St[h]) || !wald_finite(gt[h]))
+      return V::WALD_UNOBSERVABLE;
   }
   // ---- (a) observability on the joint eigenbasis ----
   Eigen::SelfAdjointEigenSolver<Eigen::MatrixXd> eig(St[0] + St[1]);
@@ -1013,7 +1083,7 @@ SessionReport::AccelGateVerdict CalibSessionRunner::wald_accel_gate_(const std::
   }
   if (r == 0) {
     if (cfg_.verbose)
-      std::printf("[session] wald %s gate: UNOBSERVABLE r=0/%d (min-half whitened eig %.2f < %.2f)\n", tag, m, min_all,
+      std::printf("[session] wald %s gate: NOT_CERTIFIED r=0/%d (min-half whitened eig %.2f < %.2f)\n", tag, m, min_all,
                   cfg_.a_obs_min_eig);
     return V::WALD_UNOBSERVABLE;
   }
@@ -1037,18 +1107,33 @@ SessionReport::AccelGateVerdict CalibSessionRunner::wald_accel_gate_(const std::
     Eigen::SelfAdjointEigenSolver<Eigen::MatrixXd> es(A);
     return es.info() == Eigen::Success ? es.eigenvalues()(0) : -1.0;
   };
-  const double pd1 = pd_min_eig(A1), pd2 = pd_min_eig(A2);
+  const WaldHalfObservability half_obs = wald_half_observability(A1, A2, kap, cfg_.a_obs_min_eig);
+  const double pd1 = half_obs.min_eig_first, pd2 = half_obs.min_eig_second;
+  if (write_rep)
+    rep_.a_wald_min_eig = std::min(min_all, half_obs.min_deflated_eig);
   const double pd_floor = 1e-9 * std::max(1.0, std::max(A1.trace(), A2.trace()));
-  if (pd1 <= pd_floor || pd2 <= pd_floor) {
+  if (!half_obs.spectra_ok || pd1 <= pd_floor || pd2 <= pd_floor) {
     if (cfg_.verbose)
-      std::printf("[session] wald %s gate: UNOBSERVABLE (half information not PD on the kept span: %.2e/%.2e)\n", tag, pd1, pd2);
+      std::printf("[session] wald %s gate: NOT_CERTIFIED (half information not PD on the kept span: %.2e/%.2e)\n", tag, pd1, pd2);
     return V::WALD_UNOBSERVABLE;
   }
-  Eigen::LDLT<Eigen::MatrixXd> l1(A1), l2(A2);
-  if (l1.info() != Eigen::Success || l2.info() != Eigen::Success)
+  // Certify EVERY direction in the kept span, not just its coordinate axes.
+  // Passing the numerical PD floor above does not meet the configured
+  // information floor: opposing half cross terms can hide a weak mode in the
+  // pooled eigenbasis. Keep the same prior whitening and kappa normalization.
+  if (!half_obs.meets_floor) {
+    if (cfg_.verbose)
+      std::printf("[session] wald %s gate: NOT_CERTIFIED (kept-span min-half whitened eig %.2f < %.2f, span %d/%d)\n",
+                  tag, half_obs.min_deflated_eig, cfg_.a_obs_min_eig, r, m);
+    return V::WALD_UNOBSERVABLE;
+  }
+  Eigen::LDLT<Eigen::MatrixXd> l1, l2;
+  if (!wald_positive_ldlt(A1, l1) || !wald_positive_ldlt(A2, l2))
     return V::WALD_UNOBSERVABLE;
   const Eigen::VectorXd d1 = -l1.solve(b1), d2 = -l2.solve(b2);
   const Eigen::VectorXd d = d1 - d2;
+  if (!wald_finite(d))
+    return V::WALD_UNOBSERVABLE;
   // ---- per-session kappa from WITHIN-HALF quarter scatter (df-corrected sizing):
   // each half's quarters scatter around that half's OWN GLS mean, never the global
   // one. The global construction folds the between-halves contrast -- the very
@@ -1073,11 +1158,14 @@ SessionReport::AccelGateVerdict CalibSessionRunner::wald_accel_gate_(const std::
     if (!quarter_system(q0, q1, Sq, gq))
       continue;
     Eigen::MatrixXd Ap = P.transpose() * Sq * P;
-    Eigen::LDLT<Eigen::MatrixXd> lq(Ap);
-    if (lq.info() != Eigen::Success || pd_min_eig(Ap) <= 1e-12 * std::max(1.0, Ap.trace()))
+    Eigen::LDLT<Eigen::MatrixXd> lq;
+    if (!wald_positive_ldlt(Ap, lq) || pd_min_eig(Ap) <= 1e-12 * std::max(1.0, Ap.trace()))
       continue; // a non-PD quarter drops (fewer df), never poisons the estimate
+    const Eigen::VectorXd quarter_step = -lq.solve(P.transpose() * gq);
+    if (!wald_finite(quarter_step))
+      continue;
     Aq.push_back(Ap);
-    dq.push_back(-lq.solve(P.transpose() * gq));
+    dq.push_back(quarter_step);
     hq.push_back(q < Jq / 2 ? 0 : 1);
   }
   double kap_sess = 0.0;
@@ -1096,7 +1184,12 @@ SessionReport::AccelGateVerdict CalibSessionRunner::wald_accel_gate_(const std::
         }
       if (nh < 2)
         continue; // a half with a single quarter carries no within-half contrast
-      const Eigen::VectorXd dbar_h = Asum.ldlt().solve(Adsum);
+      Eigen::LDLT<Eigen::MatrixXd> lsum;
+      if (!wald_positive_ldlt(Asum, lsum) || !wald_finite(Adsum))
+        return V::WALD_UNOBSERVABLE;
+      const Eigen::VectorXd dbar_h = lsum.solve(Adsum);
+      if (!wald_finite(dbar_h))
+        return V::WALD_UNOBSERVABLE;
       for (size_t q = 0; q < Aq.size(); ++q)
         if (hq[q] == h) {
           const Eigen::VectorXd e = dq[q] - dbar_h;
@@ -1107,6 +1200,8 @@ SessionReport::AccelGateVerdict CalibSessionRunner::wald_accel_gate_(const std::
     if (kdf > 0)
       kap_sess = qsum / kdf;
   }
+  if (!finite_scalar(kap_sess) || kap_sess < 0.0)
+    return V::WALD_UNOBSERVABLE;
   // floor at the configured deflation: the estimator protects against the
   // measured under-dispersion (kappa_hat 13.8, spread [1.8, 28.3] over H0
   // replicates), the floor protects against a lucky low draw re-inflating
@@ -1118,39 +1213,37 @@ SessionReport::AccelGateVerdict CalibSessionRunner::wald_accel_gate_(const std::
     rep_.a_wald_kappa = kap_sess;
     rep_.a_wald_df = kdf;
   }
-  const Eigen::MatrixXd C = kap_eff * (A1.inverse() + A2.inverse());
-  const double T = d.dot(C.ldlt().solve(d));
+  const Eigen::MatrixXd identity = Eigen::MatrixXd::Identity(r, r);
+  const Eigen::MatrixXd C = kap_eff * (l1.solve(identity) + l2.solve(identity));
+  Eigen::LDLT<Eigen::MatrixXd> lc;
+  if (!wald_positive_ldlt(C, lc))
+    return V::WALD_UNOBSERVABLE;
+  const double T = d.dot(lc.solve(d));
   // F_{r,df}(0.99) sizing for the ESTIMATED dispersion (df from the quarter
   // scatter; bucketed floor lookup; falls back to chi2/r when no estimate =
   // the fixed-kappa legacy sizing). Approximate quantiles -- the MC harness
   // sizes the end-to-end rule empirically and a_wald_thresh_scale absorbs
   // residual calibration.
-  static const double chi2_99[6] = {6.635, 9.210, 11.345, 13.277, 15.086, 16.812};
-  static const double f99[4][6] = {
-      {13.75, 10.92, 9.78, 9.15, 8.75, 8.47},  // df ~ 6
-      {9.33, 6.93, 5.95, 5.41, 5.06, 4.82},    // df ~ 12
-      {8.29, 5.93, 5.09, 4.58, 4.25, 4.02},    // df ~ 18
-      {7.82, 5.61, 4.72, 4.22, 3.90, 3.67},    // df ~ 24+
-  };
-  double Tthr;
-  if (kdf >= 6) {
-    const int bi = kdf >= 24 ? 3 : kdf >= 18 ? 2 : kdf >= 12 ? 1 : 0;
-    Tthr = cfg_.a_wald_thresh_scale * r * f99[bi][std::min(r, 6) - 1];
-  } else {
-    Tthr = cfg_.a_wald_thresh_scale * chi2_99[std::min(r, 6) - 1];
-  }
+  const double Tthr = wald_statistic_threshold(r, kdf, cfg_.a_wald_thresh_scale);
+  if (!finite_scalar(Tthr))
+    return V::WALD_UNOBSERVABLE;
   // ---- (c) cross-prediction, both directions (Satterthwaite + Wilson-Hilferty) ----
   auto xthr = [&](const Eigen::MatrixXd &A) {
     const Eigen::MatrixXd AC = A * C;
     const double m1 = 0.5 * AC.trace(), m2 = 0.5 * (AC * AC).trace();
-    if (m1 <= 0 || m2 <= 0)
-      return std::numeric_limits<double>::infinity();
+    if (!finite_scalar(m1) || !finite_scalar(m2) || m1 <= 0 || m2 <= 0)
+      return std::numeric_limits<double>::quiet_NaN();
     const double gfac = m2 / (2.0 * m1), nu = 2.0 * m1 * m1 / m2, z = 2.32635;
     const double q = nu * std::pow(1.0 - 2.0 / (9.0 * nu) + z * std::sqrt(2.0 / (9.0 * nu)), 3.0);
     return cfg_.a_wald_thresh_scale * gfac * q;
   };
   const double X12 = 0.5 * d.dot(A1 * d), X21 = 0.5 * d.dot(A2 * d);
   const double xt1 = xthr(A1), xt2 = xthr(A2);
+  if (!wald_statistics_valid(T, Tthr, X12, X21, xt1, xt2)) {
+    if (cfg_.verbose)
+      std::printf("[session] wald %s gate: numerical failure (invalid quadratic statistic or threshold)\n", tag);
+    return V::WALD_UNOBSERVABLE;
+  }
   if (write_rep) {
     rep_.a_wald_T = T;
     rep_.a_wald_x12 = X12;
@@ -1174,8 +1267,13 @@ SessionReport::AccelGateVerdict CalibSessionRunner::wald_accel_gate_(const std::
     rep_.a_wald_dqa_deg = dqa_deg;
     rep_.a_wald_dda_off = dda;
   }
-  const Eigen::VectorXd dJ = -(A1 + A2).ldlt().solve(b1 + b2);
+  Eigen::LDLT<Eigen::MatrixXd> lj;
+  if (!wald_positive_ldlt(A1 + A2, lj))
+    return V::WALD_UNOBSERVABLE;
+  const Eigen::VectorXd dJ = -lj.solve(b1 + b2);
   const Eigen::VectorXd pJ = wg.asDiagonal() * (P * dJ);
+  if (!wald_finite(dp) || !wald_finite(pJ))
+    return V::WALD_UNOBSERVABLE;
   double jqa2 = 0.0, jda = 0.0, jtg = 0.0;
   for (int a = 0; a < m; ++a) {
     if (lab[gidx[a]].rfind("q_AtoI", 0) == 0)
@@ -1193,7 +1291,7 @@ SessionReport::AccelGateVerdict CalibSessionRunner::wald_accel_gate_(const std::
   // ---- decision order ----
   if (jqa_deg > cfg_.a_qa_phys_ceiling_deg || jda > cfg_.a_da_off_phys_ceiling || jtg > cfg_.a_tg_phys_ceiling) {
     if (cfg_.verbose)
-      std::printf("[session] wald %s gate: PHYS-CEILING fused step qA %.2f deg / da_off %.4f / tg %.5f -> INCONSISTENT\n", tag, jqa_deg, jda, jtg);
+      std::printf("[session] wald %s gate: STEP-LIMIT fused step qA %.2f deg / da_off %.4f / tg %.5f -> INCONSISTENT\n", tag, jqa_deg, jda, jtg);
     return V::WALD_INCONSISTENT;
   }
   // r < m must dominate ANY consistent outcome: ordered later, the physical deadband
@@ -1202,7 +1300,7 @@ SessionReport::AccelGateVerdict CalibSessionRunner::wald_accel_gate_(const std::
   // refuse. No unlock without every direction eigen-certified.
   if (r < m) {
     if (cfg_.verbose)
-      std::printf("[session] wald %s gate: UNOBSERVABLE r=%d/%d (agreement cannot certify unobserved directions)\n", tag, r, m);
+      std::printf("[session] wald %s gate: NOT_CERTIFIED r=%d/%d (not every direction meets the configured information floor)\n", tag, r, m);
     return V::WALD_UNOBSERVABLE;
   }
   const bool stat_fail = (T > Tthr) || (X12 > xt1) || (X21 > xt2);
@@ -1211,7 +1309,7 @@ SessionReport::AccelGateVerdict CalibSessionRunner::wald_accel_gate_(const std::
     if (cfg_.verbose)
       std::printf("[session] wald %s gate: T=%.1f/%.1f X=%.1f/%.1f (thr %.1f/%.1f) kap=%.1f df=%d dqA %.3f deg dda %.4f -> %s\n", tag, T,
                   Tthr, X12, X21, xt1, xt2, kap_eff, kdf, dqa_deg, dda,
-                  deadband ? "CONSISTENT (deadband: physically irrelevant)" : "INCONSISTENT");
+                  deadband ? "CONSISTENT (within configured deadband)" : "INCONSISTENT");
     return deadband ? V::WALD_CONSISTENT : V::WALD_INCONSISTENT;
   }
   if (cfg_.verbose)
@@ -1236,6 +1334,36 @@ SessionReport::AccelGateVerdict CalibSessionRunner::wald_accel_gate_(const std::
   return va;
 }
 
+std::vector<int> CalibSessionRunner::retained_solve_candidates_() {
+  std::vector<int> eligible;
+  if (!scorer_)
+    return eligible;
+  const int np = calib_.local_dim();
+  // Keep solve-time thermal selection unchanged, then discard invalid exports. Using this
+  // same pool in collect_status prevents early cutover on mutually incompatible temperatures.
+  for (int slot : scorer_->thermal_bin())
+    if (!slots_[slot].clone_times.empty() && slot_rep_[slot].Lambda.rows() == np && slot_rep_[slot].Lambda.cols() == np)
+      eligible.push_back(slot);
+  return eligible;
+}
+
+void CalibSessionRunner::refresh_collection_guidance_() {
+  if (!display_)
+    return;
+  const std::vector<int> eligible = retained_solve_candidates_();
+  const int np = calib_.local_dim();
+  Eigen::MatrixXd information = Eigen::MatrixXd::Zero(np, np);
+  for (int slot : eligible)
+    information += slot_rep_[slot].Lambda;
+  display_->set_window_information(information);
+  if (eligible.empty()) {
+    rep_.prompt = "collect varied motion with features tracked; no usable windows in the current thermal bin";
+    return;
+  }
+  Eigen::VectorXd improve;
+  display_->progress(improve, rep_.prompt);
+}
+
 CalibSessionRunner::CollectStatus CalibSessionRunner::collect_status() {
   CollectStatus st;
   if (!scorer_)
@@ -1244,6 +1372,7 @@ CalibSessionRunner::CollectStatus CalibSessionRunner::collect_status() {
   // Prior-whitening vector: the same one the solve builds, so the eigenvalue is
   // reported in the units the commit rule lives in (sigma_post/sigma_prior).
   Eigen::VectorXd prior(np);
+  int tg_off = -1, tg_size = 0;
   {
     auto layout = calib_.free_blocks();
     int off = 0;
@@ -1251,6 +1380,14 @@ CalibSessionRunner::CollectStatus CalibSessionRunner::collect_status() {
       const double sg = cfg_.joint.prior_sigma.count(b.name) ? cfg_.joint.prior_sigma.at(b.name) : 1.0;
       for (int k = 0; k < b.lsize; ++k)
         prior(off + k) = sg;
+      if (b.name == "tg") {
+        tg_off = off;
+        tg_size = b.lsize;
+        st.tg_sigma_target = sg / cfg_.commit_sigma_factor;
+        const auto ceiling = cfg_.commit_abs_ceiling.find("tg");
+        if (ceiling != cfg_.commit_abs_ceiling.end())
+          st.tg_sigma_target = std::min(st.tg_sigma_target, ceiling->second);
+      }
       off += b.lsize;
     }
   }
@@ -1264,19 +1401,26 @@ CalibSessionRunner::CollectStatus CalibSessionRunner::collect_status() {
       st.n_holdout++;
       continue; // holdouts are never fused -- they verify
     }
-    if (slot_rep_[slot].Lambda.rows() != np)
-      continue;
+  }
+  for (int slot : retained_solve_candidates_()) {
     Lw.push_back(prior.asDiagonal() * slot_rep_[slot].Lambda * prior.asDiagonal());
     spans.push_back({scorer_->meta(slot).t0, scorer_->meta(slot).t1});
   }
   st.n_fusable = (int)Lw.size();
   if (st.n_fusable == 0)
     return st;
-  WindowScorer::select_logdet(Lw, spans, cfg_.select_K, cfg_.select_overlap_penalty, &st.min_eig);
+  Eigen::VectorXd sigma;
+  WindowScorer::select_logdet(Lw, spans, cfg_.select_K, cfg_.select_overlap_penalty, &st.min_eig,
+                              tg_off >= 0 ? &sigma : nullptr);
+  bool tg_ready = (tg_off < 0);
+  if (tg_off >= 0 && sigma.size() == np) {
+    st.tg_sigma = sigma.segment(tg_off, tg_size).cwiseProduct(prior.segment(tg_off, tg_size)).maxCoeff();
+    tg_ready = st.tg_sigma < st.tg_sigma_target;
+  }
   // Enough to FUSE (select_K) and to VERIFY (min_holdout) -- an unverifiable
   // session must never be allowed to cut over early.
   const bool enough = (st.n_fusable >= cfg_.select_K) && (st.n_holdout >= std::max(1, cfg_.min_holdout));
-  st.ready = enough && (cfg_.collect_min_eig > 0.0) && (st.min_eig >= cfg_.collect_min_eig);
+  st.ready = enough && (cfg_.collect_min_eig > 0.0) && (st.min_eig >= cfg_.collect_min_eig) && tg_ready;
   return st;
 }
 
@@ -1333,6 +1477,8 @@ void CalibSessionRunner::solve_verify_commit_() {
       const double left =
           cfg_.solve_budget_s - std::chrono::duration<double>(std::chrono::steady_clock::now() - t_solve0).count();
       j.max_wall_s = left > 0.0 ? left : -1.0; // exhausted, never a new per-stage allowance
+      for (const StageEvidence &stage : rep_.evidence)
+        j.budget_pass_hint_s = std::max(j.budget_pass_hint_s, stage.max_pass_s);
     }
     return j;
   };
@@ -1447,13 +1593,11 @@ void CalibSessionRunner::solve_verify_commit_() {
                     n_hold == 0 ? "least informative" : "median rank", ranked[pick].first);
     }
   }
-  std::vector<int> bin = scorer_ ? scorer_->thermal_bin() : std::vector<int>();
+  const std::vector<int> bin = retained_solve_candidates_();
   std::vector<Eigen::MatrixXd> Lw;
   std::vector<std::pair<double, double>> spans;
   std::vector<int> cand_slot;
   for (int slot : bin) {
-    if (slot_rep_[slot].Lambda.rows() != np)
-      continue;
     Lw.push_back(prior.asDiagonal() * slot_rep_[slot].Lambda * prior.asDiagonal());
     spans.push_back({scorer_->meta(slot).t0, scorer_->meta(slot).t1});
     cand_slot.push_back(slot);
@@ -1473,11 +1617,10 @@ void CalibSessionRunner::solve_verify_commit_() {
   if (cfg_.verbose)
     std::printf("[session] fusing %d/%d windows (D-optimal, whitened min-eig %.2e)\n", rep_.windows_fused, (int)Lw.size(),
                 rep_.min_eig_whitened);
-  // Abort floor on the selected set: a near-prior eigenvalue means an entire
-  // calibration subspace collected no excitation -- solving anyway lets the
-  // staged phases walk through a degenerate valley before COMMIT can abstain.
-  if (rep_.min_eig_whitened < cfg_.min_eig_floor) {
-    enter_(RunnerState::ABORT, "selected windows leave an unexcited calibration subspace (whitened min-eig below floor)");
+  // Selection health uses I + whitened data information. Its default floor
+  // of one cannot certify data observability; subsequent gates judge that.
+  if (sel.empty() || !finite_scalar(rep_.min_eig_whitened) || rep_.min_eig_whitened < cfg_.min_eig_floor) {
+    enter_(RunnerState::ABORT, "selected windows failed the configured information health check");
     return;
   }
 
@@ -1635,8 +1778,7 @@ void CalibSessionRunner::solve_verify_commit_() {
     // and cam_mode 0 there is no later stage, so A0's posterior IS the session's
     // -- without this it stays default-constructed (zero-length sigma) and the
     // commit gates index off the end of it.
-    if (!imu_chain_free)
-      rep_.joint = repA0;
+    rep_.joint = repA0; // also the fallback if the shared deadline prevents A1a
     calib_.imu.calib_dw = f_dw;
     calib_.imu.calib_da = f_da;
     calib_.imu.calib_RAtoI = f_qa;
@@ -1799,7 +1941,7 @@ void CalibSessionRunner::solve_verify_commit_() {
   // tg's own unlock verdict (set by whichever gate machinery runs); consumed at the freeze
   // below and at A1b entry. tg may only open WITH the accel chain, never instead of it.
   bool tg_open = false;
-  const bool a_pre_gate = (rep_.accel_att_spread_deg >= cfg_.a_full_att_gate_deg) && (rep_.accel_dyn_ms2 >= cfg_.a_full_dyn_gate) &&
+  bool a_pre_gate = (rep_.accel_att_spread_deg >= cfg_.a_full_att_gate_deg) && (rep_.accel_dyn_ms2 >= cfg_.a_full_dyn_gate) &&
                           ((int)w_a1->size() >= cfg_.a_full_min_windows) && calib_.imu.calib_da && calib_.imu.calib_RAtoI;
   if (cfg_.verbose && calib_.imu.calib_da)
     std::printf("[session] accel excitation: attitude spread %.1f deg, dynamics %.2f m/s^2, %d windows -> full-chain pre-gate %s\n",
@@ -1828,6 +1970,7 @@ void CalibSessionRunner::solve_verify_commit_() {
     jc_imu.da_prior_vec(0) = jc_imu.da_prior_vec(2) = jc_imu.da_prior_vec(5) = sda; // d11 d22 d33
   }
   std::vector<WindowWarmState> warm_a1a; // the Wald gate's linearization states (accepted-point optima)
+  bool a1a_completed = false;
   if (imu_chain_free) {
     const bool f_qa = calib_.imu.calib_RAtoI;
     calib_.imu.calib_RAtoI = false;
@@ -1839,14 +1982,28 @@ void CalibSessionRunner::solve_verify_commit_() {
     // inherits the contaminated entry (measured on a Tg-bearing synthetic: frozen-judge dqA 0.583
     // deg / worst z 1.65 vs 0.91 at Tg=0). A Tg~0 rig fits ~0 under the 1e-3 prior -- harmless by
     // construction.
+    JointReport repA1a;
     const bool okA1a =
-        JointCalib::solve(*w_a1, calib_, arm_budget(jc_imu), rep_.joint, nullptr, &store_, &warm_a1a); // legacy via jc_imu(jc_legacyA)
-    note_stage_("A1a-dw-dadiag", rep_.joint);
+        JointCalib::solve(*w_a1, calib_, arm_budget(jc_imu), repA1a, nullptr, &store_, &warm_a1a); // legacy via jc_imu(jc_legacyA)
+    note_stage_("A1a-dw-dadiag", repA1a);
     if (!okA1a) {
-      enter_(RunnerState::ABORT, "joint solve failed");
-      return;
+      if (!repA1a.hit_wall_budget) {
+        enter_(RunnerState::ABORT, "joint solve failed");
+        return;
+      }
+      // The IMU stage never produced a complete posterior. Keep A0's camera
+      // solution and its matching layout; none of the unestimated IMU chain
+      // may enter the subsequent gates or commit walk as though it were fit.
+      calib_ = calib_a0;
+      calib_.imu.calib_dw = calib_.imu.calib_da = calib_.imu.calib_RAtoI = calib_.imu.calib_tg = false;
+      a_pre_gate = false;
+      if (cfg_.verbose)
+        std::printf("[session] IMU refinement SKIPPED (budget prevented a complete A1a posterior; A0 extrinsics/time offsets retained)\n");
+    } else {
+      rep_.joint = std::move(repA1a);
+      a1a_completed = true;
+      calib_.imu.calib_RAtoI = f_qa;
     }
-    calib_.imu.calib_RAtoI = f_qa;
     if (cfg_.verbose && calib_.imu.calib_tg) {
       const Eigen::Map<const Eigen::Matrix<double, 9, 1>> tv(calib_.imu.Tg.data());
       std::printf("[session] A1a tg (nuisance): |Tg| %.3f deg/s @1g, el(storage):", calib_.imu.Tg.rowwise().norm().maxCoeff() * 9.81 * 180.0 / M_PI);
@@ -1860,7 +2017,7 @@ void CalibSessionRunner::solve_verify_commit_() {
   // estimate. Skip Tg half-solves if even that estimate misses the commit
   // threshold. Keep Tg as an A1a nuisance to avoid absorbing it into Dw.
   bool tg_precision_ready = true;
-  if (calib_.tg_enabled && cfg_.tg_precision_screen) {
+  if (calib_.tg_enabled && cfg_.tg_precision_screen && a1a_completed) {
     int count = 0;
     const auto ceiling = cfg_.commit_abs_ceiling.find("tg");
     for (size_t i = 0; i < rep_.joint.labels.size(); ++i) {
@@ -2213,6 +2370,7 @@ void CalibSessionRunner::solve_verify_commit_() {
 
   // ---- phase B: staged camera-intrinsic refinement AFTER temporal/IMU ----
   if (cfg_.cam_mode > 0) {
+    const size_t phase_b_evidence_start = rep_.evidence.size();
     // Radial-coverage gate for k3/k4 (fraction of obs beyond 0.7 * r_max), decided PER CAMERA: it
     // asks whether THIS camera actually saw its own image corners, and one camera reaching them
     // says nothing about another pointing somewhere else entirely.
@@ -2308,7 +2466,7 @@ void CalibSessionRunner::solve_verify_commit_() {
           JointReport repBb;
           JointCalib::solve(*w_b, calib_, arm_budget(jb), repBb, &carry, &store_);
           note_stage_("B1b-dist-r" + std::to_string(round + 1), repBb);
-          if (cfg_.verbose)
+          if (cfg_.verbose && (repBa.accepted_passes > 0 || repBb.accepted_passes > 0))
             for (int c = 0; c < n_cams_; ++c) {
               const Eigen::Matrix<double, 8, 1> &k = calib_.cams[(size_t)c].cam;
               std::printf("[session] phase B-1 alt round %d cam %d: [%.2f %.2f %.2f %.2f | %.5f %.5f %.5f %.5f]\n", round + 1, c,
@@ -2349,15 +2507,13 @@ void CalibSessionRunner::solve_verify_commit_() {
     jb2.cert_open_imu = cfg_.b2_cert; // qn-policing replaces plateau/anchor (profile-gated A/B)
     bool okB = JointCalib::solve(*w_b, calib_, arm_budget(jb2), repB, &carry, &store_);
     note_stage_("B2-polish", repB);
-    // A radtan refinement can constrain distortion while its metric focal
-    // length remains near-prior (common with one camera). Preserve that factory
-    // pair and re-fit the remaining parameters under the SAME precision bar.
+    // Either camera model can constrain distortion while its focal or center
+    // pair remains unresolved. Preserve those factory pairs and jointly refit
+    // the remaining parameters under the SAME precision bar and wall budget.
     // Never graft a few entries from a correlated, eight-parameter solution.
     if (okB && cfg_.cam_mode == 1) {
       bool refit = false;
       for (int c = 0; c < n_cams_; ++c) {
-        if (calib_.cams[(size_t)c].fisheye)
-          continue;
         CameraPrior sigma = CameraPrior::Constant(std::numeric_limits<double>::infinity());
         for (size_t i = 0; i < repB.labels.size(); ++i)
           for (int k = 0; k < 8; ++k)
@@ -2370,7 +2526,7 @@ void CalibSessionRunner::solve_verify_commit_() {
         jb2.cam_prior_vec = jc.cam_prior_vec;
         JointReport reduced;
         okB = JointCalib::solve(*w_b, calib_, arm_budget(jb2), reduced, nullptr, &store_);
-        note_stage_("B2-radtan-refit", reduced);
+        note_stage_("B2-camera-refit", reduced);
         if (okB)
           repB = std::move(reduced);
       }
@@ -2387,8 +2543,21 @@ void CalibSessionRunner::solve_verify_commit_() {
             cam_sane = false;
     if (!cam_sane) {
       calib_ = calib_phaseA; // revert the whole phase (cam aliases into ext/td when it breaks)
-      if (cfg_.verbose)
-        std::printf("[session] phase B REVERTED (refinement-hurt detector)\n");
+      if (cfg_.verbose) {
+        bool any_pass = false, budget_hit = false;
+        for (size_t i = phase_b_evidence_start; i < rep_.evidence.size(); ++i) {
+          any_pass = any_pass || rep_.evidence[i].passes > 0;
+          budget_hit = budget_hit || rep_.evidence[i].hit_budget;
+        }
+        if (!any_pass && budget_hit)
+          std::printf("[session] phase B SKIPPED (no solve budget for a complete pass; phase A retained)\n");
+        else if (!okB && budget_hit)
+          std::printf("[session] phase B REVERTED (budget ended before a complete final posterior; phase A retained)\n");
+        else if (!okB)
+          std::printf("[session] phase B REVERTED (joint refinement failed; phase A retained)\n");
+        else
+          std::printf("[session] phase B REVERTED (refinement-hurt detector)\n");
+      }
     } else {
       rep_.joint = repB; // posterior of the full staged solve
     }
@@ -2401,7 +2570,7 @@ void CalibSessionRunner::solve_verify_commit_() {
   // excluded), THEN the solved point, the resulting mixture, and the
   // leave-one-out variants all face the SAME held-out windows below ----
   const auto t_verify0 = std::chrono::steady_clock::now();
-  enter_(RunnerState::VERIFY, "held-out reprojection check");
+  enter_(RunnerState::VERIFY, "held-out joint-cost check");
   SharedCalib out = calib_;
   // The revert point in the SAME layout as `out`: the values a block ships if it
   // does NOT commit. Flags are copied from `out` (a closed accel gate can freeze
@@ -2548,10 +2717,10 @@ void CalibSessionRunner::solve_verify_commit_() {
   // Candidates: [0] post-bootstrap seed, [1] fully-solved point, [2] committed
   // MIXTURE when blocks reverted (the mixture is what actually ships -- commit
   // decisions couple blocks, so it must beat the seed itself), then
-  // leave-one-out variants per committed block (accuracy attribution). A
-  // window where ANY candidate fails to re-seed/solve is dropped for ALL
-  // candidates: one-sided failures previously inflated only that candidate's
-  // cost (asymmetric walling -> spurious aborts).
+  // leave-one-out variants per committed block (cost attribution). A failure
+  // of a required seed/solution/mixture candidate drops the paired window.
+  // Optional diagnostics cannot change that common test set; incomplete
+  // diagnostic comparisons report no cost difference.
   std::vector<SharedCalib> cand = {calib_postboot, calib_};
   const int i_mix = any_reverted ? 2 : 1;
   if (any_reverted)
@@ -2567,6 +2736,7 @@ void CalibSessionRunner::solve_verify_commit_() {
         lobo_block.push_back((int)bi);
       }
   std::vector<double> csum(cand.size(), 0.0);
+  std::vector<char> diagnostic_complete(cand.size(), 1);
   int n_hold = 0, n_drop = 0;
   StageEvidence vev; // verify-sweep aggregate (seed+BA per holdout x candidate)
   vev.label = "verify-sweep";
@@ -2588,32 +2758,47 @@ void CalibSessionRunner::solve_verify_commit_() {
     WindowSolveReport r;
   };
   std::vector<VJob> jobs(hslots.size() * C);
+  std::vector<WindowEvaluationContext> evaluations(hslots.size());
+  std::vector<char> evaluation_ok(hslots.size(), 0);
   {
     const int nthreads = std::max(1, std::min(cfg_.joint.num_threads, (int)jobs.size()));
     ov_init::zbft_sfm::ParallelExecutor vpool(nthreads);
+    vpool.parallel_ranges((int)hslots.size(), [&](int, int b0, int b1) {
+      for (int si = b0; si < b1; ++si)
+        evaluation_ok[si] = WindowBA::make_evaluation_context(slots_[hslots[si]], calib_postboot, evaluations[si]);
+    });
     vpool.parallel_ranges((int)jobs.size(), [&](int, int b0, int b1) {
       for (int ji = b0; ji < b1; ++ji) {
         const int slot = hslots[ji / C];
         const size_t ci = ji % C;
         VJob &J = jobs[ji];
+        if (!evaluation_ok[ji / C])
+          continue;
         // re-seed at EACH candidate calibration: harvest-time seeds are
         // p-stamped and would wall the evaluation against any calibration but
         // their own. On a seed GATE failure fall back to the harvest seeds:
         // the gate protects ADMISSION, not evaluation.
         SharedCalib cc = cand[ci];
         WindowData w = slots_[slot];
+        // Compare every candidate using the SAME measurement weights and
+        // physical first-bias prior. Candidate-specific initialization may
+        // change starting values; it must not move the scoring objective.
+        cc.noise_lin = calib_postboot.imu;
+        cc.noise_frozen = true;
         LinearSeedReport sr;
         const auto t_vs0 = std::chrono::steady_clock::now();
         const bool seeded = LinearSeed::seed_window(w, cc, w.seed_bg, sr, cfg_.seed);
         J.seed_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_vs0).count();
         J.ok = (seeded || w.has_seeds) &&
-               WindowBA::solve_and_export(w, cc, false, J.r, cfg_.joint.window_max_iters, false, nullptr, nullptr);
+               WindowBA::solve_and_export(w, cc, false, J.r, cfg_.joint.window_max_iters, false, nullptr, nullptr, nullptr,
+                                         &evaluations[ji / C]);
         J.cost = J.r.cost_final;
+        J.ok = valid_verification_cost(J.ok, J.r.time_stopped, J.cost);
       }
     });
   }
   for (size_t si = 0; si < hslots.size(); ++si) {
-    bool all_ok = true;
+    std::vector<char> candidate_ok(C, 0);
     for (size_t ci = 0; ci < C; ++ci) {
       const VJob &J = jobs[si * C + ci];
       vev.passes++;
@@ -2625,17 +2810,21 @@ void CalibSessionRunner::solve_verify_commit_() {
       vev.factor_s += J.r.t_factor;
       (J.r.preint_hit ? vev.phit : vev.pmiss)++;
       vev.tstop += J.r.time_stopped ? 1 : 0;
-      if (J.ok)
+      if (J.ok) {
         vev.accepted++;
-      else
-        all_ok = false;
+        candidate_ok[ci] = 1;
+      }
     }
-    if (!all_ok) {
+    if (!verification_window_usable(candidate_ok, (size_t)lobo0)) {
       ++n_drop;
       continue;
     }
-    for (size_t ci = 0; ci < C; ++ci)
-      csum[ci] += jobs[si * C + ci].cost;
+    for (size_t ci = 0; ci < C; ++ci) {
+      if (candidate_ok[ci])
+        csum[ci] += jobs[si * C + ci].cost;
+      else
+        diagnostic_complete[ci] = 0;
+    }
     // per-window paired improvement of the shipped mixture (small-n evidence:
     // one aggregate ratio hides a single window carrying the whole verdict)
     const double c0 = jobs[si * C + 0].cost;
@@ -2689,7 +2878,8 @@ void CalibSessionRunner::solve_verify_commit_() {
     return;
   }
   for (size_t li = 0; li < lobo_block.size(); ++li)
-    rep_.blocks[lobo_block[li]].holdout_delta = csum[lobo0 + li] - csum[i_mix];
+    rep_.blocks[lobo_block[li]].holdout_delta = diagnostic_complete[lobo0 + li]
+        ? csum[lobo0 + li] - csum[i_mix] : std::numeric_limits<double>::quiet_NaN();
 
   // ---- COMMIT: ship the verified mixture ----
   enter_(RunnerState::COMMIT, "gated partial commit");
@@ -2721,13 +2911,19 @@ void CalibSessionRunner::solve_verify_commit_() {
         if (!present)
           no.push_back(std::string(nm) + "@" + std::to_string(c));
       }
-    // rollback copy, then atomic write
-    FILE *prev = std::fopen(cfg_.out_yaml.c_str(), "rb");
-    if (prev) {
-      std::fclose(prev);
-      std::rename(cfg_.out_yaml.c_str(), (cfg_.out_yaml + ".rollback").c_str());
+    // A failed flush/close (notably ENOSPC) must never replace a good result
+    // or claim that the session committed. Keep the solved diagnostics, but
+    // withdraw publication of every block and leave the previous file intact.
+    if (!write_calib_yaml(cfg_.out_yaml, rep_.committed, rep_.mean_exposure_s, &yes, &no, true)) {
+      const int error = errno;
+      const std::string reason = "calibration YAML write failed: " + cfg_.out_yaml + ": " + std::strerror(error);
+      std::fprintf(stderr, "[session] ERROR: %s\n", reason.c_str());
+      rep_.committed = calib_postboot;
+      for (auto &bc : rep_.blocks)
+        bc.committed = false;
+      enter_(RunnerState::ABORT, reason.c_str());
+      return;
     }
-    write_calib_yaml(cfg_.out_yaml, rep_.committed, rep_.mean_exposure_s, &yes, &no);
   }
   if (cfg_.verbose) {
     std::printf("[session] COMMIT:");
@@ -2751,8 +2947,12 @@ void CalibSessionRunner::solve_verify_commit_() {
 bool CalibSessionRunner::run_replay(const std::string &record_path, const SessionConfig &cfg, SessionReport &out,
                                     const SeedOverride *seed_override) {
   SessionRecordReader rd;
-  if (!rd.open(record_path))
+  if (!rd.open(record_path)) {
+    out = SessionReport();
+    out.final_state = RunnerState::ABORT;
+    out.abort_reason = "cannot read session record: " + record_path + ": " + rd.error();
     return false;
+  }
   // The recorded seed is authoritative for the CAMERA and the streams; the rest
   // may be patched so ONE recorded session can be scored across the seeding
   // matrix (blind vs chain-seeded, per block).
@@ -2783,6 +2983,11 @@ bool CalibSessionRunner::run_replay(const std::string &record_path, const Sessio
       runner.feed_imu(s);
     else
       runner.feed_frame(f);
+  }
+  if (rd.failed()) {
+    runner.abort("incomplete session record: " + record_path + ": " + rd.error());
+    out = runner.finish();
+    return false;
   }
   out = runner.finish();
   return true;

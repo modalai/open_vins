@@ -20,8 +20,9 @@
  * Tg-off arithmetic must stay BYTE-IDENTICAL to the validated corpus, and under
  * -ffast-math even multiplying through nine explicitly-zero columns reassociates
  * the reductions (a measured 1-ulp regression class). The legacy 15-wide
- * statements below are therefore kept verbatim in their own branch; the 24-wide
- * path is separate code that only runs when Tg is being estimated. tg is packed
+ * zero-Tg statements remain in their own branch; fixed nonzero Tg additionally
+ * applies its accel-bias/rotation coupling without introducing Tg columns. The
+ * 24-wide path is separate code that only runs when Tg is being estimated. tg is packed
  * in Matrix3d STORAGE order (column-major) to match mixing()'s enumeration.
  * All Jacobians are pinned by the factor-level FD oracle in test_aci3_fd (the
  * J_r-flavor episode is the standing justification).
@@ -51,7 +52,7 @@ public:
   Eigen::Vector3d bg_lin, ba_lin;
   Eigen::Matrix<double, 6, 1> dw_lin, da_lin;
   Eigen::Vector4d qA_lin;
-  Eigen::Matrix3d tg_lin = Eigen::Matrix3d::Zero(); ///< only consulted when tg_on
+  Eigen::Matrix3d tg_lin = Eigen::Matrix3d::Zero(); ///< also controls H_q correction when Tg is fixed nonzero
   bool tg_on = false;                               ///< preint carried 24 intrinsic columns (dw6|da6|thA3|tg9)
   // sqrt information of m.P15
   Eigen::Matrix<double, 15, 15> sqrtI;

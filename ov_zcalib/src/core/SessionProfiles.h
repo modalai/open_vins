@@ -126,27 +126,14 @@ inline void apply_flight_overlay(SessionConfig &cfg, bool set_cam_mode0) {
     cfg.cam_mode = 0;
 }
 
-/// ICM-class 1 kHz imu_apps CALIBRATION-weighting densities -- deliberately NOT the filter's.
-///
-/// The platform kalibr chains ship INFLATED noise for filter robustness. A FILTER wants that: an
-/// over-stated sigma buys stability against unmodelled effects. A batch CALIBRATOR must not, because
-/// sigma here is not a safety margin, it is the LEVER ARM between the IMU residuals and the camera
-/// residuals. Inflating the IMU ~7x down-weights it ~48x in INFORMATION against the cameras -- and
-/// then the gyro can no longer defend dw, which is a gyro parameter and (on a rig with no shared
-/// field of view) the ONLY block the cameras share. A misspecified camera walks it out of family,
-/// and every other camera inherits the damage through preintegration.
-///
-/// These four values are the raw Allan fit carried in the platform chain's own trailing
-/// comments (kalibr_imu_chain.yaml: "#w", "#wb", "#a", "#ab") -- 6.9x / 1667x / 5.9x / 43x
-/// below the inflated filter-chain values.
-///
-/// MEASURED, truth log vs the kalibr-grade reference:
-///   inflated:   0.115 deg / 1.36 mm   VERIFY 50.6%
-///   raw Allan:  0.025 deg / 0.54 mm   VERIFY 59.0%     <- 4.6x rotation, 2.5x position
-/// and every block's posterior tightened (dw 0.21 -> 0.14, da 0.82 -> 0.38).
-///
-/// Override per rig with the four kalibr key names in ov_zcalib.yaml -- an Allan fit is a property of
-/// the PART, and this is the one place a calibrator should be told about it.
+/// Historical ICM-class 1 kHz calibration-weighting defaults, separate from VINS tuning.
+/// These values came from platform-chain trailing comments; they are not universal IMU
+/// constants or the supplied same-board BMI270 Allan fit. Override them in ov_calib.yaml.
+/// Noise sets the relative weight of camera/IMU evidence and the allowed bias drift.
+/// Static Allan estimates depend on the sensor, driver filtering, rate and temperature;
+/// they need not describe errors during calibration motion. Kalibr explicitly allows
+/// inflation for unmodeled effects: https://github.com/ethz-asl/kalibr/wiki/IMU-Noise-Model
+/// Validate weighting with independent recovery/prediction checks, not smaller sigmas alone.
 inline void apply_voxl_noise_defaults(ImuNoise &n) {
   n.sigma_w = 1.3990944749616306e-4;
   n.sigma_wb = 4.1189724174615527e-7;

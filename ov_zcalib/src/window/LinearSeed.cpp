@@ -31,12 +31,14 @@
 
 using namespace ov_zcalib;
 
-namespace {
 /// Window-local gyro-bias refinement: consecutive-clone camera rotations from
 /// the tracked bearings (Procrustes) vs the gyro chain, R_ItoC known from the
-/// current calibration. Same closed-form dt-column update as the hand-eye.
-Eigen::Vector3d bias_presolve(const WindowData &win, const SharedCalib &calib, const Eigen::Vector3d &bg0, int iters) {
+/// current calibration. Biases live BEFORE Dw, exactly as in the ACI chain.
+Eigen::Vector3d LinearSeed::bias_presolve(const WindowData &win, const SharedCalib &calib, const Eigen::Vector3d &bg0, int iters) {
   const int n_cams = calib.n_cams();
+  if (win.imu.size() < 2 || (int)win.td_ref.size() != n_cams)
+    return bg0;
+  const Eigen::Matrix3d Dw = ImuIntrinsicModel::ut(calib.imu.dw);
   std::vector<Eigen::Matrix3d> R_IC((size_t)n_cams);
   for (int c = 0; c < n_cams; ++c)
     R_IC[(size_t)c] = ov_core::quat_2_Rot(calib.cams[(size_t)c].q_ItoC);
@@ -49,79 +51,133 @@ Eigen::Vector3d bias_presolve(const WindowData &win, const SharedCalib &calib, c
   // adjacent-clone pair that straddles cameras has nothing to match and yields nothing -- on an
   // interleaved rig that is EVERY pair, and the presolve would silently return the seed bias.
   struct Pair {
-    Eigen::Vector3d th_C;
-    double t0, t1;
-    int cam;
+    struct Step {
+      double dt;
+      Eigen::Vector3d w_zero_bias;
+    };
+    Eigen::Matrix3d R_visual;
+    std::vector<Step> steps;
   };
   std::vector<Pair> pairs;
   pairs.reserve((size_t)std::max(0, N - 1));
-  std::vector<std::vector<int>> clones_of((size_t)n_cams);
-  for (int k = 0; k < N; ++k)
-    if (!win.obs[(size_t)k].empty()) {
-      const int c = win.obs[(size_t)k].front().cam;
-      if (c >= 0 && c < n_cams)
-        clones_of[(size_t)c].push_back(k);
+  struct CamClone {
+    int clone;
+    double time;
+  };
+  std::vector<std::vector<CamClone>> clones_of((size_t)n_cams);
+  for (int k = 0; k < N; ++k) {
+    for (const CloneObs &o : win.obs[(size_t)k]) {
+      const int c = o.cam;
+      if (c < 0 || c >= n_cams)
+        continue;
+      auto &ks = clones_of[(size_t)c];
+      // A merged clone can contain several cameras. Each contributes its own
+      // bearings at its own optical instant, independent of observation order.
+      if (ks.empty() || ks.back().clone != k)
+        ks.push_back({k, win.clone_times[(size_t)k] + o.dt_ref +
+                            (calib.cams[(size_t)c].td - win.td_ref[(size_t)c])});
     }
+  }
+  // Feature ids are dense within a window. Index the next clone once rather
+  // than searching all its bearings for each match. Preserve first-clone
+  // order so the deterministic relative-rotation solver sees identical input.
+  std::vector<const CloneObs *> next_obs(win.num_feats, nullptr);
   for (int c = 0; c < n_cams; ++c) {
-    const std::vector<int> &ks = clones_of[(size_t)c];
+    const auto &ks = clones_of[(size_t)c];
     for (size_t i = 0; i + 1 < ks.size(); ++i) {
-      const int k = ks[i], k2 = ks[i + 1];
+      const int k = ks[i].clone, k2 = ks[i + 1].clone;
       std::vector<Eigen::Vector3d> b0, b1;
-      for (const CloneObs &oa : win.obs[(size_t)k])
-        for (const CloneObs &ob : win.obs[(size_t)k2])
-          if (oa.feat_id == ob.feat_id) {
-            b0.push_back(oa.bearing);
-            b1.push_back(ob.bearing);
-            break;
-          }
+      for (const CloneObs &ob : win.obs[(size_t)k2])
+        if (ob.cam == c && !next_obs[ob.feat_id])
+          next_obs[ob.feat_id] = &ob;
+      for (const CloneObs &oa : win.obs[(size_t)k]) {
+        if (oa.cam != c)
+          continue;
+        if (const CloneObs *ob = next_obs[oa.feat_id]) {
+          b0.push_back(oa.bearing);
+          b1.push_back(ob->bearing);
+        }
+      }
+      for (const CloneObs &ob : win.obs[(size_t)k2])
+        if (ob.cam == c)
+          next_obs[ob.feat_id] = nullptr;
       RelRotEssential::Options ro;
       const RelRotEssential::Result rr = RelRotEssential::solve(b0, b1, (uint64_t)(win.clone_times[(size_t)k] * 1e6) + k, ro);
       if (!rr.ok)
         continue;
       Pair p;
-      p.th_C = ov_core::log_so3(rr.R_C1toC2);
-      p.t0 = win.clone_times[(size_t)k];
-      p.t1 = win.clone_times[(size_t)k2];
-      p.cam = c;
-      pairs.push_back(p);
+      p.R_visual = R_IC[(size_t)c].transpose() * rr.R_C1toC2 * R_IC[(size_t)c];
+      const double t0 = ks[i].time, t1 = ks[i + 1].time;
+      // Clone stamps already contain td_ref. Only the CURRENT-minus-reference
+      // offset belongs here. Refuse an uncovered shifted interval instead of
+      // fitting its visual rotation against a silently shortened gyro integral.
+      if (!(t1 > t0) || t0 < win.imu.front().timestamp || t1 > win.imu.back().timestamp)
+        continue;
+      auto sample = std::upper_bound(win.imu.begin(), win.imu.end(), t0,
+                                     [](double t, const RawImu &s) { return t < s.timestamp; });
+      if (sample == win.imu.begin())
+        continue;
+      size_t j = (size_t)(sample - win.imu.begin() - 1);
+      for (; j + 1 < win.imu.size() && win.imu[j].timestamp < t1; ++j) {
+        const RawImu &s0 = win.imu[j], &s1 = win.imu[j + 1];
+        const double ta = std::max(s0.timestamp, t0), tb = std::min(s1.timestamp, t1);
+        if (!(tb > ta))
+          continue;
+        // Interpolate BOTH clipped endpoints, then take their midpoint, as
+        // AciCalibPreint does. Averaging the original endpoints is wrong at
+        // non-grid camera times when angular rate or specific force changes.
+        const double la = (ta - s0.timestamp) / (s1.timestamp - s0.timestamp);
+        const double lb = (tb - s0.timestamp) / (s1.timestamp - s0.timestamp);
+        const Eigen::Vector3d wm = 0.5 * ((1.0 - la) * s0.wm + la * s1.wm +
+                                        (1.0 - lb) * s0.wm + lb * s1.wm);
+        const Eigen::Vector3d am = 0.5 * ((1.0 - la) * s0.am + la * s1.am +
+                                        (1.0 - lb) * s0.am + lb * s1.am);
+        Pair::Step step;
+        step.dt = tb - ta;
+        Eigen::Vector3d a_hat;
+        // ba=0 is the SAME linearization used by the downstream linear seeder;
+        // its accel bias is solved afterward. The value of Tg is used even
+        // when that parameter is fixed, matching ImuIntrinsicModel::correct.
+        calib.imu.correct(wm, am, Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero(), step.w_zero_bias, a_hat);
+        p.steps.push_back(step);
+      }
+      if (!p.steps.empty())
+        pairs.push_back(std::move(p));
     }
   }
   Eigen::Vector3d bg = bg0;
   if (pairs.size() < 4)
     return bg;
   for (int it = 0; it < iters; ++it) {
-    double denom = 0.0;
-    Eigen::Vector3d num = Eigen::Vector3d::Zero();
+    Eigen::Matrix3d H = Eigen::Matrix3d::Zero();
+    Eigen::Vector3d g = Eigen::Vector3d::Zero();
     for (const Pair &p : pairs) {
-      Eigen::Vector3d th_I;
-      // gyro-only chain over the interval at the current bias (boundary-interp)
       Eigen::Matrix3d DR = Eigen::Matrix3d::Identity();
-      bool any = false;
-      for (size_t i = 0; i + 1 < win.imu.size(); ++i) {
-        const RawImu &s0 = win.imu[i], &s1 = win.imu[i + 1];
-        if (s1.timestamp <= p.t0 || s0.timestamp >= p.t1)
-          continue;
-        const double ta = std::max(s0.timestamp, p.t0), tb = std::min(s1.timestamp, p.t1);
-        if (!(tb > ta))
-          continue;
-        DR = ov_core::exp_so3(-(0.5 * (s0.wm + s1.wm) - bg) * (tb - ta)) * DR;
-        any = true;
+      Eigen::Matrix3d J = Eigen::Matrix3d::Zero();
+      for (const Pair::Step &s : p.steps) {
+        const Eigen::Vector3d phi = -(s.w_zero_bias - Dw * bg) * s.dt;
+        const Eigen::Matrix3d R = ov_core::exp_so3(phi);
+        // DR(bg+db) = Exp(J db) DR(bg), the ACI left/end-frame
+        // convention. Mw_bg=-Dw, so increasing RAW bias has this + sign.
+        J = R * (J + ov_core::Jr_so3(phi) * Dw * s.dt);
+        DR = R * DR;
       }
-      if (!any)
-        continue;
-      th_I = ov_core::log_so3(DR);
-      const double dt = p.t1 - p.t0;
-      const double w = th_I.norm(); // rotation-rich intervals dominate
-      num += w * dt * (R_IC[(size_t)p.cam].transpose() * p.th_C - th_I);
-      denom += w * dt * dt;
+      const Eigen::Vector3d residual = ov_core::log_so3(p.R_visual * DR.transpose());
+      // Log(Rv DR(bg+db)^T) = residual - Jr(residual)^-1 J db.
+      // Keep the exact SO(3) differential; dt*I is valid only for an
+      // identity gyro chain and infinitesimal, single-axis rotation.
+      const Eigen::Matrix3d A = ov_core::Jr_so3(residual).partialPivLu().solve(J);
+      const double weight = ov_core::log_so3(DR).norm();
+      H.noalias() += weight * A.transpose() * A;
+      g.noalias() += weight * A.transpose() * residual;
     }
-    if (denom > 1e-12)
-      bg += num / denom;
+    Eigen::LDLT<Eigen::Matrix3d> ldlt(H);
+    if (ldlt.info() != Eigen::Success || ldlt.vectorD().minCoeff() <= 1e-12)
+      return bg0;
+    bg += ldlt.solve(g);
   }
   return bg;
 }
-} // namespace
-
 bool LinearSeed::seed_window(WindowData &win, const SharedCalib &calib, const Eigen::Vector3d &bg_boot, LinearSeedReport &rep) {
   return seed_window(win, calib, bg_boot, rep, LinearSeedConfig());
 }

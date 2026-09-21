@@ -58,7 +58,7 @@ static void print_report(const SessionReport &rep) {
     std::printf("  %s=%s(%.2f)", b.label().c_str(), b.committed ? "COMMIT" : "seed", b.worst_ratio);
   std::printf("\n");
   if (rep.joint.sigma.size() > 0) {
-    std::printf("posterior (1-sigma / prior):\n");
+    std::printf("raw posterior (1-sigma / prior; accuracy coverage uncalibrated):\n");
     for (int i = 0; i < rep.joint.sigma.size(); ++i)
       std::printf("  %-10s %.3e / %.3e\n", rep.joint.labels[i].c_str(), rep.joint.sigma(i), rep.joint.prior_sigma_vec(i));
   }
@@ -461,7 +461,7 @@ int main(int argc, char **argv) {
       return 1;
     SessionReport rep;
     if (!CalibSessionRunner::run_replay(rec, cfg, rep, ovr_p)) {
-      std::printf("replay of the converted record failed\n");
+      std::printf("replay of the converted record failed: %s\n", rep.abort_reason.c_str());
       return 1;
     }
     print_report(rep);
@@ -551,7 +551,7 @@ int main(int argc, char **argv) {
     // still win -- they are applied after.
     SessionSeed hdr;
     if (!read_session_header(replay_path, hdr)) {
-      std::printf("cannot open session record %s\n", replay_path.c_str());
+      std::printf("cannot read session header %s\n", replay_path.c_str());
       return 1;
     }
     SessionProfile prof = hdr.profile;
@@ -582,7 +582,7 @@ int main(int argc, char **argv) {
     SessionReport rep;
     apply_cli_overrides(cfg);
     if (!CalibSessionRunner::run_replay(replay_path, cfg, rep, ovr_p)) {
-      std::printf("cannot open session record %s\n", replay_path.c_str());
+      std::printf("replay failed for %s: %s\n", replay_path.c_str(), rep.abort_reason.c_str());
       return 1;
     }
     print_report(rep);

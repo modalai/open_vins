@@ -29,14 +29,13 @@
  * (Q_w = I), so ONE path serves both models and a same-gauge chain round-trips
  * exactly.
  *
- * WHY SEED AT ALL: extrinsics and td are earned BLIND, but the IMU and camera
- * intrinsics are per-unit factory data the rig already ships. Seeding them
- * (a) starts the chain at the truth instead of identity, so the solve
- * converges far sooner, and (b) makes an unmoved block ship the FACTORY value
- * rather than an uncalibrated identity -- the failure mode that silently
- * overwrites a good factory Dw.
+ * The active chain is an optional initializer, not calibration ground truth.
+ * A historical single-session comparison favored intrinsic seeding on its
+ * reference rig (see CalibConfigYaml.h); it establishes no accuracy guarantee
+ * for another recording or rig. SeedPolicy independently selects the ported
+ * Dw/Da/R_AtoI values or identity, and the ported Tg value or zero.
  *
- * Tg (g-sensitivity) is seeded too, and the gauge change conjugates it on one
+ * When Tg (g-sensitivity) is seeded, the gauge change conjugates it on one
  * side only: in both models the bracket is (w_m - b_g - Tg * a_hat), where w_m
  * and b_g are RAW GYRO AXES quantities identical in either gauge, so only
  * a_hat's frame moves. With a_hat^K = Q_w a_hat^R,
@@ -45,11 +44,10 @@
  *
  * and an rpng-gauge chain (Q_w = I) round-trips exactly, like Dw and Da. The
  * port seeds Tg FIXED (calib_tg = false); whether a session ESTIMATES it is
- * runner policy behind the A1b excitation gate. Zeroing the seed instead would
- * discard a term the chain actually measured: at ~4e-4 (rad/s)/(m/s^2) that is
- * 0.23 deg/s of spurious rate at 1 g -- a ~1% relative gyro error on the
- * SLOW-TILT windows the session keeps (fast ones are seed-gate rejected),
- * landing squarely on dw, the one block every camera shares.
+ * runner policy behind the A1b excitation gate. The later seed policy can
+ * choose zero instead without changing that estimation policy. The choice
+ * affects the initial corrected angular rate and can couple to gyro scale
+ * and bias during bootstrap, so it must be explicit in the session setup.
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -87,12 +85,18 @@ inline void qr_positive_diag(const Eigen::Matrix3d &A, Eigen::Matrix3d &Q, Eigen
 /// @param R_ACCtoIMU    chain's accel->IMU rotation (identity in the kalibr gauge)
 /// @param Tg_chain      full 3x3 g-sensitivity from the chain (Zero if the chain has none)
 /// @param[out] imu      dw/da (upper-tri packed) + q_AtoI + Tg, ready to seed SharedCalib
+/// @param[out] R_imu2_to_chain optional frame map: v_chain = R_imu2_to_chain * v_imu2.
+///                      Camera rotations must use R_C_imu2 = R_C_chain * R_imu2_to_chain.
+///                      Selecting identity intrinsic seeds later does not change this gauge.
 inline void imu_chain_to_calib(const Eigen::Matrix3d &Dw_chain, const Eigen::Matrix3d &Da_chain,
                                const Eigen::Matrix3d &R_GYROtoIMU, const Eigen::Matrix3d &R_ACCtoIMU,
-                               const Eigen::Matrix3d &Tg_chain, ImuIntrinsicModel &imu) {
+                               const Eigen::Matrix3d &Tg_chain, ImuIntrinsicModel &imu,
+                               Eigen::Matrix3d *R_imu2_to_chain = nullptr) {
   Eigen::Matrix3d Qw, Uw, Qa, Ua;
   qr_positive_diag(R_GYROtoIMU * Dw_chain, Qw, Uw);            // gyro rows -> the frame rotation + upper-tri Dw
   qr_positive_diag(Qw.transpose() * R_ACCtoIMU * Da_chain, Qa, Ua); // accel rows, in the GYRO frame
+  if (R_imu2_to_chain)
+    *R_imu2_to_chain = Qw;
   imu.dw << Uw(0, 0), Uw(0, 1), Uw(1, 1), Uw(0, 2), Uw(1, 2), Uw(2, 2); // ut() packing [d11,d12,d22,d13,d23,d33]
   imu.da << Ua(0, 0), Ua(0, 1), Ua(1, 1), Ua(0, 2), Ua(1, 2), Ua(2, 2);
   imu.q_AtoI = ov_core::rot_2_quat(Qa);

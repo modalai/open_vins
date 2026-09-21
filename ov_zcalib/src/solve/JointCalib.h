@@ -20,6 +20,7 @@
 #define OV_ZCALIB_JOINT_CALIB_H
 
 #include <map>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -93,7 +94,9 @@ struct JointConfig {
   // ---- Fused (capped) evaluation: after fused_warmup_passes, warm-path
   // evaluations run ONE inner iteration and export -- the exported
   // gred = gk - Hkn Hnn^-1 gn is the nuisance-corrected joint-Newton reduced
-  // gradient (first-order exact off-optimum, the Problem.cpp export contract),
+  // gradient of the linearized least-squares model. First-order accuracy for
+  // the NONLINEAR reduced gradient additionally requires negligible residual
+  // curvature; a GN decrement alone does not prove an inexact-Newton bound.
   // so the outer's damped step drives p and the single inner step at the NEXT
   // eval is the z back-substitution. Cold paths and the first pass stay FULL
   // solves (basin escapes + honest entry); plateau/anchor triggers are
@@ -172,11 +175,18 @@ struct JointConfig {
   /// parallel BIT-IDENTICAL (see ov_init::zbft_sfm::ParallelExecutor). <=1 runs
   /// inline (no threads created) -- the RT default for on-target flight profiles.
   int num_threads = 4;
-  /// Wall-clock budget for ONE solve() call [s]; 0 = unlimited, <0 = skip. When exceeded
-  /// the loop stops at the best accepted point (never mid-evaluation), so the
-  /// report stays consistent. Flight profiles set this to meet the <=60 s
-  /// session target (collection included).
+  /// Wall-clock budget for ONE solve() call [s]; 0 = unlimited, <0 = skip.
+  /// Admit another complete pass only when its measured cost, with headroom,
+  /// fits. Deadline checks between window operations discard an incomplete
+  /// candidate as a whole; only a complete accepted posterior may ship.
+  /// A window factorization is not preemptible: this is a cooperative budget,
+  /// not a hard real-time guarantee under arbitrary scheduling delays.
   double max_wall_s = 0.0;
+  double budget_pass_hint_s = 0.0; ///< slowest complete pass measured by earlier session stages
+  /// Optional elapsed-seconds clock for deterministic deadline tests. Empty
+  /// uses steady_clock; report timings always retain actual wall time. A
+  /// supplied callback must support concurrent reads when num_threads > 1.
+  std::function<double()> budget_clock;
   /// Absolute per-dof per-outer step caps: the ACI3 mean correction and the
   /// temporal transport are FIRST-ORDER in dp, so an outer step must stay
   /// inside first-order validity regardless of how confident the fused
@@ -232,7 +242,7 @@ struct JointConfig {
 struct JointReport {
   bool ok = false;
   int windows_used = 0;
-  Eigen::VectorXd sigma;             ///< posterior 1-sigma per local dof (block order)
+  Eigen::VectorXd sigma;             ///< raw local-curvature 1-sigma per dof; not calibrated accuracy coverage
   Eigen::VectorXd prior_sigma_vec;   ///< matching prior sigmas (for improvement ratios)
   std::vector<std::string> labels;   ///< per local dof
   Eigen::MatrixXd Lambda;            ///< fused information (whitened checks downstream)
@@ -240,6 +250,7 @@ struct JointReport {
   int evaluation_passes = 0;         ///< evaluations spent (re-seed+solve+export sweeps)
   int windows_dead = 0;              ///< windows dropped at an accepted point (never candidates)
   double wall_s = 0.0;               ///< wall clock of this solve() call
+  double max_pass_s = 0.0;           ///< slowest evaluation/export pass, for downstream admission
   bool hit_wall_budget = false;      ///< stopped by max_wall_s (best accepted point shipped)
   // summed thread-CPU split across all window evaluations (> wall_s when parallel)
   double t_seed_sum = 0.0, t_preint_sum = 0.0, t_inner_sum = 0.0, t_export_sum = 0.0;
@@ -310,7 +321,7 @@ struct SeedSnap {
 struct JointWarmCarry {
   bool valid = false;
   std::vector<double> p_stamp;              ///< all shared values at the recording accepted point
-  Eigen::Matrix<double, 16, 1> noise_stamp; ///< recording stage's ENTRY imu values (dw6 da6 qA4)
+  Eigen::Matrix<double, 25, 1> noise_stamp; ///< recording stage's ENTRY imu values (dw6 da6 qA4 Tg9)
   std::string layout_sig;                   ///< recording stage's free-set signature ("name:gsize;")
   std::vector<WindowWarmState> warm;        ///< accepted nuisance optima per window
   std::vector<SeedSnap> seeds;              ///< seed anchors of record per window

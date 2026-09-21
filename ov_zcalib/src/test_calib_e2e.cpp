@@ -23,6 +23,7 @@
 #include "types/ImuIntrinsicModel.h"
 #include "solve/JointCalib.h"
 #include "utils/quat_ops.h"
+#include "utils/NumericChecks.h"
 
 using namespace ov_zcalib;
 
@@ -91,7 +92,7 @@ struct Synth {
 
 /// Generate one window: raw IMU (model-inverted + biases) and pixel tracks.
 static WindowData make_window(const Truth &tr, double phase, double dur, double fps, double imu_hz, unsigned seed,
-                              double drift_px_per_frame = 0.0) {
+                              double drift_px_per_frame = 0.0, bool noiseless = false) {
   Synth sy{tr, phase};
   WindowData w;
   w.pix_sigma = 0.5;
@@ -146,7 +147,7 @@ static WindowData make_window(const Truth &tr, double phase, double dur, double 
       track_len[f]++;
       CloneObs o;
       o.feat_id = (size_t)f;
-      o.uv = uv + w.pix_sigma * Eigen::Vector2d(nrm(rng), nrm(rng));
+      o.uv = uv + (noiseless ? 0.0 : w.pix_sigma) * Eigen::Vector2d(nrm(rng), nrm(rng));
       o.u_frac = uv(1) / 480.0 - 0.5; // centered convention
       w.obs.back().push_back(o);
     }
@@ -168,6 +169,11 @@ static WindowData make_window(const Truth &tr, double phase, double dur, double 
     const Eigen::Vector3d vW = (p_of(t + h, phase) - p_of(t - h, phase)) / (2 * h);
     w.seed_v.push_back(R0 * vW + 0.02 * Eigen::Vector3d(nrm(rng), nrm(rng), nrm(rng)));
     w.seed_p.push_back(R0 * (p_of(t, phase) - p0) + 0.005 * Eigen::Vector3d(nrm(rng), nrm(rng), nrm(rng)));
+    if (noiseless) {
+      w.seed_q.back() = qk;
+      w.seed_v.back() = R0 * vW;
+      w.seed_p.back() = R0 * (p_of(t, phase) - p0);
+    }
   }
   w.seed_q[0] = Eigen::Vector4d(0, 0, 0, 1); // exact gauge anchor at the window origin
   w.seed_p[0].setZero();
@@ -176,6 +182,12 @@ static WindowData make_window(const Truth &tr, double phase, double dur, double 
   w.seed_grav = R0 * tr.g_W;
   for (int f = 0; f < NF; ++f)
     w.seed_feats.push_back(R0 * (pf[f] - p0) + 0.02 * Eigen::Vector3d(nrm(rng), nrm(rng), nrm(rng)));
+  if (noiseless) {
+    w.seed_bg = tr.bg;
+    w.seed_ba = tr.ba;
+    for (int f = 0; f < NF; ++f)
+      w.seed_feats[f] = R0 * (pf[f] - p0);
+  }
   return w;
 }
 
@@ -202,12 +214,16 @@ static void report_errors(const SharedCalib &c, const Truth &tr, double &e_rot_d
   e_qA_deg = 2.0 * ov_core::quat_multiply(c.imu.q_AtoI, ov_core::Inv(tr.imu.q_AtoI)).head<3>().norm() * 180.0 / M_PI;
 }
 
-int main() {
+int main(int argc, char **argv) {
   Truth tr = make_truth();
 
-  // ---------------- model sanity: at TRUTH p, a window must cost ~noise level ----------------
+  // ---------------- model sanity: a noise-free truth is a residual oracle ----------------
+  // A fitted noisy truth/seed cost ratio is not a model-sign oracle: the
+  // irreducible pixel cost, nuisance optimization and prior means all affect
+  // that ratio. Remove measurement/seed noise here and compare candidates
+  // against one fixed scoring objective. S2/S3 retain noisy recovery tests.
   {
-    WindowData w0 = make_window(tr, 0.3, 3.0, 20.0, 800.0, 11);
+    WindowData w0 = make_window(tr, 0.3, 3.0, 20.0, 800.0, 11, 0.0, true);
     SharedCalib ct = make_seed(tr);
     ct.imu.dw = tr.imu.dw;
     ct.imu.da = tr.imu.da;
@@ -215,13 +231,43 @@ int main() {
     ct.cams[0].q_ItoC = tr.q_ItoC;
     ct.cams[0].p_IinC = tr.p_IinC;
     ct.cams[0].td = tr.td;
+    WindowEvaluationContext evaluation;
+    CHECK(WindowBA::make_evaluation_context(w0, ct, evaluation), "truth scoring context failed");
     WindowSolveReport wr_t, wr_s;
-    WindowBA::solve_and_export(w0, ct, false, wr_t, 30, false);
+    CHECK(WindowBA::solve_and_export(w0, ct, false, wr_t, 30, false, nullptr, nullptr, nullptr, &evaluation),
+          "truth nuisance fit failed");
     SharedCalib cs = make_seed(tr);
-    WindowBA::solve_and_export(w0, cs, false, wr_s, 30, false);
-    std::printf("[sanity] window cost at TRUTH p = %.4e | at SEED p = %.4e (truth must be << seed)\n", wr_t.cost_final, wr_s.cost_final);
-    CHECK(wr_t.cost_final < 0.3 * wr_s.cost_final, "truth-p cost not below seed-p cost: model/sign defect");
+    CHECK(WindowBA::solve_and_export(w0, cs, false, wr_s, 30, false, nullptr, nullptr, nullptr, &evaluation),
+          "perturbed calibration nuisance fit failed");
+    size_t observations = 0;
+    for (const auto &frame : w0.obs)
+      observations += frame.size();
+    const double truth_cost_per_observation = wr_t.cost_final / std::max<size_t>(1, observations);
+    std::printf("[sanity] noiseless truth cost %.6e (%.6e/observation), perturbed calibration %.6e, observations %zu\n",
+                wr_t.cost_final, truth_cost_per_observation, wr_s.cost_final, observations);
+    // Allow finite-step IMU integration and first-order td transport error,
+    // but less than one percent of a unit-whitened residual per observation.
+    CHECK(finite_scalar(truth_cost_per_observation) && truth_cost_per_observation < 0.01,
+          "noiseless truth residual exceeds discretization allowance");
+    CHECK(finite_scalar(wr_s.cost_final) && wr_s.cost_final > wr_t.cost_final + 1.0,
+          "injected calibration perturbation was not distinguished from noise-free truth");
+    for (bool wrong_time_sign : {true, false}) {
+      SharedCalib wrong = ct;
+      if (wrong_time_sign)
+        wrong.cams[0].td = -tr.td;
+      else
+        wrong.cams[0].q_ItoC = ov_core::Inv(tr.q_ItoC);
+      WindowSolveReport bad;
+      const bool fitted = WindowBA::solve_and_export(w0, wrong, false, bad, 30, false, nullptr, nullptr, nullptr, &evaluation);
+      const double normalized = bad.cost_final / std::max<size_t>(1, observations);
+      std::printf("[sanity negative control] reversed %s: fitted=%d cost/observation=%.6e\n",
+                  wrong_time_sign ? "td sign" : "extrinsic direction", fitted, normalized);
+      CHECK(fitted && finite_scalar(normalized) && normalized > 0.01,
+            "residual oracle did not detect reversed %s", wrong_time_sign ? "td sign" : "extrinsic direction");
+    }
   }
+  if (argc > 1 && std::string(argv[1]) == "sanity")
+    return failures == 0 ? 0 : 1;
 
   // ---------------- S2: single window, extrinsics + td only ----------------
   // Data generated with IDENTITY IMU intrinsics so the frozen dw/da/qA are consistent
@@ -323,7 +369,7 @@ int main() {
         WindowBA::solve_and_export(w, ct2, false, r2, 30, false);
         cost_truth += r2.cost_final;
       }
-      std::printf("\n[probe da] cost at FOUND=%.6e  at TRUTH=%.6e  (found<truth => real model defect)\n", cost_found, cost_truth);
+      std::printf("\n[probe da] cost at FOUND=%.6e  at TRUTH=%.6e  (a fitted noisy sample may score below truth)\n", cost_found, cost_truth);
     }
     // da / qA single-group probes are INFORMATIONAL: the accel column-3 (d13/d23/d33)
     // direction is a shallow valley against scene scale + per-window S2 gravity in the
