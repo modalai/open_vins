@@ -60,6 +60,10 @@ struct CamCalib {
   /// and a second one would only drift from it). The harvester seeds each camera's period from
   /// this so the first window's drop accounting is right instead of learned.
   double fps = 0.0;
+  /// Calibration-only isotropic reprojection standard deviation [pixels per axis].
+  /// Zero inherits WindowData::pix_sigma, preserving legacy windows and fixtures.
+  /// This is a fixed measurement weight, not an estimated calibration parameter.
+  double reprojection_sigma_px = 0.0;
   /// Declared shutter, from the chain's cam_N_shutter. A GLOBAL-shutter camera exposes every row at
   /// the same instant: it has no readout time, so tr is forced to 0 for any camera that is not
   /// rolling. There is deliberately no free-flag for tr: the readout is hardware truth, and a
@@ -267,8 +271,27 @@ struct WindowWarmState {
   Eigen::Vector3d grav = Eigen::Vector3d::Zero();
 };
 
+/// Optional physical bias-prior means, independent of a candidate's initializer.
+/// Held fixed across training candidates and held-out comparisons.
+struct WindowBiasPrior {
+  Eigen::Vector3d bg = Eigen::Vector3d::Zero();
+  Eigen::Vector3d ba = Eigen::Vector3d::Zero();
+};
+
+struct WindowEvaluationContext {
+  WindowBiasPrior bias_prior;
+  Eigen::Vector4d q_anchor{0.0, 0.0, 0.0, 1.0};
+  Eigen::Vector3d p_anchor = Eigen::Vector3d::Zero();
+  std::vector<Eigen::Matrix<double, 15, 15>> imu_sqrt_info;
+  std::vector<Eigen::Matrix<double, 15, 3>> imu_gravity_fold;
+};
+
 class WindowBA {
 public:
+  /// Construct one fixed scoring objective for all candidates of a held-out
+  /// window. Full covariance transport is evaluated at this reference once.
+  static bool make_evaluation_context(const WindowData &win, const SharedCalib &reference,
+                                      WindowEvaluationContext &context);
   /**
    * @brief Solve the window nuisances at the CURRENT calibration (calib blocks held
    *        constant), then (optionally) free them and export the reduced information.
@@ -277,18 +300,25 @@ public:
    *        value-keyed on the exact (pi, noise-pi) bytes -- a hit reuses the stored
    *        preintegration + whitener (bit-identical to recomputation), a miss
    *        refills the entry. nullptr = legacy per-call recomputation.
-   * @param state_at export-on-accept re-entry: AFTER the entry state (warm/seeds)
-   *        has pinned the reprojection transport linearization (w_clone/v_clone)
-   *        and the gauge anchors -- exactly as the evaluation that produced this
-   *        optimum did -- override the solve state to *state_at and (with
+   * @param state_at export-on-accept re-entry: AFTER constructing the same
+   *        angular-rate linearization and gauge anchors as the accepted
+   *        evaluation, override the solve state, including velocity, to *state_at and (with
    *        max_iters=0) export there. This is what makes the deferred accept-time
    *        export byte-equal to the legacy inline eval export. Pass max_iters=0
    *        with it: no inner iterations run (a Solve(0) would only pay a wasted
    *        linearization), and cost_final is NOT claimed (stays 0).
+   * @param evaluation optional fixed held-out weights and bias-prior means.
+   *        Candidate preintegration means still follow calib. This context
+   *        bypasses the persistent graph cache to preserve training weights.
+   * @param bias_prior optional physical bias-prior means, separate from the
+   *        initialization seeds. JointCalib holds these fixed while re-seeding
+   *        its nuisance states. An evaluation context takes precedence.
    */
   static bool solve_and_export(const WindowData &win, SharedCalib &calib, bool export_info, WindowSolveReport &rep,
                                int max_iters = 30, bool verbose = false, WindowWarmState *warm = nullptr,
-                               WindowPreint *pc = nullptr, const WindowWarmState *state_at = nullptr);
+                               WindowPreint *pc = nullptr, const WindowWarmState *state_at = nullptr,
+                               const WindowEvaluationContext *evaluation = nullptr,
+                               const WindowBiasPrior *bias_prior = nullptr);
 };
 
 } // namespace ov_zcalib

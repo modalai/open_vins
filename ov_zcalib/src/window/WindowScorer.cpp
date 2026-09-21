@@ -11,6 +11,7 @@
  */
 
 #include "WindowScorer.h"
+#include "utils/NumericChecks.h"
 
 #include <algorithm>
 #include <cmath>
@@ -131,17 +132,26 @@ std::vector<int> WindowScorer::thermal_bin() const {
 }
 
 std::vector<int> WindowScorer::select_logdet(const std::vector<Eigen::MatrixXd> &Lw, const std::vector<std::pair<double, double>> &spans,
-                                             int K, double overlap_penalty, double *min_eig_out) {
+                                             int K, double overlap_penalty, double *min_eig_out, Eigen::VectorXd *sigma_out) {
   std::vector<int> sel;
-  if (Lw.empty())
+  if (min_eig_out)
+    *min_eig_out = 0.0;
+  if (sigma_out)
+    sigma_out->resize(0);
+  if (Lw.empty() || spans.size() != Lw.size() || K <= 0 || !finite_scalar(overlap_penalty) || overlap_penalty < 0.0)
     return sel;
   const int np = (int)Lw[0].rows();
+  if (np <= 0)
+    return sel;
   Eigen::MatrixXd A = Eigen::MatrixXd::Identity(np, np); // whitened prior
   auto logdet = [&](const Eigen::MatrixXd &M) {
+    if (!finite_matrix(M))
+      return -1e300;
     Eigen::LLT<Eigen::MatrixXd> llt(M);
     if (llt.info() != Eigen::Success)
       return -1e300;
-    return 2.0 * llt.matrixL().toDenseMatrix().diagonal().array().log().sum();
+    const double value = 2.0 * llt.matrixL().toDenseMatrix().diagonal().array().log().sum();
+    return finite_scalar(value) ? value : -1e300;
   };
   auto overlap = [&](int a, int b) {
     const double lo = std::max(spans[a].first, spans[b].first);
@@ -150,6 +160,9 @@ std::vector<int> WindowScorer::select_logdet(const std::vector<Eigen::MatrixXd> 
     return (hi > lo && la > 0.0) ? (hi - lo) / la : 0.0;
   };
   std::vector<char> used(Lw.size(), 0);
+  for (size_t c = 0; c < Lw.size(); ++c)
+    used[c] = Lw[c].rows() != np || Lw[c].cols() != np || !finite_matrix(Lw[c]) ||
+              !finite_scalar(spans[c].first) || !finite_scalar(spans[c].second) || spans[c].second < spans[c].first;
   double base = logdet(A);
   for (int round = 0; round < K; ++round) {
     int best = -1;
@@ -160,7 +173,7 @@ std::vector<int> WindowScorer::select_logdet(const std::vector<Eigen::MatrixXd> 
       double gain = logdet(A + Lw[c]) - base;
       for (int s : sel)
         gain -= overlap_penalty * overlap((int)c, s) * std::abs(gain);
-      if (gain > best_gain) {
+      if (finite_scalar(gain) && gain > best_gain) {
         best_gain = gain;
         best = (int)c;
       }
@@ -172,9 +185,22 @@ std::vector<int> WindowScorer::select_logdet(const std::vector<Eigen::MatrixXd> 
     used[best] = 1;
     sel.push_back(best);
   }
+  if (sel.empty())
+    return sel; // a prior alone is not a selected data set or a measured sigma
   if (min_eig_out) {
     Eigen::SelfAdjointEigenSolver<Eigen::MatrixXd> eig(A);
-    *min_eig_out = eig.eigenvalues()(0);
+    if (eig.info() == Eigen::Success && finite_scalar(eig.eigenvalues()(0)))
+      *min_eig_out = eig.eigenvalues()(0);
+  }
+  if (sigma_out) {
+    // Only collection requests this. Reuse the selected information above:
+    // no extra window solves and no covariance work on the solve-time path.
+    Eigen::LLT<Eigen::MatrixXd> llt(A);
+    if (llt.info() == Eigen::Success) {
+      const Eigen::MatrixXd cov = llt.solve(Eigen::MatrixXd::Identity(np, np));
+      if (finite_matrix(cov) && (cov.diagonal().array() > 0.0).all())
+        *sigma_out = cov.diagonal().cwiseSqrt();
+    }
   }
   std::sort(sel.begin(), sel.end());
   return sel;

@@ -15,7 +15,8 @@
  *  [P5] Three-way model selection (Procrustes / homography / essential) on
  *       planar, close-3D, and far-field scenes; deterministic per seed.
  *  [P6] IMU-chain gauge port: kalibr/rpng chains must reproduce the same
- *       corrected signals up to one frame rotation (Tg conjugated, not zeroed).
+ *       corrected signals and seeded camera predictions (Tg and camera rotation
+ *       transported by the same frame map).
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -290,9 +291,14 @@ int main() {
     const Eigen::Matrix3d R_A = Eigen::Matrix3d::Identity();                                // kalibr: accel frame IS the IMU frame
 
     ImuIntrinsicModel imu;
-    imu_chain_to_calib(Dw_k, Da_k, R_G, R_A, Tg_k, imu);
+    Eigen::Matrix3d R_imu2_to_chain;
+    imu_chain_to_calib(Dw_k, Da_k, R_G, R_A, Tg_k, imu, &R_imu2_to_chain);
     const Eigen::Matrix3d Dw_r = ImuIntrinsicModel::ut(imu.dw), Da_r = ImuIntrinsicModel::ut(imu.da);
     const Eigen::Matrix3d R_AtoI = ov_core::quat_2_Rot(imu.q_AtoI);
+    const Eigen::Matrix3d R_chain_to_cam = ov_core::exp_so3(Eigen::Vector3d(0.4, -0.2, 0.7));
+    // Match the quaternion storage used by the session seed, including its round-trip.
+    const Eigen::Vector4d q_imu2_to_cam = ov_core::rot_2_quat(R_chain_to_cam * R_imu2_to_chain);
+    const Eigen::Matrix3d R_imu2_to_cam = ov_core::quat_2_Rot(q_imu2_to_cam);
 
     // Structure: ov_zcalib's matrices MUST be upper-triangular with positive scale
     CHECK(std::abs(Dw_r(1, 0)) + std::abs(Dw_r(2, 0)) + std::abs(Dw_r(2, 1)) < 1e-12, "P6: Dw not upper-triangular");
@@ -303,6 +309,7 @@ int main() {
     // rotation R (the gyro->accel frame change) on BOTH channels simultaneously.
     Eigen::Matrix3d R_frame = Eigen::Matrix3d::Zero();
     double worst_w = 0.0, worst_a = 0.0;
+    double worst_cam_w = 0.0, worst_cam_a = 0.0, naive_cam_w = 0.0, naive_cam_a = 0.0;
     for (int k = 0; k < 200; ++k) {
       const Eigen::Vector3d wm(nrm(crng), nrm(crng), nrm(crng)), am(nrm(crng), nrm(crng), 9.81 + nrm(crng));
       // Tg feeds the CORRECTED accel back into the gyro in BOTH gauges (w_hat = D*(w_m - Tg*a_hat)),
@@ -321,12 +328,24 @@ int main() {
       }
       worst_w = std::max(worst_w, (w_K - R_frame * w_R).norm());
       worst_a = std::max(worst_a, (a_K - R_frame * a_R).norm());
+      // Compare physical camera-frame signals directly with the original chain,
+      // independently of the returned frame map. Copying R_chain_to_cam unchanged
+      // is the old seed behavior and must fail this nonzero-misalignment fixture.
+      worst_cam_w = std::max(worst_cam_w, (R_chain_to_cam * w_K - R_imu2_to_cam * w_R).norm());
+      worst_cam_a = std::max(worst_cam_a, (R_chain_to_cam * a_K - R_imu2_to_cam * a_R).norm());
+      naive_cam_w = std::max(naive_cam_w, (R_chain_to_cam * (w_K - w_R)).norm());
+      naive_cam_a = std::max(naive_cam_a, (R_chain_to_cam * (a_K - a_R)).norm());
     }
     const double frame_deg = std::acos(std::min(1.0, std::max(-1.0, (R_frame.trace() - 1.0) / 2.0))) * 180.0 / M_PI;
     std::printf("[P6] chain gauge port: frame rotation %.3f deg | max |dw_hat| %.2e | max |da_hat| %.2e | R_AtoI %.3f deg\n", frame_deg,
                 worst_w, worst_a, 2.0 * imu.q_AtoI.head<3>().norm() * 180.0 / M_PI);
     CHECK(worst_w < 1e-12, "P6: gyro channel not gauge-invariant (%.2e)", worst_w);
     CHECK(worst_a < 1e-12, "P6: accel channel not gauge-invariant (%.2e)", worst_a);
+    CHECK((R_imu2_to_chain - R_frame).norm() < 1e-12, "P6: exported frame map disagrees with corrected gyro signals");
+    std::printf("[P6] seeded camera prediction: |dw_cam| %.2e |da_cam| %.2e; unchanged rotation errors %.2e rad/s, %.2e m/s^2\n",
+                worst_cam_w, worst_cam_a, naive_cam_w, naive_cam_a);
+    CHECK(worst_cam_w < 1e-12 && worst_cam_a < 1e-12, "P6: seeded camera and IMU predictions use different gauges");
+    CHECK(naive_cam_w > 1e-3 && naive_cam_a > 1e-2, "P6: fixture does not expose an unported camera rotation");
     CHECK(R_frame.transpose() * R_frame - Eigen::Matrix3d::Identity() == Eigen::Matrix3d::Zero() ||
               (R_frame.transpose() * R_frame - Eigen::Matrix3d::Identity()).norm() < 1e-10,
           "P6: recovered frame map is not a rotation");
@@ -348,13 +367,16 @@ int main() {
       Da_u << 0.9974, 0.0019, -0.0026, 0, 1.0032, 0.0035, 0, 0, 0.9951;
       const Eigen::Matrix3d R_Ac = ov_core::exp_so3(Eigen::Vector3d(0.004, -0.002, 0.006));
       ImuIntrinsicModel r;
-      imu_chain_to_calib(Dw_u, Da_u, Eigen::Matrix3d::Identity(), R_Ac, Tg_k, r);
+      Eigen::Matrix3d R_rpng_to_chain;
+      imu_chain_to_calib(Dw_u, Da_u, Eigen::Matrix3d::Identity(), R_Ac, Tg_k, r, &R_rpng_to_chain);
       const double edw = (ImuIntrinsicModel::ut(r.dw) - Dw_u).norm();
       const double eda = (ImuIntrinsicModel::ut(r.da) - Da_u).norm();
       const double eqa = (ov_core::quat_2_Rot(r.q_AtoI) - R_Ac).norm();
       const double etg = (r.Tg - Tg_k).norm(); // Q_w = I in its own gauge, so Tg passes through
       std::printf("[P6] rpng round-trip (no-op gauge): |dDw| %.2e |dDa| %.2e |dR_AtoI| %.2e |dTg| %.2e\n", edw, eda, eqa, etg);
       CHECK(edw < 1e-12 && eda < 1e-12 && eqa < 1e-12 && etg < 1e-12, "P6: rpng chain did not round-trip exactly");
+      CHECK((R_chain_to_cam * R_rpng_to_chain - R_chain_to_cam).norm() < 1e-12,
+            "P6: rpng camera seed changed despite the identity gauge map");
     }
   }
 

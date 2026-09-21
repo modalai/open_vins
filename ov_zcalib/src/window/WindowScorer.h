@@ -104,9 +104,13 @@ public:
    * @param K        max windows to select
    * @param overlap_penalty  logdet-gain multiplier per unit overlap fraction
    * @param min_eig_out  whitened min eigenvalue of I + sum(selected) (E-opt report)
+   * @param sigma_out  optional marginal standard deviations in prior-whitened
+   *        units, including correlations with the other calibration blocks.
+   *        Empty if the selected information cannot be factored.
    */
   static std::vector<int> select_logdet(const std::vector<Eigen::MatrixXd> &Lw, const std::vector<std::pair<double, double>> &spans,
-                                        int K, double overlap_penalty, double *min_eig_out);
+                                        int K, double overlap_penalty, double *min_eig_out,
+                                        Eigen::VectorXd *sigma_out = nullptr);
 
 private:
   struct Slot {

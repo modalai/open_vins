@@ -87,9 +87,9 @@ Factor_ImuAci3::Factor_ImuAci3(const AciPreintResult &meas, const ImuIntrinsicMo
 }
 
 bool Factor_ImuAci3::Evaluate(double const *const *parameters, double *residuals, double **jacobians) const {
-  // Dispatch FIRST, so the legacy body below is the LITERAL pre-tg function under the same
-  // codegen context (-ffast-math parity: in-body branching alone measurably reflowed the
-  // vectorizer and drifted a validation corpus in the 4th decimal).
+  // Keep the 24-column evaluation separate. The 15-column path also supports
+  // a fixed nonzero Tg; only its accel-bias/rotation correction differs from
+  // the historical zero-Tg arithmetic below.
   if (tg_on)
     return evaluate_tg_(parameters, residuals, jacobians);
 
@@ -119,6 +119,10 @@ bool Factor_ImuAci3::Evaluate(double const *const *parameters, double *residuals
 
   // ---- first-order corrected measurement (bias + ACI3 intrinsic columns) ----
   Eigen::Vector3d th_corr = m.J_q * dbw + m.Jq_pi * dpi;
+  // The calibration switch controls parameter columns, not the physical
+  // correction: even a fixed Tg sends accel-bias changes into angular rate.
+  if (!tg_lin.isZero())
+    th_corr.noalias() += m.H_q * dba;
   Eigen::Vector4d q_b;
   q_b.head<3>() = 0.5 * th_corr;
   q_b(3) = 1.0;
@@ -152,6 +156,8 @@ bool Factor_ImuAci3::Evaluate(double const *const *parameters, double *residuals
                            q_1_to_2.head<3>() * q_meas_plus.head<3>().transpose());
   Jc.block<3, 3>(0, 15) = q_res_plus(3) * eye + ov_core::skew_x(q_res_plus.head<3>());
   Jc.block<3, 3>(0, 3) = Lq * m.J_q;
+  if (!tg_lin.isZero())
+    Jc.block<3, 3>(0, 9) = Lq * m.H_q;
   Jc.block<3, 3>(3, 3) = -eye;
   Jc.block<3, 3>(3, 18) = eye;
   Jc.block<3, 3>(6, 0) = ov_core::skew_x(R_1 * (v_2 - v_1 + gravity * m.dt));
@@ -215,10 +221,9 @@ bool Factor_ImuAci3::Evaluate(double const *const *parameters, double *residuals
 }
 
 // ---- Tg-enabled evaluation (n_pi = 24; parameter block [14] = tg9 in Matrix3d storage order).
-// A SEPARATE function on purpose: the legacy body above must keep its exact emitted code (see the
-// dispatch note), and this path is new arithmetic with no parity contract to honor. Structure
-// mirrors the legacy body with dpi widened to 24 and the Tg-induced ba->rotation coupling (H_q)
-// applied to the theta correction and its ba-block Jacobian.
+// A separate function keeps the 24-column arithmetic independent of the fixed-Tg path.
+// Structure mirrors the 15-column body with dpi widened to 24; both apply the
+// Tg-induced ba->rotation coupling (H_q) when the physical model carries it.
 bool Factor_ImuAci3::evaluate_tg_(double const *const *parameters, double *residuals, double **jacobians) const {
 
   // ---- states ----

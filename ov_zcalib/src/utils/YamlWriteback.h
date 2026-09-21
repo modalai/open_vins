@@ -3,7 +3,7 @@
  * Copyright (C) 2025-2026 Joao Leonardo Silva Cotta
  *
  * ov_zcalib: calibration writeback (kalibr-chain fields consumed by the VOXL
- * config sync). Atomic write: temp file + rename; the caller keeps a rollback.
+ * config sync). Checked atomic write; optional rollback keeps the previous inode.
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -16,6 +16,8 @@
 
 #include <cstdio>
 #include <string>
+
+#include "AtomicFile.h"
 
 #include "../solve/WindowBA.h"
 #include "utils/quat_ops.h"
@@ -33,7 +35,7 @@ namespace ov_zcalib {
  */
 inline bool write_calib_yaml(const std::string &path, SharedCalib &c, const std::vector<double> &mean_exposure_s = {},
                              const std::vector<std::string> *committed = nullptr,
-                             const std::vector<std::string> *at_seed = nullptr) {
+                             const std::vector<std::string> *at_seed = nullptr, bool keep_rollback = false) {
   const std::string tmp = path + ".tmp";
   FILE *f = std::fopen(tmp.c_str(), "w");
   if (!f)
@@ -95,8 +97,7 @@ inline bool write_calib_yaml(const std::string &path, SharedCalib &c, const std:
     list("committed_blocks", committed);
     list("seed_blocks", at_seed);
   }
-  std::fclose(f);
-  return std::rename(tmp.c_str(), path.c_str()) == 0;
+  return finish_atomic_file(f, tmp, path, keep_rollback ? path + ".rollback" : std::string());
 }
 
 } // namespace ov_zcalib

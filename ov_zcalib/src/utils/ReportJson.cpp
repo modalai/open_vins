@@ -6,6 +6,7 @@
  */
 
 #include "utils/ReportJson.h"
+#include "utils/AtomicFile.h"
 
 #include <cerrno>
 #include <cmath>
@@ -369,6 +370,12 @@ void emit_bootstrap(std::string &o, const SessionReport &rep) {
     emit_vec(o, h.q_ItoC.data(), 4);
     j.key("bg");
     emit_vec(o, h.bg.data(), 3);
+    j.s("bg_status", handeye_bias_status_name(h.bg_status));
+    if (h.bg_status == HandEyeBiasStatus::ESTIMATED || h.bg_status == HandEyeBiasStatus::SANITY_FALLBACK) {
+      j.n("bg_initial_delta_norm", h.bg_initial_delta_norm);
+      j.n("bg_sanity_limit", h.bg_sanity_limit);
+      j.s("bg_diagnostic_frame", "corrected_imu");
+    }
     if (i < rep.xcorr.size()) {
       const TimeOffsetResult &x = rep.xcorr[i];
       j.key("xcorr");
@@ -453,10 +460,13 @@ void emit_meta(std::string &o, const ReportMeta &m, const SessionReport &rep) {
   s.s_opt("config_path", m.config_path);
   s.s_opt("out_yaml", m.out_yaml);
   s.s_opt("record_path", m.record_path);
+  s.n("gravity_mag", rep.committed.grav_mag);
+  s.s_opt("gravity_source", m.gravity_source);
   s.s_opt("started_utc", m.started_utc);
   if (m.cam_mode >= 0)
     s.i("cam_mode", m.cam_mode);
   s.n("t_solve_s", rep.t_solve_s);
+  s.n_opt("solve_budget_s", m.solve_budget_s, -1.0);
   s.n("t_verify_s", rep.t_verify_s);
   s.n("t_total_s", rep.t_total_s);
   s.n_opt("span_collect_s", m.span_collect_s, -1.0);
@@ -503,6 +513,14 @@ void emit_cameras(std::string &o, const ReportMeta &m, const SessionReport &rep)
       j.b("rolling", k.rolling);
       j.n("t_readout", k.tr);
       j.b("fisheye", k.fisheye);
+      // The runner captures the actual scalar fallback too (including custom library callers).
+      // A manually constructed report without that metadata must not invent a 1px measurement.
+      const double pixel_sigma = i < rep.camera_pixel_sigmas.size()
+                                     ? rep.camera_pixel_sigmas[i]
+                                     : (k.reprojection_sigma_px > 0.0 ? k.reprojection_sigma_px
+                                                                     : std::numeric_limits<double>::quiet_NaN());
+      j.n("reprojection_sigma_px", pixel_sigma);
+      j.b("reprojection_sigma_uses_window_default", k.reprojection_sigma_px == 0.0);
     }
     if (i < rep.mean_exposure_s.size())
       j.n("mean_exposure_s", rep.mean_exposure_s[i]);
@@ -610,6 +628,7 @@ std::string report_to_json(const SessionReport &rep, const ReportMeta &meta) {
     {
       Obj a(o);
       a.s("verdict", accel_verdict_name(rep.a_wald_verdict));
+      a.s("verdict_semantics", "configured_policy_certification");
       a.b("full_open", rep.a_full_open);
       a.n("att_spread_deg", rep.accel_att_spread_deg);
       a.n("dyn_ms2", rep.accel_dyn_ms2);
@@ -617,6 +636,7 @@ std::string report_to_json(const SessionReport &rep, const ReportMeta &meta) {
       {
         Obj w(o);
         w.i("r", rep.a_wald_r);
+        w.s("r_semantics", "directions_above_configured_information_floor");
         w.n("T", rep.a_wald_T);
         w.i("df", rep.a_wald_df);
         w.n("kappa", rep.a_wald_kappa);
@@ -639,6 +659,7 @@ std::string report_to_json(const SessionReport &rep, const ReportMeta &meta) {
     {
       Obj t(o);
       t.s("verdict", accel_verdict_name(rep.tg_gate_verdict));
+      t.s("verdict_semantics", "configured_policy_certification");
       t.b("open", rep.tg_open);
       t.n("conditional_sigma", rep.tg_conditional_sigma);
       t.close();
@@ -657,6 +678,12 @@ std::string report_to_json(const SessionReport &rep, const ReportMeta &meta) {
   {
     Obj p(o);
     p.b("ok", rep.joint.ok);
+    p.s("sigma_semantics", "local_curvature_precision");
+    p.b("coverage_calibrated", false);
+    // The gate's kappa applies to its tested accel-chain subspace. It is not
+    // a measured coverage correction for this full posterior (or for td).
+    p.key("coverage_kappa");
+    o += "null";
     p.i("dim_p", rep.joint.dim_p);
     p.i("windows_used", rep.joint.windows_used);
     p.i("windows_dead", rep.joint.windows_dead);
@@ -699,6 +726,11 @@ std::string report_to_json(const SessionReport &rep, const ReportMeta &meta) {
   root.key("verify");
   {
     Obj v(o);
+    v.s("objective", "joint_window_cost");
+    v.s("weight_reference", "post_bootstrap_fixed_full_covariance");
+    v.s("bias_prior_reference", "harvested_window");
+    v.s("temporal_velocity_reference", "optimized_window_velocity");
+    v.s("inner_fit", "iteration_bounded_not_stationarity_certified");
     v.n("holdout_cost_seed", rep.holdout_cost_seed);
     v.n("holdout_cost_committed", rep.holdout_cost_committed);
     v.n("holdout_cost_mixture", rep.holdout_cost_mixture);
@@ -768,30 +800,37 @@ std::string report_to_json(const SessionReport &rep, const ReportMeta &meta) {
   return o;
 }
 
-bool write_report_json(const std::string &path, const SessionReport &rep, const ReportMeta &meta) {
+bool write_report_json(const std::string &path, const SessionReport &rep, const ReportMeta &meta, std::string *error) {
+  if (error)
+    error->clear();
   const std::string body = report_to_json(rep, meta);
+  auto fail = [&](const std::string &operation, int saved_errno) {
+    if (!saved_errno)
+      saved_errno = EIO;
+    const std::string message = operation + ": " + std::strerror(saved_errno);
+    if (error)
+      *error = message;
+    std::fprintf(stderr, "[calib] ERROR: %s\n", message.c_str());
+    errno = saved_errno;
+    return false;
+  };
 
   // Atomic: a reader (the portal polls this directory) must never see a
   // half-written report. Same tmp+rename discipline as the result YAML.
   const std::string tmp = path + ".tmp";
   FILE *f = std::fopen(tmp.c_str(), "wb");
-  if (f == nullptr) {
-    std::fprintf(stderr, "[calib] WARNING: cannot open %s: %s\n", tmp.c_str(), std::strerror(errno));
-    return false;
-  }
+  if (f == nullptr)
+    return fail("cannot open report " + tmp, errno);
+  errno = 0;
   const size_t n = std::fwrite(body.data(), 1, body.size(), f);
-  const bool short_write = (n != body.size());
-  if (std::fclose(f) != 0 || short_write) {
-    std::fprintf(stderr, "[calib] WARNING: short write on %s\n", tmp.c_str());
+  if (n != body.size()) {
+    const int saved_errno = errno;
+    std::fclose(f);
     std::remove(tmp.c_str());
-    return false;
+    return fail("cannot write report " + tmp + " (" + std::to_string(n) + "/" + std::to_string(body.size()) + " bytes)", saved_errno);
   }
-  if (std::rename(tmp.c_str(), path.c_str()) != 0) {
-    std::fprintf(stderr, "[calib] WARNING: cannot rename %s -> %s: %s\n", tmp.c_str(), path.c_str(),
-                 std::strerror(errno));
-    std::remove(tmp.c_str());
-    return false;
-  }
+  if (!finish_atomic_file(f, tmp, path))
+    return fail("cannot finalize report " + path, errno);
   return true;
 }
 

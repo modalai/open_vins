@@ -86,7 +86,9 @@ struct SessionConfig {
   double collect_max_s = 240.0;
   /// EARLY CUTOVER (live sessions): stop collecting as soon as the reservoir's
   /// D-optimal selection reaches this whitened min-eigenvalue AND holds enough
-  /// windows to fuse + verify. 0 = disabled (collect the whole budget).
+  /// windows to fuse + verify. Estimated Tg must also reach its marginal
+  /// precision target; a generic min-eigenvalue of 5 does not certify Tg's
+  /// absolute ceiling. 0 = disabled (collect the whole budget).
   ///
   /// Why an eigenvalue and not a window count: the weakest direction is what
   /// gates committability, and 20 near-duplicate windows can leave it as bare as
@@ -117,11 +119,13 @@ struct SessionConfig {
   /// Session-wide SOLVE budget [s] (0 = unlimited). One deadline shared by
   /// EVERY staged JointCalib call (A0/A1a/split-halves/A1b/B passes): each call
   /// receives the remaining time as its max_wall_s; exhausted stages are skipped.
-  /// JointCalib stops between complete evaluation passes, so the final pass
-  /// can overrun the deadline. Truncated half-solves never certify a gate. The
+  /// JointCalib reserves measured pass time and cancels incomplete candidates
+  /// between window operations, preserving its last complete posterior.
+  /// Indivisible factorizations and scheduling delays remain a soft-bound
+  /// limitation. Truncated half-solves never certify a gate. The
   /// per-call joint.max_wall_s remains available but is overridden when this
   /// is set -- staging multiplied the call count, so only a shared deadline
-  /// bounds the session (flight profiles set this to meet the <=60 s target).
+  /// applies the requested solve budget to the whole session.
   double solve_budget_s = 0.0;
   /// 0 fixed | 1 refine (tight priors from the existing cal -- the default)
   /// | 2 full (weak priors; gated, loud). Intrinsics unlock only in
@@ -200,13 +204,11 @@ struct SessionConfig {
                                       ///< the accuracy CLAIM (~0.3%); tighter floors freeze chains whose halves
                                       ///< agree 8x better than the suite's own documented da valley tolerance
   double a_split_qa_floor_deg = 0.1;  ///< band floor for the q_AtoI angle
-  /// Band floor for tg dofs [(rad/s)/(m/s^2)]: agreement is demanded at the scale of the accuracy
-  /// CLAIM -- the a_split_da_floor doctrine -- i.e. 0.3x the measured 4e-4 part class (~0.22
-  /// dps/g), the per-element bound the recovery gate and the commit ceiling ship. A floor below
-  /// the claim lets the falsifier's own noise adjudicate: on a synthetic with a real part-class
-  /// Tg the halves' worst |d| held at 1.1-1.2e-4 across window budgets -- inside the claim, yet
-  /// refused by a 1e-4 floor. Kalibr's BETWEEN-session scatter (+/-5e-4) stays 4x above this
-  /// floor: scatter-class junk still refuses.
+  /// Absolute split-half difference floor for Tg [(rad/s)/(m/s^2)]. Historical
+  /// policy (commit 3e95384): 0.3 times a 4e-4 ICM reference scale, supported by
+  /// synthetic half differences around 1.1-1.2e-4. This is not a BMI270 accuracy
+  /// validation. A difference floor and a one-sigma posterior ceiling describe
+  /// different statistics even when their numeric values happen to match.
   double a_split_tg_floor = 1.2e-4;
   /// Signal-fraction term of the agreement band: halves also agree when their
   /// disagreement is below this fraction of the SIGNAL they claim (deviation
@@ -223,15 +225,13 @@ struct SessionConfig {
   // constraint.
   int a_gate_mode = 0;           ///< 0 split-half decides (legacy-exact); 1 wald decides; 2 shadow (split decides, wald logged)
   double a_info_deflate = 2.0;   ///< kappa: measured exported-Lambda under-dispersion, VARIANCE semantics (MC harness re-pins per shape)
-  double a_obs_min_eig = 4.5;    ///< per-half prior-whitened eigenvalue floor along joint eigendirections
+  double a_obs_min_eig = 4.5;    ///< per-half prior-whitened eigenvalue floor over the entire tested span, after kappa deflation
   double a_wald_thresh_scale = 1.0;
-  double a_qa_phys_ceiling_deg = 2.0;  ///< fused-step ceiling (vs 0.776 deg die misalignment + ICM cross-axis spec class)
+  double a_qa_phys_ceiling_deg = 2.0;  ///< historical fused-step guard relative to entry; not an absolute sensor limit
   double a_da_off_phys_ceiling = 0.02;
-  /// Fused-step ceiling for tg elements. ANCHORED TO THE MEASURED PART CLASS, not the datasheet
-  /// typ: the reference chain carries |Tg| ~ 4e-4 (0.22 dps/g) and kalibr's own per-session
-  /// estimates scatter +/-5e-4 -- a blind (zero-seeded) session recovering the REAL value implies
-  /// a fused step of ~4-6e-4, which a 5e-4 ceiling refuses as "unphysical" (measured: a flight
-  /// log refused at 5.9e-4). 3x the part class = 1.5e-3: junk basins still hit it, physics does not.
+  /// Historical fused-step guard for Tg elements relative to the entry value,
+  /// motivated by an ICM reference chain and between-session scatter. This is
+  /// an acceptance heuristic, not an absolute physical bound for every IMU.
   double a_tg_phys_ceiling = 1.5e-3;
   // Identifiability gates (diagnostics with AUTHORITY)
   double xcorr_min_peak = 0.6;      ///< normalized xcorr peak floor: a flat correlation ridge
@@ -239,7 +239,7 @@ struct SessionConfig {
   double xcorr_min_sharpness = 0.0; ///< curvature floor at the xcorr peak (0 = off; grid-scale dependent)
   double min_eig_floor = 1.0;       ///< whitened min-eig ABORT floor on the selected window set
                                     ///< (catastrophic-only: committability needs ~(commit_sigma_factor)^2 per dof)
-  double min_window_parallax = 0.0; ///< admission floor on the fingerprint median parallax [px]
+  double min_window_parallax = 0.0; ///< admission floor on median first-to-last bearing angle [rad]
                                     ///< (0 = off; enable on bench data -- far-field/translation-free guard)
   // VERIFY / COMMIT
   double verify_min_improve = 0.05;  ///< held-out cost must improve by >= 5%
@@ -269,10 +269,11 @@ struct SessionConfig {
   /// Absolute posterior ceilings [local units] per block: commit additionally
   /// requires sigma_post <= ceiling on every non-frozen dof. This ties the
   /// commit rule to the acceptance targets (the 3x-prior rule alone admits
-  /// sigmas 3-5x looser than the flight acceptance numbers). tg's ceiling is the
-  /// CLAIM scale -- 0.3x the measured 4e-4 part class, the same 1.2e-4 the split
-  /// floor demands agreement at (a_split_tg_floor doctrine): a pair certified at
-  /// claim-scale agreement must not then be refused for claim-scale precision.
+  /// sigmas 3-5x looser than the historical flight acceptance numbers). Tg's
+  /// 1.2e-4 ceiling has the ICM/synthetic provenance above; it is a local one-sigma
+  /// precision policy, not an empirically calibrated accuracy interval or a
+  /// BMI270-specific limit. Passing the split-half floor does not imply passing
+  /// this separate precision test.
   std::map<std::string, double> commit_abs_ceiling = {{"q_ItoC", 1.7e-3}, {"p_IinC", 2.5e-3}, {"td", 2.5e-4}, {"tg", 1.2e-4}};
   /// q_ItoC and td commit/revert TOGETHER: they move jointly in the solve, and
   /// a mixed state (new rotation, seed td) can be worse than either endpoint.
@@ -331,6 +332,7 @@ struct StageEvidence {
   int accepted = 0;
   int windows = 0, dim_p = 0;
   double wall_s = 0, seed_s = 0, preint_s = 0, inner_s = 0, export_s = 0;
+  double max_pass_s = 0.0; ///< observed cost used to admit later staged passes
   long iters = 0, warm = 0, cold = 0, cold_plateau = 0, cold_anchor = 0, cold_won = 0, cold_won_guard = 0;
   long cold_cert = 0, cold_jump = 0; ///< certificate / carry-jump duels
   long phit = 0, pmiss = 0;   ///< preint-cache hits / misses (window solves)
@@ -378,6 +380,8 @@ struct SessionReport {
   bool a_full_open = false;          ///< full accel chain (da off-diag + q_AtoI) unlocked
   // Wald gate verdict + statistics (modes 1/2; PRE_CLOSED when the cheap
   // pre-gate never admitted the question)
+  // WALD_UNOBSERVABLE is the legacy wire name for failure to certify under
+  // configured information/numerical/budget checks, not a proof of algebraic rank loss.
   enum class AccelGateVerdict { PRE_CLOSED, SPLIT_CONSISTENT, SPLIT_INCONSISTENT, SPLIT_FAILED, WALD_CONSISTENT, WALD_INCONSISTENT, WALD_UNOBSERVABLE, PRECISION_WEAK };
   AccelGateVerdict a_wald_verdict = AccelGateVerdict::PRE_CLOSED;
   /// tg's OWN gate verdict. Mode 1: the wald tg-subspace judge (runs only when the chain
@@ -389,7 +393,7 @@ struct SessionReport {
   AccelGateVerdict tg_gate_verdict = AccelGateVerdict::PRE_CLOSED;
   double tg_conditional_sigma = 0.0; ///< optimistic A1a Tg sigma before the full-chain split solves
   bool tg_open = false; ///< tg unlocked WITH the chain and survived A1b (the commit machinery still gates the block)
-  int a_wald_r = 0;                  ///< observable gate-subspace dimension (of 6)
+  int a_wald_r = 0;                  ///< pooled-basis candidate dimension (of 6); the whole-span floor is also required
   double a_wald_T = 0.0;             ///< correlated Wald statistic (chi^2_r under H0)
   double a_wald_x12 = 0.0, a_wald_x21 = 0.0; ///< cross-prediction excesses
   /// Cross-prediction thresholds AT THE RUN CONFIG. X12/X21 are kappa-free, but their
@@ -400,7 +404,7 @@ struct SessionReport {
   /// Fused-step physical magnitudes (the phys-ceiling inputs). Config-invariant across
   /// (kappa, thresh_scale): the offline re-sizer needs them to replay the ceiling branch.
   double a_wald_jqa_deg = 0.0, a_wald_jda = 0.0;
-  double a_wald_min_eig = 0.0;       ///< min-half whitened eig along the weakest joint direction
+  double a_wald_min_eig = 0.0;       ///< min-half whitened information bound used by the gate, after kappa deflation
   double a_wald_dqa_deg = 0.0;       ///< implied half-disagreement rotation angle
   double a_wald_dda_off = 0.0;       ///< implied half-disagreement max |da_offdiag|
   double a_wald_kappa = 0.0;         ///< per-session dispersion estimate (quarter-scatter method of moments)
@@ -412,14 +416,17 @@ struct SessionReport {
   double verify_improve = 0.0;
   double holdout_cost_mixture = 0.0; ///< cost of the partially-committed mixture (== committed when nothing reverted)
   double mixture_improve = 0.0;
-  int verify_windows_used = 0;    ///< holdout windows where EVERY candidate solved
-  int verify_windows_dropped = 0; ///< holdout windows dropped symmetrically (any candidate failed)
+  int verify_windows_used = 0;    ///< holdout windows where seed/solution/mixture solved
+  int verify_windows_dropped = 0; ///< paired windows dropped for a required candidate failure
   /// Session-mean camera exposure [s], PER CAMERA -- DIAGNOSTIC ONLY. Frame timestamps arrive
   /// already anchored at center-row mid-exposure (the producer applies SOF + (readout+exposure)/2
   /// at ingest), so the committed td needs NO exposure conversion for any consumer: every stamp in
   /// the system is in the same convention. Kept in the report/YAML because the session's exposure
   /// range is real evidence about the record (AE behavior, lighting).
   std::vector<double> mean_exposure_s;
+  /// Effective reprojection measurement standard deviations [px], PER CAMERA. Resolved once
+  /// from camera overrides or the harvester's scalar fallback; these are weights, not accuracy.
+  std::vector<double> camera_pixel_sigmas;
   // timings (wall clock)
   double t_solve_s = 0.0, t_verify_s = 0.0, t_total_s = 0.0;
   // commit
@@ -441,6 +448,9 @@ public:
 
   /// End of stream: run SOLVE_REFINE -> VERIFY -> COMMIT. Returns final report.
   const SessionReport &finish();
+
+  /// Stop before solving/publishing when the source or mandatory record failed.
+  void abort(const std::string &reason) { enter_(RunnerState::ABORT, reason.c_str()); }
 
   RunnerState state() const { return state_; }
   const SessionReport &report() const { return rep_; }
@@ -470,9 +480,11 @@ public:
   struct CollectStatus {
     int n_retained = 0;   ///< windows in the reservoir
     int n_holdout = 0;    ///< of those, reserved for VERIFY
-    int n_fusable = 0;    ///< of those, with a valid export (the solve's candidates)
+    int n_fusable = 0;    ///< valid exports in the solve's eligible thermal bin
     double min_eig = 0.0; ///< whitened min-eig of the D-optimal selection over them
-    bool ready = false;   ///< enough windows AND min_eig >= cfg.collect_min_eig
+    double tg_sigma = -1.0; ///< worst marginal Tg sigma; -1 = unavailable
+    double tg_sigma_target = 0.0; ///< precision needed for early cutover; 0 = Tg not estimated
+    bool ready = false;   ///< enough windows, min-eig target AND estimated-Tg precision
   };
   CollectStatus collect_status();
   /// Per-block seed patches for a replay: which blocks start from the rig's own
@@ -501,9 +513,13 @@ public:
                          const SeedOverride *seed_override = nullptr);
 
 private:
+  friend struct CalibCollectionTestAccess; ///< deterministic information-only collection regressions
   void enter_(RunnerState s, const char *why);
   void try_bootstrap_(double now);
   void handle_window_(WindowData &&w, const WindowMeta &m);
+  /// One eligibility rule for collection screens, prompts and the final D-optimal solve pool.
+  std::vector<int> retained_solve_candidates_();
+  void refresh_collection_guidance_();
   void solve_verify_commit_();
   double temp_slope_() const;
   void note_stage_(const std::string &label, const JointReport &r);

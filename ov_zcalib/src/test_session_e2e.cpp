@@ -26,11 +26,14 @@
 
 #include <cstdio>
 #include <cstring>
+#include <cerrno>
 #include <thread>
 
 #include "core/CalibSessionRunner.h"
 #include "sim/SynthWorld.h"
+#include "utils/YamlWriteback.h"
 
+#include <sys/stat.h>
 #include <unistd.h>
 
 using namespace ov_zcalib;
@@ -231,6 +234,48 @@ int main(int argc, char **argv) {
   };
   const bool s2 = want("S2");
   const bool s1 = want("S1") || s2;
+  const bool s5 = want("S5");
+  const bool s6 = want("S6");
+
+  if (want("IO")) {
+    char directory[] = "/tmp/ov_zcalib_yaml_io.XXXXXX";
+    CHECK(::mkdtemp(directory) != nullptr, "IO: temporary directory failed");
+    const std::string path = std::string(directory) + "/result.yaml";
+    const std::string temporary = path + ".tmp", backup = path + ".rollback";
+    auto write_text = [&](const std::string &file, const char *text) {
+      FILE *f = std::fopen(file.c_str(), "wb");
+      CHECK(f != nullptr, "IO: fixture open failed");
+      if (f) {
+        CHECK(std::fputs(text, f) >= 0, "IO: fixture write failed");
+        CHECK(std::fclose(f) == 0, "IO: fixture close failed");
+      }
+    };
+    SharedCalib calibration;
+    write_text(path, "previous valid calibration\n");
+    write_text(backup, "older rollback\n");
+    CHECK(::symlink("/dev/full", temporary.c_str()) == 0, "IO: /dev/full fixture failed");
+    errno = 0;
+    CHECK(!write_calib_yaml(path, calibration, {}, nullptr, nullptr, true) && errno == ENOSPC,
+          "IO: buffered ENOSPC was reported as a successful write");
+    CHECK(slurp(path) == "previous valid calibration\n" && slurp(backup) == "older rollback\n",
+          "IO: failed write replaced previous result or rollback");
+    CHECK(::access(temporary.c_str(), F_OK) != 0, "IO: failed temporary file was not removed");
+    CHECK(!write_calib_yaml(std::string(directory) + "/absent/result.yaml", calibration),
+          "IO: nonexistent output directory accepted");
+    CHECK(write_calib_yaml(path, calibration, {}, nullptr, nullptr, true), "IO: valid atomic replacement failed");
+    CHECK(slurp(path).find("num_cameras: 1\n") != std::string::npos && slurp(backup) == "previous valid calibration\n",
+          "IO: successful replacement lost content or prior calibration");
+    const std::string good = slurp(path);
+    CHECK(::unlink(backup.c_str()) == 0 && ::mkdir(backup.c_str(), 0700) == 0, "IO: rollback-failure fixture failed");
+    CHECK(!write_calib_yaml(path, calibration, {}, nullptr, nullptr, true) && slurp(path) == good,
+          "IO: backup failure removed the live calibration");
+    CHECK(::access(temporary.c_str(), F_OK) != 0 && ::access((backup + ".tmp").c_str(), F_OK) != 0,
+          "IO: backup failure leaked temporary files");
+    ::rmdir(backup.c_str());
+    ::unlink(path.c_str());
+    ::rmdir(directory);
+    std::printf("[IO] YAML save detects buffered ENOSPC and preserves prior files on failure\n");
+  }
 
   synth::Truth tr = synth::make_truth();
   const std::string rec = tmp_file("ov_zcalib_session_e2e.bin");
@@ -255,7 +300,7 @@ int main(int argc, char **argv) {
   // shape REFUSES under the arbiter's split-half judge (its per-half qA basin is
   // wider than the agreement band) -- that refusal world is tg_e2e's T2/T3 territory;
   // S1 must be the certify world.
-  if (s1)
+  if (s1 || s5 || s6)
     write_session_record(tr, rec, 120.0, 6.0, 118.0, 4242, false, nullptr, 0.35);
 
   // ---------------- S1: full session, replay path ----------------
@@ -413,6 +458,82 @@ int main(int argc, char **argv) {
     const double rotation_limit = perturb_tangent ? 0.30 : 0.25;
     CHECK(er_c < rotation_limit && et_c < 0.30, "S4: temporal/ext degraded under cam unlock (%.3f deg, %.3f ms)", er_c, et_c);
     std::remove(rec_cam.c_str());
+  }
+
+  for (bool output_failure : {false, true}) {
+    if (!(output_failure ? s6 : s5))
+      continue;
+    // Deterministic deadline: A0 runs normally; every later joint call sees
+    // an expired clock. This must preserve the complete A0 posterior and
+    // freeze the unestimated IMU chain, rather than aborting or reusing A0
+    // sigmas under A1a's larger parameter layout.
+    SessionRecordReader rd;
+    CHECK(rd.open(rec), "S5: record open failed");
+    const SessionSeed seed = rd.seed();
+    SessionConfig limited = cfg;
+    limited.cam_mode = 1;
+    limited.joint.max_wall_s = 1e6;
+    limited.joint.num_threads = 1;
+    const std::string io_output = tmp_file("ov_zcalib_session_io.yaml");
+    if (output_failure) {
+      limited.out_yaml = io_output;
+      FILE *previous = std::fopen(io_output.c_str(), "wb");
+      CHECK(previous != nullptr, "S6: previous output fixture failed");
+      if (previous) {
+        CHECK(std::fputs("previous valid calibration\n", previous) >= 0 && std::fclose(previous) == 0,
+              "S6: previous output fixture write failed");
+      }
+      CHECK(::symlink("/dev/full", (io_output + ".tmp").c_str()) == 0, "S6: /dev/full fixture failed");
+    }
+    CalibSessionRunner *live = nullptr;
+    limited.joint.budget_clock = [&]() {
+      if (live)
+        for (const auto &stage : live->report().evidence)
+          if (stage.label == "A0-ext-td")
+            return 1e6;
+      return 0.0;
+    };
+    CalibSessionRunner runner(limited, seed);
+    live = &runner;
+    bool is_imu = false;
+    RawImu imu;
+    FrameObs frame;
+    while (rd.next(is_imu, imu, frame)) {
+      if (is_imu)
+        runner.feed_imu(imu);
+      else
+        runner.feed_frame(frame);
+    }
+    const SessionReport &result = runner.finish();
+    SharedCalib solved_layout = result.solved;
+    if (output_failure) {
+      CHECK(result.final_state == RunnerState::ABORT && result.abort_reason.find("calibration YAML write failed") != std::string::npos,
+            "S6: failed output reported success (%s)", result.abort_reason.c_str());
+      bool committed = false;
+      for (const auto &block : result.blocks)
+        committed = committed || block.committed;
+      CHECK(!committed && !result.blocks.empty(), "S6: failed output still claims committed blocks");
+      CHECK(slurp(io_output) == "previous valid calibration\n", "S6: failed output destroyed previous result");
+      ::unlink((io_output + ".tmp").c_str());
+      ::unlink(io_output.c_str());
+      std::printf("[S6] output failure aborts a verified solve without publishing committed blocks\n");
+    } else {
+      CHECK(result.final_state == RunnerState::DONE, "S5: lost completed A0 under A1a deadline (%s)", result.abort_reason.c_str());
+    }
+    CHECK(result.joint.ok && result.joint.sigma.size() == solved_layout.local_dim(),
+          "S5: A0 posterior/layout mismatch after A1a deadline");
+    CHECK(!result.solved.imu.calib_dw && !result.solved.imu.calib_da && !result.solved.imu.calib_RAtoI &&
+              !result.solved.imu.calib_tg && !result.a_full_open && !result.tg_open,
+          "S5: skipped IMU stage opened unestimated blocks");
+    bool skipped_a1a = false, skipped_b = false;
+    for (const auto &stage : result.evidence) {
+      if (stage.label == "A1a-dw-dadiag")
+        skipped_a1a = stage.hit_budget && stage.passes == 0;
+      if (stage.label == "B2-polish")
+        skipped_b = stage.hit_budget && stage.passes == 0;
+    }
+    CHECK(skipped_a1a && skipped_b, "S5: missing truthful skipped-stage evidence");
+    std::printf("[S5] A1a/B deadline preserves A0 posterior and freezes unestimated IMU blocks\n");
   }
 
   std::remove(rec.c_str());

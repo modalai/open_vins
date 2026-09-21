@@ -34,6 +34,7 @@ struct ReportMeta {
   std::string config_path; ///< the calibrator profile consumed
   std::string out_yaml;    ///< where the result landed
   std::string record_path; ///< session record mirror ("" if disabled)
+  std::string gravity_source; ///< "estimator_yaml" | "calibration_profile" | "session_record"
   int cam_mode = -1;
 
   // ---- per-camera identity (index == sensor id) ----
@@ -64,6 +65,9 @@ struct ReportMeta {
   long long ordering_gate_benign = -1; ///< late/bogus frames the solver must not see
   double span_collect_s = -1.0;
   double span_preboot_s = -1.0;
+  /// Configured solver wall limit only; 0 unlimited, -1 not supplied by caller.
+  /// Collection and held-out verification have separate durations.
+  double solve_budget_s = -1.0;
 };
 
 /// Serialize a finished session; non-finite doubles become null.
@@ -71,8 +75,10 @@ std::string report_to_json(const SessionReport &rep, const ReportMeta &meta);
 
 /// Write report_to_json() to `path` atomically (tmp + rename), so a reader can
 /// never observe a half-written report. Returns false on I/O failure; the
-/// caller should warn, not abort -- this file is evidence, not the result.
-bool write_report_json(const std::string &path, const SessionReport &rep, const ReportMeta &meta);
+/// caller must report incomplete output, not successful persistence. When supplied,
+/// error receives the failed operation/path and OS error; errno is preserved.
+bool write_report_json(const std::string &path, const SessionReport &rep, const ReportMeta &meta,
+                       std::string *error = nullptr);
 
 /// Human-readable name of an accel-gate verdict, as it appears in the JSON and
 /// in any UI that renders it.

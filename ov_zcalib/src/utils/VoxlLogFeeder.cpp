@@ -187,7 +187,8 @@ bool VoxlLogFeeder::convert(const std::string &log_dir, const std::string &cam_p
       s.wm = imu[ii].w;
       s.am = imu[ii].a;
       s.temp_c = imu[ii].temp;
-      wr.write_imu(s);
+      if (!wr.write_imu(s))
+        return false;
       ++ii;
     }
     std::snprintf(png, sizeof(png), "/%05d.png", cf.idx);
@@ -217,11 +218,13 @@ bool VoxlLogFeeder::convert(const std::string &log_dir, const std::string &cam_p
       p.v = kps[i].pt.y;
       fo.pts.push_back(p);
     }
-    wr.write_frame(fo);
+    if (!wr.write_frame(fo))
+      return false;
     exp_sum += cf.exposure_s;
     ++written;
   }
-  wr.close();
+  if (!wr.close())
+    return false;
   if (mean_exposure_s)
     *mean_exposure_s = (written > 0) ? exp_sum / written : 0.0;
   std::printf("[voxl] wrote %d frames / %.1f s to %s (mean exposure %.3f ms)\n", written, (cams.back().t - t0), record_out.c_str(),

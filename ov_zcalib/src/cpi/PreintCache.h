@@ -14,8 +14,8 @@
  * same p, across passes in frozen-pi stages, and across STAGES whose entry pi
  * bytes match -- keyed by VALUE, never by pass index or stage name.
  *
- * KEY DISCIPLINE: bitwise equality (memcmp) on the exact 32-double value key
- * (live pi + noise-linearization pi), never an epsilon tolerance (hits would
+ * KEY DISCIPLINE: bitwise equality (memcmp) on the exact value key
+ * (live/noise intrinsic values, Tg layout and noise sigmas), never an epsilon tolerance (hits would
  * become path-dependent) and never a hash (a collision is a silent wrong-pi
  * reuse that biases every block downstream). Well-defined because JointCalib's
  * restore(accepted_p) rewrites exact snapshot bytes. The window-content fields
@@ -58,14 +58,10 @@ namespace ov_zcalib {
  *
  * v[0..15]  = live pi (dw6 | da6 | q_AtoI4) -- the mean/column linearization.
  * v[16..31] = noise-linearization pi (mirrors live pi when noise is unfrozen).
- * v[32..35] = ImuNoise sigmas (w, wb, a, ab) -- they feed P15/the whitener;
- *             session-constant today, keyed so a future per-stage weighting
- *             change can never silently reuse a stale whitener.
- * v[36..54] = Tg extension, written ONLY when the session estimates Tg
- *             (SharedCalib::tg_enabled): live Tg (9) + noise-lin Tg (9) + a
- *             1.0 marker slot, so a 15-column entry can never serve a
- *             24-column request. Stays zero (the initializer) when tg is off
- *             -- legacy keys keep their exact bytes.
+ * v[32..49] = live Tg (9) + noise-linearization Tg (9), including fixed Tg.
+ * v[50]     = SharedCalib::tg_enabled (0 or 1); distinguishes the 15- and
+ *             24-column layouts independently of Tg's physical value.
+ * v[51..54] = ImuNoise sigmas (w, wb, a, ab), which feed P15/the whitener.
  * The remaining fields are the window-content checksum (fixed-stream guard).
  */
 struct PreintKey {

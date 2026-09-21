@@ -186,11 +186,18 @@ static void test_sweep(double hz, double tol_mean, double tol_col) {
   std::printf("[ok] sweep columns @%.0f Hz: max rel err %.3e over 21 columns\n", hz, max_rel);
 }
 
-static void test_factor_fd() {
+static void test_factor_fd(bool fixed_tg = false) {
   const double t0 = 10.0, t1 = 10.2;
   const double hz = 800.0;
   const Eigen::Vector3d bg(0.004, -0.010, 0.020), ba(0.03, -0.05, 0.01);
   ImuIntrinsicModel model = make_model();
+  if (fixed_tg) {
+    // A fixed nonzero Tg still couples accel bias into the gyro correction.
+    // Keeping the 15-column layout must not erase that physical derivative.
+    model.Tg << 0.0030, -0.0011, 0.0007,
+               -0.0008, 0.0021, -0.0014,
+                0.0012, 0.0006, -0.0027;
+  }
   ImuNoise nz;
   auto imu = make_imu(t0, t1, hz);
   AciPreintResult r;
@@ -231,6 +238,37 @@ static void test_factor_fd() {
   }
   f.Evaluate(params, res0.data(), jac);
 
+  if (fixed_tg) {
+    // Compare both parameter layouts at IDENTICAL physical values, including
+    // nonzero dba. FD of the old 15-column residual alone would miss the bug:
+    // its residual and Jacobian both omitted H_q. Pin the model as well.
+    ImuIntrinsicModel full = model;
+    full.calib_tg = true;
+    AciPreintResult r_full;
+    CHECK(AciCalibPreint::integrate(imu, t0, t1, full, bg, ba, nz, r_full),
+          "fixed Tg: 24-column reference integration failed");
+    Factor_ImuAci3 reference(r_full, full, bg, ba, f.sqrtI, f.sqrtI_grav_fold);
+    double *params_full[15];
+    std::copy(params, params + 14, params_full);
+    params_full[14] = full.Tg.data(); // zero Tg delta; only parameter availability differs
+    std::vector<Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>> Jr(14);
+    double *jac_full[15] = {};
+    for (int b = 0; b < 14; ++b) {
+      Jr[b].resize(15, gsize[b]);
+      jac_full[b] = Jr[b].data();
+    }
+    Eigen::Matrix<double, 15, 1> res_full;
+    reference.Evaluate(params_full, res_full.data(), jac_full);
+    const double residual_delta = (res_full - res0).norm();
+    double jacobian_delta = 0.0;
+    for (int b = 0; b < 14; ++b)
+      jacobian_delta = std::max(jacobian_delta, (Jr[b] - J[b]).norm() / std::max(1.0, Jr[b].norm()));
+    CHECK(residual_delta < 1e-9 && jacobian_delta < 1e-11,
+          "fixed Tg: parameter layouts changed residual %.3e / Jacobian %.3e", residual_delta, jacobian_delta);
+    CHECK((r.H_q * (ba1 - ba)).norm() > 1e-6, "fixed Tg: test did not excite accel-bias/rotation coupling");
+    std::printf("[ok] fixed Tg layout parity: residual %.3e, relative Jacobian %.3e\n", residual_delta, jacobian_delta);
+  }
+
   // FD per block (gravity: 3-dof euclidean FD but compare only the tangent-projected part;
   // it is exact in ambient coords for this factor since the residual is linear in gravity)
   const double eps = 1e-7;
@@ -260,21 +298,21 @@ static void test_factor_fd() {
       const Eigen::Matrix<double, 15, 1> an = J[b].col(k);
       const double rel = (fd - an).norm() / std::max(1.0, fd.norm());
       max_rel = std::max(max_rel, rel);
-      CHECK(rel < 5e-6, "factor block %d col %d: rel err %.3e", b, k, rel);
+      CHECK(rel < 5e-6, "%sfactor block %d col %d: rel err %.3e", fixed_tg ? "fixed Tg " : "", b, k, rel);
     }
   }
-  std::printf("[ok] factor FD: max rel err %.3e over all 14 blocks\n", max_rel);
+  std::printf("[ok] %sfactor FD: max rel err %.3e over all 14 blocks\n", fixed_tg ? "fixed Tg " : "", max_rel);
 }
 
 // FD oracle for the reprojection factor's EQUIDISTANT (fisheye) branch at
 // production-unit intrinsics. The synthetic e2e suites are radtan-only, so the
 // fisheye distortion Jacobians (k1..k4 columns and their fx/theta chain) would
 // otherwise ship untested at values real wide-FOV units exercise. Covers all
-// 7 blocks of Factor_ReprojTd including the td transport column and the fixed
+// 8 blocks of Factor_ReprojTd including live velocity, the td column and the fixed
 // dt_ref shift (the centered rolling-shutter row time folds in there);
-// tolerance loosened under transport: the analytic pose columns reuse the
-// transported-frame Jacobians, an O(|w| Delta) omission by design.
-static void test_reproj_fd(bool fisheye, bool with_transport) {
+// Every column must match finite differences, including the rotation of the
+// clone's local attitude perturbation into the transported frame.
+static void test_reproj_fd(bool fisheye, double transport_delta) {
   // Per-unit calibration of a real AR0144 fisheye (1280x800). The radtan
   // variant reuses the pinhole row with small k1/k2/p1/p2 as the harness
   // CONTROL: it isolates CamEqui-specific defects from factor plumbing.
@@ -315,35 +353,55 @@ static void test_reproj_fd(bool fisheye, bool with_transport) {
   }
   uv += Eigen::Vector2d(0.3, -0.2);
 
-  // Clone kinematics; the transported variant moves td away from the
-  // linearization point AND carries a fixed dt_ref (the centered row time
-  // (v/h - 0.5)*tr_hw of a rolling frame, a known constant), the exact
-  // variant sits at Delta == 0 where EVERY column must match FD to double-FD
-  // precision.
-  const Eigen::Vector3d w_clone(1.2, -0.8, 0.9), v_clone(0.4, -0.3, 0.2);
-  double td = with_transport ? 1.3e-3 : 1.0e-3;
-  const double dt_ref = with_transport ? 2.0e-3 * (0.37 - 0.5) : 0.0; // row 0.37 of a tr=2 ms frame
-  const double Delta = dt_ref + (td - 1.0e-3);
-  Factor_ReprojTd f(uv, 1.0, fisheye, w_clone, v_clone, /*td_lin=*/1.0e-3, dt_ref);
+  // Exercise both signs of the frame/row transport at real camera rates,
+  // with fixed dt_ref and a separate td change. No transport-dependent slack.
+  const Eigen::Vector3d w_clone(1.2, -0.8, 0.9);
+  Eigen::Vector3d v_IinG(0.4, -0.3, 0.2);
+  const double dt_ref = transport_delta == 0.0 ? 0.0 : std::copysign(2.0e-3 * (0.5 - 0.37), transport_delta);
+  double td = 1.0e-3 + transport_delta - dt_ref;
+  Factor_ReprojTd f(uv, 1.0, fisheye, w_clone, /*td_lin=*/1.0e-3, dt_ref);
   f.prepare_transport(td); // FD on td must also exercise the off-stamp fallback
 
-  double *params[7] = {q_GtoI.data(), p_IinG.data(), p_FinG.data(), q_ItoC.data(), p_IinC.data(), cam.data(), &td};
-  const int gsize[7] = {4, 3, 3, 4, 3, 8, 1};
-  const bool is_quat[7] = {true, false, false, true, false, false, false};
+  double *params[8] = {q_GtoI.data(), p_IinG.data(), p_FinG.data(), q_ItoC.data(), p_IinC.data(), cam.data(), &td, v_IinG.data()};
+  const int gsize[8] = {4, 3, 3, 4, 3, 8, 1, 3};
+  const bool is_quat[8] = {true, false, false, true, false, false, false, false};
 
   Eigen::Vector2d res0;
-  std::vector<Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>> J(7);
-  double *jac[7];
-  for (int b = 0; b < 7; ++b) {
+  std::vector<Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>> J(8);
+  double *jac[8];
+  for (int b = 0; b < 8; ++b) {
     J[b].resize(2, gsize[b]);
     jac[b] = J[b].data();
   }
   CHECK(f.Evaluate(params, res0.data(), jac), "fisheye reproj Evaluate failed");
-  CHECK(res0.norm() > 1e-3 && res0.norm() < 5.0, "fisheye residual magnitude off (%.3e px): geometry bug", res0.norm());
+  CHECK(res0.norm() > 1e-3 && res0.norm() < 50.0, "reproj residual magnitude off (%.3e px): geometry bug", res0.norm());
+
+  auto physical_residual = [&]() {
+    const double delta = dt_ref + td - 1.0e-3;
+    const Eigen::Matrix3d Rt = ov_core::exp_so3(-w_clone * delta) * ov_core::quat_2_Rot(q_GtoI);
+    const Eigen::Vector3d pt = p_IinG + v_IinG * delta;
+    const Eigen::Vector3d pc = ov_core::quat_2_Rot(q_ItoC) * Rt * (p_FinG - pt) + p_IinC;
+    const double x = pc.x() / pc.z(), y = pc.y() / pc.z(), r2 = x*x + y*y;
+    Eigen::Vector2d pixel;
+    if (fisheye) {
+      const double r = std::sqrt(r2), theta = std::atan(r), t2 = theta*theta;
+      const double scale = theta * (1.0 + t2*(cam(4) + t2*(cam(5) + t2*(cam(6) + t2*cam(7))))) / r;
+      pixel << cam(0)*scale*x + cam(2), cam(1)*scale*y + cam(3);
+    } else {
+      const double scale = 1.0 + cam(4)*r2 + cam(5)*r2*r2;
+      pixel << cam(0)*(x*scale + 2.0*cam(6)*x*y + cam(7)*(r2 + 2.0*x*x)) + cam(2),
+               cam(1)*(y*scale + cam(6)*(r2 + 2.0*y*y) + 2.0*cam(7)*x*y) + cam(3);
+    }
+    return Eigen::Vector2d(pixel - uv);
+  };
+  CHECK((res0 - physical_residual()).norm() < 1e-9,
+        "%s reproj differs from independent transported geometry", fisheye ? "fisheye" : "radtan");
+  if (transport_delta == 0.0)
+    CHECK(J[7].isZero(0.0), "zero transport has nonzero velocity Jacobian");
 
   const double eps = 1e-7;
   double max_rel = 0.0;
-  for (int b = 0; b < 7; ++b) {
+  for (int b = 0; b < 8; ++b) {
     const int loc = is_quat[b] ? 3 : gsize[b];
     for (int k = 0; k < loc; ++k) {
       std::vector<double> backup(params[b], params[b] + gsize[b]);
@@ -368,20 +426,40 @@ static void test_reproj_fd(bool fisheye, bool with_transport) {
       const Eigen::Vector2d an = J[b].col(k);
       const double rel = (fd - an).norm() / std::max(1.0, fd.norm());
       max_rel = std::max(max_rel, rel);
-      // Tolerances by CONTRACT: everything is exact at Delta == 0; under
-      // transport the clone-attitude column reuses the transported-frame
-      // Jacobian (documented O(|w| Delta) omission), and the td chain
-      // carries the same first-order slack.
-      double tol = 5e-6;
-      if (b == 0 || b >= 6)
-        tol = std::max(tol, 3.0 * w_clone.norm() * std::abs(Delta));
+      const double tol = 5e-6;
       if (std::getenv("OV_FD_DEBUG") && rel >= tol)
         std::printf("  dbg b%d c%d: fd=[%.6e %.6e] an=[%.6e %.6e]\n", b, k, fd(0), fd(1), an(0), an(1));
       CHECK(rel < tol, "%s reproj block %d col %d: rel err %.3e (tol %.1e)", fisheye ? "fisheye" : "radtan", b, k, rel, tol);
     }
   }
-  std::printf("[ok] %s reproj FD (%s, @ Stinger-class intrinsics): max rel err %.3e over all 7 blocks\n", fisheye ? "fisheye" : "radtan",
-              with_transport ? "transported" : "Delta=0 exact", max_rel);
+  // The prepared rotation must not freeze velocity, including the td
+  // column at Delta=0. Compare to direct geometry and an unprepared factor.
+  const Eigen::Vector3d original_v = v_IinG;
+  v_IinG += Eigen::Vector3d(0.11, -0.07, 0.09);
+  Eigen::Vector2d moved, fresh, rp, rm;
+  CHECK(f.Evaluate(params, moved.data(), jac), "prepared live-velocity Evaluate failed");
+  Factor_ReprojTd unprepared(uv, 1.0, fisheye, w_clone, 1.0e-3, dt_ref);
+  CHECK(unprepared.Evaluate(params, fresh.data(), nullptr), "unprepared live-velocity Evaluate failed");
+  CHECK((moved - fresh).norm() < 1e-12 && (moved - physical_residual()).norm() < 1e-9,
+        "prepared transport froze velocity or changed physical projection");
+  if (transport_delta == 0.0)
+    CHECK((moved - res0).norm() < 1e-12 && J[7].isZero(0.0),
+          "zero-Delta residual depends on velocity");
+  else
+    CHECK((moved - res0).norm() > 1e-8, "nonzero-Delta value does not read live velocity");
+  const double td0 = td;
+  td = td0 + eps;
+  f.Evaluate(params, rp.data(), nullptr);
+  td = td0 - eps;
+  f.Evaluate(params, rm.data(), nullptr);
+  td = td0;
+  const Eigen::Vector2d fd_td = (rp-rm)/(2.0*eps);
+  CHECK((fd_td-J[6].col(0)).norm()/std::max(1.0,fd_td.norm()) < 5e-6,
+        "prepared temporal Jacobian uses stale velocity");
+  v_IinG = original_v;
+
+  std::printf("[ok] %s reproj FD (Delta=%+.3f ms, @ Stinger-class intrinsics): max rel err %.3e over all 8 blocks\n",
+              fisheye ? "fisheye" : "radtan", transport_delta * 1000.0, max_rel);
 }
 
 // ---- Tg-enabled variants: n_pi = 24 (dw6|da6|thA3|tg9). Pins the tg pi columns AND the D12
@@ -556,11 +634,11 @@ int main() {
   test_sweep(200.0, 3e-4, 1e-6);
   test_sweep_tg(800.0, 2e-5, 1e-6);
   test_factor_fd();
+  test_factor_fd(true);
   test_factor_fd_tg();
-  test_reproj_fd(false, false);
-  test_reproj_fd(false, true);
-  test_reproj_fd(true, false);
-  test_reproj_fd(true, true);
+  for (bool fisheye : {false, true})
+    for (double dt : {0.0, 4.0e-5, -3.0e-3, 8.0e-3})
+      test_reproj_fd(fisheye, dt);
   if (failures == 0) {
     std::printf("[PASS] AciCalibPreint: mean exact, 21 + 30 (tg) ACI3/bias columns == FD, factor Jacobians == FD (14 + 15-block)\n");
     return 0;

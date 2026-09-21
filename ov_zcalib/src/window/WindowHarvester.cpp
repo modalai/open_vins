@@ -269,7 +269,9 @@ bool WindowHarvester::assemble_(WindowData &out, WindowMeta &meta) {
   stamped.reserve(sel.size());
   for (int i : sel) {
     const FrameObs &fr = frames_[(size_t)i];
-    stamped.emplace_back(fr.timestamp + 0.5 * (double)fr.exposure_s + seed_.cams[(size_t)fr.cam].td, i);
+    // Ingest already anchors this stamp at mid-exposure. Exposure is provenance,
+    // not another clock correction (and differs between cameras under auto-exposure).
+    stamped.emplace_back(fr.timestamp + seed_.cams[(size_t)fr.cam].td, i);
   }
   std::sort(stamped.begin(), stamped.end());
   std::vector<std::vector<int>> clone_frames; // frames_ indices grouped per clone
