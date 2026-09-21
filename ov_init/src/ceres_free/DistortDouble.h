@@ -8,7 +8,7 @@
  * which stairsteps optimization costs against the double-exact analytic
  * Jacobians and breaks finite-difference oracles run against the factors.
  * Same models as ov_core compute_distort_jacobian (all-double already); the
- * filter's own CamBase consumers are untouched.
+ * filter's forward projection retains its existing precision.
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -23,6 +23,51 @@
 #include <cmath>
 
 namespace ov_init {
+
+// Equidistant derivatives with the same forward model and optical-center
+// branch as distort_double. The historical camera-object implementation used
+// theta/r with r replaced by 1 near zero, incorrectly returning zero instead
+// of diag(fx,fy) at the optical center.
+// Use the pinhole limit there and a series nearby to avoid cancellation in
+// (d(theta_d)/dr - theta_d/r)/r^2. All temporaries have fixed size.
+inline void equidistant_jacobian_double(const Eigen::Matrix<double, 8, 1> &c, const Eigen::Vector2d &uv,
+                                       Eigen::Matrix2d &Jn, Eigen::Matrix<double, 2, 8> *Jc = nullptr) {
+  const double x = uv(0), y = uv(1), r2 = x*x + y*y;
+  const double r = std::sqrt(r2);
+  if (r <= 1e-8) {
+    Jn << c(0), 0.0, 0.0, c(1);
+    if (Jc) {
+      Jc->setZero();
+      (*Jc)(0,0) = x; (*Jc)(1,1) = y;
+      (*Jc)(0,2) = (*Jc)(1,3) = 1.0;
+    }
+    return;
+  }
+
+  const double theta = std::atan(r), t2 = theta*theta, t4 = t2*t2, t6 = t4*t2, t8 = t4*t4;
+  const double theta_d = theta*(1.0 + c(4)*t2 + c(5)*t4 + c(6)*t6 + c(7)*t8);
+  const double s = theta_d/r;
+  double h;
+  if (r2 < 1e-8) {
+    // theta_d/r = 1 + (k1-1/3)r^2 + (k2-k1+1/5)r^4 + O(r^6).
+    h = 2.0*(c(4) - 1.0/3.0) + 4.0*(c(5) - c(4) + 1.0/5.0)*r2;
+  } else {
+    const double dtheta = 1.0 + 3.0*c(4)*t2 + 5.0*c(5)*t4 + 7.0*c(6)*t6 + 9.0*c(7)*t8;
+    h = (dtheta/(1.0 + r2) - s)/r2;
+  }
+  Jn << c(0)*(s + h*x*x), c(0)*h*x*y,
+        c(1)*h*x*y, c(1)*(s + h*y*y);
+  if (Jc) {
+    Jc->setZero();
+    (*Jc)(0,0) = x*s; (*Jc)(1,1) = y*s;
+    (*Jc)(0,2) = (*Jc)(1,3) = 1.0;
+    const double fx_x_theta = c(0)*x*theta/r, fy_y_theta = c(1)*y*theta/r;
+    (*Jc)(0,4) = fx_x_theta*t2; (*Jc)(1,4) = fy_y_theta*t2;
+    (*Jc)(0,5) = fx_x_theta*t4; (*Jc)(1,5) = fy_y_theta*t4;
+    (*Jc)(0,6) = fx_x_theta*t6; (*Jc)(1,6) = fy_y_theta*t6;
+    (*Jc)(0,7) = fx_x_theta*t8; (*Jc)(1,7) = fy_y_theta*t8;
+  }
+}
 
 // Fixed-size analytic radtan derivatives. No camera object, OpenCV matrix
 // update, or dynamic Eigen allocation is needed for an individual residual.

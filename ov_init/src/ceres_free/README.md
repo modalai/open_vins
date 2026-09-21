@@ -201,7 +201,7 @@ fixed `num_threads`** (verified); across thread counts, identical up to FP summa
 Eigen-only self-tests, built and run in-tree just now:
 
 ```
-# solver core — 13/13 pass
+# solver core — 318 checks pass (587 with forced QR)
 g++ -O3 -std=c++17 -pthread -I/usr/include/eigen3 -Iceres_free \
     ceres_free/test_mini_solver.cpp ceres_free/Problem.cpp ceres_free/Parallel.cpp -o /tmp/t && /tmp/t
 
@@ -272,18 +272,42 @@ production builds skip them. Standalone `g++` recipes are still in each file hea
 
 | File | Purpose | CTest | Status |
 |------|---------|-------|--------|
-| `ceres_free/test_mini_solver.cpp` | Eigen-only solver-core self-test | ✅ | 13/13 |
+| `ceres_free/test_mini_solver.cpp` | Eigen-only solver-core self-test | ✅ | 318 default / 587 forced-QR checks pass |
 | `ceres_free/test_warmstart_cov.cpp` | Warm-start joint-cov / realign / inflation congruence | ✅ | 20/20 |
-| `test_init_consistency.cpp` | Monte-Carlo **NEES** consistency + flip-rejection gold standard (argv: `K gmode inflate [ba_prior_sigma] [ba_seed_err]` — the last two exercise the soft-reset tightened-prior mode) | ✅ | red gate (see status) |
+| `test_init_consistency.cpp` | Monte-Carlo **NEES** consistency + flip rejection (argv: `K gmode inflate [ba_prior_sigma] [ba_seed_err]` — the last two exercise the soft-reset tightened-prior mode) | ✅ | CTest; historical fixture results below |
 | `test_stage1_equiv.cpp` | Stage-1 rewrite gate: projector-free Dong-Si ≡ dense projector; CPI composition ≡ direct build | — | 32/32 |
-| `ceres_free/test_mini_factors.cpp` | FD checks of lifted factors vs `ov_core` | — | manual |
+| `ceres_free/test_mini_factors.cpp` | FD checks of lifted factors and assembled manifold Jacobians | ✅ | CTest |
+| `ceres_free/test_reprojection.cpp` | Camera-model parity, center-limit FD, full-factor FD and Eigen allocation guards | ✅ | CTest |
+| `test_initializer_public.cpp` | Public static/dynamic entry point, tilted start, reset bias prior, FEJ, warm clone covariance | ✅ | CTest |
+| `test_initializer_pruning.cpp` | IMU history pruning: historical sequence parity, boundary/empty/unsorted cases | ✅ | CTest |
 | `test_init_ab_compare.cpp` | Ceres vs ceres-free A/B (needs Ceres) | — | manual |
 | `bench_zbft_s2.cpp` | S²-gravity MLE micro-benchmark | — | manual |
+
+The reprojection test optionally accepts a repeat count, e.g.
+`test_reprojection 300000`, to time the old camera-object derivative against the
+fixed-size equidistant helper. Timing is reported separately from correctness;
+there is no machine-dependent speed threshold in CTest. Both initializer factor
+backends use the helper. Its optical-center derivative is the pinhole limit
+`diag(fx,fy)` matching the forward model; the legacy camera-object derivative
+incorrectly vanished at zero radius. A small-radius series avoids cancellation
+near that limit. `ov_core::CamEqui` also uses the corrected pinhole derivative
+inside its existing `r <= 1e-8` branch, so centered observations retain their
+pose information in the filter as well. Its forward projection is unchanged.
+
+`test_initializer_public output.txt [repeats]` writes the complete returned state and
+covariance plus a fingerprint of the generated IMU/feature inputs. It uses an
+analytic trajectory rather than the initializer's preintegrator to generate
+measurements. This supports numerical comparisons against historical libraries
+and checks the IMU marginal and FEJ contract when warm clones are returned.
+History pruning compacts the IMU buffer once per call. The public/dynamic
+initialization paths still remove only an old prefix; feed calls still remove
+every old sample stably, including out-of-order input. The pruning test checks
+those distinct contracts against the historical per-sample erase loops.
 
 ## Current status (code-accurate, honest)
 
 **Done and default:**
-- Ceres-free LM/Schur solver core, lock-free pool, covariance — verified (13/13, 20/20).
+- Ceres-free LM/Schur solver core, lock-free pool, covariance — verified (318 default / 587 forced-QR solver checks; 20/20 warm-start covariance checks).
 - S²-gravity MLE, full-orientation gauge prior, **weak +Z gravity prior** (`init_dyn_grav_prior_sigma`),
   config-driven gravity gate (`init_dyn_grav_gate_deg`) + conditional re-align, covariance-at-optimum +
   similarity carry-through — implemented and `ON` by default.
@@ -293,18 +317,24 @@ production builds skip them. Standalone `g++` recipes are still in each file hea
 - **Ceres unlinked from the default build**; test/bench exes gated behind `OV_INIT_BUILD_TESTS` and the
   Eigen-only self-tests wired into CTest.
 
-**Open / not-yet-true (do not read the "Done" list as production-signed-off):**
-- **Statistical consistency is NOT in band.** `test_init_consistency` (500 trials, inflation OFF,
-  free-S²) reports **ANEES/15 ≈ 25** (ideal 1.0), dominated by accel-bias (per-block NEES ≈ 278),
-  velocity (≈ 56), position (≈ 16). This is intrinsic to *free* gravity over the short init window: with
-  gravity **fixed** the same test is conservative (ANEES/15 ≈ 0.46), and the gravity prior does **not**
-  change it (≈ 26.5). Mitigated by the `init_dyn_inflation_*` congruence; **position is still uninflated**
-  (`init_dyn_inflation_pos` = 1.0, ~5× overconfident) — deliberately left to real-reset-log tuning per
-  the in-code note, not a sim-derived value.
-- **Flip rejection is 49/50** (was 42/50 before the gravity prior). One synthetic flipped seed still
-  slips the gate.
-- On-hardware A/B + consistency validation of the dynamic init is still pending — the CTest NEES gate is
-  intentionally **red** until then.
+**Historical consistency measurements (2026-07 fixture):**
+
+These figures came from the old simulation/prior fixture. The current test has a
+corrected noise and prior oracle, so these numbers do not describe its present
+result. Re-run the registered test for a current receipt; neither fixture alone
+establishes on-device estimator accuracy.
+
+- The old `test_init_consistency` (500 trials, inflation OFF,
+  free-S²) reported **ANEES/15 ≈ 25** (ideal 1.0), dominated by accel-bias (per-block NEES ≈ 278),
+  velocity (≈ 56), position (≈ 16). Its fixed-gravity case gave ANEES/15 ≈ 0.46
+  and its gravity-prior case ≈ 26.5. Those old figures do not isolate a physical
+  cause or justify changing current inflation defaults; real reset data remains
+  necessary for tuning. `init_dyn_inflation_pos` remains 1.0.
+- Flip rejection in that fixture was 49/50 (42/50 before the gravity prior).
+
+**Remaining validation and implementation work:**
+
+- On-hardware A/B and consistency validation of the dynamic init is still pending.
 - `init_dyn_mle_opt_calib` calibration injection is still a TODO in the injection block.
 
 **2026-07 production pass (summary):** Stage-1 projector-free arrowhead Dong-Si + single-sweep

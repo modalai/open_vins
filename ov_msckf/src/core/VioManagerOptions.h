@@ -296,6 +296,59 @@ struct VioManagerOptions {
   /// Mask images for each camera
   std::map<size_t, cv::Mat> masks;
 
+  /// Load only the IMU chain after state_options selected its model.
+  /// Shared by normal option loading and boot-time calibration gauge planning.
+  void load_imu_intrinsics(const std::shared_ptr<ov_core::YamlParser> &parser) {
+    if (!parser) return;
+    // IMU intrinsics
+    Eigen::Matrix3d Tw = Eigen::Matrix3d::Identity();
+    parser->parse_external("relative_config_imu", "imu0", "Tw", Tw);
+    Eigen::Matrix3d Ta = Eigen::Matrix3d::Identity();
+    parser->parse_external("relative_config_imu", "imu0", "Ta", Ta);
+    Eigen::Matrix3d R_IMUtoACC = Eigen::Matrix3d::Identity();
+    parser->parse_external("relative_config_imu", "imu0", "R_IMUtoACC", R_IMUtoACC);
+    Eigen::Matrix3d R_IMUtoGYRO = Eigen::Matrix3d::Identity();
+    parser->parse_external("relative_config_imu", "imu0", "R_IMUtoGYRO", R_IMUtoGYRO);
+    Eigen::Matrix3d Tg = Eigen::Matrix3d::Zero();
+    parser->parse_external("relative_config_imu", "imu0", "Tg", Tg);
+
+    // Generate the parameters we need
+    // TODO: error here if this returns a NaN value (i.e. invalid matrix specified)
+    Eigen::Matrix3d Dw = Tw.colPivHouseholderQr().solve(Eigen::Matrix3d::Identity());
+    Eigen::Matrix3d Da = Ta.colPivHouseholderQr().solve(Eigen::Matrix3d::Identity());
+    Eigen::Matrix3d R_ACCtoIMU = R_IMUtoACC.transpose();
+    Eigen::Matrix3d R_GYROtoIMU = R_IMUtoGYRO.transpose();
+    if (std::isnan(Tw.norm()) || std::isnan(Dw.norm())) {
+      std::stringstream ss;
+      ss << "gyroscope has bad intrinsic values!" << std::endl;
+      ss << "Tw - " << std::endl << Tw << std::endl << std::endl;
+      ss << "Dw - " << std::endl << Dw << std::endl << std::endl;
+      PRINT_DEBUG(RED "" RESET, ss.str().c_str());
+      std::exit(EXIT_FAILURE);
+    }
+    if (std::isnan(Ta.norm()) || std::isnan(Da.norm())) {
+      std::stringstream ss;
+      ss << "accelerometer has bad intrinsic values!" << std::endl;
+      ss << "Ta - " << std::endl << Ta << std::endl << std::endl;
+      ss << "Da - " << std::endl << Da << std::endl << std::endl;
+      PRINT_DEBUG(RED "" RESET, ss.str().c_str());
+      std::exit(EXIT_FAILURE);
+    }
+
+    // kalibr model: lower triangular of the matrix and R_GYROtoI
+    // rpng model: upper triangular of the matrix and R_ACCtoI
+    if (state_options.imu_model == StateOptions::ImuModel::KALIBR) {
+      vec_dw << Dw.block<3, 1>(0, 0), Dw.block<2, 1>(1, 1), Dw(2, 2);
+      vec_da << Da.block<3, 1>(0, 0), Da.block<2, 1>(1, 1), Da(2, 2);
+    } else {
+      vec_dw << Dw(0, 0), Dw.block<2, 1>(0, 1), Dw.block<3, 1>(0, 2);
+      vec_da << Da(0, 0), Da.block<2, 1>(0, 1), Da.block<3, 1>(0, 2);
+    }
+    vec_tg << Tg.block<3, 1>(0, 0), Tg.block<3, 1>(0, 1), Tg.block<3, 1>(0, 2);
+    q_GYROtoIMU = ov_core::rot_2_quat(R_GYROtoIMU);
+    q_ACCtoIMU = ov_core::rot_2_quat(R_ACCtoIMU);
+  }
+
   /**
    * @brief This function will load and print all state parameters (e.g. sensor extrinsics)
    * This allows for visual checking that everything was loaded properly from ROS/CMD parsers.
@@ -445,53 +498,7 @@ struct VioManagerOptions {
         }
       }
 
-      // IMU intrinsics
-      Eigen::Matrix3d Tw = Eigen::Matrix3d::Identity();
-      parser->parse_external("relative_config_imu", "imu0", "Tw", Tw);
-      Eigen::Matrix3d Ta = Eigen::Matrix3d::Identity();
-      parser->parse_external("relative_config_imu", "imu0", "Ta", Ta);
-      Eigen::Matrix3d R_IMUtoACC = Eigen::Matrix3d::Identity();
-      parser->parse_external("relative_config_imu", "imu0", "R_IMUtoACC", R_IMUtoACC);
-      Eigen::Matrix3d R_IMUtoGYRO = Eigen::Matrix3d::Identity();
-      parser->parse_external("relative_config_imu", "imu0", "R_IMUtoGYRO", R_IMUtoGYRO);
-      Eigen::Matrix3d Tg = Eigen::Matrix3d::Zero();
-      parser->parse_external("relative_config_imu", "imu0", "Tg", Tg);
-
-      // Generate the parameters we need
-      // TODO: error here if this returns a NaN value (i.e. invalid matrix specified)
-      Eigen::Matrix3d Dw = Tw.colPivHouseholderQr().solve(Eigen::Matrix3d::Identity());
-      Eigen::Matrix3d Da = Ta.colPivHouseholderQr().solve(Eigen::Matrix3d::Identity());
-      Eigen::Matrix3d R_ACCtoIMU = R_IMUtoACC.transpose();
-      Eigen::Matrix3d R_GYROtoIMU = R_IMUtoGYRO.transpose();
-      if (std::isnan(Tw.norm()) || std::isnan(Dw.norm())) {
-        std::stringstream ss;
-        ss << "gyroscope has bad intrinsic values!" << std::endl;
-        ss << "Tw - " << std::endl << Tw << std::endl << std::endl;
-        ss << "Dw - " << std::endl << Dw << std::endl << std::endl;
-        PRINT_DEBUG(RED "" RESET, ss.str().c_str());
-        std::exit(EXIT_FAILURE);
-      }
-      if (std::isnan(Ta.norm()) || std::isnan(Da.norm())) {
-        std::stringstream ss;
-        ss << "accelerometer has bad intrinsic values!" << std::endl;
-        ss << "Ta - " << std::endl << Ta << std::endl << std::endl;
-        ss << "Da - " << std::endl << Da << std::endl << std::endl;
-        PRINT_DEBUG(RED "" RESET, ss.str().c_str());
-        std::exit(EXIT_FAILURE);
-      }
-
-      // kalibr model: lower triangular of the matrix and R_GYROtoI
-      // rpng model: upper triangular of the matrix and R_ACCtoI
-      if (state_options.imu_model == StateOptions::ImuModel::KALIBR) {
-        vec_dw << Dw.block<3, 1>(0, 0), Dw.block<2, 1>(1, 1), Dw(2, 2);
-        vec_da << Da.block<3, 1>(0, 0), Da.block<2, 1>(1, 1), Da(2, 2);
-      } else {
-        vec_dw << Dw(0, 0), Dw.block<2, 1>(0, 1), Dw.block<3, 1>(0, 2);
-        vec_da << Da(0, 0), Da.block<2, 1>(0, 1), Da.block<3, 1>(0, 2);
-      }
-      vec_tg << Tg.block<3, 1>(0, 0), Tg.block<3, 1>(0, 1), Tg.block<3, 1>(0, 2);
-      q_GYROtoIMU = ov_core::rot_2_quat(R_GYROtoIMU);
-      q_ACCtoIMU = ov_core::rot_2_quat(R_ACCtoIMU);
+      load_imu_intrinsics(parser);
     }
     PRINT_DEBUG("STATE PARAMETERS:\n");
     PRINT_DEBUG("  - gravity_mag: %.4f\n", gravity_mag);

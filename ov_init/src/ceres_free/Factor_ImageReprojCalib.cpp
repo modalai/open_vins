@@ -5,7 +5,7 @@
  * Copyright (C) 2018-2023 Guoquan Huang
  * Copyright (C) 2018-2023 OpenVINS Contributors
  *
- * Lifted from ov_init/src/ceres/Factor_ImageReprojCalib.cpp (residual + Jacobians verbatim).
+ * Reprojection factor with shared double-precision distortion and derivatives.
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -66,20 +66,14 @@ bool Factor_ImageReprojCalib::Evaluate(double const *const *parameters, double *
   // Forward distortion in DOUBLE (see DistortDouble.h: CamBase::distort_d is
   // float32-quantized; both reprojection backends share this helper).
   Eigen::Vector2d uv_dist = distort_double(camera_vals, uv_norm, is_fisheye);
-  // The camera objects are THREAD-LOCAL and reused across evaluations
-  // (constructing per call heap-allocates and rebuilds the OpenCV matrices,
-  // measurable at ~1e4-1e5 evaluations per solve); needed only when Jacobians
-  // are requested, so cost-only evaluations skip set_value entirely.
+  // Fixed-size model derivatives avoid camera-object / dynamic-matrix work at
+  // every observation. Intrinsics are usually fixed during VINS initialization,
+  // so compute their Jacobian only when requested.
   Eigen::Matrix2d H_dz_dzn;
   Eigen::Matrix<double, 2, 8> H_dz_dzeta;
   if (jacobians) {
     if (is_fisheye) {
-      static thread_local ov_core::CamEqui cam(0, 0);
-      static thread_local Eigen::MatrixXd Jn, Jc;
-      cam.set_value(camera_vals);
-      cam.compute_distort_jacobian(uv_norm, Jn, Jc);
-      H_dz_dzn = Jn;
-      if (jacobians[5]) H_dz_dzeta = Jc;
+      equidistant_jacobian_double(camera_vals, uv_norm, H_dz_dzn, jacobians[5] ? &H_dz_dzeta : nullptr);
     } else {
       radtan_jacobian_double(camera_vals, uv_norm, H_dz_dzn, jacobians[5] ? &H_dz_dzeta : nullptr);
     }

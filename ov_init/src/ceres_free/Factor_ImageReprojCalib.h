@@ -7,8 +7,9 @@
  *
  * Ceres-free initialization backend (ov_init::zbft_sfm)
  * ------------------------------------------------
- * Lifted from ov_init/src/ceres/Factor_ImageReprojCalib.{h,cpp}; residual and
- * analytic Jacobians verbatim. Base class swapped to zbft_sfm::CostFunction.
+ * Based on ov_init/src/ceres/Factor_ImageReprojCalib.{h,cpp}; both backends use
+ * the same double-precision camera model and fixed-size analytic derivatives.
+ * Base class swapped to zbft_sfm::CostFunction.
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -22,8 +23,6 @@
 #include <Eigen/Dense>
 
 #include "CostFunction.h"
-#include "cam/CamEqui.h"
-#include "cam/CamRadtan.h"
 #include "utils/quat_ops.h"
 
 namespace ov_init {

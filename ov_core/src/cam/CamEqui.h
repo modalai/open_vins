@@ -178,6 +178,19 @@ public:
 
     // Calculate distorted coordinates for fisheye
     double r = std::sqrt(uv_norm(0) * uv_norm(0) + uv_norm(1) * uv_norm(1));
+    // The forward model uses cdist=1 at the optical center. Its derivative is
+    // therefore the pinhole limit, not theta_d/r with an artificial inv_r=1
+    // (which incorrectly made centered features contribute zero pose information).
+    if (r <= 1e-8) {
+      H_dz_dzn = Eigen::Matrix2d::Zero();
+      H_dz_dzn(0, 0) = cam_d(0);
+      H_dz_dzn(1, 1) = cam_d(1);
+      H_dz_dzeta = Eigen::MatrixXd::Zero(2, 8);
+      H_dz_dzeta(0, 0) = uv_norm(0);
+      H_dz_dzeta(1, 1) = uv_norm(1);
+      H_dz_dzeta(0, 2) = H_dz_dzeta(1, 3) = 1;
+      return;
+    }
     double theta = std::atan(r);
     double theta_d = theta + cam_d(4) * std::pow(theta, 3) + cam_d(5) * std::pow(theta, 5) + cam_d(6) * std::pow(theta, 7) +
                      cam_d(7) * std::pow(theta, 9);

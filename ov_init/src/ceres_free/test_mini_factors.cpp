@@ -14,7 +14,8 @@
  *   OVC=../../../ov_core/src
  *   g++ -O2 -std=c++17 -I/usr/include/eigen3 -I$OVC \
  *       test_mini_factors.cpp State_JPLQuatLocal.cpp Factor_ImuCPIv1.cpp \
- *       Factor_GenericPrior.cpp $OVC/cpi/CpiV1.cpp -o /tmp/test_factors && /tmp/test_factors
+ *       Factor_GenericPrior.cpp Problem.cpp Parallel.cpp $OVC/cpi/CpiV1.cpp \
+ *       -pthread -o /tmp/test_factors && /tmp/test_factors
  *
  * The reprojection factor additionally needs the OpenCV-backed camera models, so
  * it is covered by the aarch64 ov_init_lib cross-build + -fsyntax-only checks.
@@ -35,6 +36,8 @@
 #include "Factor_GenericPrior.h"
 #include "Factor_ImuCPIv1.h"
 #include "LocalParameterization.h"
+#include "Parallel.h"
+#include "Problem.h"
 #include "State_JPLQuatLocal.h"
 
 #include "cpi/CpiV1.h"
@@ -259,12 +262,75 @@ static void test_gravity_s2() {
   check_gravity_s2_at(Eigen::Vector3d(0.5001, 0.5, 0.707), G, "argmin edge");
 }
 
+// Exercise the actual ambient-to-local assembly in Problem::linearize. The
+// factor/manifold FD tests above use PlusJacobian(), so they cannot detect a
+// solver scratch buffer interpreting ComputeJacobian's row-major bytes as
+// column-major. A non-diagonal residual and tilted gravity expose both local
+// columns in the assembled gradient and Gauss-Newton Hessian.
+static void test_assembled_gravity() {
+  std::printf("[test] Problem gravity gradient/Hessian vs retracted residual FD\n");
+  class GravityFactor : public CostFunction {
+  public:
+    Eigen::Matrix3d A = (Eigen::Matrix3d() << 1.0, 0.2, -0.3, 0.4, 1.7, 0.5, -0.6, 0.8, 1.3).finished();
+    Eigen::Vector3d target = Eigen::Vector3d(0.3, -0.7, 0.2);
+    GravityFactor() { set_num_residuals(3); mutable_parameter_block_sizes()->push_back(3); }
+    bool Evaluate(double const *const *parameters, double *residuals, double **jacobians) const override {
+      Eigen::Map<Eigen::Vector3d> residual(residuals);
+      residual = A * Eigen::Map<const Eigen::Vector3d>(parameters[0]) - target;
+      if (jacobians && jacobians[0]) {
+        Eigen::Map<Eigen::Matrix<double, 3, 3, Eigen::RowMajor>> J(jacobians[0]);
+        J = A;
+      }
+      return true;
+    }
+  } factor;
+  class AssemblyProbe : public Problem {
+  public:
+    void assemble(Eigen::MatrixXd &H, Eigen::VectorXd &g, double &cost) {
+      assign_ordering();
+      ParallelExecutor executor(1);
+      linearize(H, g, cost, executor);
+    }
+  };
+  const double G = 9.81, eps = 1e-5;
+  GravityS2Parameterization manifold(G);
+  for (const Eigen::Vector3d &direction : {Eigen::Vector3d(0, 0, 1), Eigen::Vector3d(1.7, -2.3, 9.4),
+                                          Eigen::Vector3d(-4.76, -3.09, -8.0)}) {
+    Eigen::Vector3d gravity = G * direction.normalized();
+    AssemblyProbe problem;
+    problem.AddParameterBlock(gravity.data(), 3, &manifold);
+    problem.AddResidualBlock(&factor, nullptr, {gravity.data()});
+    Eigen::MatrixXd H;
+    Eigen::VectorXd gradient;
+    double cost = 0.0;
+    problem.assemble(H, gradient, cost);
+    Eigen::Matrix<double, 3, 2> Jfd;
+    Eigen::Vector2d gradient_fd;
+    for (int k = 0; k < 2; ++k) {
+      Eigen::Vector2d step = Eigen::Vector2d::Zero();
+      Eigen::Vector3d plus, minus;
+      step(k) = eps;
+      manifold.Plus(gravity.data(), step.data(), plus.data());
+      step(k) = -eps;
+      manifold.Plus(gravity.data(), step.data(), minus.data());
+      const Eigen::Vector3d rp = factor.A * plus - factor.target;
+      const Eigen::Vector3d rm = factor.A * minus - factor.target;
+      Jfd.col(k) = (rp - rm) / (2.0 * eps);
+      gradient_fd(k) = (rp.squaredNorm() - rm.squaredNorm()) / (4.0 * eps);
+    }
+    const Eigen::Matrix2d assembled = H.selfadjointView<Eigen::Lower>();
+    check_lt((gradient - gradient_fd).cwiseAbs().maxCoeff(), 1e-7, "assembled S2 gradient vs cost FD");
+    check_lt((assembled - Jfd.transpose() * Jfd).cwiseAbs().maxCoeff(), 1e-8, "assembled S2 GN Hessian vs residual FD");
+  }
+}
+
 int main() {
   std::printf("==== ov_init::zbft_sfm lifted-factor FD tests (vs ov_core) ====\n");
   std::mt19937 rng(7);
   test_imu_cpi(rng);
   test_generic_prior(rng);
   test_gravity_s2();
+  test_assembled_gravity();
   std::printf("==== %d failures ====\n", g_failures);
   return g_failures == 0 ? 0 : 1;
 }
