@@ -13,6 +13,7 @@
 
 #include "Problem.h"
 
+#include "LandmarkQr.h"
 #include "Parallel.h"
 
 #include <algorithm>
@@ -80,6 +81,17 @@ struct OrderEntryScope { // RAII denominator: covers every return path of the en
       g_order_probe.entry_ns.fetch_add((long long)std::llround(1e9 * seconds_since(t0)), std::memory_order_relaxed);
   }
 };
+
+// Staged release switch: the square-root export is exercised independently of
+// the nonlinear step solver. The existing legacy/audit switches still select
+// their original normal-equation paths for matched comparisons.
+bool use_landmark_qr_export() {
+  static const char *mode = std::getenv("OV_ZCALIB_EXPORT_QR");
+  static const bool enabled = mode != nullptr && std::strcmp(mode, "1") == 0 &&
+                              std::getenv("OV_ZCALIB_EXPORT_LEGACY") == nullptr &&
+                              std::getenv("OV_ZCALIB_EXPORT_AUDIT") == nullptr;
+  return enabled;
+}
 
 } // namespace
 
@@ -455,7 +467,7 @@ void Problem::linearize(Eigen::MatrixXd &H, Eigen::VectorXd &grad, double &cost,
     // For false blocks (gravity), Jeff[k] = Jstore[k] * V where V is the tangent basis.
     // Sized per-block per-residual, heap-backed but resize-and-reuse (steady-state no alloc).
     std::vector<Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>> Jeff;
-    Eigen::Matrix<double, 3, 2> Vbuf; // tangent basis scratch for S² (stack, 3×2)
+    Eigen::Matrix<double, 3, 2, Eigen::RowMajor> Vbuf; // ComputeJacobian writes row-major (S²: stack, 3×2)
 
     for (int ri = begin; ri < end; ++ri) {
       const Residual &res = residuals_[ri];
@@ -1214,13 +1226,23 @@ bool Problem::ComputeCovariance(const std::vector<double *> &blocks, Eigen::Matr
   Eigen::MatrixXd H;
   Eigen::VectorXd grad;
   double cov_cost = 0.0;
-  linearize(H, grad, cov_cost, exec); // at the current (solved) iterate, undamped
+  const bool qr_export = n_land_ > 0 && use_landmark_qr_export();
+  if (qr_export) {
+    landmark_qr::Evidence evidence;
+    if (!landmark_qr::assemble(blocks_, residuals_, land_block_idx_, land_adj_, n_nav_, exec, H, grad, evidence))
+      return false;
+    cov_cost = evidence.cost;
+  } else {
+    linearize(H, grad, cov_cost, exec); // at the current (solved) iterate, undamped
+  }
 
   // Reduced navigation information with landmarks marginalized (lambda = 0).
   // H holds only the used lower triangle: B^T = H(land-rows, nav-cols) is stored directly,
   // the nav-nav block is materialized from its lower half.
   Eigen::MatrixXd Hred;
-  if (n_land_ == 0) {
+  if (qr_export) {
+    Hred = std::move(H); // already assembled from projected rows; no subtractive Schur fold
+  } else if (n_land_ == 0) {
     Hred = H.topLeftCorner(n_nav_, n_nav_).selfadjointView<Eigen::Lower>();
   } else {
     // Hred = Hnn - (B * D^-1) * B^T with D BLOCK-diagonal: scale B's landmark column-blocks by
@@ -1262,10 +1284,10 @@ bool Problem::ComputeCovariance(const std::vector<double *> &blocks, Eigen::Matr
 
   // Invert (requires the gauge to be anchored -> PD). Marginal covariance = Hred^{-1}.
   Eigen::LDLT<Eigen::MatrixXd> ldlt(Hred);
-  if (ldlt.info() != Eigen::Success)
+  if (ldlt.info() != Eigen::Success || !landmark_qr::all_finite(ldlt.vectorD()))
     return false;
   Eigen::MatrixXd Sigma = ldlt.solve(Eigen::MatrixXd::Identity(n_nav_, n_nav_));
-  if (!Sigma.allFinite() || (ldlt.vectorD().array() <= 0.0).any())
+  if (!landmark_qr::all_finite(Sigma) || (ldlt.vectorD().array() <= 0.0).any())
     return false;
 
   // Extract requested sub-blocks in the requested order.
@@ -1339,6 +1361,61 @@ bool Problem::ExportReducedInformation(const std::vector<double *> &blocks, Eige
   static const bool export_audit = (std::getenv("OV_ZCALIB_EXPORT_AUDIT") != nullptr);
 
   ParallelExecutor exec(options.num_threads, options.worker_init_fn);
+  if (n_land_ > 0 && use_landmark_qr_export()) {
+    Eigen::MatrixXd Hnav;
+    Eigen::VectorXd gnav;
+    landmark_qr::Evidence evidence;
+    if (!landmark_qr::assemble(blocks_, residuals_, land_block_idx_, land_adj_, n_nav_, exec, Hnav, gnav, evidence))
+      return false;
+    if (stats) {
+      stats->land_decrement += evidence.land_decrement;
+      stats->clamped_dirs += evidence.clamped_dirs;
+    }
+
+    // Keep the full nuisance/calibration cross information and the existing
+    // nuisance LDLT/marginalization semantics. QR changes feature elimination
+    // only; it does not whiten or damp the nuisance solve a second time.
+    Eigen::MatrixXd Hkk(nk, nk), Hkn(nk, nn), Hnn(nn, nn);
+    Eigen::VectorXd gk(nk), gn(nn);
+    for (int a = 0; a < nk; ++a) {
+      gk(a) = gnav(kidx[a]);
+      for (int b = 0; b < nk; ++b)
+        Hkk(a, b) = Hnav(kidx[a], kidx[b]);
+      for (int b = 0; b < nn; ++b)
+        Hkn(a, b) = Hnav(kidx[a], nidx[b]);
+    }
+    for (int a = 0; a < nn; ++a) {
+      gn(a) = gnav(nidx[a]);
+      for (int b = 0; b < nn; ++b)
+        Hnn(a, b) = Hnav(nidx[a], nidx[b]);
+    }
+    if (nn == 0) {
+      Lambda = Hkk;
+      gred = gk;
+      if (stats)
+        stats->nuis_decrement = stats->land_decrement;
+      return landmark_qr::all_finite(Lambda) && landmark_qr::all_finite(gred) &&
+             (!stats || landmark_qr::finite_scalar(stats->nuis_decrement));
+    }
+    Eigen::LDLT<Eigen::MatrixXd> ldlt(Hnn);
+    if (stats) {
+      stats->nuis_dim = nn;
+      stats->nuis_min_pivot =
+          ldlt.info() == Eigen::Success ? ldlt.vectorD().minCoeff() : std::numeric_limits<double>::quiet_NaN();
+    }
+    if (ldlt.info() != Eigen::Success || !landmark_qr::all_finite(ldlt.vectorD()) || (ldlt.vectorD().array() <= 0.0).any())
+      return false;
+    const Eigen::MatrixXd HnnInvHnk = ldlt.solve(Hkn.transpose());
+    Lambda = Hkk - Hkn * HnnInvHnk;
+    gred = gk - HnnInvHnk.transpose() * gn;
+    if (stats) {
+      stats->nuis_decrement = stats->land_decrement + gn.dot(ldlt.solve(gn));
+      stats->nuis_grad_inf = gn.lpNorm<Eigen::Infinity>();
+    }
+    Lambda = 0.5 * (Lambda + Lambda.transpose()).eval();
+    return landmark_qr::all_finite(Lambda) && landmark_qr::all_finite(gred) &&
+           (!stats || (landmark_qr::finite_scalar(stats->nuis_decrement) && landmark_qr::finite_scalar(stats->nuis_grad_inf)));
+  }
   Eigen::MatrixXd H;
   Eigen::VectorXd grad;
   double cost = 0.0;

@@ -33,6 +33,7 @@
 #include <Eigen/Dense>
 
 #include "LocalParameterization.h"
+#include "LandmarkQr.h"
 #include "LossFunction.h"
 #include "Problem.h"
 
@@ -429,6 +430,301 @@ static void test_covariance(std::mt19937 &rng) {
   }
 }
 
+// Multiple ambient blocks, including repeated pointers and constant blocks.
+class ExportLinearFactor : public CostFunction {
+public:
+  ExportLinearFactor(std::vector<Eigen::MatrixXd> J, Eigen::VectorXd r) : J_(std::move(J)), r_(std::move(r)) {
+    set_num_residuals((int)r_.size());
+    for (const auto &j : J_)
+      mutable_parameter_block_sizes()->push_back((int)j.cols());
+  }
+  bool Evaluate(double const *const *p, double *r, double **j) const override {
+    Eigen::Map<Eigen::VectorXd> out(r, r_.size());
+    out = r_;
+    for (size_t k = 0; k < J_.size(); ++k) {
+      out.noalias() += J_[k] * Eigen::Map<const Eigen::VectorXd>(p[k], J_[k].cols());
+      if (j && j[k])
+        Eigen::Map<Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>>(j[k], J_[k].rows(), J_[k].cols()) = J_[k];
+    }
+    return true;
+  }
+private:
+  std::vector<Eigen::MatrixXd> J_;
+  Eigen::VectorXd r_;
+};
+
+class ZeroWeightLoss : public LossFunction {
+public:
+  void Evaluate(double, double out[2]) const override { out[0] = 7.0; out[1] = 0.0; }
+};
+
+class ExportInspectableProblem : public Problem {
+public:
+  bool projected(Eigen::MatrixXd &H, Eigen::VectorXd &g, landmark_qr::Evidence &e, int threads) {
+    assign_ordering();
+    ParallelExecutor exec(threads);
+    return landmark_qr::assemble(blocks_, residuals_, land_block_idx_, land_adj_, n_nav_, exec, H, g, e);
+  }
+};
+
+static void test_qr_exports(std::mt19937 &rng) {
+  std::printf("[test] rank-aware export against independent full-row SVD\n");
+  std::normal_distribution<double> normal;
+  auto random = [&](int r, int c) {
+    Eigen::MatrixXd M(r, c);
+    for (int j = 0; j < c; ++j)
+      for (int i = 0; i < r; ++i)
+        M(i, j) = normal(rng);
+    return M;
+  };
+  const char *qr_mode = std::getenv("OV_ZCALIB_EXPORT_QR");
+  const bool production_qr = qr_mode != nullptr && std::strcmp(qr_mode, "1") == 0 &&
+                             std::getenv("OV_ZCALIB_EXPORT_LEGACY") == nullptr &&
+                             std::getenv("OV_ZCALIB_EXPORT_AUDIT") == nullptr;
+  for (int obs : {1, 2, 3, 10, 40}) {
+    for (int kind = 0; kind < 6; ++kind) {
+      const int m = 2 * obs;
+      Eigen::MatrixXd B = random(m, 3), A = random(m, 6);
+      if (kind == 1) B.col(2).setZero();
+      if (kind == 2) { B.col(1).setZero(); B.col(2).setZero(); }
+      if (kind == 3) B *= 1e-9; // all-dust absolute floor
+      if (kind == 5 && m >= 3) {
+        // A cancellation-sensitive feature: large information in directions
+        // eliminated from A, while the surviving information remains O(1).
+        Eigen::HouseholderQR<Eigen::MatrixXd> q(B);
+        B = q.householderQ() * Eigen::MatrixXd::Identity(m, 3);
+        B.col(0) *= 4e5; B.col(1) *= 3.9e5; B.col(2) *= 58.;
+        A.noalias() += B * random(3, 6);
+      }
+      const Eigen::VectorXd residual = random(m, 1);
+      Eigen::MatrixXd Bw = B, Aw = A;
+      Eigen::VectorXd rw = residual;
+      double cost = 0.0;
+      CauchyLoss cauchy(2.0);
+      ZeroWeightLoss zero;
+      ProjParam param;
+      Eigen::Vector3d q = Eigen::Vector3d::Zero(), p = Eigen::Vector3d::Zero(), feature = Eigen::Vector3d::Zero();
+      Eigen::Vector3d feature_only = Eigen::Vector3d::Zero();
+      Eigen::Vector2d fixed(0.2, -0.3);
+      double scalar = 0.0;
+      ExportInspectableProblem problem;
+      problem.AddParameterBlock(q.data(), 3, &param); // local 2, ambient 3
+      problem.AddParameterBlock(p.data(), 3);
+      problem.AddParameterBlock(&scalar, 1);
+      problem.AddParameterBlock(feature.data(), 3);
+      problem.SetSchurLandmark(feature.data());
+      problem.AddParameterBlock(feature_only.data(), 3);
+      problem.SetSchurLandmark(feature_only.data());
+      problem.AddParameterBlock(fixed.data(), 2);
+      problem.SetParameterBlockConstant(fixed.data());
+      problem.SetSchurLandmark(fixed.data()); // a constant landmark stays outside elimination
+      std::vector<ExportLinearFactor> factors;
+      factors.reserve(obs);
+      for (int ob = 0; ob < obs; ++ob) {
+        const int row = 2 * ob;
+        const double sigma = (ob % 2) ? 2.2 : 0.45;
+        const bool zero_weight = kind == 4 || (ob == 1 && kind == 2);
+        const LossFunction *loss = zero_weight ? static_cast<LossFunction *>(&zero) : &cauchy;
+        Eigen::MatrixXd Jq = Eigen::MatrixXd::Zero(2, 3);
+        Jq.leftCols(2) = A.block(row, 0, 2, 2) / sigma;
+        const Eigen::MatrixXd Jp = A.block(row, 2, 2, 3) / sigma;
+        const Eigen::MatrixXd Js = A.block(row, 5, 2, 1) / sigma;
+        const Eigen::MatrixXd Jb = B.middleRows(row, 2) / sigma;
+        const Eigen::MatrixXd Jfixed = random(2, 2);
+        factors.emplace_back(std::vector<Eigen::MatrixXd>{Jq, 0.4 * Jp, Js, Jb, Jfixed, 0.6 * Jp},
+                             residual.segment(row, 2) / sigma - Jfixed * fixed);
+        problem.AddResidualBlock(&factors.back(), loss,
+                                 {q.data(), p.data(), &scalar, feature.data(), fixed.data(), p.data()});
+        double rho[2];
+        loss->Evaluate(residual.segment(row, 2).squaredNorm() / (sigma * sigma), rho);
+        const double scale = std::sqrt(std::max(0.0, rho[1])) / sigma;
+        Bw.middleRows(row, 2) *= scale;
+        Aw.middleRows(row, 2) *= scale;
+        rw.segment(row, 2) *= scale;
+        cost += 0.5 * rho[0];
+      }
+      // Feature-only residual: must affect cost/decrement/rank metadata without
+      // inventing navigation columns or being combined with another feature.
+      Eigen::Matrix3d only_B = Eigen::Matrix3d::Zero(); only_B(0, 0) = 3.0;
+      const Eigen::Vector3d only_r(0.2, 0.4, 0.6);
+      ExportLinearFactor only({only_B}, only_r);
+      problem.AddResidualBlock(&only, nullptr, {feature_only.data()});
+      cost += 0.5 * only_r.squaredNorm();
+      // Independent navigation prior includes nuisance/calibration cross terms.
+      const Eigen::MatrixXd prior = random(8, 6);
+      Eigen::MatrixXd prior_q = Eigen::MatrixXd::Zero(8, 3);
+      prior_q.leftCols(2) = prior.leftCols(2);
+      ExportLinearFactor anchor({prior_q, prior.middleCols(2, 3), prior.rightCols(1)}, Eigen::VectorXd::Zero(8));
+      problem.AddResidualBlock(&anchor, nullptr, {q.data(), p.data(), &scalar});
+
+      // Independent oracle: full SVD of the original weighted m x 3 B, not
+      // the implementation's QR followed by a 3 x 3 SVD.
+      Eigen::JacobiSVD<Eigen::MatrixXd> svd(Bw, Eigen::ComputeFullU);
+      int rank = 0;
+      if (svd.singularValues()(0) > 1e-6)
+        for (int i = 0; i < svd.singularValues().size(); ++i)
+          if (svd.singularValues()(i) > 1e-4 * svd.singularValues()(0)) ++rank;
+      const Eigen::MatrixXd null = svd.matrixU().rightCols(m - rank);
+      const Eigen::MatrixXd projected_A = null.transpose() * Aw;
+      const Eigen::VectorXd projected_r = null.transpose() * rw;
+      const Eigen::MatrixXd expected_H = projected_A.transpose() * projected_A + prior.transpose() * prior;
+      const Eigen::VectorXd expected_g = projected_A.transpose() * projected_r;
+      const double decrement = (svd.matrixU().leftCols(rank).transpose() * rw).squaredNorm() + 0.04;
+      Eigen::MatrixXd H;
+      Eigen::VectorXd g;
+      landmark_qr::Evidence evidence;
+      check_true(problem.projected(H, g, evidence, 2), "QR graph assembled");
+      check_lt((H - expected_H).norm() / std::max(1.0, expected_H.norm()), 2e-9, "projected information agrees with SVD");
+      check_lt((g - expected_g).norm() / std::max(1.0, expected_g.norm()), 2e-9, "projected gradient agrees with SVD");
+      check_lt(std::abs(evidence.cost - cost), 1e-11, "robust residual-only objective constant retained");
+      check_lt(std::abs(evidence.land_decrement - decrement), 1e-9, "landmark cost decrement agrees with SVD");
+      check_true(evidence.clamped_dirs == (3 - rank) + 2, "rank and all-dust metadata preserved");
+      for (int t = 0; t < 3; ++t) {
+        const Eigen::VectorXd dx = random(6, 1);
+        const double actual = evidence.cost - 0.5 * evidence.land_decrement + g.dot(dx) + 0.5 * dx.dot(H * dx);
+        const double oracle = cost - 0.5 * decrement + expected_g.dot(dx) + 0.5 * dx.dot(expected_H * dx);
+        check_lt(std::abs(actual - oracle) / std::max(1.0, std::abs(oracle)), 2e-9, "profiled robust quadratic objective agrees");
+      }
+      if (production_qr) {
+        SolverOptions opts; opts.num_threads = 2;
+        Eigen::MatrixXd Lambda, covariance;
+        Eigen::VectorXd reduced_g;
+        Problem::ExportStats stats;
+        check_true(problem.ExportReducedInformation({&scalar, q.data()}, Lambda, reduced_g, opts, &stats), "production export computed (permuted, nontrailing keep)");
+        const Eigen::MatrixXd full_cov = expected_H.inverse();
+        const int keep[3] = {5, 0, 1};
+        Eigen::Matrix3d cov_keep;
+        for (int a = 0; a < 3; ++a)
+          for (int b = 0; b < 3; ++b) cov_keep(a, b) = full_cov(keep[a], keep[b]);
+        const Eigen::Matrix3d expected_L = cov_keep.inverse();
+        const Eigen::VectorXd full_step = full_cov * expected_g;
+        const Eigen::Vector3d expected_gr = expected_L * Eigen::Vector3d(full_step(5), full_step(0), full_step(1));
+        check_lt((Lambda - expected_L).norm() / std::max(1.0, expected_L.norm()), 3e-9, "full nuisance-profile information agrees");
+        check_lt((reduced_g - expected_gr).norm() / std::max(1.0, expected_gr.norm()), 3e-9, "full nuisance-profile gradient agrees");
+        check_true(problem.ComputeCovariance({&scalar, q.data()}, covariance, opts), "production marginal covariance computed");
+        check_lt((covariance - cov_keep).norm() / std::max(1.0, cov_keep.norm()), 3e-9, "marginal covariance agrees with oracle");
+        const Eigen::Vector3d gn = expected_g.segment<3>(2);
+        const double qn = decrement + gn.dot(expected_H.block<3, 3>(2, 2).ldlt().solve(gn));
+        check_lt(std::abs(stats.nuis_decrement - qn) / std::max(1.0, qn), 3e-9, "complete nuisance decrement agrees");
+        check_true(stats.clamped_dirs == evidence.clamped_dirs, "production rank evidence agrees");
+        if (obs == 40 && kind == 5) {
+          stats = Problem::ExportStats();
+          stats.land_decrement = 1.25;
+          stats.clamped_dirs = 2;
+          check_true(problem.ExportReducedInformation({q.data(), p.data(), &scalar}, Lambda, reduced_g, opts, &stats),
+                     "export with no navigation nuisance succeeds");
+          check_lt((Lambda - expected_H).norm() / expected_H.norm(), 3e-9, "no-nuisance information agrees");
+          check_lt(std::abs(stats.nuis_decrement - 1.25 - decrement), 1e-9, "additive decrement evidence preserved");
+          check_true(stats.clamped_dirs == evidence.clamped_dirs + 2, "additive rank evidence preserved");
+        }
+      }
+    }
+  }
+
+  Eigen::Vector3d nav = Eigen::Vector3d::Zero(), f1 = nav, f2 = nav;
+  ExportInspectableProblem invalid;
+  for (double *p : {nav.data(), f1.data(), f2.data()}) invalid.AddParameterBlock(p, 3);
+  invalid.SetSchurLandmark(f1.data()); invalid.SetSchurLandmark(f2.data());
+  DiffFactor coupled(Eigen::Vector3d::Zero(), 1.0);
+  invalid.AddResidualBlock(&coupled, nullptr, {f1.data(), f2.data()});
+  Eigen::MatrixXd H; Eigen::VectorXd g; landmark_qr::Evidence evidence;
+  check_true(!invalid.projected(H, g, evidence, 1), "coupled variable landmarks fail explicitly");
+  if (production_qr) {
+    SolverOptions opts;
+    check_true(!invalid.ExportReducedInformation({nav.data()}, H, g, opts), "production export rejects coupled landmarks");
+  }
+
+  for (double ratio : {0.999999e-4, 1.000001e-4}) {
+    Eigen::MatrixXd B = Eigen::MatrixXd::Zero(4, 3), Ar = random(4, 3);
+    B(0, 0) = 1.; B(1, 1) = 0.01; B(2, 2) = ratio;
+    int rank = -1; double decrement = -1.;
+    check_true(landmark_qr::project(B, Ar, rank, decrement), "near-cutoff QR projection succeeds");
+    check_true(rank == (ratio < 1e-4 ? 2 : 3), "relative information rank cutoff preserved");
+  }
+}
+
+// Inject invalid values after arithmetic so fast-math cannot erase their role
+// in the factor implementation. The export must reject them before SVD/LDLT.
+class InvalidExportFactor : public CostFunction {
+public:
+  InvalidExportFactor(int site, double bad) : site_(site), bad_(bad) {
+    set_num_residuals(4);
+    *mutable_parameter_block_sizes() = {1, 3};
+  }
+  bool Evaluate(double const *const *, double *r, double **j) const override {
+    Eigen::Map<Eigen::Vector4d>(r).setConstant(0.25);
+    if (j && j[0]) Eigen::Map<Eigen::Vector4d>(j[0]).setOnes();
+    if (j && j[1]) {
+      Eigen::Map<Eigen::Matrix<double, 4, 3, Eigen::RowMajor>> B(j[1]);
+      B.setZero(); B.topRows(3).setIdentity();
+    }
+    if (site_ == 0) r[0] = bad_;
+    if (site_ == 1 && j && j[0]) j[0][0] = bad_;
+    if (site_ == 2 && j && j[1]) j[1][0] = bad_;
+    if (site_ == 3) r[0] = 1e200; // finite residual, overflowing squared norm
+    if (site_ == 4 && j && j[0]) j[0][3] = 1e200; // overflowing projected information
+    if (site_ == 5 && j && j[1]) { j[1][0] = 1e308; j[1][3] = 1e308; }
+    return true;
+  }
+private:
+  int site_;
+  double bad_;
+};
+
+class InvalidExportLoss : public LossFunction {
+public:
+  InvalidExportLoss(bool derivative, double bad) : derivative_(derivative), bad_(bad) {}
+  void Evaluate(double s, double out[2]) const override {
+    out[0] = derivative_ ? s : bad_;
+    out[1] = derivative_ ? bad_ : 1.0;
+  }
+private:
+  bool derivative_;
+  double bad_;
+};
+
+class InvalidExportParam : public LocalParameterization {
+public:
+  explicit InvalidExportParam(double bad) : bad_(bad) {}
+  bool Plus(const double *x, const double *d, double *out) const override { out[0] = x[0] + d[0]; return true; }
+  bool ComputeJacobian(const double *, double *out) const override { out[0] = bad_; return true; }
+  int GlobalSize() const override { return 1; }
+  int LocalSize() const override { return 1; }
+private:
+  double bad_;
+};
+
+static void test_qr_invalid_values() {
+  std::printf("[test] QR finite checks survive -ffast-math\n");
+  const char *mode = std::getenv("OV_ZCALIB_EXPORT_QR");
+  const bool production_qr = mode && std::strcmp(mode, "1") == 0 &&
+                             !std::getenv("OV_ZCALIB_EXPORT_LEGACY") && !std::getenv("OV_ZCALIB_EXPORT_AUDIT");
+  for (std::uint64_t bits : {UINT64_C(0x7ff8000000000001), UINT64_C(0x7ff0000000000000), UINT64_C(0xfff0000000000000)}) {
+    double bad;
+    std::memcpy(&bad, &bits, sizeof(bad));
+    check_true(!landmark_qr::finite_scalar(bad), "bitwise finite predicate rejects NaN/Inf");
+    for (int site = 0; site < 9; ++site) {
+      double nav = 0.0;
+      Eigen::Vector3d feature = Eigen::Vector3d::Zero();
+      InvalidExportFactor factor(site, bad);
+      InvalidExportLoss loss(site == 7, bad);
+      InvalidExportParam param(bad);
+      ExportInspectableProblem problem;
+      problem.AddParameterBlock(&nav, 1, site == 8 ? &param : nullptr);
+      problem.AddParameterBlock(feature.data(), 3);
+      problem.SetSchurLandmark(feature.data());
+      problem.AddResidualBlock(&factor, (site == 6 || site == 7) ? &loss : nullptr, {&nav, feature.data()});
+      Eigen::MatrixXd H; Eigen::VectorXd g; landmark_qr::Evidence evidence;
+      check_true(!problem.projected(H, g, evidence, 1), "invalid residual/J/loss/basis/overflow fails closed");
+      if (production_qr) {
+        SolverOptions opts;
+        check_true(!problem.ExportReducedInformation({&nav}, H, g, opts), "invalid production information export rejected");
+        check_true(!problem.ComputeCovariance({&nav}, H, opts), "invalid production covariance export rejected");
+      }
+    }
+  }
+}
+
 int main() {
   std::printf("==== ov_init::zbft_sfm ceres-free solver core tests ====\n");
   std::mt19937 rng(42);
@@ -437,6 +733,8 @@ int main() {
   test_schur_vs_dense(rng);
   test_parallel_determinism(rng);
   test_covariance(rng);
+  test_qr_exports(rng);
+  test_qr_invalid_values();
   std::printf("==== %d checks, %d failures ====\n", g_checks, g_failures);
   return g_failures == 0 ? 0 : 1;
 }

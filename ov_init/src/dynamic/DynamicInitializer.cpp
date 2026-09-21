@@ -106,8 +106,9 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
   auto it_imu = imu_data->begin();
   while (it_imu != imu_data->end() && it_imu->timestamp < oldest_time + params.calib_camimu_dt) {
     have_old_imu_readings = true;
-    it_imu = imu_data->erase(it_imu);
+    ++it_imu;
   }
+  imu_data->erase(imu_data->begin(), it_imu);
   if (_db->get_internal_data().size() < 0.75 * params.init_max_features) {
     PRINT_WARNING(RED "[init-d]: only %zu valid features of required (%.0f thresh)!!\n" RESET, _db->get_internal_data().size(),
                   0.95 * params.init_max_features);

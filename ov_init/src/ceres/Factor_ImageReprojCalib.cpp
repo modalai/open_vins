@@ -75,23 +75,15 @@ bool Factor_ImageReprojCalib::Evaluate(double const *const *parameters, double *
   // float32-quantized, and the two reprojection backends must agree bit-level)
   // Also if jacobians are requested, then compute derivatives
   Eigen::Vector2d uv_dist = ov_init::distort_double(camera_vals, uv_norm, is_fisheye);
-  Eigen::MatrixXd H_dz_dzn, H_dz_dzeta;
-  if (is_fisheye) {
-    ov_core::CamEqui cam(0, 0);
-    cam.set_value(camera_vals);
-    if (jacobians) {
-      cam.compute_distort_jacobian(uv_norm, H_dz_dzn, H_dz_dzeta);
-      H_dz_dzn = sqrtQ_gate * H_dz_dzn;
-      H_dz_dzeta = sqrtQ_gate * H_dz_dzeta;
-    }
-  } else {
-    ov_core::CamRadtan cam(0, 0);
-    cam.set_value(camera_vals);
-    if (jacobians) {
-      cam.compute_distort_jacobian(uv_norm, H_dz_dzn, H_dz_dzeta);
-      H_dz_dzn = sqrtQ_gate * H_dz_dzn;
-      H_dz_dzeta = sqrtQ_gate * H_dz_dzeta;
-    }
+  Eigen::Matrix2d H_dz_dzn;
+  Eigen::Matrix<double, 2, 8> H_dz_dzeta;
+  if (jacobians) {
+    if (is_fisheye)
+      equidistant_jacobian_double(camera_vals, uv_norm, H_dz_dzn, jacobians[5] ? &H_dz_dzeta : nullptr);
+    else
+      radtan_jacobian_double(camera_vals, uv_norm, H_dz_dzn, jacobians[5] ? &H_dz_dzeta : nullptr);
+    H_dz_dzn = sqrtQ_gate * H_dz_dzn;
+    if (jacobians[5]) H_dz_dzeta = sqrtQ_gate * H_dz_dzeta;
   }
 
   // Compute residual
@@ -108,9 +100,9 @@ bool Factor_ImageReprojCalib::Evaluate(double const *const *parameters, double *
   if (jacobians) {
 
     // Normalized coordinates in respect to projection function
-    Eigen::MatrixXd H_dzn_dpfc = Eigen::MatrixXd::Zero(2, 3);
+    Eigen::Matrix<double, 2, 3> H_dzn_dpfc;
     H_dzn_dpfc << 1.0 / p_FinCi(2), 0, -p_FinCi(0) / std::pow(p_FinCi(2), 2), 0, 1.0 / p_FinCi(2), -p_FinCi(1) / std::pow(p_FinCi(2), 2);
-    Eigen::MatrixXd H_dz_dpfc = H_dz_dzn * H_dzn_dpfc;
+    Eigen::Matrix<double, 2, 3> H_dz_dpfc = H_dz_dzn * H_dzn_dpfc;
 
     // Jacobian wrt q_GtoIi
     if (jacobians[0]) {

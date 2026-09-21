@@ -148,6 +148,29 @@ endif ()
 
 # Tests/benches that need ov_core (and, for bench_init, Ceres). Dev/CI only.
 if (OV_INIT_BUILD_TESTS)
+    # Factor and assembled-manifold Jacobian checks. This exercises the
+    # solver's row-major tangent contract, not only individual factor math.
+    add_executable(test_mini_factors src/ceres_free/test_mini_factors.cpp)
+    target_link_libraries(test_mini_factors ov_init_lib ${thirdparty_libraries})
+    add_test(NAME test_mini_factors COMMAND test_mini_factors)
+
+    # Build the production factor into this executable so Eigen's runtime
+    # no-allocation check covers its entire Evaluate() path.
+    add_executable(test_reprojection src/ceres_free/test_reprojection.cpp
+            src/ceres_free/Factor_ImageReprojCalib.cpp src/ceres_free/State_JPLQuatLocal.cpp)
+    target_compile_definitions(test_reprojection PRIVATE EIGEN_RUNTIME_NO_MALLOC)
+    target_compile_options(test_reprojection PRIVATE -UNDEBUG)
+    target_link_libraries(test_reprojection ${thirdparty_libraries})
+    add_test(NAME test_reprojection COMMAND test_reprojection)
+
+    add_executable(test_initializer_public src/test_initializer_public.cpp)
+    target_link_libraries(test_initializer_public ov_init_lib ${thirdparty_libraries})
+    add_test(NAME test_initializer_public COMMAND test_initializer_public)
+
+    add_executable(test_initializer_pruning src/test_initializer_pruning.cpp)
+    target_link_libraries(test_initializer_pruning ov_init_lib ${thirdparty_libraries})
+    add_test(NAME test_initializer_pruning COMMAND test_initializer_pruning)
+
     # test_dynamic_init using TrackSIM (no modal_flow needed for simulation)
     add_executable(test_dynamic_init src/test_dynamic_init.cpp)
     target_link_libraries(test_dynamic_init ov_init_lib ${thirdparty_libraries})
@@ -184,5 +207,3 @@ if (OV_INIT_BUILD_TESTS)
         message(STATUS "ov_init: bench_init skipped (Ceres not found; it is the Ceres-vs-free benchmark)")
     endif ()
 endif ()
-
-
