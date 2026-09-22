@@ -30,6 +30,9 @@ State::State(StateOptions &options) {
 
   // Save our options
   _options = options;
+  if (_options.physical_camera_clones) {
+    _exposure_poses.reserve(static_cast<size_t>(_options.max_pose_clones()) + static_cast<size_t>(_options.num_cameras));
+  }
   if (_options.cam_imu_dt_ref_camid < 0 || _options.cam_imu_dt_ref_camid >= _options.num_cameras) {
     _options.cam_imu_dt_ref_camid = 0;
   }
@@ -57,7 +60,7 @@ State::State(StateOptions &options) {
   } else {
     // upper triangular of the matrix (column-wise)
     Eigen::Matrix<double, 6, 1> _imu_default = Eigen::Matrix<double, 6, 1>::Zero();
-    _imu_default << 1.0, 0.0, 0.0, 1.0, 0.0, 1.0;
+    _imu_default << 1.0, 0.0, 1.0, 0.0, 0.0, 1.0;
     _calib_imu_dw->set_value(_imu_default);
     _calib_imu_dw->set_fej(_imu_default);
     _calib_imu_da->set_value(_imu_default);

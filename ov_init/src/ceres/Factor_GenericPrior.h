@@ -58,7 +58,7 @@ namespace ov_init {
  * The Jacobian (and thus information matrix A) is computed at the current best guess @f$ x_{lin} @f$.
  * We can define the following optimal subcost form which only involves the @f$ xr @f$ states as:
  * @f[
- * cost^2 = (xr - xr_{lin})^T*(A^T*A)*(xr - xr_{lin}) + b^T*A*(xr - xr_{lin}) + b^b
+ * cost^2 = (xr - xr_{lin})^T*(A^T*A)*(xr - xr_{lin}) + 2*b^T*A*(xr - xr_{lin}) + b^T*b
  * @f]
  *
  * where we have:
@@ -66,7 +66,7 @@ namespace ov_init {
  * A = sqrt(Arr - Arm*Amm^{-1}*Amr)
  * @f]
  * @f[
- * b = A^-1 * (gr - Arm*Amm^{-1}*gm)
+ * b = A^{-T} * (gr - Arm*Amm^{-1}*gm)
  * @f]
  *
  */
@@ -83,6 +83,9 @@ public:
 
   /// Constant term inside the cost s.t. sqrtI^T * b = marginal gradient (can be zero)
   Eigen::MatrixXd b;
+
+  /// Invalid input makes Evaluate fail without terminating the VINS process.
+  bool valid = false;
 
   /**
    * @brief Default constructor

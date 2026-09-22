@@ -119,6 +119,14 @@ public:
    */
   virtual std::shared_ptr<Type> check_if_subvariable(const std::shared_ptr<Type> check) { return nullptr; }
 
+  /**
+   * Compute the same retraction as update() into caller-owned storage without
+   * changing this variable or its FEJ value. Appended virtual contract: rebuild
+   * derived types and consumers together. The caller validates the proposal.
+   */
+  virtual void propose_update(const Eigen::Ref<const Eigen::VectorXd> &dx,
+                              Eigen::Ref<Eigen::VectorXd> proposed) const = 0;
+
 protected:
   /// First-estimate
   Eigen::MatrixXd _fej;

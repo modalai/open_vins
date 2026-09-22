@@ -24,10 +24,13 @@
 #define OV_MSCKF_UPDATER_ZEROVELOCITY_H
 
 #include <memory>
+#include <utility>
+#include <vector>
 
 #include "utils/sensor_data.h"
 
 #include "UpdaterOptions.h"
+#include "state/State.h"
 #include "utils/NoiseManager.h"
 
 namespace ov_core {
@@ -116,6 +119,65 @@ public:
    */
   bool try_update(std::shared_ptr<State> state, double timestamp);
 
+  using RawCameraKeys = std::vector<std::pair<size_t, double>>;
+
+  /// Explicit physical endpoint; the reference label is committed only on
+  /// acceptance. Physical-clone mode requires the current owner raw keys so
+  /// disparity and accepted-track cleanup retain camera-specific ownership.
+  bool try_update_at_imu(std::shared_ptr<State> state, double target_imu, double reference_timestamp,
+                         const RawCameraKeys &raw_keys = {});
+
+  struct SampledStationaryFactor {
+    // Columns: current attitude, raw bg, raw ba, original raw sample noise6.
+    Eigen::Matrix<double, 6, 15> H = Eigen::Matrix<double, 6, 15>::Zero();
+    Eigen::Matrix<double, 6, 1> residual = Eigen::Matrix<double, 6, 1>::Zero();
+    Eigen::Matrix<double, 6, 6> independent_R = Eigen::Matrix<double, 6, 6>::Zero();
+  };
+
+  /// Disabled-runtime proof API. Linearize one admitted ORIGINAL raw record at
+  /// its exact accepted knot, with fixed IMU calibration and do_fej=false.
+  /// independent_stationarity_covariance is an explicit model discrepancy;
+  /// sensor uncertainty is already owned by the sample Vec6 and is not R.
+  /// Zero independent covariance is supported. Refusal leaves out unchanged.
+  bool linearize_sampled_at_knot(std::shared_ptr<State> state, const State::SampledImuRecord &record,
+                                const Eigen::Matrix<double, 6, 6> &independent_stationarity_covariance,
+                                SampledStationaryFactor &out) const;
+
+  /// Apply the same-knot factor once, using the existing chi-square/velocity
+  /// gates and the full state/sample posterior. No interval bias Q, camera
+  /// history, track cleanup or timestamp advancement occurs here. The sampled
+  /// Propagator must already have evolved the state to this knot. The caller
+  /// serializes State access and restores this updater together with State.
+  /// Unsupported/numeric/gate rejection leaves state, receipt, cache and out
+  /// unchanged. No runtime configuration invokes this proof caller.
+  bool try_update_sampled_at_knot(std::shared_ptr<State> state, const State::SampledImuRecord &record,
+                                 const Eigen::Matrix<double, 6, 6> &independent_stationarity_covariance,
+                                 SampledStationaryFactor *out = nullptr);
+
+  struct CameraHistory {
+    double previous_raw = 0.0;
+    double accepted_raw = 0.0;
+    bool has_previous = false;
+    int accepted_count = 0;
+  };
+
+  struct Snapshot {
+    std::vector<ov_core::ImuData> imu_data;
+    std::vector<CameraHistory> camera_history;
+    double last_prop_time_offset = 0.0;
+    bool have_last_prop_time_offset = false;
+    double last_zupt_state_timestamp = 0.0;
+    int last_zupt_count = 0;
+    uint64_t sampled_stream_episode = 0;
+    uint64_t sampled_last_sequence = 0;
+    uint64_t sampled_last_timestamp_bits = 0;
+  };
+
+  /// Serialized estimator lifecycle helpers; retain buffered raw IMU on reset.
+  void reset_for_new_state();
+  Snapshot capture() const;
+  void restore(const Snapshot &snapshot);
+
   /**
    * @brief Feed a batch of IMU measurements with a single lock
    * @param messages Vector of IMU measurements to process
@@ -154,6 +216,9 @@ protected:
   /// Our history of IMU messages (time, angular, linear)
   std::vector<ov_core::ImuData> imu_data;
 
+  /// Dense camera-ID history, allocated on first covered physical-mode request.
+  std::vector<CameraHistory> camera_history;
+
   /// Estimate for time offset at last propagation time
   double last_prop_time_offset = 0.0;
   bool have_last_prop_time_offset = false;
@@ -163,6 +228,12 @@ protected:
 
   /// Number of times we have called update
   int last_zupt_count = 0;
+
+  /// One-use likelihood receipt for this updater's current State episode.
+  /// Vec slot pointers are reused, so only immutable sample identity is valid.
+  uint64_t sampled_stream_episode = 0;
+  uint64_t sampled_last_sequence = 0;
+  uint64_t sampled_last_timestamp_bits = 0;
 };
 
 } // namespace ov_msckf

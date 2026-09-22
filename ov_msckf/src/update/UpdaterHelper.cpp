@@ -21,12 +21,14 @@
  */
 
 #include "UpdaterHelper.h"
+#include "LegacyExposure.h"
 
 #include <algorithm>
 #include <cinttypes>
 
 #include "state/State.h"
 
+#include "feat/Feature.h"
 #include "utils/colors.h"
 #include "utils/print.h"
 #include "utils/quat_ops.h"
@@ -34,6 +36,41 @@
 using namespace ov_core;
 using namespace ov_type;
 using namespace ov_msckf;
+
+void UpdaterHelper::clean_feature_measurements(const std::shared_ptr<State> &state, ov_core::Feature &feature,
+                                                const std::vector<double> &legacy_times) {
+  if (!state->uses_physical_clones()) {
+    feature.clean_old_measurements(legacy_times);
+    return;
+  }
+  for (auto &entry : feature.timestamps) {
+    auto &times = entry.second;
+    auto &uvs = feature.uvs.at(entry.first);
+    auto &norm = feature.uvs_norm.at(entry.first);
+    assert(times.size() == uvs.size() && times.size() == norm.size());
+    size_t kept = 0;
+    for (size_t i = 0; i < times.size(); ++i) {
+      if (!state->find_pose(entry.first, times[i]))
+        continue;
+      if (kept != i) {
+        times[kept] = times[i];
+        uvs[kept] = uvs[i];
+        norm[kept] = norm[i];
+      }
+      ++kept;
+    }
+    times.resize(kept);
+    uvs.resize(kept);
+    norm.resize(kept);
+  }
+}
+
+Eigen::Vector3d UpdaterHelper::world_to_anchor(const std::shared_ptr<State> &state, size_t camera_id, double clone_time,
+                                               const Eigen::Vector3d &p_FinG) {
+  const auto &clone = state->pose_for_camera(camera_id, clone_time);
+  const auto &camera = state->_calib_IMUtoCAM.at(camera_id);
+  return camera->Rot() * clone->Rot() * (p_FinG - clone->pos()) + camera->pos();
+}
 
 void UpdaterHelper::get_feature_jacobian_representation(std::shared_ptr<State> state, UpdaterHelperFeature &feature, Eigen::MatrixXd &H_f,
                                                         std::vector<Eigen::MatrixXd> &H_x, std::vector<std::shared_ptr<Type>> &x_order) {
@@ -86,82 +123,13 @@ void UpdaterHelper::get_feature_jacobian_representation(std::shared_ptr<State> s
   // Anchor pose orientation and position, and camera calibration for our anchor camera
   Eigen::Matrix3d R_ItoC = state->_calib_IMUtoCAM.at(feature.anchor_cam_id)->Rot();
   Eigen::Vector3d p_IinC = state->_calib_IMUtoCAM.at(feature.anchor_cam_id)->pos();
-  Eigen::Matrix3d R_GtoI = state->_clones_IMU.at(feature.anchor_clone_timestamp)->Rot();
-  Eigen::Vector3d p_IinG = state->_clones_IMU.at(feature.anchor_clone_timestamp)->pos();
+  Eigen::Matrix3d R_GtoI = state->pose_for_camera(feature.anchor_cam_id, feature.anchor_clone_timestamp)->Rot();
+  Eigen::Vector3d p_IinG = state->pose_for_camera(feature.anchor_cam_id, feature.anchor_clone_timestamp)->pos();
   Eigen::Vector3d p_FinA = feature.p_FinA;
 
-  // Camera time offset delta for anchor camera (consistent with get_feature_jacobian_full);
-  // the KNOWN epoch residual of the anchor observation adds to both linearizations
-  const double dt_epoch_anc = state->epoch_residual((size_t)feature.anchor_cam_id, feature.anchor_clone_timestamp);
-  double dt_camoff_anc = state->cam_imu_dt_delta(feature.anchor_cam_id) + dt_epoch_anc;
-  double dt_camoff_anc_lin = (state->_options.do_calib_camera_timeoffset
-      ? state->cam_imu_dt_delta_fej(feature.anchor_cam_id) : state->cam_imu_dt_delta(feature.anchor_cam_id)) + dt_epoch_anc;
-
-  // RS row-anchor convention (rs_convention: top 0.0 / center 0.5 / bottom 1.0)
-  const double rs_row_anchor = state->_options.rs_row_anchor;
-
-  // Rolling shutter readout for anchor camera (map is populated for every camera at construction;
-  // id >= 0 iff this camera's readout is an ESTIMATED state -- declared rolling under calib)
-  std::shared_ptr<Vec> readout_anc = state->_calib_camera_readout.at(feature.anchor_cam_id);
-  const bool readout_anc_est = readout_anc->id() >= 0;
-  double t_readout_anc = readout_anc->value()(0);
-  double t_readout_anc_lin = readout_anc_est ? readout_anc->fej()(0) : t_readout_anc;
-  Eigen::Vector3d omega_anc_val = Eigen::Vector3d::Zero();
-  Eigen::Vector3d v_anc_val = Eigen::Vector3d::Zero();
-  Eigen::Vector3d omega_anc_lin = Eigen::Vector3d::Zero();
-  Eigen::Vector3d v_anc_lin = Eigen::Vector3d::Zero();
-  double v_frac_anc = 0.0;
-  bool need_anchor_correction = readout_anc_est || state->_options.do_calib_camera_timeoffset ||
-      std::abs(dt_camoff_anc) > 1e-10 || std::abs(dt_camoff_anc_lin) > 1e-10 ||
-      std::abs(t_readout_anc) > 1e-10 || std::abs(t_readout_anc_lin) > 1e-10;
-  if (need_anchor_correction) {
-    // Get kinematics at anchor clone time (needed for both time offset and RS corrections).
-    // Tolerant lookup: a clone restored by a warm-started reset may have no kinematics -- degrade
-    // to zero correction/columns for it (counted; the clone marginalizes out within one window).
-    auto kin_anc_it = state->_clones_kinematics.find(feature.anchor_clone_timestamp);
-    if (kin_anc_it != state->_clones_kinematics.end()) {
-      const State::CloneKinematics &kin_anc = kin_anc_it->second;
-      omega_anc_val = kin_anc.omega;
-      v_anc_val = kin_anc.vel;
-      if (state->_options.do_fej) {
-        omega_anc_lin = kin_anc.omega_fej;
-        v_anc_lin = kin_anc.vel_fej;
-      } else {
-        omega_anc_lin = omega_anc_val;
-        v_anc_lin = v_anc_val;
-      }
-    } else {
-      state->_kin_miss_count++;
-      if (state->_kin_miss_count == 1 || state->_kin_miss_count % 256 == 0) {
-        PRINT_WARNING(YELLOW "UpdaterHelper: no clone kinematics at %.6f (miss #%" PRIu64 "); zero dt/RS correction\n" RESET,
-                      feature.anchor_clone_timestamp, state->_kin_miss_count);
-      }
-    }
-
-    // Compute centered v_frac from anchor observation pixel row (RS component; stamps anchor mid-frame)
-    auto ts_it = feature.timestamps.find(feature.anchor_cam_id);
-    if (ts_it != feature.timestamps.end()) {
-      const auto &anc_timestamps = ts_it->second;
-      auto it = std::find(anc_timestamps.begin(), anc_timestamps.end(), feature.anchor_clone_timestamp);
-      if (it != anc_timestamps.end()) {
-        size_t anc_idx = std::distance(anc_timestamps.begin(), it);
-        const auto &anc_uvs = feature.uvs.at(feature.anchor_cam_id);
-        double v_pixel_anc = (double)anc_uvs.at(anc_idx)(1);
-        double inv_img_h_anc = 1.0 / (double)state->_cam_intrinsics_cameras.at(feature.anchor_cam_id)->h();
-        v_frac_anc = v_pixel_anc * inv_img_h_anc - rs_row_anchor;
-      }
-    }
-
-    // Apply combined time offset delta and RS correction to anchor pose (value)
-    double dt_total_anc = dt_camoff_anc;
-    if (std::abs(t_readout_anc) > 1e-10) {
-      dt_total_anc += v_frac_anc * t_readout_anc;
-    }
-    if (std::abs(dt_total_anc) > 1e-10) {
-      R_GtoI = exp_so3(-omega_anc_val * dt_total_anc) * R_GtoI;
-      p_IinG = p_IinG + v_anc_val * dt_total_anc;
-    }
-  }
+  // Landmark coordinates belong to the virtual camera rigidly attached to
+  // this retained clone. The anchor is a parameterization frame, not an image
+  // exposure: td, rolling shutter and epoch bridges act only on observers.
 
   // If I am doing FEJ, I should FEJ the anchor states (should we fej calibration???)
   // Also get the FEJ position of the feature if we are
@@ -169,19 +137,8 @@ void UpdaterHelper::get_feature_jacobian_representation(std::shared_ptr<State> s
     // "Best" feature in the global frame
     Eigen::Vector3d p_FinG_best = R_GtoI.transpose() * R_ItoC.transpose() * (feature.p_FinA - p_IinC) + p_IinG;
     // Transform the best into our anchor frame using FEJ
-    R_GtoI = state->_clones_IMU.at(feature.anchor_clone_timestamp)->Rot_fej();
-    p_IinG = state->_clones_IMU.at(feature.anchor_clone_timestamp)->pos_fej();
-    // Apply combined time offset delta and RS correction to FEJ anchor pose
-    if (need_anchor_correction) {
-      double dt_total_anc_fej = dt_camoff_anc_lin;
-      if (std::abs(t_readout_anc_lin) > 1e-10) {
-        dt_total_anc_fej += v_frac_anc * t_readout_anc_lin;
-      }
-      if (std::abs(dt_total_anc_fej) > 1e-10) {
-        R_GtoI = exp_so3(-omega_anc_lin * dt_total_anc_fej) * R_GtoI;
-        p_IinG = p_IinG + v_anc_lin * dt_total_anc_fej;
-      }
-    }
+    R_GtoI = state->pose_for_camera(feature.anchor_cam_id, feature.anchor_clone_timestamp)->Rot_fej();
+    p_IinG = state->pose_for_camera(feature.anchor_cam_id, feature.anchor_clone_timestamp)->pos_fej();
     p_FinA = (R_GtoI.transpose() * R_ItoC.transpose()).transpose() * (p_FinG_best - p_IinG) + p_IinC;
   }
   Eigen::Matrix3d R_CtoG = R_GtoI.transpose() * R_ItoC.transpose();
@@ -192,7 +149,7 @@ void UpdaterHelper::get_feature_jacobian_representation(std::shared_ptr<State> s
   H_anc.block(0, 3, 3, 3).setIdentity();
 
   // Add anchor Jacobians to our return vector
-  x_order.push_back(state->_clones_IMU.at(feature.anchor_clone_timestamp));
+  x_order.push_back(state->pose_for_camera(feature.anchor_cam_id, feature.anchor_clone_timestamp));
   H_x.push_back(H_anc);
 
   // Get calibration Jacobians (for anchor clone)
@@ -202,18 +159,6 @@ void UpdaterHelper::get_feature_jacobian_representation(std::shared_ptr<State> s
     H_calib.block(0, 3, 3, 3) = -R_CtoG;
     x_order.push_back(state->_calib_IMUtoCAM.at(feature.anchor_cam_id));
     H_x.push_back(H_calib);
-  }
-
-  // Anchor readout time calibration Jacobian
-  // p_FinG = R_GtoI^T * R_ItoC^T * (p_FinA - p_IinC) + p_IinG
-  // d(p_FinG)/d(t_rd) = (R_GtoI^T * [ω]× * R_ItoC^T * (p_FinA - p_IinC) + v) * v_frac
-  // Column skipped while the window motion is degenerate for temporal calibration (values still used)
-  if (readout_anc_est && !state->dt_calib_degenerate()) {
-    Eigen::Vector3d p_FinI_anc = R_ItoC.transpose() * (p_FinA - p_IinC);
-    Eigen::Matrix<double, 3, 1> H_readout_anc;
-    H_readout_anc = (R_GtoI.transpose() * skew_x(omega_anc_lin) * p_FinI_anc + v_anc_lin) * v_frac_anc;
-    x_order.push_back(state->_calib_camera_readout.at(feature.anchor_cam_id));
-    H_x.push_back(H_readout_anc);
   }
 
   // If we are doing anchored XYZ feature
@@ -307,7 +252,7 @@ void UpdaterHelper::get_feature_jacobian_full(std::shared_ptr<State> state, Upda
 
   // Reference camera timeoffset term is used by all camera measurements as dt_cam - dt_ref
   std::shared_ptr<Vec> dt_ref_var;
-  if (state->_options.do_calib_camera_timeoffset) {
+  if (state->_options.do_calib_camera_timeoffset && !state->uses_physical_clones()) {
     dt_ref_var = state->cam_imu_dt_var((size_t)state->cam_imu_dt_ref_camid());
   }
 
@@ -332,7 +277,7 @@ void UpdaterHelper::get_feature_jacobian_full(std::shared_ptr<State> state, Upda
     }
 
     // If doing camera-imu timeoffset calibration
-    if (state->_options.do_calib_camera_timeoffset) {
+    if (state->_options.do_calib_camera_timeoffset && !state->uses_physical_clones()) {
       std::shared_ptr<Vec> dt_cam = state->cam_imu_dt_var(pair.first);
       if (dt_cam.get() != dt_ref_var.get() && map_hx.find(dt_cam) == map_hx.end()) {
         include_dt_ref_col = true;
@@ -356,7 +301,7 @@ void UpdaterHelper::get_feature_jacobian_full(std::shared_ptr<State> state, Upda
     for (size_t m = 0; m < feature.timestamps[pair.first].size(); m++) {
 
       // Add this clone if it is not added already
-      std::shared_ptr<PoseJPL> clone_Ci = state->_clones_IMU.at(feature.timestamps[pair.first].at(m));
+      std::shared_ptr<PoseJPL> clone_Ci = state->pose_for_camera(pair.first, feature.timestamps[pair.first].at(m));
       if (map_hx.find(clone_Ci) == map_hx.end()) {
         map_hx.insert({clone_Ci, total_hx});
         x_order.push_back(clone_Ci);
@@ -401,7 +346,7 @@ void UpdaterHelper::get_feature_jacobian_full(std::shared_ptr<State> state, Upda
     assert(feature.anchor_cam_id != -1);
 
     // Add this anchor if it is not added already
-    std::shared_ptr<PoseJPL> clone_Ai = state->_clones_IMU.at(feature.anchor_clone_timestamp);
+    std::shared_ptr<PoseJPL> clone_Ai = state->pose_for_camera(feature.anchor_cam_id, feature.anchor_clone_timestamp);
     if (map_hx.find(clone_Ai) == map_hx.end()) {
       map_hx.insert({clone_Ai, total_hx});
       x_order.push_back(clone_Ai);
@@ -428,9 +373,8 @@ void UpdaterHelper::get_feature_jacobian_full(std::shared_ptr<State> state, Upda
   const int dt_ref_hx_col = (state->_options.do_calib_camera_timeoffset && map_hx.find(dt_ref_var) != map_hx.end())
                                 ? (int)map_hx.at(dt_ref_var)
                                 : -1;
-  // Freeze the temporal-calibration COLUMNS (dt and readout) while the window motion is degenerate
-  // for them; their current values are still applied to the poses above/below
-  const bool dt_rs_cols_active = !state->dt_calib_degenerate();
+  // Keep all temporal measurement columns. The optional excitation gate freezes gain rows
+  // centrally in StateHelper, retaining the uncertainty and cross-covariance of these states.
 
   // RS row-anchor convention (rs_convention: top 0.0 / center 0.5 / bottom 1.0)
   const double rs_row_anchor = state->_options.rs_row_anchor;
@@ -445,33 +389,10 @@ void UpdaterHelper::get_feature_jacobian_full(std::shared_ptr<State> state, Upda
     Eigen::Matrix3d R_ItoC = state->_calib_IMUtoCAM.at(feature.anchor_cam_id)->Rot();
     Eigen::Vector3d p_IinC = state->_calib_IMUtoCAM.at(feature.anchor_cam_id)->pos();
     // Anchor pose orientation and position
-    Eigen::Matrix3d R_GtoI = state->_clones_IMU.at(feature.anchor_clone_timestamp)->Rot();
-    Eigen::Vector3d p_IinG = state->_clones_IMU.at(feature.anchor_clone_timestamp)->pos();
-    // Apply async camera timeoffset correction and rolling shutter correction for anchor pose
-    double dt_camoff_anc =
-        state->cam_imu_dt_delta(feature.anchor_cam_id) + state->epoch_residual((size_t)feature.anchor_cam_id, feature.anchor_clone_timestamp);
-    double t_readout_anc = state->_calib_camera_readout.at(feature.anchor_cam_id)->value()(0);
-    double dt_total_anc = dt_camoff_anc;
-    if (std::abs(t_readout_anc) > 1e-10) {
-      const auto &anc_timestamps = feature.timestamps.at(feature.anchor_cam_id);
-      auto it = std::find(anc_timestamps.begin(), anc_timestamps.end(), feature.anchor_clone_timestamp);
-      if (it != anc_timestamps.end()) {
-        size_t anc_idx = std::distance(anc_timestamps.begin(), it);
-        const auto &anc_uvs = feature.uvs.at(feature.anchor_cam_id);
-        double v_pixel_anc = (double)anc_uvs.at(anc_idx)(1);
-        double inv_img_h_anc = 1.0 / (double)state->_cam_intrinsics_cameras.at(feature.anchor_cam_id)->h();
-        dt_total_anc += (v_pixel_anc * inv_img_h_anc - rs_row_anchor) * t_readout_anc;
-      }
-    }
-    if (std::abs(dt_total_anc) > 1e-10) {
-      auto kin_anc_it = state->_clones_kinematics.find(feature.anchor_clone_timestamp);
-      if (kin_anc_it != state->_clones_kinematics.end()) {
-        R_GtoI = exp_so3(-kin_anc_it->second.omega * dt_total_anc) * R_GtoI;
-        p_IinG = p_IinG + kin_anc_it->second.vel * dt_total_anc;
-      } else {
-        state->_kin_miss_count++;
-      }
-    }
+    Eigen::Matrix3d R_GtoI = state->pose_for_camera(feature.anchor_cam_id, feature.anchor_clone_timestamp)->Rot();
+    Eigen::Vector3d p_IinG = state->pose_for_camera(feature.anchor_cam_id, feature.anchor_clone_timestamp)->pos();
+    // The virtual anchor uses the clone pose directly. Exposure transport is
+    // applied below for each observation, including an image at the anchor key.
     // Feature in the global frame
     p_FinG = R_GtoI.transpose() * R_ItoC.transpose() * (feature.p_FinA - p_IinC) + p_IinG;
   }
@@ -527,14 +448,14 @@ void UpdaterHelper::get_feature_jacobian_full(std::shared_ptr<State> state, Upda
     double t_readout = readout->value()(0);
     double t_readout_lin = readout_est ? readout->fej()(0) : t_readout;
     std::shared_ptr<Vec> dt_cam_var = state->cam_imu_dt_var(cam_id);
-    double dt_camoff = dt_cam_var->value()(0) - dt_ref_val;
-    double dt_camoff_lin = (state->_options.do_calib_camera_timeoffset ? dt_cam_var->fej()(0) : dt_cam_var->value()(0)) - dt_ref_lin;
+    double dt_camoff = state->uses_physical_clones() ? 0.0 : dt_cam_var->value()(0) - dt_ref_val;
+    double dt_camoff_lin = state->uses_physical_clones() ? 0.0 : (state->_options.do_calib_camera_timeoffset ? dt_cam_var->fej()(0) : dt_cam_var->value()(0)) - dt_ref_lin;
     bool rs_on_value = std::abs(t_readout) > 1e-10;
     bool rs_on_linearization = std::abs(t_readout_lin) > 1e-10;
     bool dt_on_value = std::abs(dt_camoff) > 1e-10;
     bool dt_on_linearization = std::abs(dt_camoff_lin) > 1e-10;
-    bool need_rs_terms = readout_est || state->_options.do_calib_camera_timeoffset || rs_on_value ||
-                         rs_on_linearization || dt_on_value || dt_on_linearization;
+    bool need_rs_terms = !state->uses_physical_clones() && (readout_est || state->_options.do_calib_camera_timeoffset || rs_on_value ||
+                         rs_on_linearization || dt_on_value || dt_on_linearization);
     int readout_hx_col = -1;
     if (readout_est) {
       readout_hx_col = map_hx.at(readout);
@@ -551,7 +472,7 @@ void UpdaterHelper::get_feature_jacobian_full(std::shared_ptr<State> state, Upda
       //=========================================================================
 
       // Get current IMU clone state
-      std::shared_ptr<PoseJPL> clone_Ii = state->_clones_IMU.at(cam_timestamps.at(m));
+      std::shared_ptr<PoseJPL> clone_Ii = state->pose_for_camera(cam_id, cam_timestamps.at(m));
       Eigen::Matrix3d R_GtoIi = clone_Ii->Rot();
       Eigen::Vector3d p_IiinG = clone_Ii->pos();
 
@@ -565,6 +486,7 @@ void UpdaterHelper::get_feature_jacobian_full(std::shared_ptr<State> state, Upda
       const double clone_time = cam_timestamps.at(m);
       const double dt_epoch = state->epoch_residual(cam_id, clone_time);
       const PreintBridgeData *bridge = state->epoch_bridge(cam_id, clone_time);
+      const bool body_velocity = legacy_exposure::uses_body_velocity(*state, cam_id, bridge != nullptr);
       const bool need_obs_terms = need_rs_terms || std::abs(dt_epoch) > 1e-12;
       // Estimated shift: with a bridge the KNOWN residual is integrated exactly, so it drops out
       double dt_total = dt_camoff + ((bridge == nullptr) ? dt_epoch : 0.0);
@@ -577,13 +499,17 @@ void UpdaterHelper::get_feature_jacobian_full(std::shared_ptr<State> state, Upda
       // Bridge-endpoint kinematics for the Jacobian columns / extra shifts (filled below)
       Eigen::Vector3d omega_end_lin = Eigen::Vector3d::Zero();
       Eigen::Vector3d v_end_lin = Eigen::Vector3d::Zero();
-      Eigen::Matrix3d R_clone_lin = Eigen::Matrix3d::Identity(); // clone rotation at the Jacobian linearization
+      Eigen::Matrix3d R_clone_lin = R_GtoIi; // clone rotation at the Jacobian linearization
+      Eigen::Matrix3d R_warp_lin = Eigen::Matrix3d::Identity();
+      double dt_warp_lin = dt_total;
       if (need_obs_terms) {
         auto kin_it = state->_clones_kinematics.find(clone_time);
         if (kin_it != state->_clones_kinematics.end()) {
           have_clone_kin = true;
           omega_clone_val = kin_it->second.omega;
           v_clone_val = kin_it->second.vel;
+          if (body_velocity)
+            v_clone_val = legacy_exposure::world_velocity(R_GtoIi, clone_Ii->Rot_fej(), v_clone_val);
           if (state->_options.do_fej) {
             omega_clone_lin = kin_it->second.omega_fej;
             v_clone_lin = kin_it->second.vel_fej;
@@ -624,7 +550,8 @@ void UpdaterHelper::get_feature_jacobian_full(std::shared_ptr<State> state, Upda
             p_IiinG = p_IiinG + v_end_val * dt_total;
           }
         } else if (have_clone_kin && std::abs(dt_total) > 1e-10) {
-          R_GtoIi = exp_so3(-omega_clone_val * dt_total) * R_GtoIi;
+          R_warp_lin = exp_so3(-omega_clone_val * dt_total);
+          R_GtoIi = R_warp_lin * R_GtoIi;
           p_IiinG = p_IiinG + v_clone_val * dt_total;
         }
       }
@@ -657,11 +584,13 @@ void UpdaterHelper::get_feature_jacobian_full(std::shared_ptr<State> state, Upda
         // residual composes at the FIXED build-time linearization (b0), which is exactly what
         // FEJ prescribes; the estimated remainder composes exactly on SO(3) at the endpoint kinematics.
         R_clone_lin = R_GtoIi;
+        R_warp_lin.setIdentity();
         if (need_obs_terms) {
           double dt_total_fej = dt_camoff_lin + ((bridge == nullptr) ? dt_epoch : 0.0);
           if (rs_on_linearization) {
             dt_total_fej += (v_pixel * inv_img_h - rs_row_anchor) * t_readout_lin;
           }
+          dt_warp_lin = dt_total_fej;
           if (bridge != nullptr) {
             const Eigen::Matrix3d R_clone_fej = R_GtoIi;
             R_GtoIi = bridge->DR * R_clone_fej;
@@ -673,7 +602,8 @@ void UpdaterHelper::get_feature_jacobian_full(std::shared_ptr<State> state, Upda
               p_IiinG = p_IiinG + v_end_lin * dt_total_fej;
             }
           } else if (have_clone_kin && std::abs(dt_total_fej) > 1e-10) {
-            R_GtoIi = exp_so3(-omega_clone_lin * dt_total_fej) * R_GtoIi;
+            R_warp_lin = exp_so3(-omega_clone_lin * dt_total_fej);
+            R_GtoIi = R_warp_lin * R_GtoIi;
             p_IiinG = p_IiinG + v_clone_lin * dt_total_fej;
           }
         }
@@ -681,11 +611,13 @@ void UpdaterHelper::get_feature_jacobian_full(std::shared_ptr<State> state, Upda
         // p_IinC = calibration->pos_fej();
         p_FinIi = R_GtoIi * (p_FinG_fej - p_IiinG);
         p_FinCi = R_ItoC * p_FinIi + p_IinC;
-        // uv_norm << p_FinCi(0)/p_FinCi(2),p_FinCi(1)/p_FinCi(2);
-        // cam_d = state->get_intrinsics_CAM(pair.first)->fej();
       }
 
-      // Compute Jacobians in respect to normalized image coordinates and possibly the camera intrinsics
+      // FEJ uses the affine camera jet at the current normalized observation:
+      // distort(uv_current, k+dk) + J_dist(uv_current,k) * (uv_FEJ(dg)-uv_FEJ(0)).
+      // Freeze uv_current and J_dist in this surrogate; geometric and extrinsic
+      // columns share its left factor, while intrinsic columns remain current.
+      // With FEJ disabled this is the derivative of the current nonlinear mean.
       Eigen::MatrixXd dz_dzn, dz_dzeta;
       camera_model->compute_distort_jacobian(uv_norm, dz_dzn, dz_dzeta);
 
@@ -696,16 +628,17 @@ void UpdaterHelper::get_feature_jacobian_full(std::shared_ptr<State> state, Upda
       // Derivative of p_FinCi in respect to p_FinIi
       Eigen::MatrixXd dpfc_dpfg = R_ItoC * R_GtoIi;
 
-      // Derivative of p_FinCi in respect to camera clone state.
-      // NOTE (MEASURED -- do not re-attempt piecemeal): assigning the SAMPLED-pose derivative to
-      // the CLONE block strictly wants the warp transport dtheta_sample = (R_sample R_clone^T) *
-      // dtheta_clone (+ the bridged lever arm). Built and A/B-measured on this block alone:
-      // synced sim NEES 32.0 -> 45.1, ori RMSE 0.397 -> 0.510 deg -- the FEJ observability-
-      // violation signature. Consistently-first-order Jacobians keep the nullspace cancellations
-      // a piecemeal-exact block breaks; a warp-coherent fix must move every coupled block
-      // (feature, calib, temporal columns) together. This block stays first-order on purpose.
+      // For the fixed-body exposure map y=E*(R*(f-p)-u*dt), the JPL clone
+      // rotation derivative is E*[R*(f-p)]x. It includes both rotation transport
+      // and the orientation dependence of v(R)=R^T*u. Other exposure models
+      // retain their existing first-order clone derivative.
       Eigen::MatrixXd dpfc_dclone = Eigen::MatrixXd::Zero(3, 6);
       dpfc_dclone.block(0, 0, 3, 3).noalias() = R_ItoC * skew_x(p_FinIi);
+      if (body_velocity && have_clone_kin && std::abs(dt_warp_lin) > 1e-10) {
+        const Eigen::Vector3d &point = state->_options.do_fej ? p_FinG_fej : p_FinG;
+        const Eigen::Vector3d base_position = state->_options.do_fej ? clone_Ii->pos_fej() : clone_Ii->pos();
+        dpfc_dclone.block(0, 0, 3, 3).noalias() = R_ItoC * R_warp_lin * skew_x(R_clone_lin * (point - base_position));
+      }
       dpfc_dclone.block(0, 3, 3, 3) = -dpfc_dpfg;
 
       //=========================================================================
@@ -753,8 +686,8 @@ void UpdaterHelper::get_feature_jacobian_full(std::shared_ptr<State> state, Upda
       const Eigen::Vector3d &v_col = (bridge != nullptr) ? v_end_lin : v_clone_lin;
 
       // Derivative of measurement in respect to rolling shutter readout time
-      // (column skipped when the window motion is degenerate or this clone has no kinematics)
-      if (readout_hx_col >= 0 && dt_rs_cols_active && have_clone_kin) {
+      // (column requires kinematics; the excitation gate acts later on the gain, not this model)
+      if (readout_hx_col >= 0 && have_clone_kin) {
         double v_frac = v_pixel * inv_img_h - rs_row_anchor;
         Eigen::Vector3d dpfI_dtrd = -(skew_x(w_col) * p_FinIi + R_GtoIi * v_col) * v_frac;
         H_x.block(2 * c, readout_hx_col, 2, 1).noalias() += dz_dpfc * R_ItoC * dpfI_dtrd;
@@ -763,7 +696,7 @@ void UpdaterHelper::get_feature_jacobian_full(std::shared_ptr<State> state, Upda
       // Derivative of measurement in respect to camera-imu timeoffsets (dz/d(dt_cam) = +dz_ddt and
       // dz/d(dt_ref) = -dz_ddt since the effective quantity is dt_cam - dt_ref; the reference
       // camera's own measurements contribute nothing by construction)
-      if (state->_options.do_calib_camera_timeoffset && dt_rs_cols_active && have_clone_kin && dt_cam_hx_col >= 0 &&
+      if (state->_options.do_calib_camera_timeoffset && have_clone_kin && dt_cam_hx_col >= 0 &&
           dt_ref_hx_col >= 0 && dt_cam_hx_col != dt_ref_hx_col) {
         Eigen::Vector3d dpfI_ddt = -(skew_x(w_col) * p_FinIi + R_GtoIi * v_col);
         Eigen::Matrix<double, 2, 1> dz_ddt = dz_dpfc * R_ItoC * dpfI_ddt;
@@ -820,6 +753,13 @@ void UpdaterHelper::nullspace_project_inplace(Eigen::MatrixXd &H_f, Eigen::Matri
 }
 
 void UpdaterHelper::measurement_compress_inplace(Eigen::MatrixXd &H_x, Eigen::VectorXd &res) {
+  double discarded_residual_squared;
+  measurement_compress_inplace(H_x, res, discarded_residual_squared);
+}
+
+void UpdaterHelper::measurement_compress_inplace(Eigen::MatrixXd &H_x, Eigen::VectorXd &res,
+                                                double &discarded_residual_squared) {
+  discarded_residual_squared = 0.0;
 
   // Return if H_x is a fat matrix (there is no need to compress in this case)
   if (H_x.rows() <= H_x.cols())
@@ -848,6 +788,7 @@ void UpdaterHelper::measurement_compress_inplace(Eigen::MatrixXd &H_x, Eigen::Ve
 
   // Construct the smaller jacobian and residual after measurement compression
   assert(r <= H_x.rows());
+  discarded_residual_squared = res.tail(res.rows() - r).squaredNorm();
   H_x.conservativeResize(r, H_x.cols());
   res.conservativeResize(r, res.cols());
 }

@@ -8,16 +8,12 @@
  * Live and replay share this object through the push interface (feed_imu /
  * feed_frame / finish): on-device the session thread pops the feeder's SPSC
  * rings and pushes here; on host the replay pump pushes the recorded streams.
- * All per-window work (linear seed, display-Lambda micro-BA, reservoir
- * admission) runs SYNCHRONOUSLY on this thread: windows close every few
- * seconds and cost ~100-300 ms on target, so the duty cycle stays low, the
- * rings upstream absorb the burst, and -- decisive -- live and replay execute
- * the IDENTICAL deterministic computation (the S4 bit-parity gate extends to
- * the committed answer). The streaming one-pass fusion drives DISPLAY ONLY;
- * the committed calibration always comes from the end-of-session VarPro
- * (JointCalib) over the D-optimal window selection, then VERIFY on held-out
- * windows gates a PARTIAL commit (only blocks whose posterior beats the prior
- * by commit_sigma_factor; the rest stay at seed and are reported).
+ * Per-window seeding, information export and reservoir admission run on this
+ * caller thread. Live and replay use the same stages, but matching input alone
+ * does not guarantee identical results: overrides, deadlines and numerical
+ * execution also matter. Streaming fusion is for collection diagnostics.
+ * The staged JointCalib solves supply the accepted calibration/posterior;
+ * held-out verification and per-block rules decide the committed mixture.
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -66,22 +62,12 @@ struct SessionConfig {
   double td_search_s = 0.08;
   bool bootstrap_epipolar = true; ///< geometrically refine time-unstable xcorr seeds before harvest
   int min_pair_matches = 12;
-  /// Evidence recency horizon [s] for the xcorr/hand-eye buffers (0 = whole session). The gate
-  /// judges the operator's RECENT motion: an early bad stretch (AE settling, blur, the pick-up)
-  /// must age out instead of capping the achievable peak forever -- measured: the cumulative
-  /// peak crawled 0.52->0.57 over a minute because the prefix never left the sum. Also bounds
-  /// per-attempt cost and memory on a long bootstrap. Sessions whose bootstrap passes within
-  /// the horizon are byte-identical to the unwindowed behaviour.
+  /// Bootstrap xcorr/hand-eye history [s]; zero retains the whole session.
+  /// Older motion ages out of both the evidence and per-attempt workspace.
   double bootstrap_window_s = 45.0;
   // COLLECT
-  /// Merge-replay the bootstrap-span frames+imu into the harvester once it
-  /// exists (see try_bootstrap_). Measured: transformative on starved flight
-  /// logs (4->10 harvested windows, ABORT->COMMIT) but HARMFUL on rich
-  /// handheld sessions (two early cold-start windows joined the fused set,
-  /// flipped split-half INCONSISTENT at dqA 0.823 deg vs the 0.305 band --
-  /// freezing the accel chain -- and dragged cam 1.4-1.8 px off the kalibr
-  /// reference). Default OFF preserves the validated rich-session path; the
-  /// --flight profile turns it on.
+  /// Replay buffered bootstrap IMU/frames into the newly created harvester.
+  /// This changes the admitted window set; the flight overlay enables it.
   bool retro_harvest = false;
   double collect_max_s = 240.0;
   /// EARLY CUTOVER (live sessions): stop collecting as soon as the reservoir's
@@ -89,24 +75,16 @@ struct SessionConfig {
   /// windows to fuse + verify. Estimated Tg must also reach its marginal
   /// precision target; a generic min-eigenvalue of 5 does not certify Tg's
   /// absolute ceiling. 0 = disabled (collect the whole budget).
-  ///
-  /// Why an eigenvalue and not a window count: the weakest direction is what
-  /// gates committability, and 20 near-duplicate windows can leave it as bare as
-  /// 5. The one-pass Lambda used here UNDER-states the information the full
-  /// nonlinear solve extracts (measured: sessions committing every block sat at
-  /// min-eig 4.8-6.3), so this threshold is a STOPPING heuristic, deliberately
-  /// below the theoretical commit-grade value (9 = the 3-sigma rule in whitened
-  /// units) -- the real gates still adjudicate at solve time.
+  /// This is a collection stopping heuristic, not a commit or accuracy verdict;
+  /// correlated or repeated windows need not add independent information.
   double collect_min_eig = 0.0;
   double thermal_hold_slope = 1.5 / 60.0; ///< deg C/s: pause window opening above this
   // SOLVE / camera staging
   int select_K = 18;
   double select_overlap_penalty = 0.5;
-  /// Stage-specific D-optimal subsets over the retained reservoir.
-  /// SELECTION-SIDE ONLY: admission fingerprints and reservoir retention are
-  /// parity-frozen (WindowScorer untouched); holdouts never enter any set
-  /// (thermal_bin excludes them). OFF = the single master selection feeds
-  /// every stage -- byte-identical legacy path.
+  /// Optional stage-specific D-optimal subsets of the retained reservoir.
+  /// Admission and reservoir retention are unchanged; holdouts stay excluded.
+  /// When disabled, every stage receives the master selection.
   bool stage_select = false;
   int select_K_a0 = 0; ///< A0 (ext/td/tr) budget; 0 = select_K
   int select_K_a1 = 0; ///< A1a/A1b + accel/tg gates budget; 0 = select_K (keep >= a_full_min_windows)
@@ -136,73 +114,41 @@ struct SessionConfig {
   double radtan_tangent_refine_sigma = 0.001; ///< p1/p2, independent of radial k1/k2 units
   double radtan_tangent_full_sigma = 0.01;
   double k34_radial_gate = 0.12; ///< min fraction of obs beyond 0.7*r_max to free k3/k4
-  /// C1 (center gate): min per-quadrant fraction of this camera's fused observations, quadrants
-  /// taken about the current (cx, cy). Below it the data never brackets the center and cx/cy walk
-  /// into self-consistent junk (measured: cy walked +2.9 px and COMMITTED); freeze them at seed
-  /// via the k3/k4 sigma mechanism -- the frozen-dof exclusion keeps the block committable.
+  /// Minimum per-quadrant fraction about this camera's current center.
+  /// Below it, constrain cx/cy to their seed while judging the remaining dofs.
   double cam_center_quadrant_gate = 0.10;
   Eigen::Matrix<double, 8, 1> cam_refine_prior = (Eigen::Matrix<double, 8, 1>() << 2, 2, 2, 2, 0.01, 0.01, 1e-9, 1e-9).finished();
   Eigen::Matrix<double, 8, 1> cam_full_prior = (Eigen::Matrix<double, 8, 1>() << 20, 20, 20, 20, 0.1, 0.1, 1e-9, 1e-9).finished();
-  /// Camera-block coordinate alternation rounds inside phase B: fx<->k1
-  /// correlate at |rho|~0.9 on equidistant, so a monolithic 8-dof pass walks
-  /// the shared valley slowly and drifts the pinhole row. Each round runs
-  /// (a) pinhole+k1/k2 with k3/k4 frozen, then (b) distortion-only k1..k4 with
-  /// the pinhole row frozen (k3/k4 still behind the radial-coverage gate).
-  /// 0 disables (monolithic B-1). SEED QUALITY moderates the round count:
-  /// on a well-seeded rig (per-unit cal, reproj 0.31 px) one round reproduces
-  /// the two-round kalibr scorecard exactly and saves ~30 s, but on
-  /// existing-cal-grade seeds (S4 sim, 1.5 px off: the production cam-refine
-  /// case) round 2 is load-bearing for the flattest dof (cy +0.70 vs +0.94 px,
-  /// carry-free). Library default serves the general case; drop to 1 via
-  /// --cam-alt-rounds when the rig's existing cal is known-good. Judge
-  /// alt-round savings carry-free: carried basins make round 2 a no-op at any
-  /// setting.
+  /// Camera coordinate rounds in phase B: pinhole+k1/k2 with the final
+  /// distortion pair held, then distortion-only with pinhole held. Coverage
+  /// gates remain active. Zero selects one monolithic camera-block solve.
+  /// Round count changes the reached solution and must be evaluated per rig.
   int cam_alt_rounds = 2;
-  /// Run the pinhole-only settle pass after the alternation rounds. Measured
-  /// merit-flat alongside round 2; profiles may drop settle (~9 s host) after
-  /// a byte-level A/B on their own shape.
+  /// Run a pinhole-only settle solve after camera coordinate alternation.
   bool cam_settle = true;
-  /// Arm the stationarity certificate in B2-polish (IMU chain open there, so
-  /// JointConfig::cert_open_imu is required): replaces the legacy
-  /// plateau/anchor double-solves, measured ~85% redundant in that stage.
-  /// Off by default; profiles enable after their falsifier+scorecard A/B.
+  /// Permit the local stationarity heuristic in B2 joint polish when the
+  /// IMU chain is open. It does not replace final verification or commit gates.
   bool b2_cert = false;
-  /// Re-baseline candidate (default off; --a-candidate CLI): the A-chain
-  /// stages (A0/A1a/A1b-full) run the certificate instead of legacy
-  /// plateau/anchor, and every staged solve arms the Newton-decrement
-  /// conv-stop. The split HALVES stay legacy two-path unconditionally (they
-  /// ARE the falsifier). This deliberately moves the A-chain statistics the
-  /// legacy invariant pins -- verdicts are adjudicated against the suite,
-  /// both reference logs, and the kalibr-gauge envelope, never assumed.
+  /// Experimental outer Newton-decrement stopping for A0/A1a/A1b and the
+  /// B-stage configurations. This does not enable an A-stage certificate.
+  /// Split halves keep their separate stopping and arbitration settings.
   bool a_candidate = false;
-  /// Fused evaluation in every staged solve EXCEPT the split halves (the
-  /// mode-0/2 falsifier keeps its legacy statistics in every configuration).
-  /// At host mode-1 the operative falsifier is the wald gate, whose stability
-  /// under the fused solver is measured by test_wald_mc --p4.
+  /// Use capped fused evaluations for staged solves except split halves.
+  /// Changes to the optimization path can change gate statistics; enabling
+  /// this does not establish either null sizing or model-error rejection.
   bool p4 = false;
-  /// A-chain warm-carry (mode-1 experiment): carry nuisance optima across
-  /// A0->A1a->A1b. Carried seeds poison the SPLIT-HALF falsifier (measured:
-  /// S1 sim verdict flip) -- which never runs at mode-1, where the wald
-  /// gate + kalibr scoring adjudicate instead. B-chain carry stays OFF
-  /// unconditionally (S4 cy flat-dof walk, measured).
+  /// Historical carry experiment request. Current session A-stage policy
+  /// explicitly disables carry after reading it; this flag does not enable it.
   bool a_carry = false;
-  // Accel-chain unlock (A1b): the full accel intrinsic chain (da off-diagonals
-  /// + q_AtoI) needs specific-force DIRECTION diversity (attitude spread) to be
-  /// identifiable at all -- the cheap pre-gate below -- but on real sensors the
-  /// weakly-excited dofs also absorb unmodeled systematics (-1%-level scale
-  /// junk measured on a handheld ICM while kalibr resolves 0.3-0.6%). The
-  /// authoritative gate is therefore SPLIT-HALF CONSISTENCY: the chain is
-  /// solved independently on the first and second time-half of the fused
-  /// windows and unlocks only when both halves agree within their posteriors
-  /// (time split, not interleaved: the junk mode tracks self-heating/drift).
-  /// Diagonal da always solves (A1a).
+  /// Full accel-chain fitting needs attitude and dynamic excitation before
+  /// the consistency gate runs. Split modes independently fit the temporal
+  /// halves; mode 1 instead uses the local Wald test. Agreement under either
+  /// model is not independent accuracy validation. A1a fits diagonal Da.
   double a_full_att_gate_deg = 45.0;  ///< pre-gate: min pairwise angle between window gravity dirs (body frame)
   double a_full_dyn_gate = 0.2;       ///< pre-gate floor: mean within-window std of |a_m| [m/s^2] (near-static guard)
   int a_full_min_windows = 6;         ///< pre-gate: enough fused windows for two meaningful halves
   double a_split_sigma_k = 3.0;       ///< half-agreement band: k * sqrt(sig1^2 + sig2^2) per dof
-  double a_split_da_floor = 3e-3;     ///< band floor for da dofs: agreement is only demanded at the scale of
-                                      ///< the accuracy CLAIM (~0.3%); tighter floors freeze chains whose halves
-                                      ///< agree 8x better than the suite's own documented da valley tolerance
+  double a_split_da_floor = 3e-3;     ///< historical absolute agreement floor for Da dofs
   double a_split_qa_floor_deg = 0.1;  ///< band floor for the q_AtoI angle
   /// Absolute split-half difference floor for Tg [(rad/s)/(m/s^2)]. Historical
   /// policy (commit 3e95384): 0.3 times a 4e-4 ICM reference scale, supported by
@@ -210,21 +156,16 @@ struct SessionConfig {
   /// validation. A difference floor and a one-sigma posterior ceiling describe
   /// different statistics even when their numeric values happen to match.
   double a_split_tg_floor = 1.2e-4;
-  /// Signal-fraction term of the agreement band: halves also agree when their
-  /// disagreement is below this fraction of the SIGNAL they claim (deviation
-  /// from the frozen A1a value). Scale-free falsifier: exported posteriors are
-  /// precision-only and under-disperse (measured ~2x on the synthetic suite),
-  /// so a pure sigma band wrongly freezes a well-observed chain; junk modes
-  /// have scatter ~ signal and still fail this ratio.
+  /// Agreement band also includes this fraction of the halves' departure
+  /// from their shared entry. It supplements raw local-posterior bands;
+  /// time-stable model errors can still pass a consistency test.
   double a_split_signal_frac = 0.34;
-  // ---- Wald reduced-information accel gate: replaces the two nonlinear
-  // half-solves with ONE widened warm evaluation pass at the A1a accepted
-  // point + marginal Wald / cross-prediction / observability statistics on
-  // the 6-dof gate subspace {da off-diag, qA}. The half-solves' launch
-  // sensitivity is what pins A1a's pass count -- this gate dissolves that
-  // constraint.
-  int a_gate_mode = 0;           ///< 0 split-half decides (legacy-exact); 1 wald decides; 2 shadow (split decides, wald logged)
-  double a_info_deflate = 2.0;   ///< kappa: measured exported-Lambda under-dispersion, VARIANCE semantics (MC harness re-pins per shape)
+  // Local Wald gate: widen one warm evaluation at the accepted A1a point,
+  // then form marginal contrast, quadratic cross-prediction and information
+  // checks for the six accel-chain dofs. Tg has its own nine-dof subspace.
+  // Mode 1 is experimental authority; supported profiles use mode 2.
+  int a_gate_mode = 0;           ///< 0 split decides; 1 Wald decides; 2 split decides with Wald diagnostics
+  double a_info_deflate = 2.0;   ///< covariance inflation floor; H0 sizing alone does not validate H1 rejection
   double a_obs_min_eig = 4.5;    ///< per-half prior-whitened eigenvalue floor over the entire tested span, after kappa deflation
   double a_wald_thresh_scale = 1.0;
   double a_qa_phys_ceiling_deg = 2.0;  ///< historical fused-step guard relative to entry; not an absolute sensor limit
@@ -243,10 +184,8 @@ struct SessionConfig {
                                     ///< (0 = off; enable on bench data -- far-field/translation-free guard)
   // VERIFY / COMMIT
   double verify_min_improve = 0.05;  ///< held-out cost must improve by >= 5%
-  /// Small-n honesty floors: a +5% improvement on ONE holdout window is weak
-  /// evidence (measured flight sessions sit exactly there). With n_hold <= 2
-  /// the improvement floor rises (n=1 -> n1, n=2 -> n2); the profile answer
-  /// to a starved session is MORE holdouts (min_holdout), not a softer gate.
+  /// Require larger held-out improvement when only one or two windows are
+  /// available. Extra repeated observations are not independent validation.
   double verify_min_improve_n1 = 0.15;
   double verify_min_improve_n2 = 0.10;
   /// Retro-holdout top-up target: force_holdout weakest-information retained
@@ -254,22 +193,13 @@ struct SessionConfig {
   /// keeping N_fused >= max(2, N_ret-3). 1 = legacy single retro-designation.
   int min_holdout = 1;
   double commit_sigma_factor = 3.0;  ///< block commits only if 3*sigma_post < sigma_prior for all dofs
-  /// A block must be DISTINGUISHABLE from the value it would otherwise ship (the
-  /// revert point: its seed) before it may claim a calibration. The 3-sigma rule
-  /// above is PRECISION-only -- it asks "is the posterior tight?", never "did the
-  /// data actually move this block?" -- and a block the solver never stepped still
-  /// accumulates information at the linearization point, so its posterior
-  /// collapses and it COMMITS AT ITS SEED. Measured: a budget-truncated A1a took
-  /// zero accepted steps, and dw/da were reported `COMMIT` while carrying
-  /// identity -- which a writeback would then have written over the rig's real
-  /// factory Dw. The bar here is deliberately low (did it move at all, in
-  /// posterior units), not a significance test: it fires only on the pathology,
-  /// and every converged block clears it by orders of magnitude.
+  /// Minimum movement from the seed in posterior-sigma units. This prevents
+  /// local information alone from labeling an unmoved block as estimated.
+  /// It is a small movement guard, not a significance or accuracy test.
   double commit_min_move_sigma = 0.1;
   /// Absolute posterior ceilings [local units] per block: commit additionally
   /// requires sigma_post <= ceiling on every non-frozen dof. This ties the
-  /// commit rule to the acceptance targets (the 3x-prior rule alone admits
-  /// sigmas 3-5x looser than the historical flight acceptance numbers). Tg's
+  /// commit rule to separate absolute precision targets. Tg's
   /// 1.2e-4 ceiling has the ICM/synthetic provenance above; it is a local one-sigma
   /// precision policy, not an empirically calibrated accuracy interval or a
   /// BMI270-specific limit. Passing the split-half floor does not imply passing
@@ -283,18 +213,14 @@ struct SessionConfig {
   /// against each other, and neither the solve nor the split-half falsifier
   /// validated a mixed state.
   bool commit_atomic_accel = true;
-  /// Leave-one-block-out holdout deltas for committed blocks (accuracy-side
-  /// falsifier; costs a few extra held-out window solves).
+  /// Leave-one-block-out held-out cost deltas for committed blocks; these
+  /// measure predictive contribution, not error against physical truth.
   bool commit_attribution = true;
-  // NOTE: there is deliberately no free_tr and no tr gate machinery here. The rolling-shutter
-  // readout is HAL3 hardware truth (camN_readout_time_s -> seed CamCalib::tr), a fixed transport
-  // constant of every reprojection -- estimating it re-opens the td-aliasing failure class.
-  /// Estimate Tg (gyro g-sensitivity, 9 dof). EARNED, never trusted from a chain: the rig's own
-  /// kalibr sessions scatter beyond the value's magnitude between runs, so a seed is an init and
-  /// the session must certify its own estimate. Unlocks ONLY through the A1b full-chain gate
-  /// (accel excitation pre-gate + split-half / Wald falsifier) and commits through the standard
-  /// machinery + its ceiling.
-  /// Requires an estimable IMU chain (a frozen factory chain freezes tg with it).
+  // Readout is a supplied fixed value (camN_readout_time_s -> seed CamCalib::tr),
+  // used by reprojection timing. This session neither estimates nor validates it.
+  /// Estimate nine-dof gyro g-sensitivity when the IMU chain is estimable.
+  /// Tg may move as an A1a nuisance but must pass the full-chain/Tg gates and
+  /// the commit rules before shipping. Seeding Tg does not certify its value.
   bool free_tg = true;
   bool tg_precision_screen = true; ///< skip split Tg solves when A1a conditional precision already misses commit
   std::string out_yaml = "ov_zcalib_result.yaml";
@@ -384,17 +310,16 @@ struct SessionReport {
   // configured information/numerical/budget checks, not a proof of algebraic rank loss.
   enum class AccelGateVerdict { PRE_CLOSED, SPLIT_CONSISTENT, SPLIT_INCONSISTENT, SPLIT_FAILED, WALD_CONSISTENT, WALD_INCONSISTENT, WALD_UNOBSERVABLE, PRECISION_WEAK };
   AccelGateVerdict a_wald_verdict = AccelGateVerdict::PRE_CLOSED;
-  /// tg's OWN gate verdict. Mode 1: the wald tg-subspace judge (runs only when the chain
-  /// certifies). Split modes: the tg half pair -- which also runs when the frozen-tg chain judge
-  /// REFUSED, because a certified-reproducible Tg falsifies that judge's tg=seed conditioning and
-  /// arbitrates a re-judge on the tg-free halves. PRE_CLOSED = the question was never admitted
-  /// (accel pre-gate closed, no solve, or the session does not estimate tg). A CONSISTENT verdict
-  /// with tg_open=false means tg reproduced but the chain never certified (tg opens only WITH it).
+  /// Tg's separate verdict. Mode 1 tests its local Wald subspace only after
+  /// the accel chain passes. Split modes use a Tg-free pair initialized at A0;
+  /// if Tg agrees, those halves can also re-judge a rejected chain that was
+  /// conditioned on A1a's common nuisance Tg. A consistent Tg verdict alone
+  /// does not unlock or commit Tg: the chain and later checks must also pass.
   AccelGateVerdict tg_gate_verdict = AccelGateVerdict::PRE_CLOSED;
   double tg_conditional_sigma = 0.0; ///< optimistic A1a Tg sigma before the full-chain split solves
   bool tg_open = false; ///< tg unlocked WITH the chain and survived A1b (the commit machinery still gates the block)
   int a_wald_r = 0;                  ///< pooled-basis candidate dimension (of 6); the whole-span floor is also required
-  double a_wald_T = 0.0;             ///< correlated Wald statistic (chi^2_r under H0)
+  double a_wald_T = 0.0;             ///< dispersion-scaled local Wald statistic; finite-df sizing when estimated
   double a_wald_x12 = 0.0, a_wald_x21 = 0.0; ///< cross-prediction excesses
   /// Cross-prediction thresholds AT THE RUN CONFIG. X12/X21 are kappa-free, but their
   /// Satterthwaite thresholds are exactly proportional to kap_eff * a_wald_thresh_scale
@@ -408,7 +333,7 @@ struct SessionReport {
   double a_wald_dqa_deg = 0.0;       ///< implied half-disagreement rotation angle
   double a_wald_dda_off = 0.0;       ///< implied half-disagreement max |da_offdiag|
   double a_wald_kappa = 0.0;         ///< per-session dispersion estimate (quarter-scatter method of moments)
-  int a_wald_df = 0;                 ///< its degrees of freedom (J-1)*r
+  int a_wald_df = 0;                 ///< within-half scatter degrees of freedom: sum_h (n_h-1)*r
   int a_wald_windows = 0, a_wald_dropped = 0;
   JointReport joint;
   // verify (all candidates evaluated on the IDENTICAL held-out window set)
@@ -455,28 +380,16 @@ public:
   RunnerState state() const { return state_; }
   const SessionReport &report() const { return rep_; }
 
-  /// True once the session has entered COLLECT (bootstrap accepted). Safe to read from OTHER
-  /// threads (relaxed atomic): the server's ingest decimation keys on it -- the hand-eye pair
-  /// engine needs the full sensor rate (halving it doubles per-pair KLT displacement; measured:
-  /// xcorr peak 0.2 at 30 Hz vs 0.55 at 60 Hz on the same session), while the saturation the
-  /// decimation prevents is a COLLECT-phase problem (window destruction). Never unset:
-  /// THERMAL_HOLD and the solve states are all post-bootstrap.
+  /// True after the first COLLECT entry; never unset. Ingest threads may read
+  /// this relaxed atomic to enable post-bootstrap decimation. It does not
+  /// synchronize access to the report or other runner state.
   bool bootstrap_done() const { return past_bootstrap_.load(std::memory_order_relaxed); }
 
-  /// Live collection-sufficiency probe: "if I stopped collecting RIGHT NOW, how
-  /// much information would the solve actually have?"
-  ///
-  /// A live stream has no EOF, so something must decide when to stop. Stopping
-  /// on a CLOCK collects until the budget expires regardless of whether the data
-  /// became informative 20 s ago (or never will). This runs the SAME D-optimal
-  /// selection the solve will run, over the reservoir as it currently stands,
-  /// and reports its whitened min-eigenvalue (E-optimality: the WEAKEST
-  /// calibration direction). The driver stops when the weakest direction is
-  /// already well determined and there are enough windows to fuse AND verify.
-  ///
-  /// This only decides WHEN TO STOP COLLECTING. Every accuracy gate (seed gates,
-  /// excitation gates, VERIFY, commit ceilings) still runs afterwards, unchanged
-  /// -- so an early cutover can cost polish, never correctness.
+  /// Information-based collection screen over eligible retained windows.
+  /// Reports the D-optimal selection's whitened minimum eigenvalue and the
+  /// marginal Tg precision screen. Readiness is a stopping heuristic; it does
+  /// not predict the final nonlinear posterior or establish physical accuracy.
+  /// Excitation, verification and commit checks still run after collection.
   struct CollectStatus {
     int n_retained = 0;   ///< windows in the reservoir
     int n_holdout = 0;    ///< of those, reserved for VERIFY
@@ -550,20 +463,13 @@ private:
   std::vector<long> exp_n_;
   // collection-side admission BA aggregate (one evidence row at table time)
   StageEvidence adm_ev_;
-  // Session preint store (PreintCache.h): pure value-keyed memoization --
-  // hits return the exact bytes recomputation would produce (replay-proven),
-  // so it is A-CHAIN-LEGACY-INVARIANT-compatible and threads through EVERY
-  // window solve: admission BAs pre-fill at the seed pi (== the A0/A1a entry
-  // key), the B-1 family shares one preint per window across its five solves,
-  // split halves use disjoint windows, VERIFY's shared-pi candidates collapse.
+  // Value-keyed preintegration reuse across admission, staged solves and
+  // verification. Split halves access disjoint existing window slots; any
+  // storage growth must finish before concurrent calls begin.
   PreintStore store_;
-  // Retroactive harvest: frames buffered during BOOTSTRAP are merge-replayed
-  // (with boot_imu_) into the harvester the moment it exists -- on a short
-  // flight log SETTLE+BOOTSTRAP otherwise eat ~half the collection span.
-  // RESOURCE CONTRACT: FrameObs is the POST-TRACKING point set (id,u,v --
-  // 12 B/point, ~2 KB/frame, no image payload). The tracker ran ONCE per
-  // frame in the feeder; replay is harvester bookkeeping only -- NO
-  // re-detection, NO KLT re-run, ~8 MB worst-case at the 4000 cap.
+  // Optional bootstrap replay into the newly created harvester uses tracked
+  // observations and boot_imu_; it does not repeat image tracking. The frame
+  // deque has a 4000-entry cap; payload memory also depends on points per frame.
   std::deque<FrameObs> boot_frames_;
   std::vector<char> probation_; ///< per-slot: retained via the drift envelope
   // SETTLE

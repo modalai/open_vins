@@ -32,6 +32,7 @@
 namespace ov_core {
 
 class Feature;
+struct InitObservationKey;
 
 /**
  * @brief Database containing features we are currently tracking.
@@ -100,6 +101,12 @@ public:
    */
   std::vector<std::shared_ptr<Feature>> features_not_containing_newer(double timestamp, bool remove = false, bool skip_deleted = false);
 
+  /// Lost on every camera that has observed the feature, using each camera's
+  /// own latest raw key. Only return tracks belonging to a just-updated camera.
+  std::vector<std::shared_ptr<Feature>> features_lost_after_camera_updates(
+      const std::vector<double> &latest_camera_times, const std::vector<int> &updated_cameras,
+      bool remove = false, bool skip_deleted = false);
+
   /**
    * @brief Get features that has measurements older then the specified time.
    *
@@ -115,6 +122,11 @@ public:
    * This would be used to get all features that occurred at a specific clone/state.
    */
   std::vector<std::shared_ptr<Feature>> features_containing(double timestamp, bool remove = false, bool skip_deleted = false);
+
+  /// Query an exact raw observation key. remove transfers ownership of the
+  /// whole returned feature, as in features_containing; the filter is camera-specific.
+  std::vector<std::shared_ptr<Feature>> features_containing_camera(size_t camera_id, double timestamp, bool remove = false,
+                                                                 bool skip_deleted = false);
 
   /**
    * @brief This function will delete all features that have been used up.
@@ -132,6 +144,21 @@ public:
    * @brief This function will delete all feature measurements that are at the specified timestamp
    */
   void cleanup_measurements_exact(double timestamp);
+
+  /// Remove only this camera's older/exact raw observations. Parallel pixel,
+  /// normalized-pixel and timestamp arrays are compacted once under the mutex.
+  void cleanup_measurements_camera(size_t camera_id, double timestamp);
+  void cleanup_measurements_exact_camera(size_t camera_id, double timestamp);
+
+  /// Consume accepted initializer factor rows by their original camera/raw-bit
+  /// identity. Future rows and the same raw time in another camera survive.
+  size_t cleanup_measurements_exact_observations(const std::vector<InitObservationKey> &observations);
+
+  /// Remove precisely the selected feature/time rows across their cameras.
+  /// Used after an initializer posterior has assimilated those image factors.
+  /// Times must be sorted; untouched features and later async arrivals survive.
+  size_t cleanup_measurements_exact_for_features(const std::vector<size_t> &feature_ids,
+                                                const std::vector<double> &sorted_timestamps);
 
   /**
    * @brief Returns the size of the feature database
@@ -158,6 +185,11 @@ public:
    * @brief Will update the passed database with this database's latest feature information.
    */
   void append_new_measurements(const std::shared_ptr<FeatureDatabase> &database);
+
+  /// Deep snapshot under the database mutex. The returned database and every
+  /// Feature are owned independently, so policy and nonlinear solves can read
+  /// them after releasing the live tracker's lock.
+  std::shared_ptr<FeatureDatabase> clone();
 
   /**
    * @brief Deep-copy every feature into a new id->Feature map (state snapshotting).

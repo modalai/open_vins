@@ -102,7 +102,7 @@ int main() {
     CalibProfile zero;
     check(load(std::string(key) + ": 0\n", zero), (std::string(key) + " valid zero rejected").c_str());
   }
-  for (const char *key : {"collect_budget_s", "commit_sigma_factor", "radtan_tangent_refine_sigma", "radtan_tangent_full_sigma"})
+  for (const char *key : {"collect_budget_s", "commit_sigma_factor", "tg_max_sigma", "radtan_tangent_refine_sigma", "radtan_tangent_full_sigma"})
     for (const char *bad : {"0", "-1", ".Nan", ".Inf", "-.Inf", "\"1.0\"", "[1.0]"})
       rejected(key, bad);
   for (const char *key : {"num_threads", "max_clones", "max_track_len", "select_k", "min_holdout", "estimate_cam_intrinsics"})
@@ -123,7 +123,7 @@ int main() {
     rejected("verify_min_improve", bad);
   for (const char *bad : {"Flight", "benhc", "0", "[flight]", "{ value: flight }"})
     rejected("profile", bad);
-  for (const char *key : {"profile", "num_threads", "gyroscope_noise_density"}) {
+  for (const char *key : {"profile", "num_threads", "gyroscope_noise_density", "tg_max_sigma"}) {
     const std::string value = std::string(key) == "profile" ? "flight" : "4";
     rejected(key, value, std::string(key) + ": " + value + "\n");
   }
@@ -164,8 +164,36 @@ int main() {
         "valid flight profile changed");
   check(load("profile: bench\n", bench) && bench.session.harvester.max_clones == 70 &&
             bench.session.harvester.max_track_len == 40 && bench.session.select_K == 18 &&
-            bench.session.a_gate_mode == 1 && bench.session.solve_budget_s == 0.0 && !bench.session.retro_harvest,
+            bench.session.a_gate_mode == 2 && bench.session.solve_budget_s == 0.0 && !bench.session.retro_harvest,
         "valid bench profile changed");
+  // Records restore a profile tag through the same preset used by host/live
+  // profile loading. Both routes must keep the authoritative nonlinear judge.
+  SessionConfig recorded_bench, recorded_flight;
+  check(std::strcmp(apply_profile_tag(recorded_bench, SessionProfile::VOXL, -1), "voxl") == 0 &&
+            recorded_bench.a_gate_mode == 2 && recorded_bench.harvester.max_clones == bench.session.harvester.max_clones &&
+            recorded_bench.harvester.max_track_len == bench.session.harvester.max_track_len,
+        "recorded bench profile must restore split authority with Wald diagnostics");
+  check(std::strcmp(apply_profile_tag(recorded_flight, SessionProfile::VOXL_FLIGHT, -1), "voxl+flight") == 0 &&
+            recorded_flight.a_gate_mode == 2 && recorded_flight.solve_budget_s == flight.session.solve_budget_s,
+        "recorded flight authority and budget must stay unchanged");
+  const SessionConfig defaults;
+  for (const SessionConfig *cfg : {&bench.session, &flight.session, &recorded_bench, &recorded_flight})
+    check(cfg->a_info_deflate == defaults.a_info_deflate && cfg->a_obs_min_eig == defaults.a_obs_min_eig &&
+              cfg->a_wald_thresh_scale == defaults.a_wald_thresh_scale && cfg->a_split_tg_floor == defaults.a_split_tg_floor &&
+              cfg->a_split_signal_frac == defaults.a_split_signal_frac && cfg->a_tg_phys_ceiling == defaults.a_tg_phys_ceiling &&
+              cfg->commit_abs_ceiling == defaults.commit_abs_ceiling,
+          "profile authority change must preserve numerical observability, disagreement and commit policies");
+  check(flight.session.commit_abs_ceiling.at("tg") == 1.2e-4 && bench.session.commit_abs_ceiling.at("tg") == 1.2e-4,
+        "absent Tg precision override must preserve the historical policy");
+  for (const char *base : {"flight", "bench"}) {
+    check(load(std::string("profile: ") + base + "\ntg_max_sigma: 3e-4\n", valid) &&
+              valid.session.commit_abs_ceiling.at("tg") == 3e-4 &&
+              valid.session.a_split_tg_floor == SessionConfig().a_split_tg_floor &&
+              valid.session.commit_sigma_factor == SessionConfig().commit_sigma_factor &&
+              valid.session.verify_min_improve == SessionConfig().verify_min_improve &&
+              valid.session.tg_precision_screen,
+          "Tg ceiling override must not alter split consistency, contraction, verification or screen policy");
+  }
   check(load("profile: flight\nmax_clones: 70\nmax_track_len: 40\nselect_k: 18\nnum_threads: 4.0\n"
              "solve_budget_s: 120\nestimate_cam_intrinsics: 2\n", valid) &&
             valid.session.harvester.max_clones == 70 && valid.session.harvester.max_track_len == 40 &&

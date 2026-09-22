@@ -24,6 +24,7 @@
 
 #include "Feature.h"
 #include "utils/print.h"
+#include "utils/finite.h"
 #include "utils/quat_ops.h"
 
 #define RANSAAC_THRESHOLD 0.02f
@@ -47,6 +48,7 @@ bool FeatureInitializer::single_triangulation(std::shared_ptr<Feature> feat,
       most_meas = pair.second.size();
     }
   }
+  if (!most_meas) return false;
   feat->anchor_cam_id = anchor_most_meas;
   feat->anchor_clone_timestamp = feat->timestamps.at(feat->anchor_cam_id).back();
 
@@ -89,6 +91,11 @@ bool FeatureInitializer::single_triangulation(std::shared_ptr<Feature> feat,
     }
   }
 
+  // Do not send nonfinite rays through QR/SVD. Fast-math removes isnan guards.
+  if (!numeric::finite_matrix(A) || !numeric::finite_matrix(b)) {
+    if (reason) *reason = FailReason::TRI_NAN;
+    return false;
+  }
   // Solve the linear system
   Eigen::MatrixXd p_f = A.colPivHouseholderQr().solve(b);
 
@@ -105,12 +112,12 @@ bool FeatureInitializer::single_triangulation(std::shared_ptr<Feature> feat,
 
   // If we have a bad condition number, or it is too close
   // Then set the flag for bad (i.e. set z-axis to nan)
-  if (std::abs(condA) > _options.max_cond_number || p_f(2, 0) < _options.min_dist || p_f(2, 0) > _options.max_dist ||
-      std::isnan(p_f.norm())) {
+  if (!numeric::finite(condA) || std::abs(condA) > _options.max_cond_number || p_f(2, 0) < _options.min_dist ||
+      p_f(2, 0) > _options.max_dist || !numeric::finite_matrix(p_f)) {
     if (reason) {
-      if (std::isnan(p_f.norm()))
+      if (!numeric::finite_matrix(p_f))
         *reason = FailReason::TRI_NAN;
-      else if (std::abs(condA) > _options.max_cond_number)
+      else if (!numeric::finite(condA) || std::abs(condA) > _options.max_cond_number)
         *reason = FailReason::TRI_COND;
       else
         *reason = FailReason::TRI_DEPTH;
@@ -172,6 +179,7 @@ bool FeatureInitializer::single_triangulation_1d(std::shared_ptr<Feature> feat,
       most_meas = pair.second.size();
     }
   }
+  if (!most_meas) return false;
   feat->anchor_cam_id = anchor_most_meas;
   feat->anchor_clone_timestamp = feat->timestamps.at(feat->anchor_cam_id).back();
   size_t idx_anchor_bearing = feat->timestamps.at(feat->anchor_cam_id).size() - 1;
@@ -225,12 +233,15 @@ bool FeatureInitializer::single_triangulation_1d(std::shared_ptr<Feature> feat,
     }
   }
 
+  // A is scalar bearing information. A zero/invalid baseline must not produce
+  // a NaN seed that can survive optimized ordered comparisons.
+  if (!numeric::finite(A) || !numeric::finite(b) || A <= 0.) return false;
   // Solve the linear system
   double depth = b / A;
   Eigen::MatrixXd p_f = depth * bearing_inA;
 
   // Then set the flag for bad (i.e. set z-axis to nan)
-  if (p_f(2, 0) < _options.min_dist || p_f(2, 0) > _options.max_dist || std::isnan(p_f.norm())) {
+  if (p_f(2, 0) < _options.min_dist || p_f(2, 0) > _options.max_dist || !numeric::finite_matrix(p_f)) {
     return false;
   }
 
@@ -263,6 +274,11 @@ bool FeatureInitializer::single_gaussnewton(std::shared_ptr<Feature> feat,
   if (reason)
     *reason = FailReason::NONE;
 
+  if (!numeric::finite_matrix(feat->p_FinA) || feat->p_FinA.z() <= 0.) {
+    if (reason) *reason = FailReason::GN_NAN;
+    return false;
+  }
+
   // Get into inverse depth
   double rho = 1 / feat->p_FinA(2);
   double alpha = feat->p_FinA(0) / feat->p_FinA(2);
@@ -280,6 +296,10 @@ bool FeatureInitializer::single_gaussnewton(std::shared_ptr<Feature> feat,
 
   // Cost at the last iteration
   double cost_old = compute_error(clonesCAM, feat, alpha, beta, rho);
+  if (!numeric::finite(cost_old)) {
+    if (reason) *reason = FailReason::GN_NAN;
+    return false;
+  }
 
   // Get the position of the anchor pose
   const Eigen::Matrix<double, 3, 3> &R_GtoA = clonesCAM.at(feat->anchor_cam_id).at(feat->anchor_clone_timestamp).Rot();
@@ -336,21 +356,25 @@ bool FeatureInitializer::single_gaussnewton(std::shared_ptr<Feature> feat,
           Eigen::Matrix<double, 2, 3> H;
           H << d_z1_d_alpha, d_z1_d_beta, d_z1_d_rho, d_z2_d_alpha, d_z2_d_beta, d_z2_d_rho;
           // Calculate residual
-          Eigen::Matrix<float, 2, 1> z;
+          Eigen::Vector2d z;
           z << hi1 / hi3, hi2 / hi3;
-          Eigen::Matrix<float, 2, 1> res = feat->uvs_norm.at(pair.first).at(m) - z;
+          Eigen::Vector2d res = feat->uvs_norm.at(pair.first).at(m).cast<double>() - z;
 
           //=====================================================================================
           //=====================================================================================
 
           // Append to our summation variables
-          err += std::pow(res.norm(), 2);
-          grad.noalias() += H.transpose() * res.cast<double>();
+          err += res.squaredNorm();
+          grad.noalias() += H.transpose() * res;
           Hess.noalias() += H.transpose() * H;
         }
       }
     }
 
+    if (!numeric::finite_matrix(Hess) || !numeric::finite_matrix(grad)) {
+      if (reason) *reason = FailReason::GN_NAN;
+      return false;
+    }
     // Solve Levenberg iteration
     Eigen::Matrix<double, 3, 3> Hess_l = Hess;
     for (size_t r = 0; r < (size_t)Hess.rows(); r++) {
@@ -360,6 +384,10 @@ bool FeatureInitializer::single_gaussnewton(std::shared_ptr<Feature> feat,
     Eigen::Matrix<double, 3, 1> dx = Hess_l.colPivHouseholderQr().solve(grad);
     // Eigen::Matrix<double,3,1> dx = (Hess+lam*Eigen::MatrixXd::Identity(Hess.rows(), Hess.rows())).colPivHouseholderQr().solve(grad);
 
+    if (!numeric::finite_matrix(dx)) {
+      if (reason) *reason = FailReason::GN_NAN;
+      return false;
+    }
     // Check if error has gone down
     double cost = compute_error(clonesCAM, feat, alpha + dx(0, 0), beta + dx(1, 0), rho + dx(2, 0));
 
@@ -369,7 +397,7 @@ bool FeatureInitializer::single_gaussnewton(std::shared_ptr<Feature> feat,
     // PRINT_DEBUG(ss.str().c_str());
 
     // Check if converged
-    if (cost <= cost_old && (cost_old - cost) / cost_old < _options.min_dcost) {
+    if (numeric::finite(cost) && cost <= cost_old && (cost_old == 0. || (cost_old - cost) / cost_old < _options.min_dcost)) {
       alpha += dx(0, 0);
       beta += dx(1, 0);
       rho += dx(2, 0);
@@ -379,7 +407,7 @@ bool FeatureInitializer::single_gaussnewton(std::shared_ptr<Feature> feat,
 
     // If cost is lowered, accept step
     // Else inflate lambda (try to make more stable)
-    if (cost <= cost_old) {
+    if (numeric::finite(cost) && cost <= cost_old) {
       recompute = true;
       cost_old = cost;
       alpha += dx(0, 0);
@@ -399,6 +427,11 @@ bool FeatureInitializer::single_gaussnewton(std::shared_ptr<Feature> feat,
   feat->p_FinA(0) = alpha / rho;
   feat->p_FinA(1) = beta / rho;
   feat->p_FinA(2) = 1 / rho;
+  if (!numeric::finite_matrix(feat->p_FinA)) {
+    if (reason) *reason = FailReason::GN_NAN;
+    return false;
+  }
+
 
   // Get tangent plane to x_hat
   Eigen::HouseholderQR<Eigen::MatrixXd> qr(feat->p_FinA);
@@ -431,9 +464,9 @@ bool FeatureInitializer::single_gaussnewton(std::shared_ptr<Feature> feat,
   // 2. If the feature is invalid
   // 3. If the baseline ratio is large
   if (feat->p_FinA(2) < _options.min_dist || feat->p_FinA(2) > _options.max_dist ||
-      (feat->p_FinA.norm() / base_line_max) > _options.max_baseline || std::isnan(feat->p_FinA.norm())) {
+      (feat->p_FinA.norm() / base_line_max) > _options.max_baseline || !numeric::finite_matrix(feat->p_FinA)) {
     if (reason) {
-      if (std::isnan(feat->p_FinA.norm()))
+      if (!numeric::finite_matrix(feat->p_FinA))
         *reason = FailReason::GN_NAN;
       else if (feat->p_FinA(2) < _options.min_dist || feat->p_FinA(2) > _options.max_dist)
         *reason = FailReason::GN_DEPTH;
@@ -485,11 +518,11 @@ double FeatureInitializer::compute_error(std::unordered_map<size_t, std::unorder
       double hi2 = R_AtoCi(1, 0) * alpha + R_AtoCi(1, 1) * beta + R_AtoCi(1, 2) + rho * p_AinCi(1, 0);
       double hi3 = R_AtoCi(2, 0) * alpha + R_AtoCi(2, 1) * beta + R_AtoCi(2, 2) + rho * p_AinCi(2, 0);
       // Calculate residual
-      Eigen::Matrix<float, 2, 1> z;
+      Eigen::Vector2d z;
       z << hi1 / hi3, hi2 / hi3;
-      Eigen::Matrix<float, 2, 1> res = feat->uvs_norm.at(pair.first).at(m) - z;
+      Eigen::Vector2d res = feat->uvs_norm.at(pair.first).at(m).cast<double>() - z;
       // Append to our summation variables
-      err += pow(res.norm(), 2);
+      err += res.squaredNorm();
     }
   }
 

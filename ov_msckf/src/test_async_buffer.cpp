@@ -63,27 +63,44 @@ static ov_core::CameraData make_frame(int cam, double ts) {
 // Scenario 1: two jittered 30 Hz producers, phase-shifted -> strictly increasing release order,
 // every frame released once IMU covers it, zero drops of any kind.
 static void test_ordered_release_two_producers() {
+  const int failures_before = failures;
+  const int N = 300;
   std::atomic<uint64_t> disposed{0};
   AsyncCameraBuffer::Options o;
-  o.ring_capacity = 64;
+  // A scheduler pause must not turn a zero-drop ordering test into an overflow
+  // or camera-death test. Those policies have separate cases below.
+  o.ring_capacity = N;
+  o.stale_factor = 1e6;
   AsyncCameraBuffer buf(2, o, [&](const ov_core::CameraData &) { disposed++; });
 
-  const int N = 300;
   const double P = 1.0 / 30.0, phase1 = 0.0073;
   // Producers paced in wall time (1 ms per frame) like real camera pipes; occasional extra jitter
   std::atomic<bool> done0{false}, done1{false};
+  std::atomic<int> ready{0};
+  std::atomic<bool> start{false};
+  auto arrive = [&] {
+    ready.fetch_add(1, std::memory_order_release);
+    while (!start.load(std::memory_order_acquire))
+      std::this_thread::yield();
+  };
   std::thread p0([&] {
     for (int k = 0; k < N; k++) {
       buf.push(make_frame(0, 100.0 + k * P));
+      if (k == 0)
+        arrive();
       std::this_thread::sleep_for(std::chrono::microseconds(1000 + ((k % 7 == 0) ? 400 : 0)));
     }
+    buf.finish_camera(0);
     done0 = true;
   });
   std::thread p1([&] {
     for (int k = 0; k < N; k++) {
       buf.push(make_frame(1, 100.0 + phase1 + k * P));
+      if (k == 0)
+        arrive();
       std::this_thread::sleep_for(std::chrono::microseconds(1000 + ((k % 5 == 0) ? 600 : 0)));
     }
+    buf.finish_camera(1);
     done1 = true;
   });
 
@@ -95,6 +112,11 @@ static void test_ordered_release_two_producers() {
     released_cams.push_back(m.sensor_ids.front());
     return true;
   };
+  // A never-started stream deliberately does not block production startup.
+  // Establish both live streams before asserting complete two-camera ordering.
+  while (ready.load(std::memory_order_acquire) != 2)
+    std::this_thread::yield();
+  start.store(true, std::memory_order_release);
   // Consumer: IMU time always ahead of the stream (gate never limits); drain while producers run
   while (!done0.load() || !done1.load()) {
     buf.drain(1000.0, dtfn, sink);
@@ -102,8 +124,7 @@ static void test_ordered_release_two_producers() {
   }
   p0.join();
   p1.join();
-  // Stream tail: the last frames hold until the peer camera exceeds its staleness window
-  std::this_thread::sleep_for(std::chrono::milliseconds(120));
+  // Each producer declared EOF after its final publication.
   buf.drain(1000.0, dtfn, sink);
 
   CHECK(released.size() == (size_t)(2 * N), "released %zu of %d frames", released.size(), 2 * N);
@@ -111,8 +132,84 @@ static void test_ordered_release_two_producers() {
     CHECK(released[i] > released[i - 1], "release order violated at %zu (%.6f <= %.6f)", i, released[i], released[i - 1]);
   }
   CHECK(disposed.load() == 0, "unexpected disposals: %llu", (unsigned long long)disposed.load());
-  CHECK(buf.count_drop_late() == 0 && buf.count_drop_full() == 0 && buf.count_drop_bogus() == 0, "unexpected drop counters");
-  std::printf("[ok] ordered_release_two_producers: %zu frames, strict order, 0 drops\n", released.size());
+  CHECK(buf.count_drop_late() == 0 && buf.count_drop_full() == 0 && buf.count_drop_bogus() == 0,
+        "unexpected drops: late=%llu full=%llu bogus=%llu", (unsigned long long)buf.count_drop_late(),
+        (unsigned long long)buf.count_drop_full(), (unsigned long long)buf.count_drop_bogus());
+  if (failures == failures_before)
+    std::printf("[ok] ordered_release_two_producers: %zu frames, strict order, 0 drops\n", released.size());
+}
+
+// A producer publishes after the consumer's staging snapshot. The later tail
+// must not hide its older/equal head, including when EOF follows that burst.
+// The clock callback creates this interleaving deterministically, without
+// probabilistic sleeps or a test hook in the production ring.
+static void test_arrival_after_staging() {
+  const int failures_before = failures;
+  for (bool physical : {false, true}) {
+    for (bool finish : {false, true}) {
+      for (bool equal : {false, true}) {
+        AsyncCameraBuffer::Options o;
+        o.physical_order = physical;
+        o.stale_factor = 1e6;
+        size_t disposed = 0;
+        AsyncCameraBuffer buf(2, o, [&](const ov_core::CameraData &) { ++disposed; });
+        std::vector<double> times;
+        std::vector<size_t> sizes;
+        auto sink = [&](ov_core::CameraData &&m) {
+          times.push_back(m.timestamp);
+          sizes.push_back(m.sensor_ids.size());
+          return true;
+        };
+        bool inject = false;
+        auto clock = [&]() {
+          if (inject) {
+            inject = false;
+            CHECK(buf.push(make_frame(1, equal ? 101.0 : 100.5)), "first burst push failed");
+            CHECK(buf.push(make_frame(1, 101.5)), "tail burst push failed");
+            if (finish)
+              CHECK(buf.finish_camera(1), "EOF declaration failed");
+          }
+          return 0.0;
+        };
+        auto drain = [&] {
+          if (physical) {
+            buf.drain_physical(1000.0, [&](int) { return clock(); },
+                               [&](std::vector<ov_core::CameraData> &group, double) {
+                                 for (auto &m : group)
+                                   sink(std::move(m));
+                                 return true;
+                               });
+          } else {
+            buf.drain(1000.0, [&](const std::vector<int> &) { return clock(); }, sink);
+          }
+        };
+        CHECK(buf.push(make_frame(1, 100.0)), "startup push failed");
+        drain();
+        CHECK(times.size() == 1 && times[0] == 100.0, "startup did not release");
+        times.clear();
+        sizes.clear();
+        CHECK(buf.push(make_frame(0, 101.0)), "head push failed");
+        inject = true;
+        drain();
+        buf.finish_all();
+        // One extra drain after the bounded deferral must process the complete
+        // burst, preserving the ordering and bundling of its actual first row.
+        drain();
+        const std::vector<double> expected_times = equal ? std::vector<double>{101.0, 101.5}
+                                                         : std::vector<double>{100.5, 101.0, 101.5};
+        const std::vector<size_t> expected_sizes = equal ? std::vector<size_t>{2, 1}
+                                                        : std::vector<size_t>{1, 1, 1};
+        CHECK(times == expected_times && sizes == expected_sizes,
+              "post-stage burst order/bundling wrong (physical=%d EOF=%d equal=%d; events=%zu)",
+              physical, finish, equal, times.size());
+        CHECK(disposed == 0 && buf.count_drop_late() == 0 && buf.count_drop_full() == 0,
+              "post-stage burst disposed queued input (physical=%d EOF=%d equal=%d; drops=%zu)",
+              physical, finish, equal, disposed);
+      }
+    }
+  }
+  if (failures == failures_before)
+    std::printf("[ok] arrival_after_staging: 8 deterministic raw/physical, live/EOF, older/equal cases\n");
 }
 
 // Scenario 2: camera 1 dies mid-run -> after its staleness window, camera 0 keeps releasing;
@@ -293,6 +390,7 @@ static void test_viomanager_wiring(const char *config_path) {
 }
 
 int main(int argc, char **argv) {
+  test_arrival_after_staging();
   test_ordered_release_two_producers();
   test_camera_death_and_restart();
   test_bundling_equal_timestamps();

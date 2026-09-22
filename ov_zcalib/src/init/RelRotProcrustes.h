@@ -26,11 +26,43 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <limits>
 #include <numeric>
 #include <random>
 #include <vector>
 
+#include "utils/NumericChecks.h"
+
 namespace ov_zcalib {
+
+namespace relrot_detail {
+// Public callers supply unit bearings. Reject malformed rays before an SVD or
+// an angular clamp can turn them into an apparently usable seed. Do not repair
+// them by normalization: valid inputs keep their original arithmetic.
+inline bool valid_ray(const Eigen::Vector3d &ray) {
+  if (!finite_matrix(ray)) return false;
+  const double norm2 = ray.squaredNorm();
+  return finite_scalar(norm2) && norm2 > 0.0;
+}
+inline bool valid_pairs(const std::vector<Eigen::Vector3d> &b1, const std::vector<Eigen::Vector3d> &b2) {
+  if (b1.size() != b2.size() || b1.size() > static_cast<size_t>(std::numeric_limits<int>::max())) return false;
+  for (size_t i = 0; i < b1.size(); ++i)
+    if (!valid_ray(b1[i]) || !valid_ray(b2[i])) return false;
+  return true;
+}
+inline bool valid_indices(const std::vector<Eigen::Vector3d> &b1, const std::vector<Eigen::Vector3d> &b2,
+                          const std::vector<int> &indices, size_t minimum) {
+  if (b1.size() != b2.size() || indices.size() < minimum ||
+      indices.size() > static_cast<size_t>(std::numeric_limits<int>::max()/3)) return false;
+  for (int index : indices)
+    if (index < 0 || static_cast<size_t>(index) >= b1.size() || !valid_ray(b1[index]) || !valid_ray(b2[index])) return false;
+  return true;
+}
+inline bool valid_options(int min_pairs, int iterations, double angle, double ratio) {
+  return min_pairs >= 0 && iterations > 0 && finite_scalar(angle) && angle >= 0.0 && angle <= M_PI &&
+      finite_scalar(ratio) && ratio >= 0.0 && ratio <= 1.0;
+}
+} // namespace relrot_detail
 
 /**
  * @brief Rotation-only relative rotation between two bearing sets.
@@ -61,14 +93,21 @@ public:
   };
 
   /// Procrustes on all given pairs (no gating). b1/b2 must be unit bearings.
+  /// An invalid input/decomposition returns a nonfinite matrix; solve returns ok=false.
   static Eigen::Matrix3d procrustes(const std::vector<Eigen::Vector3d> &b1, const std::vector<Eigen::Vector3d> &b2) {
+    const auto invalid = [] { return Eigen::Matrix3d::Constant(std::numeric_limits<double>::quiet_NaN()).eval(); };
+    if (b1.empty() || !relrot_detail::valid_pairs(b1,b2)) return invalid();
     Eigen::Matrix3d H = Eigen::Matrix3d::Zero();
     for (size_t i = 0; i < b1.size(); ++i)
       H += b1[i] * b2[i].transpose();
+    if (!finite_matrix(H)) return invalid();
     Eigen::JacobiSVD<Eigen::Matrix3d> svd(H, Eigen::ComputeFullU | Eigen::ComputeFullV);
+    if (svd.info() != Eigen::Success || !finite_matrix(svd.singularValues()) ||
+        !finite_matrix(svd.matrixU()) || !finite_matrix(svd.matrixV())) return invalid();
     Eigen::Matrix3d D = Eigen::Matrix3d::Identity();
     D(2, 2) = ((svd.matrixV() * svd.matrixU().transpose()).determinant() < 0.0) ? -1.0 : 1.0;
-    return svd.matrixV() * D * svd.matrixU().transpose();
+    const Eigen::Matrix3d R = svd.matrixV() * D * svd.matrixU().transpose();
+    return finite_matrix(R) ? R : invalid();
   }
 
   /**
@@ -81,8 +120,10 @@ public:
   static Result solve(const std::vector<Eigen::Vector3d> &b1, const std::vector<Eigen::Vector3d> &b2, uint64_t rng_seed,
                       const Options &opt) {
     Result out;
+    if (!relrot_detail::valid_pairs(b1,b2) ||
+        !relrot_detail::valid_options(opt.min_pairs,opt.ransac_iterations,opt.inlier_threshold_rad,opt.min_inlier_ratio)) return out;
     const int N = (int)b1.size();
-    if (N < opt.min_pairs)
+    if (N < std::max(opt.min_pairs,3))
       return out;
     std::mt19937 rng((unsigned)(rng_seed & 0xFFFFFFFFu));
     const double cos_gate = std::cos(opt.inlier_threshold_rad);
@@ -100,6 +141,7 @@ public:
         s2[s] = b2[idx[s]];
       }
       const Eigen::Matrix3d R = procrustes(s1, s2);
+      if (!finite_matrix(R)) continue;
       int inl = 0;
       for (int i = 0; i < N; ++i)
         if ((R * b1[i]).dot(b2[i]) > cos_gate)
@@ -123,12 +165,14 @@ public:
         i2.push_back(b2[i]);
       }
     out.R_C1toC2 = procrustes(i1, i2);
+    if (!finite_matrix(out.R_C1toC2)) return Result();
     out.inliers = (int)i1.size();
     out.inlier_ratio = (double)out.inliers / (double)N;
     double rsum = 0.0;
     for (size_t i = 0; i < i1.size(); ++i)
       rsum += std::acos(std::min(1.0, std::max(-1.0, (out.R_C1toC2 * i1[i]).dot(i2[i]))));
     out.mean_resid_rad = rsum / std::max<size_t>(i1.size(), 1);
+    if (!finite_scalar(out.mean_resid_rad)) return Result();
     out.ok = true;
     return out;
   }
@@ -209,17 +253,14 @@ public:
 
   /// b2^T E b1 residual as an angle: |b2 . n| with n = unit(E b1) (b2 off-plane angle)
   static double epi_ang(const Eigen::Matrix3d &E, const Eigen::Vector3d &b1, const Eigen::Vector3d &b2) {
-    const Eigen::Vector3d n = E * b1;
-    const double nn = n.norm();
-    if (nn < 1e-12)
-      return 0.0;
-    return std::asin(std::min(1.0, std::abs(b2.dot(n)) / nn));
+    if (!finite_matrix(E) || !relrot_detail::valid_ray(b1) || !relrot_detail::valid_ray(b2)) return M_PI;
+    return epi_ang_finite_inputs_(E, b1, b2);
   }
 
   /// Linear E fit (|fit set| >= 8) projected onto the essential manifold.
   static bool fit_E(const std::vector<Eigen::Vector3d> &b1, const std::vector<Eigen::Vector3d> &b2, const std::vector<int> &idx,
                     Eigen::Matrix3d &E) {
-    if (idx.size() < 8)
+    if (!relrot_detail::valid_indices(b1,b2,idx,8))
       return false;
     Eigen::MatrixXd A((int)idx.size(), 9);
     for (size_t r = 0; r < idx.size(); ++r) {
@@ -227,30 +268,33 @@ public:
       A.row((int)r) << q(0) * p(0), q(0) * p(1), q(0) * p(2), q(1) * p(0), q(1) * p(1), q(1) * p(2), q(2) * p(0), q(2) * p(1),
           q(2) * p(2);
     }
+    if (!finite_matrix(A)) return false;
     Eigen::JacobiSVD<Eigen::MatrixXd> svd(A, Eigen::ComputeFullV);
+    if (svd.info() != Eigen::Success || !finite_matrix(svd.singularValues()) || !finite_matrix(svd.matrixV())) return false;
     const Eigen::Matrix<double, 9, 1> e = svd.matrixV().col(8);
     Eigen::Matrix3d E0;
     E0 << e(0), e(1), e(2), e(3), e(4), e(5), e(6), e(7), e(8);
     Eigen::JacobiSVD<Eigen::Matrix3d> s2(E0, Eigen::ComputeFullU | Eigen::ComputeFullV);
+    if (s2.info() != Eigen::Success || !finite_matrix(s2.singularValues()) ||
+        !finite_matrix(s2.matrixU()) || !finite_matrix(s2.matrixV())) return false;
     Eigen::Vector3d d(1.0, 1.0, 0.0);
-    E = s2.matrixU() * d.asDiagonal() * s2.matrixV().transpose();
+    const Eigen::Matrix3d candidate = s2.matrixU() * d.asDiagonal() * s2.matrixV().transpose();
+    if (!finite_matrix(candidate)) return false;
+    E = candidate;
     return true;
   }
 
   /// Angular transfer residual of the homography model: angle(b2, H b1).
   static double transfer_ang(const Eigen::Matrix3d &H, const Eigen::Vector3d &b1, const Eigen::Vector3d &b2) {
-    const Eigen::Vector3d p = H * b1;
-    const double pn = p.norm();
-    if (pn < 1e-12)
-      return M_PI;
-    return std::acos(std::min(1.0, std::max(-1.0, b2.dot(p) / pn)));
+    if (!finite_matrix(H) || !relrot_detail::valid_ray(b1) || !relrot_detail::valid_ray(b2)) return M_PI;
+    return transfer_ang_finite_inputs_(H, b1, b2);
   }
 
   /// Linear calibrated-homography fit on unit bearings: rows of skew(b2) H b1 = 0
   /// (3 rows per pair, rank 2). Sign-fixed so that b2 . (H b1) > 0 on average.
   static bool fit_H(const std::vector<Eigen::Vector3d> &b1, const std::vector<Eigen::Vector3d> &b2, const std::vector<int> &idx,
                     Eigen::Matrix3d &H) {
-    if (idx.size() < 4)
+    if (!relrot_detail::valid_indices(b1,b2,idx,4))
       return false;
     Eigen::MatrixXd A(3 * (int)idx.size(), 9);
     for (size_t r = 0; r < idx.size(); ++r) {
@@ -262,15 +306,20 @@ public:
           for (int k = 0; k < 3; ++k)
             A(3 * (int)r + i, 3 * k + j) = sq(i, k) * p(j);
     }
+    if (!finite_matrix(A)) return false;
     Eigen::JacobiSVD<Eigen::MatrixXd> svd(A, Eigen::ComputeFullV);
+    if (svd.info() != Eigen::Success || !finite_matrix(svd.singularValues()) || !finite_matrix(svd.matrixV())) return false;
     const Eigen::Matrix<double, 9, 1> h = svd.matrixV().col(8);
-    H << h(0), h(1), h(2), h(3), h(4), h(5), h(6), h(7), h(8);
+    Eigen::Matrix3d candidate;
+    candidate << h(0), h(1), h(2), h(3), h(4), h(5), h(6), h(7), h(8);
     double s = 0.0;
     for (int i : idx)
-      s += b2[i].dot(H * b1[i]);
+      s += b2[i].dot(candidate * b1[i]);
+    if (!finite_scalar(s) || !finite_matrix(candidate)) return false;
     if (s < 0.0)
-      H = -H;
-    return H.allFinite();
+      candidate = -candidate;
+    H = candidate;
+    return true;
   }
 
   /**
@@ -282,30 +331,40 @@ public:
    */
   static bool decompose_H(const Eigen::Matrix3d &H_in, const std::vector<Eigen::Vector3d> &b1, const std::vector<Eigen::Vector3d> &b2,
                           const std::vector<int> &inl, Eigen::Matrix3d &R_best) {
+    if (!finite_matrix(H_in) || !relrot_detail::valid_indices(b1,b2,inl,1)) return false;
     Eigen::JacobiSVD<Eigen::Matrix3d> svh(H_in);
+    if (svh.info() != Eigen::Success || !finite_matrix(svh.singularValues())) return false;
     const double s2 = svh.singularValues()(1);
     if (s2 < 1e-12)
       return false;
     const Eigen::Matrix3d H = H_in / s2;
     const Eigen::Matrix3d HtH = H.transpose() * H;
+    if (!finite_matrix(H) || !finite_matrix(HtH)) return false;
     Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> eig(HtH);
+    if (eig.info() != Eigen::Success || !finite_matrix(eig.eigenvalues()) || !finite_matrix(eig.eigenvectors())) return false;
     // eigenvalues ascending: s3^2 <= 1 <= s1^2
     const double l1 = eig.eigenvalues()(2), l3 = eig.eigenvalues()(0);
     const Eigen::Vector3d v1 = eig.eigenvectors().col(2), v2 = eig.eigenvectors().col(1), v3 = eig.eigenvectors().col(0);
     if (l1 - l3 < 1e-9) {
       // pure rotation: H is (numerically) orthogonal -- polar projection
       Eigen::JacobiSVD<Eigen::Matrix3d> s(H, Eigen::ComputeFullU | Eigen::ComputeFullV);
+      if (s.info() != Eigen::Success || !finite_matrix(s.singularValues()) ||
+          !finite_matrix(s.matrixU()) || !finite_matrix(s.matrixV())) return false;
       Eigen::Matrix3d D = Eigen::Matrix3d::Identity();
       D(2, 2) = ((s.matrixU() * s.matrixV().transpose()).determinant() < 0.0) ? -1.0 : 1.0;
-      R_best = s.matrixU() * D * s.matrixV().transpose();
+      const Eigen::Matrix3d candidate = s.matrixU() * D * s.matrixV().transpose();
+      if (!finite_matrix(candidate)) return false;
+      R_best = candidate;
       return true;
     }
     const double a = std::sqrt(std::max(0.0, 1.0 - l3)), b = std::sqrt(std::max(0.0, l1 - 1.0));
     const double den = std::sqrt(std::max(1e-30, l1 - l3));
     const Eigen::Vector3d u1 = (a * v1 + b * v3) / den;
     const Eigen::Vector3d u2 = (a * v1 - b * v3) / den;
+    if (!finite_matrix(u1) || !finite_matrix(u2)) return false;
 
     int best_score = -1;
+    Eigen::Matrix3d best = Eigen::Matrix3d::Identity();
     for (int c = 0; c < 2; ++c) {
       const Eigen::Vector3d &u = (c == 0) ? u1 : u2;
       Eigen::Matrix3d W, Uh;
@@ -317,6 +376,7 @@ public:
       Uh.col(2) = (H * v2).cross(H * u);
       const Eigen::Matrix3d R = Uh * W.transpose();
       Eigen::Vector3d n = v2.cross(u);
+      if (!finite_matrix(R) || !finite_matrix(n)) continue;
       // plane must be in FRONT of camera 1: n . b1 > 0 for the inliers
       int vis = 0;
       for (size_t s = 0; s < inl.size(); s += std::max<size_t>(1, inl.size() / 16))
@@ -325,6 +385,7 @@ public:
       if (2 * vis < (int)std::min<size_t>(16, inl.size()))
         n = -n; // flip to the visible side (t flips with it; R unchanged)
       const Eigen::Vector3d t = (H - R) * n;
+      if (!finite_matrix(t) || !finite_scalar(t.norm())) continue;
       // cheirality on triangulated depths (as in the essential path)
       int pos = 0;
       if (t.norm() < 1e-9) {
@@ -335,23 +396,29 @@ public:
           Eigen::Matrix<double, 3, 2> M;
           M.col(0) = Rb1;
           M.col(1) = -b2[inl[s]];
+          if (!finite_matrix(M)) continue;
           const Eigen::Vector2d d = M.colPivHouseholderQr().solve(-t);
-          if (d(0) > 0 && d(1) > 0)
+          if (finite_matrix(d) && d(0) > 0 && d(1) > 0)
             ++pos;
         }
       }
       if (pos > best_score) {
         best_score = pos;
-        R_best = R;
+        best = R;
       }
     }
-    return best_score > 0 && R_best.allFinite();
+    if (best_score <= 0 || !finite_matrix(best)) return false;
+    R_best = best;
+    return true;
   }
 
   /// Decompose E into the cheirality-consistent (R, t). Returns false on tie.
   static bool decompose(const Eigen::Matrix3d &E, const std::vector<Eigen::Vector3d> &b1, const std::vector<Eigen::Vector3d> &b2,
                         const std::vector<int> &inl, Eigen::Matrix3d &R_best) {
+    if (!finite_matrix(E) || !relrot_detail::valid_indices(b1,b2,inl,1)) return false;
     Eigen::JacobiSVD<Eigen::Matrix3d> svd(E, Eigen::ComputeFullU | Eigen::ComputeFullV);
+    if (svd.info() != Eigen::Success || !finite_matrix(svd.singularValues()) ||
+        !finite_matrix(svd.matrixU()) || !finite_matrix(svd.matrixV())) return false;
     Eigen::Matrix3d U = svd.matrixU(), V = svd.matrixV();
     if (U.determinant() < 0)
       U.col(2) *= -1.0;
@@ -362,7 +429,9 @@ public:
     const Eigen::Matrix3d Ra = U * W * V.transpose();
     const Eigen::Matrix3d Rb = U * W.transpose() * V.transpose();
     const Eigen::Vector3d t = U.col(2);
+    if (!finite_matrix(Ra) || !finite_matrix(Rb) || !finite_matrix(t)) return false;
     int best_pos = -1;
+    Eigen::Matrix3d best = Eigen::Matrix3d::Identity();
     for (int c = 0; c < 4; ++c) {
       const Eigen::Matrix3d &R = (c < 2) ? Ra : Rb;
       const Eigen::Vector3d tc = (c % 2 == 0) ? t : Eigen::Vector3d(-t);
@@ -373,18 +442,21 @@ public:
         Eigen::Matrix<double, 3, 2> M;
         M.col(0) = Rb1;
         M.col(1) = -b2[inl[s]];
+        if (!finite_matrix(M)) continue;
         const Eigen::Vector2d d = M.colPivHouseholderQr().solve(-tc);
-        if (d(0) > 0 && d(1) > 0)
+        if (finite_matrix(d) && d(0) > 0 && d(1) > 0)
           ++pos;
       }
       if (pos > best_pos) {
         best_pos = pos;
-        R_best = R;
+        best = R;
       } else if (pos == best_pos) {
         // ambiguous cheirality (near-degenerate translation): caller falls back
       }
     }
-    return best_pos > 0;
+    if (best_pos <= 0 || !finite_matrix(best)) return false;
+    R_best = best;
+    return true;
   }
 
   static Result solve(const std::vector<Eigen::Vector3d> &b1, const std::vector<Eigen::Vector3d> &b2, uint64_t rng_seed) {
@@ -393,6 +465,8 @@ public:
   static Result solve(const std::vector<Eigen::Vector3d> &b1, const std::vector<Eigen::Vector3d> &b2, uint64_t rng_seed,
                       const Options &opt) {
     Result out;
+    if (!relrot_detail::valid_pairs(b1,b2) ||
+        !relrot_detail::valid_options(opt.min_pairs,opt.ransac_iterations,opt.inlier_threshold_rad,opt.min_inlier_ratio)) return out;
     const int N = (int)b1.size();
     if (N < std::max(opt.min_pairs, 9))
       return fallback_(b1, b2, rng_seed, opt);
@@ -420,7 +494,7 @@ public:
         continue;
       int inl = 0;
       for (int i = 0; i < N; ++i)
-        if (epi_ang(E, b1[i], b2[i]) < opt.inlier_threshold_rad)
+        if (epi_ang_finite_inputs_(E, b1[i], b2[i]) < opt.inlier_threshold_rad)
           ++inl;
       if (inl > best_inl) {
         best_inl = inl;
@@ -452,7 +526,7 @@ public:
           continue;
         int inl = 0;
         for (int i = 0; i < N; ++i)
-          if (transfer_ang(H, b1[i], b2[i]) < h_gate)
+          if (transfer_ang_finite_inputs_(H, b1[i], b2[i]) < h_gate)
             ++inl;
         if (inl > best_hinl) {
           best_hinl = inl;
@@ -468,7 +542,7 @@ public:
     int offplane = 0; // E-inliers the homography cannot explain = E's non-planar support
     if (e_ok && h_ok)
       for (int i = 0; i < N; ++i)
-        if (epi_ang(best_E, b1[i], b2[i]) < opt.inlier_threshold_rad && transfer_ang(best_H, b1[i], b2[i]) >= h_gate)
+        if (epi_ang_finite_inputs_(best_E, b1[i], b2[i]) < opt.inlier_threshold_rad && transfer_ang_finite_inputs_(best_H, b1[i], b2[i]) >= h_gate)
           ++offplane;
     const bool planar = h_ok && (!e_ok || offplane < opt.min_offplane_support);
 
@@ -477,13 +551,14 @@ public:
       std::vector<int> hinl;
       hinl.reserve(best_hinl);
       for (int i = 0; i < N; ++i)
-        if (transfer_ang(best_H, b1[i], b2[i]) < h_gate)
+        if (transfer_ang_finite_inputs_(best_H, b1[i], b2[i]) < h_gate)
           hinl.push_back(i);
       Eigen::Matrix3d H, R;
       if (fit_H(b1, b2, hinl, H) && decompose_H(H, b1, b2, hinl, R)) {
         double rsum = 0.0;
         for (int i : hinl)
-          rsum += transfer_ang(H, b1[i], b2[i]);
+          rsum += transfer_ang_finite_inputs_(H, b1[i], b2[i]);
+        if (!finite_scalar(rsum)) return Result();
         out.ok = true;
         out.model = MODEL_HOMOGRAPHY;
         out.used_essential = false;
@@ -500,7 +575,7 @@ public:
     std::vector<int> inl;
     inl.reserve(best_inl);
     for (int i = 0; i < N; ++i)
-      if (epi_ang(best_E, b1[i], b2[i]) < opt.inlier_threshold_rad)
+      if (epi_ang_finite_inputs_(best_E, b1[i], b2[i]) < opt.inlier_threshold_rad)
         inl.push_back(i);
     Eigen::Matrix3d E;
     if (!fit_E(b1, b2, inl, E))
@@ -510,7 +585,8 @@ public:
       return fallback_(b1, b2, rng_seed, opt);
     double rsum = 0.0;
     for (int i : inl)
-      rsum += epi_ang(E, b1[i], b2[i]);
+      rsum += epi_ang_finite_inputs_(E, b1[i], b2[i]);
+    if (!finite_scalar(rsum)) return Result();
     out.ok = true;
     out.model = MODEL_ESSENTIAL;
     out.used_essential = true;
@@ -522,6 +598,30 @@ public:
   }
 
 private:
+  // solve validates input bearings once and each model immediately after fitting.
+  // Keep arithmetic-result checks per score without rescanning those invariants.
+  static double epi_ang_finite_inputs_(const Eigen::Matrix3d &E, const Eigen::Vector3d &b1, const Eigen::Vector3d &b2) {
+    const Eigen::Vector3d n = E * b1;
+    const double nn = n.norm();
+    if (!finite_matrix(n) || !finite_scalar(nn)) return M_PI;
+    if (nn < 1e-12)
+      return 0.0;
+    const double ratio = std::abs(b2.dot(n)) / nn;
+    if (!finite_scalar(ratio)) return M_PI;
+    return std::asin(std::min(1.0, ratio));
+  }
+
+  static double transfer_ang_finite_inputs_(const Eigen::Matrix3d &H, const Eigen::Vector3d &b1, const Eigen::Vector3d &b2) {
+    const Eigen::Vector3d p = H * b1;
+    const double pn = p.norm();
+    if (!finite_matrix(p) || !finite_scalar(pn)) return M_PI;
+    if (pn < 1e-12)
+      return M_PI;
+    const double ratio = b2.dot(p) / pn;
+    if (!finite_scalar(ratio)) return M_PI;
+    return std::acos(std::min(1.0, std::max(-1.0, ratio)));
+  }
+
   static Result fallback_(const std::vector<Eigen::Vector3d> &b1, const std::vector<Eigen::Vector3d> &b2, uint64_t rng_seed,
                           const Options &opt) {
     RelRotProcrustes::Options po;

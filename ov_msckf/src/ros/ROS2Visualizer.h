@@ -26,7 +26,11 @@
 #include <geometry_msgs/msg/pose_stamped.hpp>
 #include <geometry_msgs/msg/pose_with_covariance_stamped.hpp>
 #include <geometry_msgs/msg/transform_stamped.hpp>
+#if __has_include(<image_transport/image_transport.hpp>)
+#include <image_transport/image_transport.hpp>
+#else
 #include <image_transport/image_transport.h>
+#endif
 #include <message_filters/subscriber.h>
 #include <message_filters/sync_policies/approximate_time.h>
 #include <message_filters/time_synchronizer.h>
@@ -43,18 +47,28 @@
 #include <std_msgs/msg/float64.hpp>
 #include <tf2/LinearMath/Quaternion.h>
 #include <tf2/transform_datatypes.h>
+#if __has_include(<tf2_geometry_msgs/tf2_geometry_msgs.hpp>)
+#include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
+#else
 #include <tf2_geometry_msgs/tf2_geometry_msgs.h>
+#endif
 #include <tf2_ros/transform_broadcaster.h>
 
 #include <atomic>
 #include <fstream>
 #include <memory>
+#include <condition_variable>
 #include <mutex>
+#include <thread>
 
 #include <Eigen/Eigen>
 #include <boost/date_time/posix_time/posix_time.hpp>
 #include <boost/filesystem.hpp>
+#if __has_include(<cv_bridge/cv_bridge.hpp>)
+#include <cv_bridge/cv_bridge.hpp>
+#else
 #include <cv_bridge/cv_bridge.h>
+#endif
 
 namespace ov_core {
 class YamlParser;
@@ -86,6 +100,9 @@ public:
    * @param sim Simulator if we are simulating
    */
   ROS2Visualizer(std::shared_ptr<rclcpp::Node> node, std::shared_ptr<VioManager> app, std::shared_ptr<Simulator> sim = nullptr);
+
+  /// Call after sensor callbacks have been quiesced; joins the image publisher.
+  ~ROS2Visualizer();
 
   /**
    * @brief Will setup ROS subscribers and callbacks
@@ -179,15 +196,14 @@ protected:
   bool start_time_set = false;
   boost::posix_time::ptime rT1, rT2;
 
-  // Thread atomics
-  std::atomic<bool> thread_update_running;
-
-  /// Queue up camera measurements sorted by time and trigger once we have
-  /// exactly one IMU measurement with timestamp newer than the camera measurement
-  /// This also handles out-of-order camera measurements, which is rare, but
-  /// a nice feature to have for general robustness to bad camera drivers.
-  std::deque<ov_core::CameraData> camera_queue;
-  std::mutex camera_queue_mtx;
+  // The manager owns the bounded camera queue and the IMU callback owns its
+  // consumer. Serialize ROS producers; never create a worker on every IMU tick.
+  std::mutex camera_ingress_mtx;
+  std::recursive_mutex state_mtx;
+  std::atomic<bool> stop_image_publisher{false};
+  std::thread image_publisher;
+  std::mutex image_wait_mtx;
+  std::condition_variable image_wait_cv;
 
   // Last camera message timestamps we have received (mapped by cam id)
   std::map<int, double> camera_last_timestamp;

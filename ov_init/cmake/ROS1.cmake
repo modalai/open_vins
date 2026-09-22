@@ -57,6 +57,8 @@ list(APPEND LIBRARY_SOURCES
         src/dummy.cpp
         src/init/InertialInitializer.cpp
         src/dynamic/DynamicInitializer.cpp
+        src/dynamic/RawImuCpi.cpp
+        src/dynamic/SampledCpiStatistics.cpp
         src/static/StaticInitializer.cpp
         src/sim/SimulatorInit.cpp
 )
@@ -73,7 +75,7 @@ if (OV_INIT_CERES_FREE)
         src/ceres_free/Factor_ImuCPIv1.cpp
     )
 else()
-    # Original Ceres-based factors (require Ceres with LocalParameterization API)
+    # Ceres factors support the Manifold API and older LocalParameterization releases.
     list(APPEND LIBRARY_SOURCES
         src/ceres/Factor_GenericPrior.cpp
         src/ceres/Factor_ImageReprojCalib.cpp
@@ -83,6 +85,7 @@ else()
 endif()
 file(GLOB_RECURSE LIBRARY_HEADERS "src/*.h")
 add_library(ov_init_lib SHARED ${LIBRARY_SOURCES} ${LIBRARY_HEADERS})
+target_compile_definitions(ov_init_lib PUBLIC ${OV_EIGEN_ABI_DEFINITIONS})
 
 # If we are not building with ROS then we need to manually link to its headers
 # This isn't that elegant of a way, but this at least allows for building without ROS
@@ -135,6 +138,14 @@ find_package(Threads REQUIRED)
 # Eigen-only ceres-free solver self-tests -- no ov_core / Ceres / OpenCV. Fast; registered with CTest.
 if (OV_INIT_BUILD_TESTS OR OV_INIT_BUILD_MINI_TESTS)
     enable_testing()
+    add_executable(test_sampled_cpi_statistics src/test_sampled_cpi_statistics.cpp
+            src/dynamic/SampledCpiStatistics.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/../ov_core/src/cpi/CpiV1.cpp)
+    target_include_directories(test_sampled_cpi_statistics PRIVATE src ${CMAKE_CURRENT_SOURCE_DIR}/../ov_core/src ${EIGEN3_INCLUDE_DIR})
+    target_compile_definitions(test_sampled_cpi_statistics PRIVATE EIGEN_RUNTIME_NO_MALLOC ${OV_EIGEN_ABI_DEFINITIONS})
+    target_compile_options(test_sampled_cpi_statistics PRIVATE -UNDEBUG)
+    add_test(NAME test_sampled_cpi_statistics COMMAND test_sampled_cpi_statistics)
+
     add_executable(test_mini_solver src/ceres_free/test_mini_solver.cpp src/ceres_free/Problem.cpp src/ceres_free/Parallel.cpp)
     target_include_directories(test_mini_solver PRIVATE src/ceres_free ${EIGEN3_INCLUDE_DIR})
     target_link_libraries(test_mini_solver Threads::Threads)
@@ -144,13 +155,45 @@ if (OV_INIT_BUILD_TESTS OR OV_INIT_BUILD_MINI_TESTS)
     target_include_directories(test_warmstart_cov PRIVATE src/ceres_free ${EIGEN3_INCLUDE_DIR})
     target_link_libraries(test_warmstart_cov Threads::Threads)
     add_test(NAME test_warmstart_cov COMMAND test_warmstart_cov)
+
+    add_executable(test_conditional_covariance src/ceres_free/test_conditional_covariance.cpp src/ceres_free/Problem.cpp src/ceres_free/Parallel.cpp)
+    target_include_directories(test_conditional_covariance PRIVATE src/ceres_free ${EIGEN3_INCLUDE_DIR})
+    target_link_libraries(test_conditional_covariance Threads::Threads)
+    add_test(NAME test_conditional_covariance COMMAND test_conditional_covariance)
+    add_test(NAME test_conditional_covariance_qr COMMAND test_conditional_covariance)
+    set_tests_properties(test_conditional_covariance_qr PROPERTIES ENVIRONMENT "OV_ZCALIB_EXPORT_QR=1")
+
+    add_executable(test_solver_invalid_factors src/ceres_free/test_solver_invalid_factors.cpp src/ceres_free/Problem.cpp src/ceres_free/Parallel.cpp)
+    target_include_directories(test_solver_invalid_factors PRIVATE src/ceres_free ${EIGEN3_INCLUDE_DIR})
+    target_link_libraries(test_solver_invalid_factors Threads::Threads)
+    add_test(NAME test_solver_invalid_factors COMMAND test_solver_invalid_factors)
 endif ()
 
 # Tests/benches that need ov_core (and, for bench_init, Ceres). Dev/CI only.
 if (OV_INIT_BUILD_TESTS)
+    if (OV_INIT_CERES_FREE)
+        add_executable(test_conditional_bias_prior src/ceres_free/test_conditional_bias_prior.cpp)
+        target_link_libraries(test_conditional_bias_prior ov_init_lib ${thirdparty_libraries})
+        add_test(NAME test_conditional_bias_prior COMMAND test_conditional_bias_prior)
+        add_test(NAME test_conditional_bias_prior_qr COMMAND test_conditional_bias_prior)
+        set_tests_properties(test_conditional_bias_prior_qr PROPERTIES ENVIRONMENT "OV_ZCALIB_EXPORT_QR=1")
+        add_executable(test_physical_consider src/ceres_free/test_physical_consider.cpp)
+        target_link_libraries(test_physical_consider ov_init_lib ${thirdparty_libraries})
+        add_test(NAME test_physical_consider COMMAND test_physical_consider)
+        add_test(NAME test_physical_consider_qr COMMAND test_physical_consider)
+        set_tests_properties(test_physical_consider_qr PROPERTIES ENVIRONMENT "OV_ZCALIB_EXPORT_QR=1")
+    endif()
     # Factor and assembled-manifold Jacobian checks. This exercises the
     # solver's row-major tangent contract, not only individual factor math.
     add_executable(test_mini_factors src/ceres_free/test_mini_factors.cpp)
+    if (NOT OV_INIT_CERES_FREE)
+        # This test explicitly exercises the local solver even when production
+        # ov_init_lib contains only Ceres. Keep its support code test-only.
+        target_sources(test_mini_factors PRIVATE
+            src/ceres_free/Problem.cpp src/ceres_free/Parallel.cpp
+            src/ceres_free/State_JPLQuatLocal.cpp
+            src/ceres_free/Factor_GenericPrior.cpp src/ceres_free/Factor_ImuCPIv1.cpp)
+    endif ()
     target_link_libraries(test_mini_factors ov_init_lib ${thirdparty_libraries})
     add_test(NAME test_mini_factors COMMAND test_mini_factors)
 
@@ -163,13 +206,61 @@ if (OV_INIT_BUILD_TESTS)
     target_link_libraries(test_reprojection ${thirdparty_libraries})
     add_test(NAME test_reprojection COMMAND test_reprojection)
 
+    add_executable(test_imu_factor_input src/test_imu_factor_input.cpp)
+    if (NOT OV_INIT_CERES_FREE)
+        target_compile_definitions(test_imu_factor_input PRIVATE OV_TEST_CERES=1)
+    endif ()
+    target_link_libraries(test_imu_factor_input ov_init_lib ${thirdparty_libraries})
+    foreach(case valid cov_nan cov_inf cov_ninf cov_zero cov_singular cov_indefinite cov_asymmetric
+            dt_nan dt_zero dt_negative alpha_nan beta_inf quat_zero quat_nan gravity_inf bias_nan jac_nan tg_jac_inf)
+        add_test(NAME test_imu_factor_${case} COMMAND test_imu_factor_input ${case})
+    endforeach()
+
+    add_executable(test_factor_prior src/test_factor_prior.cpp)
+    if (NOT OV_INIT_CERES_FREE)
+        target_compile_definitions(test_factor_prior PRIVATE OV_TEST_CERES=1)
+    endif ()
+    target_link_libraries(test_factor_prior ov_init_lib ${thirdparty_libraries})
+    add_test(NAME test_factor_prior COMMAND test_factor_prior)
+
     add_executable(test_initializer_public src/test_initializer_public.cpp)
     target_link_libraries(test_initializer_public ov_init_lib ${thirdparty_libraries})
     add_test(NAME test_initializer_public COMMAND test_initializer_public)
 
+    add_executable(test_static_initializer_intrinsics src/test_static_initializer_intrinsics.cpp)
+    target_link_libraries(test_static_initializer_intrinsics ov_init_lib ${thirdparty_libraries})
+    add_test(NAME test_static_initializer_intrinsics COMMAND test_static_initializer_intrinsics)
+
+    add_executable(test_raw_imu_cpi src/test_raw_imu_cpi.cpp)
+    target_link_libraries(test_raw_imu_cpi ov_init_lib ${thirdparty_libraries})
+    add_test(NAME test_raw_imu_cpi COMMAND test_raw_imu_cpi)
+
+    add_executable(test_initializer_camera_clock src/test_initializer_camera_clock.cpp)
+    target_link_libraries(test_initializer_camera_clock ov_init_lib ${thirdparty_libraries})
+    add_test(NAME test_initializer_camera_clock COMMAND test_initializer_camera_clock)
+    add_executable(test_initializer_spacing src/test_initializer_spacing.cpp)
+    target_link_libraries(test_initializer_spacing ov_init_lib ${thirdparty_libraries})
+    add_test(NAME test_initializer_spacing COMMAND test_initializer_spacing)
+
     add_executable(test_initializer_pruning src/test_initializer_pruning.cpp)
     target_link_libraries(test_initializer_pruning ov_init_lib ${thirdparty_libraries})
     add_test(NAME test_initializer_pruning COMMAND test_initializer_pruning)
+
+    add_executable(test_initializer_snapshot src/test_initializer_snapshot.cpp)
+    target_link_libraries(test_initializer_snapshot ov_init_lib ${thirdparty_libraries} Threads::Threads)
+    add_test(NAME test_initializer_snapshot COMMAND test_initializer_snapshot)
+
+    if (NOT OV_INIT_CERES_FREE)
+        add_executable(test_ceres_manifold src/test_ceres_manifold.cpp)
+        target_link_libraries(test_ceres_manifold ov_init_lib ${thirdparty_libraries})
+        add_test(NAME test_ceres_manifold COMMAND test_ceres_manifold)
+    endif ()
+
+    if (OV_INIT_CERES_FREE)
+        add_executable(test_gravity_export src/test_gravity_export.cpp)
+        target_link_libraries(test_gravity_export ov_init_lib ${thirdparty_libraries})
+        add_test(NAME test_gravity_export COMMAND test_gravity_export)
+    endif ()
 
     # test_dynamic_init using TrackSIM (no modal_flow needed for simulation)
     add_executable(test_dynamic_init src/test_dynamic_init.cpp)

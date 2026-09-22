@@ -27,7 +27,10 @@
  */
 
 #include <cstdio>
+#include <chrono>
+#include <limits>
 #include <random>
+#include <thread>
 #include <vector>
 
 #include <Eigen/Dense>
@@ -300,7 +303,8 @@ static BA make_ba(std::mt19937 &rng, int M, int K) {
 }
 // Solve the BA problem; returns the stacked solution. Factors live in the provided vectors.
 static Eigen::VectorXd solve_ba(const BA &ba, bool use_schur, int num_threads, std::vector<Eigen::Vector3d> &data,
-                                std::vector<DiffFactor> &diffs, std::vector<AnchorFactor> &anchors, SolverSummary *out = nullptr) {
+                                std::vector<DiffFactor> &diffs, std::vector<AnchorFactor> &anchors, SolverSummary *out = nullptr,
+                                const SolverOptions *test_options = nullptr) {
   data = ba.init;
   diffs.clear();
   anchors.clear();
@@ -324,7 +328,7 @@ static Eigen::VectorXd solve_ba(const BA &ba, bool use_schur, int num_threads, s
 
   // Schur-vs-dense is selected by whether landmarks are tagged via SetSchurLandmark (above),
   // not by an option: untagged landmark blocks are solved in the plain dense path.
-  SolverOptions opts;
+  SolverOptions opts = test_options ? *test_options : SolverOptions();
   opts.num_threads = num_threads;
   SolverSummary s = problem.Solve(opts);
   if (out)
@@ -356,14 +360,51 @@ static void test_parallel_determinism(std::mt19937 &rng) {
   std::vector<DiffFactor> f;
   std::vector<AnchorFactor> a;
 
-  Eigen::VectorXd x1 = solve_ba(ba, true, 1, d, f, a);
-  Eigen::VectorXd x4a = solve_ba(ba, true, 4, d, f, a);
-  Eigen::VectorXd x4b = solve_ba(ba, true, 4, d, f, a);
+  // Compare completed numerical solves. A production wall deadline can end
+  // different runs at different iterates under host scheduling contention.
+  // Keep the same iteration cap and all convergence/comparison tolerances.
+  SolverOptions complete;
+  complete.max_solver_time_seconds = std::numeric_limits<double>::max();
+  SolverSummary s1, s4a, s4b;
+  Eigen::VectorXd x1 = solve_ba(ba, true, 1, d, f, a, &s1, &complete);
+  Eigen::VectorXd x4a = solve_ba(ba, true, 4, d, f, a, &s4a, &complete);
+  Eigen::VectorXd x4b = solve_ba(ba, true, 4, d, f, a, &s4b, &complete);
+
+  check_true(s1.converged && !s1.time_stopped, "1-thread comparison solve completes");
+  check_true(s4a.converged && !s4a.time_stopped, "first 4-thread comparison solve completes");
+  check_true(s4b.converged && !s4b.time_stopped, "second 4-thread comparison solve completes");
 
   // Run-to-run with a fixed thread count must be bitwise identical (no races).
   check_true((x4a.array() == x4b.array()).all(), "4-thread run-to-run bitwise identical");
   // Across thread counts: identical up to floating-point summation grouping.
   check_lt((x1 - x4a).norm(), 1e-9, "1-thread vs 4-thread agree to round-off");
+}
+
+static void test_production_deadline() {
+  std::printf("[test] production deadline remains active\n");
+  class SlowLinearFactor : public LinearFactor {
+  public:
+    using LinearFactor::LinearFactor;
+    bool Evaluate(double const *const *parameters, double *residuals, double **jacobians) const override {
+      // Deliberately expensive input evaluation, not a timing benchmark. The
+      // unchanged default 50 ms deadline must stop before the first update.
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+      return LinearFactor::Evaluate(parameters, residuals, jacobians);
+    }
+  };
+  for (bool dogleg : {false, true}) {
+    double value = 2.;
+    SlowLinearFactor factor(Eigen::MatrixXd::Identity(1, 1), Eigen::VectorXd::Zero(1));
+    Problem problem;
+    problem.AddParameterBlock(&value, 1);
+    problem.AddResidualBlock(&factor, nullptr, {&value});
+    SolverOptions options;
+    options.num_threads = 1;
+    options.use_dogleg = dogleg;
+    const auto result = problem.Solve(options);
+    check_true(result.time_stopped && !result.converged, "default production deadline reports an incomplete solve");
+    check_true(result.iterations == 0 && value == 2., "deadline before first update preserves the parameter");
+  }
 }
 
 static void test_covariance(std::mt19937 &rng) {
@@ -732,6 +773,7 @@ int main() {
   test_linear_solve(rng);
   test_schur_vs_dense(rng);
   test_parallel_determinism(rng);
+  test_production_deadline();
   test_covariance(rng);
   test_qr_exports(rng);
   test_qr_invalid_values();

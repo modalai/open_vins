@@ -28,6 +28,7 @@
 #include <mutex>
 
 #include "state/PreintegrationBridge.h"
+#include "state/State.h"
 #include "utils/sensor_data.h"
 
 #include "utils/NoiseManager.h"
@@ -106,6 +107,17 @@ public:
    */
   void invalidate_cache() { cache_imu_valid = false; }
 
+  /// Start a new navigation episode while retaining the buffered raw IMU.
+  /// The new state has its own timestamp/offset; neither old endpoint ownership
+  /// nor a cached prediction from the previous state can be reused. The caller
+  /// must quiesce propagation just as for the surrounding State reset.
+  void reset_for_new_state() {
+    std::lock_guard<std::mutex> lck(imu_data_mtx);
+    last_prop_time_offset = 0.0;
+    have_last_prop_time_offset = false;
+    cache_imu_valid = false;
+  }
+
   /**
    * @brief Snapshot of the propagator's restorable mutable state (state snapshotting).
    *
@@ -144,7 +156,8 @@ public:
    *
    * This will first collect all imu readings that occured between the
    * *current* state time and the new time we want the state to be at.
-   * If we don't have any imu readings we will try to extrapolate into the future.
+   * Both endpoints must be bracketed by buffered IMU readings; otherwise this
+   * returns false without changing the state or propagation time ownership.
    * After propagating the mean and covariance using our dynamics,
    * We clone the current imu pose as a new clone in our state.
    *
@@ -152,6 +165,56 @@ public:
    * @param timestamp Time to propagate to and clone at (CAM clock frame)
    */
   bool propagate_and_clone(std::shared_ptr<State> state, double timestamp);
+
+  /// Corrected rates at an accepted IMU endpoint, for pose-view augmentation.
+  struct EndpointKinematics {
+    Eigen::Vector3d omega = Eigen::Vector3d::Zero();
+    Eigen::Vector3d omega_fej = Eigen::Vector3d::Zero();
+  };
+
+  /**
+   * Propagate the navigation state to an explicit IMU-clock endpoint, without
+   * inserting a clone. reference_timestamp is the compatibility camera-clock
+   * label committed with the accepted endpoint; it never determines the start.
+   * A repeated physical endpoint returns covered endpoint rates without adding
+   * process noise. Missing coverage leaves state, cache and out unchanged.
+   */
+  bool propagate_to_imu(std::shared_ptr<State> state, double target_imu, double reference_timestamp,
+                        EndpointKinematics &out);
+
+  /// Disabled-runtime proof API: original raw records and their exact support
+  /// survive selection. No prior is inferred from a cut interval's duration.
+  struct SampledImuSegment {
+    std::array<State::SampledImuRecord, 2> records;
+    double time0 = 0., time1 = 0.;
+    Eigen::Vector2d weights0 = Eigen::Vector2d::Zero();
+    Eigen::Vector2d weights1 = Eigen::Vector2d::Zero();
+  };
+
+  /// Select one segment per original raw pair. The caller must reserve output
+  /// capacity first: insufficient capacity/invalid coverage leaves out intact.
+  /// No queue or new sample identity is created for an interpolated endpoint.
+  static bool select_sampled_imu_readings(const std::vector<State::SampledImuRecord> &records,
+                                        double time0, double time1, std::vector<SampledImuSegment> &out);
+
+  struct SampledPropagationLinearization {
+    // Rows: IMU15. Columns: those same variables,
+    // then the original left/right raw-axis noise Vec6, in chronological order.
+    Eigen::MatrixXd Phi, independent_Q;
+  };
+
+  /// Explicitly scoped proof caller, not selected by any runtime configuration.
+  /// Requires prepared slots, accepted start endpoint, ANALYTICAL/DISCRETE/RK4 and
+  /// do_fej=false, fixed IMU calibration and |omega|*dt <= 0.5 radians.
+  /// ANALYTICAL/DISCRETE use endpoint-average raw signals; RK4 uses their linear
+  /// stage interpolation and bounds both endpoint rates by the same angle cap.
+  /// All methods subtract retained posterior noise means before calibration. Original sample priors supply all measurement
+  /// noise; only independent bias evolution is added as Q. At a raw knot the
+  /// old sample is retired, so all direct factors using it must already finish.
+  /// Declared input/numeric rejection preserves state, slots, cache and output.
+  bool propagate_sampled_segment(std::shared_ptr<State> state, const SampledImuSegment &segment,
+                                 double reference_timestamp, EndpointKinematics &out,
+                                 SampledPropagationLinearization *linearization = nullptr);
 
   /// ACI2 preintegration bridge payload (see state/PreintegrationBridge.h)
   using BridgeData = PreintBridgeData;
@@ -181,10 +244,39 @@ public:
   bool fast_state_propagate(std::shared_ptr<State> state, double timestamp, Eigen::Matrix<double, 13, 1> &state_plus,
                             Eigen::Matrix<double, 12, 12> &covariance);
 
+  struct SampledOutputIdentity {
+    uint64_t sequence = 0;
+    double timestamp = 0.;
+  };
+
+  struct SampledStateOutput {
+    // q_GtoI, p_IinG, v_IinI, omega_I; covariance uses the JPL attitude tangent.
+    Eigen::Matrix<double, 13, 1> mean = Eigen::Matrix<double, 13, 1>::Zero();
+    Eigen::Matrix<double, 12, 12> covariance = Eigen::Matrix<double, 12, 12>::Zero();
+    double imu_time = 0.;
+    uint64_t stream_episode = 0;
+    int support_count = 0;
+    std::array<SampledOutputIdentity, 2> support;
+    Eigen::Vector2d weights = Eigen::Vector2d::Zero();
+  };
+
+  /// Disabled-runtime current-output evaluator: no propagation or cache access.
+  /// Uses only current, active original raw owners at the exact accepted time.
+  /// Requires fixed calibration and do_fej=false; the algebraic output law is
+  /// independent of the integration method. Historical requests refuse.
+  /// Optional state_cross must ALREADY be n by 12 and is never resized.
+  /// Refusal leaves State and all outputs unchanged. A successful receipt is
+  /// an immutable posterior snapshot, stale after ANY subsequent update even
+  /// at the same time. It stores identities, never reusable owner pointers.
+  bool sampled_state_at_endpoint(std::shared_ptr<State> state, double imu_time, SampledStateOutput &out,
+                                 Eigen::MatrixXd *state_cross = nullptr) const;
+
   /**
    * @brief Helper function that given current imu data, will select imu readings between the two times.
    *
-   * This will create measurements that we will integrate with, and an extra measurement at the end.
+   * This returns the exact endpoints and all interior readings for a strictly
+   * increasing, finite, fully bracketed interval; otherwise it returns an empty vector.
+   * It never extrapolates beyond the buffered samples.
    * We use the @ref interpolate_data() function to "cut" the imu readings at the begining and end of the integration.
    * The timestamps passed should already take into account the time offset values.
    *
@@ -486,6 +578,29 @@ protected:
   void compute_F_and_G_discrete(std::shared_ptr<State> state, double dt, const Eigen::Vector3d &w_hat, const Eigen::Vector3d &a_hat,
                                 const Eigen::Vector3d &w_uncorrected, const Eigen::Vector3d &a_uncorrected, const Eigen::Vector4d &new_q,
                                 const Eigen::Vector3d &new_v, const Eigen::Vector3d &new_p, Eigen::MatrixXd &F, Eigen::MatrixXd &G);
+
+  /**
+   * Continuous-white-noise integral for the analytic error dynamics used by
+   * ANALYTICAL and RK4. Fixed calibration maps raw gyro/accel noise and raw-axis
+   * bias random walks; estimated calibration uncertainty still enters through F.
+   * Six positive Gauss-Legendre nodes integrate the impulse-response outer
+   * products using fixed-size scratch. At zero angular rate the polynomial
+   * integral is exact, including all navigation/bias cross blocks. At nonzero
+   * rate this is a twelfth-order quadrature, not a discrete raw-sample model.
+   * Uses the same frozen start rotation and final attitude chart as analytic G.
+   */
+  Eigen::Matrix<double, 15, 15> compute_Qd_analytic(std::shared_ptr<State> state, double dt,
+                                                 const Eigen::Vector3d &w_hat, const Eigen::Vector3d &a_hat,
+                                                 const Eigen::Vector4d &new_q,
+                                                 const Eigen::Matrix<double, 3, 18> &Xi_sum);
+
+  /// Same continuous impulse integral, optionally excluding sensor forcing.
+  /// Sampled propagation supplies sensor uncertainty through retained owners.
+  Eigen::Matrix<double, 15, 15> compute_Qd_analytic(std::shared_ptr<State> state, double dt,
+                                                 const Eigen::Vector3d &w_hat, const Eigen::Vector3d &a_hat,
+                                                 const Eigen::Vector4d &new_q,
+                                                 const Eigen::Matrix<double, 3, 18> &Xi_sum,
+                                                 bool include_sensor_noise);
 
   /// Container for the noise values
   NoiseManager _noises;

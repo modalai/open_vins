@@ -8,19 +8,10 @@
  *   estimator_config.yaml  what the FILTER believes at boot and refines ONLINE.
  *   ov_zcalib.yaml          what the CALIBRATOR is GIVEN versus what it must EARN.
  *
- * The seeding defaults retain a historical single-session comparison on one
- * reference rig, with all other settings held fixed:
- *
- *   seed cam intrinsics   VERIFY 62.2%
- *   + seed imu intrinsics VERIFY 62.2 -> 73.3%
- *   + seed R_ItoC         byte-identical result after hand-eye bootstrap
- *   + seed p_IinC         VERIFY 73.3 -> 48.6%
- *   + seed td             VERIFY      -> 28.3%
- *
- * VERIFY measures held-out reprojection improvement, not calibration ground truth.
- * An active chain is an initializer, not proof that its per-unit values are correct.
- * To start the full IMU chain blind, disable BOTH seed_imu_intrinsics and seed_tg;
- * their estimation policies remain separate. Defaults are unchanged.
+ * Seed policies select initial parameter values; estimate policies select
+ * which blocks may move and undergo acceptance checks. The active chain is
+ * not independent calibration ground truth. Disable both seed_imu_intrinsics
+ * and seed_tg to initialize the complete IMU chain without that chain's values.
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -84,12 +75,10 @@ inline ImuIntrinsicModel make_imu_seed(const ImuIntrinsicModel &ported_chain, co
 /// What the session may ESTIMATE and COMMIT. A block that is seeded but NOT estimated
 /// ships its seed and is reported as such (see the YAML's committed_blocks/seed_blocks).
 struct EstimatePolicy {
-  bool imu_intrinsics = true; ///< false => seed AND FREEZE: skips A1a/A1b entirely (~30% faster solve)
+  bool imu_intrinsics = true; ///< false freezes the seeded IMU chain and skips A1a/A1b
   int cam_intrinsics = 0;     ///< 0 fixed | 1 refine (tight priors) | 2 full (weak priors, gated)
-  /// Estimate Tg (gyro g-sensitivity). EARNED per unit: the rig's own kalibr sessions scatter
-  /// beyond |Tg| between runs, so no chain value deserves seed authority.
-  /// Unlocks only through the A1b excitation gate + split-half/Wald falsifier; requires an
-  /// estimable IMU chain (a frozen factory chain freezes tg with it).
+  /// Estimate gyro g-sensitivity after excitation and consistency checks.
+  /// Requires an estimable IMU chain; freezing that chain also freezes Tg.
   bool tg = true;
 };
 
@@ -105,10 +94,9 @@ struct CalibProfile {
   SessionConfig session;
   SeedPolicy seed;
   EstimatePolicy estimate;
-  /// Calibration-WEIGHTING IMU densities -- deliberately not the filter's. sigma here is not a
-  /// safety margin, it is the lever arm between the IMU and camera residuals: inflate the IMU and
-  /// the gyro loses every argument with a camera, including the one about dw. See
-  /// apply_voxl_noise_defaults().
+  /// Calibration IMU weights, independent of filter noise. They determine the
+  /// relative information carried by IMU and camera residuals. See the profile
+  /// defaults and preserve these values when comparing replay results.
   ImuNoise noise;
   /// Calibration reprojection residual 1-sigma, in pixels per image axis.
   /// Independent of MSCKF/SLAM tuning and of lens-calibration reprojection RMS.
@@ -386,6 +374,7 @@ inline bool validate_calib_profile(const CalibProfile &p, std::string &error) {
     }
   const std::pair<const char *, double> positive[] = {
       {"collect_budget_s", p.collect_budget_s}, {"commit_sigma_factor", p.session.commit_sigma_factor},
+      {"tg_max_sigma", p.session.commit_abs_ceiling.at("tg")},
       {"radtan_tangent_refine_sigma", p.session.radtan_tangent_refine_sigma},
       {"radtan_tangent_full_sigma", p.session.radtan_tangent_full_sigma}};
   for (const auto &entry : positive)
@@ -423,6 +412,7 @@ inline bool parse_calib_profile_numbers(const cv::FileNode &root, const std::str
       {"gravity_mag", &p.gravity_mag}, {"track_rate_hz", &p.track_rate_hz},
       {"collect_budget_s", &p.collect_budget_s}, {"collect_min_eig", &p.collect_min_eig},
       {"solve_budget_s", &p.session.solve_budget_s}, {"commit_sigma_factor", &p.session.commit_sigma_factor},
+      {"tg_max_sigma", &p.session.commit_abs_ceiling.at("tg")},
       {"verify_min_improve", &p.session.verify_min_improve},
       {"radtan_tangent_refine_sigma", &p.session.radtan_tangent_refine_sigma},
       {"radtan_tangent_full_sigma", &p.session.radtan_tangent_full_sigma}};
@@ -537,6 +527,8 @@ inline bool load_calib_profile(const std::string &path, CalibProfile &out) {
              out.noise.sigma_w, out.noise.sigma_wb, out.noise.sigma_a, out.noise.sigma_ab);
   PRINT_INFO("[ov_zcalib]   CAMERA WEIGHT default %.6g px, %zu named overrides (calibration only; independent of MSCKF/SLAM)\n",
              out.camera_pixel_sigma, out.camera_pixel_sigma_by_name.size());
+  PRINT_INFO("[ov_zcalib]   Tg precision ceiling %.6g (rad/s)/(m/s^2), raw local 1-sigma; consistency and verification also required\n",
+             out.session.commit_abs_ceiling.at("tg"));
   return true;
 }
 

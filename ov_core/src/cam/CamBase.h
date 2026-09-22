@@ -139,18 +139,6 @@ public:
    * @param uv_norm Normalized coordinates we wish to distort
    * @return 2d vector of raw uv coordinate
    */
-  Eigen::Vector2d distort_d(const Eigen::Vector2d &uv_norm) {
-    Eigen::Vector2f ept1, ept2;
-    ept1 = uv_norm.cast<float>();
-    ept2 = distort_f(ept1);
-    return ept2.cast<double>();
-  }
-
-  /**
-   * @brief Given a normalized uv coordinate this will distort it to the raw image plane
-   * @param uv_norm Normalized coordinates we wish to distort
-   * @return 2d vector of raw uv coordinate
-   */
   cv::Point2f distort_cv(const cv::Point2f &uv_norm) {
     Eigen::Vector2f ept1, ept2;
     ept1 << uv_norm.x, uv_norm.y;
@@ -168,6 +156,16 @@ public:
    * @param H_dz_dzeta Derivative of measurement z in respect to intrinic parameters
    */
   virtual void compute_distort_jacobian(const Eigen::Vector2d &uv_norm, Eigen::MatrixXd &H_dz_dzn, Eigen::MatrixXd &H_dz_dzeta) = 0;
+
+  /**
+   * @brief Project normalized coordinates in double precision, consistently with the analytic Jacobians.
+   *
+   * The float tracking interface remains separate: an estimator prediction must
+   * not round through float before forming a double residual. This virtual is
+   * appended after the existing virtual methods. All camera implementations and
+   * consumers must be rebuilt together when adopting this interface.
+   */
+  virtual Eigen::Vector2d distort_d(const Eigen::Vector2d &uv_norm) = 0;
 
   /// Gets the complete intrinsic vector
   Eigen::MatrixXd get_value() { return camera_values; }

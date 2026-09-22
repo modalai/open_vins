@@ -26,6 +26,7 @@
 #include <Eigen/Eigen>
 #include <memory>
 #include <unordered_map>
+#include <vector>
 
 #include "feat/FeatureInitializerOptions.h"
 
@@ -102,7 +103,8 @@ protected:
    * @param new_anchor_timestamp Clone timestamp we want to move to
    * @param new_cam_id Which camera frame we want to move to
    */
-  void perform_anchor_change(std::shared_ptr<State> state, std::shared_ptr<ov_type::Landmark> landmark, double new_anchor_timestamp,
+  /// False leaves the old anchor, current/FEJ coordinates and covariance intact.
+  bool perform_anchor_change(std::shared_ptr<State> state, std::shared_ptr<ov_type::Landmark> landmark, double new_anchor_timestamp,
                              size_t new_cam_id);
 
   /// Options used during update for slam features
@@ -113,6 +115,33 @@ protected:
 
   /// Feature initializer class object
   std::shared_ptr<ov_core::FeatureInitializer> initializer_feat;
+
+  /// Reused pre-batch virtual camera poses, indexed by camera * clone_count +
+  /// sorted clone index. Capacity follows the configured window bound and is
+  /// retained across calls; global-only landmark initialization leaves it alone.
+  struct VirtualAnchorPose {
+    Eigen::Matrix3d R_GtoC;
+    Eigen::Vector3d p_CinG;
+  };
+  std::vector<VirtualAnchorPose, Eigen::aligned_allocator<VirtualAnchorPose>> _virtual_anchor_scratch;
+
+  // Row-time triangulation and a later stereo-to-mono retry must use the same
+  // pre-batch calibration and endpoint motion. Allocate only for RS, then reuse
+  // the configured camera/window capacity; no per-feature pose maps are retained.
+  struct RowCameraSnapshot {
+    Eigen::Matrix3d R_ItoC;
+    Eigen::Vector3d p_IinC;
+    double readout = 0.0;
+    double inverse_height = 0.0;
+    bool active = false;
+  };
+  struct RowMotionSnapshot {
+    Eigen::Vector3d omega;
+    Eigen::Vector3d velocity;
+    bool available = false;
+  };
+  std::vector<RowCameraSnapshot, Eigen::aligned_allocator<RowCameraSnapshot>> _row_camera_scratch;
+  std::vector<RowMotionSnapshot, Eigen::aligned_allocator<RowMotionSnapshot>> _row_motion_scratch;
 };
 
 } // namespace ov_msckf

@@ -21,8 +21,10 @@
  */
 
 #include "Factor_GenericPrior.h"
+#include "QuaternionTangent.h"
 
 #include "utils/quat_ops.h"
+#include "utils/finite.h"
 
 using namespace ov_init;
 
@@ -54,28 +56,6 @@ Factor_GenericPrior::Factor_GenericPrior(const Eigen::MatrixXd &x_lin_, const st
       std::exit(EXIT_FAILURE);
     }
   }
-  assert(x_lin.rows() == state_size);
-  assert(x_lin.cols() == 1);
-  assert(prior_Info.rows() == state_error_size);
-  assert(prior_Info.cols() == state_error_size);
-  assert(prior_grad.rows() == state_error_size);
-  assert(prior_grad.cols() == 1);
-
-  // Now lets base-compute the square-root information and constant term b
-  // Comes from the form: cost = A * (x - x_lin) + b
-  Eigen::LLT<Eigen::MatrixXd> lltOfI(prior_Info);
-  sqrtI = lltOfI.matrixL().transpose();
-  Eigen::MatrixXd I = Eigen::MatrixXd::Identity(prior_Info.rows(), prior_Info.rows());
-  b = sqrtI.triangularView<Eigen::Upper>().solve(I) * prior_grad;
-
-  // Check that we have a valid matrix that we can get the information of
-  if (std::isnan(prior_Info.norm()) || std::isnan(sqrtI.norm()) || std::isnan(b.norm())) {
-    std::cerr << "prior_Info - " << std::endl << prior_Info << std::endl << std::endl;
-    std::cerr << "prior_Info_inv - " << std::endl << prior_Info.inverse() << std::endl << std::endl;
-    std::cerr << "b - " << std::endl << b << std::endl << std::endl;
-    std::exit(EXIT_FAILURE);
-  }
-
   // Set the number of measurements, and the block sized
   set_num_residuals(state_error_size);
   for (auto const &str : x_type_) {
@@ -90,9 +70,27 @@ Factor_GenericPrior::Factor_GenericPrior(const Eigen::MatrixXd &x_lin_, const st
     if (str == "vec8")
       mutable_parameter_block_sizes()->push_back(8);
   }
+
+  // H = U^T U and r = U*dx + b require U^T b = g. Solving U b = g
+  // changes every non-diagonal, nonzero-gradient marginal prior. Solve the
+  // lower triangle directly; do not form an inverse. Validate before LLT,
+  // since Release/fast-math does not retain NaN comparisons or assertions.
+  if (state_error_size == 0 || x_lin.rows() != state_size || x_lin.cols() != 1 ||
+      prior_Info.rows() != state_error_size || prior_Info.cols() != state_error_size ||
+      prior_grad.rows() != state_error_size || prior_grad.cols() != 1 ||
+      !ov_core::numeric::finite_matrix(x_lin) || !ov_core::numeric::finite_matrix(prior_Info) ||
+      !ov_core::numeric::finite_matrix(prior_grad) || !prior_Info.isApprox(prior_Info.transpose(), 1e-12))
+    return;
+  Eigen::LLT<Eigen::MatrixXd> lltOfI(prior_Info);
+  if (lltOfI.info() != Eigen::Success) return;
+  sqrtI = lltOfI.matrixL().transpose();
+  b = lltOfI.matrixL().solve(prior_grad);
+  valid = ov_core::numeric::finite_matrix(sqrtI) && ov_core::numeric::finite_matrix(b);
+
 }
 
 bool Factor_GenericPrior::Evaluate(double const *const *parameters, double *residuals, double **jacobians) const {
+  if (!valid) return false;
 
   // Location in our state and output residual
   int local_it = 0;
@@ -112,7 +110,7 @@ bool Factor_GenericPrior::Evaluate(double const *const *parameters, double *resi
         jacobian.setZero();
         Eigen::Matrix3d Jr_inv = ov_core::Jr_so3(theta_err).inverse();
         Eigen::Matrix3d H_theta = -Jr_inv * R_lin.transpose();
-        jacobian.block(0, 0, num_residuals(), 3) = sqrtI.block(0, local_it, num_residuals(), 3) * H_theta;
+        jacobian = sqrtI.block(0, local_it, num_residuals(), 3) * H_theta * jpl_tangent_lift(q_i);
       }
       global_it += 4;
       local_it += 3;
@@ -128,7 +126,7 @@ bool Factor_GenericPrior::Evaluate(double const *const *parameters, double *resi
         jacobian.setZero();
         Eigen::Matrix3d Jr_inv = ov_core::Jr_so3(theta_err).inverse();
         Eigen::Matrix<double, 1, 3> H_theta = -ez.transpose() * (Jr_inv * R_lin.transpose());
-        jacobian.block(0, 0, num_residuals(), 3) = sqrtI.block(0, local_it, num_residuals(), 1) * H_theta;
+        jacobian = sqrtI.block(0, local_it, num_residuals(), 1) * H_theta * jpl_tangent_lift(q_i);
       }
       global_it += 4;
       local_it += 1;

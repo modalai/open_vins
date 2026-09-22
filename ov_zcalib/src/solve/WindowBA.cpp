@@ -103,7 +103,17 @@ bool WindowBA::make_evaluation_context(const WindowData &win, const SharedCalib 
 
 bool WindowBA::solve_and_export(const WindowData &win, SharedCalib &calib, bool export_info, WindowSolveReport &rep, int max_iters,
                                 bool verbose, WindowWarmState *warm, WindowPreint *pc, const WindowWarmState *state_at,
-                                const WindowEvaluationContext *evaluation, const WindowBiasPrior *bias_prior) {
+                                const WindowEvaluationContext *evaluation, const WindowBiasPrior *bias_prior,
+                                const WindowBoundaryBias *boundary) {
+
+  if (boundary) {
+    rep.ok = false;
+    // Keep held-out scoring's fixed objective separate from linked-window
+    // training. Validate by representation even in -ffast-math builds.
+    if (evaluation || !finite_matrix(boundary->bg_first) || !finite_matrix(boundary->ba_first) ||
+        !finite_matrix(boundary->bg_last) || !finite_matrix(boundary->ba_last))
+      return false;
+  }
 
   const int N = (int)win.clone_times.size();
   if (N < 3 || win.num_feats == 0)
@@ -129,6 +139,15 @@ bool WindowBA::solve_and_export(const WindowData &win, SharedCalib &calib, bool 
     // Evaluation contexts belong to this comparison, not the production
     // cache key. Never leave their weights in a persistent training graph.
     pc = nullptr;
+  }
+  const WindowEvaluationContext *fixed_weights = evaluation ? evaluation : (boundary ? boundary->imu_weights : nullptr);
+  if (boundary && fixed_weights) {
+    if (fixed_weights->imu_sqrt_info.size() != (size_t)(N - 1) ||
+        fixed_weights->imu_gravity_fold.size() != (size_t)(N - 1))
+      return false;
+    for (int k = 0; k + 1 < N; ++k)
+      if (!finite_matrix(fixed_weights->imu_sqrt_info[k]) || !finite_matrix(fixed_weights->imu_gravity_fold[k]))
+        return false;
   }
 
   // Reject invalid weights before touching a persistent graph. Bit checks are
@@ -160,7 +179,10 @@ bool WindowBA::solve_and_export(const WindowData &win, SharedCalib &calib, bool 
   // call-local graph so admission/tests behave exactly like production) ----
   std::unique_ptr<WindowGraph> local_g;
   WindowGraph *Gp;
-  if (pc) {
+  // Boundary constancy and first-prior suppression belong only to this call.
+  // Keep the persistent legacy graph pristine; pc still supplies exact mean
+  // and whitener reuse below, independently of graph ownership.
+  if (pc && !boundary) {
     if (!pc->graph)
       pc->graph = std::shared_ptr<void>(new WindowGraph, [](void *g) { delete static_cast<WindowGraph *>(g); });
     Gp = static_cast<WindowGraph *>(pc->graph.get());
@@ -422,8 +444,8 @@ bool WindowBA::solve_and_export(const WindowData &win, SharedCalib &calib, bool 
   // ctor). A HIT feeds the copied bytes to the cache-fed ctor, skipping the
   // factorization.
   const auto t_fac0 = std::chrono::steady_clock::now();
-  const bool whit_hit = pc && pc->has_whit && pc->whit_key == key && (int)pc->W.size() == N - 1;
-  if (pc && !whit_hit) {
+  const bool whit_hit = !fixed_weights && pc && pc->has_whit && pc->whit_key == key && (int)pc->W.size() == N - 1;
+  if (pc && !fixed_weights && !whit_hit) {
     pc->W.resize(N - 1);
     pc->Wfold.resize(N - 1);
   }
@@ -431,9 +453,9 @@ bool WindowBA::solve_and_export(const WindowData &win, SharedCalib &calib, bool 
   if (!G.built) {
     for (int k = 0; k + 1 < N; ++k) {
       Factor_ImuAci3 *f;
-      if (evaluation) {
+      if (fixed_weights) {
         f = new Factor_ImuAci3(pre[k], model_all, Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero(),
-                              evaluation->imu_sqrt_info[k], evaluation->imu_gravity_fold[k]);
+                              fixed_weights->imu_sqrt_info[k], fixed_weights->imu_gravity_fold[k]);
       } else if (whit_hit) {
         f = new Factor_ImuAci3(pre[k], model_all, Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero(), pc->W[k], pc->Wfold[k]);
       } else {
@@ -480,9 +502,17 @@ bool WindowBA::solve_and_export(const WindowData &win, SharedCalib &calib, bool 
       }
     }
   }
+  // A call-local boundary graph can move the means/whitener cache while the
+  // persistent graph still holds these exact factors. Restore its matching
+  // whitener bytes before stamping the cache with this key again.
+  if (imu_fresh && pc && !fixed_weights && !whit_hit)
+    for (int k = 0; k + 1 < N; ++k) {
+      pc->W[k] = G.imu_f[k]->sqrtI;
+      pc->Wfold[k] = G.imu_f[k]->sqrtI_grav_fold;
+    }
   G.factor_key = key;
   G.has_factor_key = true;
-  if (pc && !whit_hit) {
+  if (pc && !fixed_weights && !whit_hit) {
     pc->whit_key = key;
     pc->has_whit = true;
   }
@@ -585,6 +615,11 @@ bool WindowBA::solve_and_export(const WindowData &win, SharedCalib &calib, bool 
     }
   }
 
+  if (boundary && !boundary->include_first_prior) {
+    G.pbg->w.setZero();
+    G.pba->w.setZero();
+  }
+
   // ---- export-only state override (export-on-accept re-entry) ----
   // Construct the same factors and gauge anchors as the accepted evaluation,
   // then load its kept optimum for a zero-iteration export. Reprojection reads
@@ -600,6 +635,17 @@ bool WindowBA::solve_and_export(const WindowData &win, SharedCalib &calib, bool 
     p = state_at->p;
     feats = state_at->feats;
     grav = state_at->grav;
+  }
+
+  if (boundary) {
+    // Apply after every initializer/override and after prior construction:
+    // changing a candidate boundary must not recenter its physical prior.
+    bg.front() = boundary->bg_first;
+    ba.front() = boundary->ba_first;
+    bg.back() = boundary->bg_last;
+    ba.back() = boundary->ba_last;
+    for (double *ptr : {bg.front().data(), ba.front().data(), bg.back().data(), ba.back().data()})
+      problem.SetParameterBlockConstant(ptr);
   }
 
   // ---- inner (nuisance) solve ----
@@ -664,7 +710,7 @@ bool WindowBA::solve_and_export(const WindowData &win, SharedCalib &calib, bool 
   // ---- export reduced information on the free calibration blocks ----
   // The keep set and the flag flips act on the GRAPH's calib copy (the
   // registered pointers); the caller's calib is never touched here.
-  rep.free_dim = G.calib.local_dim(); // layout dim of THIS solve (eval-only reports carry no Lambda)
+  rep.free_dim = G.calib.local_dim() + (boundary ? 12 : 0); // also set for eval-only calls
   rep.ok = true;
   if (export_info) {
     const auto t_ex0 = std::chrono::steady_clock::now();
@@ -672,6 +718,12 @@ bool WindowBA::solve_and_export(const WindowData &win, SharedCalib &calib, bool 
     for (auto &b : G.calib.free_blocks()) {
       problem.SetParameterBlockVariable(b.ptr);
       keep.push_back(b.ptr);
+    }
+    if (boundary) {
+      for (double *ptr : {bg.front().data(), ba.front().data(), bg.back().data(), ba.back().data()}) {
+        problem.SetParameterBlockVariable(ptr);
+        keep.push_back(ptr);
+      }
     }
     ov_init::zbft_sfm::Problem::ExportStats est;
     rep.ok = problem.ExportReducedInformation(keep, rep.Lambda, rep.gred, opts, &est);
@@ -682,6 +734,9 @@ bool WindowBA::solve_and_export(const WindowData &win, SharedCalib &calib, bool 
     rep.export_clamped = est.clamped_dirs;
     for (auto &b : G.calib.free_blocks())
       problem.SetParameterBlockConstant(b.ptr); // leave calib untouched by this window
+    if (boundary)
+      for (double *ptr : {bg.front().data(), ba.front().data(), bg.back().data(), ba.back().data()})
+        problem.SetParameterBlockConstant(ptr);
     rep.t_export = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_ex0).count();
   }
   // (A qn-only stats path without the calib columns was built and measured NOT

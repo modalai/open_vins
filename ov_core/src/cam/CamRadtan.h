@@ -135,7 +135,7 @@ public:
   Eigen::Vector2f distort_f(const Eigen::Vector2f &uv_norm) override {
 
     // Get our camera parameters
-    Eigen::MatrixXd cam_d = camera_values;
+    const auto &cam_d = camera_values;
 
     // Calculate distorted coordinates for radial
     double r = std::sqrt(uv_norm(0) * uv_norm(0) + uv_norm(1) * uv_norm(1));
@@ -153,6 +153,16 @@ public:
     return uv_dist;
   }
 
+  Eigen::Vector2d distort_d(const Eigen::Vector2d &uv_norm) override {
+    const auto &cam_d = camera_values;
+    const double x = uv_norm(0), y = uv_norm(1);
+    const double r2 = x * x + y * y;
+    const double radial = 1.0 + cam_d(4) * r2 + cam_d(5) * r2 * r2;
+    const double xd = x * radial + 2.0 * cam_d(6) * x * y + cam_d(7) * (r2 + 2.0 * x * x);
+    const double yd = y * radial + cam_d(6) * (r2 + 2.0 * y * y) + 2.0 * cam_d(7) * x * y;
+    return Eigen::Vector2d(cam_d(0) * xd + cam_d(2), cam_d(1) * yd + cam_d(3));
+  }
+
   /**
    * @brief Computes the derivative of raw distorted to normalized coordinate.
    * @param uv_norm Normalized coordinates we wish to distort
@@ -162,11 +172,10 @@ public:
   void compute_distort_jacobian(const Eigen::Vector2d &uv_norm, Eigen::MatrixXd &H_dz_dzn, Eigen::MatrixXd &H_dz_dzeta) override {
 
     // Get our camera parameters
-    Eigen::MatrixXd cam_d = camera_values;
+    const auto &cam_d = camera_values;
 
     // Calculate distorted coordinates for radial
-    double r = std::sqrt(uv_norm(0) * uv_norm(0) + uv_norm(1) * uv_norm(1));
-    double r_2 = r * r;
+    double r_2 = uv_norm(0) * uv_norm(0) + uv_norm(1) * uv_norm(1);
     double r_4 = r_2 * r_2;
 
     // Jacobian of distorted pixel to normalized pixel

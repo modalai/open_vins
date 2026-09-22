@@ -1,6 +1,8 @@
 cmake_minimum_required(VERSION 3.5)
 project(ov_core)
 
+include(${CMAKE_CURRENT_SOURCE_DIR}/../ov_core/cmake/EigenAbi.cmake)
+
 # Include libraries (if we don't have opencv 4, then fallback to opencv 3)
 # The OpenCV version needs to match the one used by cv_bridge otherwise you will get a segmentation fault!
 find_package(Eigen3 REQUIRED)
@@ -26,17 +28,23 @@ else ()
     add_definitions(-DENABLE_ARUCO_TAGS=1)
 endif ()
 
-# Find OpenCL (optional for native builds)
+# GPU camera payloads and TrackOCL require OpenCL AND libmodal-flow. OpenCL
+# alone (common on desktop ROS machines) does not provide the VOXL types/driver.
 find_package(OpenCL QUIET)
-if (OpenCL_FOUND)
-    message(STATUS "OpenCL found: ${OpenCL_VERSION}")
-    include_directories(${OpenCL_INCLUDE_DIRS})
-    list(APPEND thirdparty_libraries ${OpenCL_LIBRARIES})
-    add_definitions(-DHAVE_OPENCL=1)
+find_path(MODAL_FLOW_INCLUDE_DIR NAMES modal_flow_ocl_manager.h)
+find_library(MODAL_FLOW_LIBRARY NAMES modal_flow)
+set(OV_USE_MODAL_FLOW 0)
+if (OpenCL_FOUND AND MODAL_FLOW_INCLUDE_DIR AND MODAL_FLOW_LIBRARY
+    AND EXISTS "${MODAL_FLOW_INCLUDE_DIR}/modal_flow/Types.hpp"
+    AND EXISTS "${MODAL_FLOW_INCLUDE_DIR}/modal_flow/StereoMatcher.hpp")
+    set(OV_USE_MODAL_FLOW 1)
+    include_directories(${OpenCL_INCLUDE_DIRS} ${MODAL_FLOW_INCLUDE_DIR})
+    list(APPEND thirdparty_libraries ${OpenCL_LIBRARIES} ${MODAL_FLOW_LIBRARY})
+    message(STATUS "OpenCL/modal-flow tracker enabled")
 else()
-    message(WARNING "OpenCL not found - building without GPU acceleration")
-    add_definitions(-DHAVE_OPENCL=0)
+    message(STATUS "OpenCL/modal-flow tracker unavailable; building CPU trackers")
 endif()
+add_definitions(-DHAVE_OPENCL=${OV_USE_MODAL_FLOW} -DOV_HAVE_MODAL_FLOW=${OV_USE_MODAL_FLOW})
 
 # check if we have our python libs files (will search for python3 then python2 installs)
 # sudo apt-get install python-matplotlib python-numpy python-dev
@@ -89,6 +97,13 @@ else ()
     include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/ROS1.cmake)
 endif ()
 
-
-
-
+option(OV_CORE_BUILD_TESTS "Build the independent camera projection oracle" OFF)
+if (OV_CORE_BUILD_TESTS)
+    # Multiprecision is a host-test oracle dependency, not a core library dependency.
+    find_package(Boost REQUIRED)
+    enable_testing()
+    add_executable(test_camera_projection src/test_camera_projection.cpp)
+    target_include_directories(test_camera_projection PRIVATE ${Boost_INCLUDE_DIRS})
+    target_link_libraries(test_camera_projection ov_core_lib ${thirdparty_libraries})
+    add_test(NAME test_camera_projection COMMAND test_camera_projection)
+endif ()

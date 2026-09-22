@@ -17,6 +17,8 @@
  *       at its prior/seed.
  *  [S4] Staged camera-intrinsic refinement (cam_mode=1): the committed cam
  *       block must improve on its seed without sacrificing temporal/IMU blocks.
+ *  [S7/S8] Refusing the nuisance Tg refits the remaining parameters and their
+ *       posterior, or restores the complete A0 result when its budget expires.
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -27,10 +29,12 @@
 #include <cstdio>
 #include <cstring>
 #include <cerrno>
+#include <limits>
 #include <thread>
 
 #include "core/CalibSessionRunner.h"
 #include "sim/SynthWorld.h"
+#include "utils/NumericChecks.h"
 #include "utils/YamlWriteback.h"
 
 #include <sys/stat.h>
@@ -219,9 +223,53 @@ static std::string slurp(const std::string &p) {
   return s;
 }
 
+template <typename A, typename B> static bool same_bits(const A &a, const B &b) {
+  return a.rows() == b.rows() && a.cols() == b.cols() &&
+         (a.size() == 0 || std::memcmp(a.data(), b.data(), sizeof(double) * a.size()) == 0);
+}
+
+static bool same_imu(const ImuIntrinsicModel &a, const ImuIntrinsicModel &b) {
+  return same_bits(a.dw, b.dw) && same_bits(a.da, b.da) && same_bits(a.q_AtoI, b.q_AtoI) && same_bits(a.Tg, b.Tg) &&
+         a.calib_dw == b.calib_dw && a.calib_da == b.calib_da && a.calib_RAtoI == b.calib_RAtoI && a.calib_tg == b.calib_tg;
+}
+
+static bool same_calibration(const SharedCalib &a, const SharedCalib &b) {
+  if (!same_imu(a.imu, b.imu) || !same_imu(a.noise_lin, b.noise_lin) || a.noise_frozen != b.noise_frozen ||
+      a.tg_enabled != b.tg_enabled || a.cams.size() != b.cams.size())
+    return false;
+  for (size_t i = 0; i < a.cams.size(); ++i) {
+    const CamCalib &ac = a.cams[i], &bc = b.cams[i];
+    if (!same_bits(ac.q_ItoC, bc.q_ItoC) || !same_bits(ac.p_IinC, bc.p_IinC) || !same_bits(ac.cam, bc.cam) ||
+        std::memcmp(&ac.td, &bc.td, sizeof(double)) != 0 || std::memcmp(&ac.tr, &bc.tr, sizeof(double)) != 0 ||
+        ac.free_ext != bc.free_ext || ac.free_td != bc.free_td || ac.cam_mode != bc.cam_mode)
+      return false;
+  }
+  return true;
+}
+
+static bool posterior_matches_layout(const SessionReport &report) {
+  SharedCalib solved = report.solved;
+  std::vector<std::string> labels;
+  for (const auto &block : solved.free_blocks())
+    for (int k = 0; k < block.lsize; ++k)
+      labels.push_back(block.label() + "[" + std::to_string(k) + "]");
+  const int n = solved.local_dim();
+  return report.joint.ok && report.joint.labels == labels && report.joint.dim_p == n &&
+         report.joint.sigma.size() == n && report.joint.prior_sigma_vec.size() == n &&
+         report.joint.Lambda.rows() == n && report.joint.Lambda.cols() == n &&
+         finite_matrix(report.joint.sigma) && finite_matrix(report.joint.Lambda);
+}
+
+static const StageEvidence *stage_named(const SessionReport &report, const char *name) {
+  for (const auto &stage : report.evidence)
+    if (stage.label == name)
+      return &stage;
+  return nullptr;
+}
+
 int main(int argc, char **argv) {
   // ---- developer iteration affordances (results IDENTICAL by contract) ----
-  // S-block selection: pass any of S1 S2 S3 S4 to run just those (default: all). Blocks own
+  // S-block selection: pass any of S1 through S8 to run just those (default: all). Blocks own
   // their records; S2 replays S1's record, so selecting S2 runs S1 too. Lets a fix to one
   // block iterate in ~1/4 of the suite wall instead of re-paying every world.
   auto want = [&](const char *b) {
@@ -236,6 +284,8 @@ int main(int argc, char **argv) {
   const bool s1 = want("S1") || s2;
   const bool s5 = want("S5");
   const bool s6 = want("S6");
+  const bool s7 = want("S7");
+  const bool s8 = want("S8");
 
   if (want("IO")) {
     char directory[] = "/tmp/ov_zcalib_yaml_io.XXXXXX";
@@ -289,9 +339,9 @@ int main(int argc, char **argv) {
   cfg.cam_mode = 0; // S1/S2/S3 are the frozen temporal/IMU gates; S4 below gates the camera path
   // Window pool at the machine width: serial == parallel BIT-IDENTICAL (fixed-range partition,
   // worker-ordered fold -- see ov_init::zbft_sfm::ParallelExecutor), so this is pure wall-clock.
-  // NO wall budgets anywhere in the tests: solve_budget_s stays 0 and the only time limit is the
-  // 60 s inner hang guard that must never bind -- a binding budget couples machine load into the
-  // iterate and makes a determinism suite flake under load.
+  // Accuracy/determinism runs have no wall budget: only the 60 s inner hang
+  // guard, which must never bind. Deadline regressions below inject a clock
+  // tied to completed stages so machine load cannot change their verdict.
   cfg.joint.num_threads = std::max(4u, std::thread::hardware_concurrency());
 
   // 6 s quiet head (settle), excitation [6, 120]; bootstrap ~[6, 20+], collection after.
@@ -300,7 +350,7 @@ int main(int argc, char **argv) {
   // shape REFUSES under the arbiter's split-half judge (its per-half qA basin is
   // wider than the agreement band) -- that refusal world is tg_e2e's T2/T3 territory;
   // S1 must be the certify world.
-  if (s1 || s5 || s6)
+  if (s1 || s5 || s6 || s7 || s8)
     write_session_record(tr, rec, 120.0, 6.0, 118.0, 4242, false, nullptr, 0.35);
 
   // ---------------- S1: full session, replay path ----------------
@@ -534,6 +584,106 @@ int main(int argc, char **argv) {
     }
     CHECK(skipped_a1a && skipped_b, "S5: missing truthful skipped-stage evidence");
     std::printf("[S5] A1a/B deadline preserves A0 posterior and freezes unestimated IMU blocks\n");
+  }
+
+  if (s7 || s8) {
+    // Tighten only the full-chain pre-gate so this test isolates the refused
+    // Tg path. Accuracy, posterior, VERIFY and COMMIT gates retain their
+    // production settings; the record contains no estimator truth seeds.
+    auto replay_refused_tg = [&](int cam_mode, const char *expire_after, SessionSeed &seed) {
+      SessionReport result;
+      SessionRecordReader reader;
+      const bool opened = reader.open(rec);
+      CHECK(opened, "S7/S8: record open failed");
+      if (!opened)
+        return result;
+      seed = reader.seed();
+      SessionConfig refit_cfg = cfg;
+      refit_cfg.cam_mode = cam_mode;
+      refit_cfg.a_full_min_windows = std::numeric_limits<int>::max();
+      refit_cfg.verbose = false;
+      refit_cfg.out_yaml.clear();
+      refit_cfg.joint.num_threads = 4;
+      refit_cfg.joint.max_wall_s = 1e6;
+      CalibSessionRunner *live = nullptr;
+      refit_cfg.joint.budget_clock = [&]() {
+        // Evidence is appended only after each joint call joins its workers;
+        // this callback is read-only during every parallel window sweep.
+        return live && expire_after && stage_named(live->report(), expire_after) ? 1e6 : 0.0;
+      };
+      CalibSessionRunner runner(refit_cfg, seed);
+      live = &runner;
+      bool is_imu = false;
+      RawImu imu;
+      FrameObs frame;
+      while (reader.next(is_imu, imu, frame)) {
+        if (is_imu)
+          runner.feed_imu(imu);
+        else
+          runner.feed_frame(frame);
+      }
+      return SessionReport(runner.finish());
+    };
+
+    if (s7) {
+      SessionSeed seed;
+      const SessionReport result = replay_refused_tg(0, nullptr, seed);
+      const StageEvidence *a1a = stage_named(result, "A1a-dw-dadiag");
+      const StageEvidence *refit = stage_named(result, "A1a-fixed-tg");
+      CHECK(result.final_state == RunnerState::DONE, "S7: fixed-Tg replay failed (%s)", result.abort_reason.c_str());
+      CHECK(a1a && refit && refit->passes > 0 && refit->accepted > 0 && !refit->hit_budget && refit->tstop == 0,
+            "S7: refused Tg did not produce a complete fixed-Tg refit");
+      CHECK(posterior_matches_layout(result), "S7: fixed-Tg parameters and posterior layouts differ");
+      CHECK(!result.a_full_open && !result.tg_open && !result.solved.imu.calib_tg &&
+                !result.solved.imu.calib_RAtoI && same_bits(result.solved.imu.Tg, seed.calib.imu.Tg),
+            "S7: refused Tg or accel rotation escaped its seed");
+      CHECK(result.solved.imu.calib_dw && result.solved.imu.calib_da &&
+                (result.solved.imu.dw - seed.calib.imu.dw).norm() > 1e-5 &&
+                (result.solved.imu.da - seed.calib.imu.da).norm() > 1e-5,
+            "S7: fixed-Tg refit did not estimate Dw/Da");
+      if (a1a && refit) {
+        CHECK(a1a->dim_p == refit->dim_p + 9 && result.joint.dim_p == refit->dim_p &&
+                  result.joint.final_merit == refit->merit,
+              "S7: final posterior did not come from the reduced fixed-Tg model");
+      }
+      for (const auto &label : result.joint.labels)
+        CHECK(label.rfind("tg[", 0) != 0, "S7: discarded Tg remains in posterior labels");
+      CHECK(!stage_named(result, "B2-polish"), "S7: camera phase masked the missing phase-A refit");
+      CHECK(same_bits(result.committed.imu.Tg, seed.calib.imu.Tg), "S7: commit changed refused Tg");
+      std::printf("[S7] refused Tg refits Dw/Da/extrinsics/td with a matching reduced posterior (dim %d)\n", result.joint.dim_p);
+    }
+
+    if (s8) {
+      SessionSeed seed_control, seed_exhausted;
+      const SessionReport control = replay_refused_tg(1, "A0-ext-td", seed_control);
+      const SessionReport exhausted = replay_refused_tg(1, "A1a-dw-dadiag", seed_exhausted);
+      CHECK(control.final_state == RunnerState::DONE && exhausted.final_state == RunnerState::DONE,
+            "S8: A0 fallback failed (control: %s; refit: %s)", control.abort_reason.c_str(), exhausted.abort_reason.c_str());
+      const StageEvidence *a1a = stage_named(exhausted, "A1a-dw-dadiag");
+      const StageEvidence *refit = stage_named(exhausted, "A1a-fixed-tg");
+      const StageEvidence *phase_b = stage_named(exhausted, "B2-polish");
+      CHECK(a1a && a1a->passes > 0 && a1a->accepted > 0 && !a1a->hit_budget,
+            "S8: budget expired before nuisance-Tg fitting completed");
+      CHECK(refit && refit->hit_budget && refit->passes == 0 && phase_b && phase_b->hit_budget && phase_b->passes == 0,
+            "S8: refit/phase-B exhaustion lacks truthful stage evidence");
+      CHECK(posterior_matches_layout(control) && posterior_matches_layout(exhausted),
+            "S8: A0 fallback has mismatched posterior labels or dimensions");
+      CHECK(!exhausted.solved.imu.calib_dw && !exhausted.solved.imu.calib_da && !exhausted.solved.imu.calib_RAtoI &&
+                !exhausted.solved.imu.calib_tg && !exhausted.a_full_open && !exhausted.tg_open,
+            "S8: exhausted refit left unestimated IMU blocks open");
+      CHECK(same_calibration(exhausted.solved, control.solved) && same_calibration(exhausted.committed, control.committed),
+            "S8: exhausted refit/phase-B rollback failed to restore exact A0 calibration values");
+      CHECK(exhausted.joint.labels == control.joint.labels && same_bits(exhausted.joint.sigma, control.joint.sigma) &&
+                same_bits(exhausted.joint.prior_sigma_vec, control.joint.prior_sigma_vec) &&
+                same_bits(exhausted.joint.Lambda, control.joint.Lambda) &&
+                exhausted.joint.final_merit == control.joint.final_merit && exhausted.joint.qn_max_final == control.joint.qn_max_final,
+            "S8: exhausted refit retained an A1a posterior instead of exact A0 evidence");
+      for (const auto &block : exhausted.blocks)
+        CHECK(block.name != "dw" && block.name != "da" && block.name != "q_AtoI" && block.name != "tg",
+              "S8: discarded IMU fit reached the commit walk");
+      std::printf("[S8] exhausted fixed-Tg refit and phase-B rollback restore exact A0 parameters/posterior (dim %d)\n",
+                  exhausted.joint.dim_p);
+    }
   }
 
   std::remove(rec.c_str());

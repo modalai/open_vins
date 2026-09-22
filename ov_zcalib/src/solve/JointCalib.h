@@ -3,12 +3,13 @@
  * Copyright (C) 2025-2026 Joao Leonardo Silva Cotta
  *
  * ov_zcalib: cross-window VarPro fusion on the shared calibration block.
- * Windows are conditionally independent given p, so information ADDS exactly:
- * each outer iteration re-preintegrates and re-solves every window at the current
- * p (WindowBA), sums the exported (Lambda_w, g_w), applies the global seed priors
- * ONCE, solves the small dense step (sum Lambda + Lambda_prior) dp = -(sum g +
- * g_prior), and retracts p on its manifolds. The one-pass fused estimate is
- * display-only by contract; the committed answer is the converged outer loop.
+ * Under its independent-window model, each outer evaluation re-preintegrates
+ * and re-solves windows at the shared parameters, sums reduced information
+ * and gradients, applies the global seed priors once, and retracts a damped
+ * shared step. Overlapping or correlated data need separate modeling.
+ * A successful return contains an accepted point and matching posterior;
+ * iteration or time limits can stop before convergence. Session verification
+ * and commit gates remain responsible for accepting that result.
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -34,146 +35,83 @@ struct JointConfig {
   int window_max_iters = 30;
   int max_backtracks = 6; ///< consecutive damped retries before stopping at the best point
   bool verbose = true;
-  // ---- Stationarity certificate (replaces the plateau/anchor cold-solve
-  // triggers when on; use_cert=false + use_carry=false + early_stop=false is
-  // bit-identical legacy behavior for A/B). Two-path vocabulary, used
-  // throughout: the warm STRAND re-solves a window from the accepted point's
-  // nuisance optimum; a DUEL also runs a fresh-seed solve and keeps the
-  // cheaper result. The certificate accepts a warm result WITHOUT the
-  // duplicate fresh-seed solve when the inner solve exited at genuine
-  // stationarity AND the remaining nuisance Newton decrement q_n is
-  // negligible against the window cost and its own accepted reference.
-  // Measured motivation: cam-only stages double-solved ~85% of window evals
-  // (plateau trigger) for 0.05-0.34% cost noise; A-stage cold solves stay
-  // reachable through the strand guard + q_n growth + jump duels.
+  // Local stationarity heuristic for deciding whether a warm window needs
+  // a fresh-seed comparison. With fused_schur off, it requires inner
+  // convergence and a bounded nuisance Newton decrement. With fused_schur
+  // on, it uses the decrement alone, including during full-budget warmup.
+  // Other rescue, stranding and jump checks still apply.
+  // This heuristic does not certify the nonlinear basin or physical accuracy.
   bool use_cert = true;
-  /// Extend the certificate to solves with the IMU chain OPEN (calib_da /
-  /// calib_RAtoI free -- the B-2 polish class). Guarded per stage because the
-  /// certificate's q_n bands were validated with the chain frozen; open-chain
-  /// stages otherwise run the legacy plateau/anchor triggers, measured at
-  /// ~85% double-solves for 0.05-0.34% cost noise (273 plateau fires in 24
-  /// passes on a representative log). Off by default -- enable only with
-  /// stage-specific falsifier + scorecard + A/B evidence (q_n polices exactly
-  /// the stale-gradient case the plateau over-approximates; flat-cam-dof
-  /// drift is owned by the alternation anchor + the 3-sigma cam sanity gate).
+  /// Allow the heuristic when Da or R_AtoI is free. Otherwise those stages
+  /// use the plateau/periodic fresh-seed comparisons. Session stages may
+  /// override this independently of the standalone solver default.
   bool cert_open_imu = false;
   double cert_qn_rel = 2e-6;    ///< q_n ceiling as a fraction of window cost (1% of the 1e-4 acceptance band)
   double cert_ref_growth = 2.0; ///< q_n may grow at most this factor over its accepted reference
   double cert_agree_rel = 1e-3; ///< dual-pass agreement band that refreshes the q_n reference
-  /// Certificate needs enough windows for per-window basin noise to average
-  /// out of the fused step (the duels it removes were also BASIN arbitration:
-  /// keep-cheaper across two inits). Measured: a 3-window p_IinC probe drifts
-  /// 4.0 -> 4.8 mm under the certificate while 16-window stages IMPROVE; and
-  /// small-N solves are cheap, so legacy duels there cost ~nothing.
+  /// Minimum input window count before the stationarity heuristic applies.
   int cert_min_windows = 6;
-  // ---- Outer early-stop: stop after stop_k consecutive accepted steps that
-  // are stable (post-cap whitened step, relative merit change, lambda level)
-  // + one deterministic cold stop-confirmation pass.
-  // DEFAULT OFF by evidence: it never fired on real data (zero runtime
-  // rent), and its one simulated firing (a B-1 settle) cut the flat-dof cam
-  // polish short -- cy landed +1.03 px vs the 0.9 gate, a ~0.01 px/pass
-  // creep the step/merit stability tests cannot see (q_n certifies NUISANCE
-  // stationarity, not flat-calib-dof progress). The confirmation passes also
-  // burned ~85 duels per cam session. Re-enable only with per-log-class
-  // evidence.
+  // Optional stopping after stable accepted steps and a cold confirmation
+  // pass, only where the stationarity heuristic is enabled. Small steps or
+  // merit changes do not prove that weak directions are accurately fitted.
+  // Disabled by default; enabling changes the solve path.
   bool early_stop = false;
   int stop_k = 2;
-  // ---- Convergence-terminated outers. Stop when the OUTER Newton decrement
-  // lambda^2 = g^T (Lambda+Pi)^-1 g at the accepted point stays below
-  // conv_tol_rel * max(merit, 1) for conv_k consecutive accepted steps (after
-  // conv_min_accepts). Scale-free and per-dof-blind in the right way: the
-  // decrement IS the predicted attainable merit reduction, so flat-dof creep
-  // that still buys merit keeps iterating (the case the merit-watching
-  // early_stop above cuts short), while churn below the acceptance band's
-  // own noise floor stops. Default OFF: arming it changes pass counts
-  // everywhere, which re-pins every falsifier baseline.
+  // Optional local-GN convergence stop: 0.5*g^T*(Lambda+Pi)^-1*g must stay
+  // below conv_tol_rel*max(merit,1) for conv_k accepted steps, after
+  // conv_min_accepts. The predicted reduction is a local model quantity,
+  // not an exact nonlinear optimality or accuracy certificate.
   bool conv_stop = false;
   int conv_min_accepts = 3;
   int conv_k = 2;
   double conv_tol_rel = 1e-5;
   // ---- Fused (capped) evaluation: after fused_warmup_passes, warm-path
-  // evaluations run ONE inner iteration and export -- the exported
+  // evaluations run fused_iters inner iterations and export -- the exported
   // gred = gk - Hkn Hnn^-1 gn is the nuisance-corrected joint-Newton reduced
   // gradient of the linearized least-squares model. First-order accuracy for
   // the NONLINEAR reduced gradient additionally requires negligible residual
   // curvature; a GN decrement alone does not prove an inexact-Newton bound.
-  // so the outer's damped step drives p and the single inner step at the NEXT
-  // eval is the z back-substitution. Cold paths and the first pass stay FULL
-  // solves (basin escapes + honest entry); plateau/anchor triggers are
-  // structurally meaningless at capped evals and are disabled under the flag
-  // (strand/warmfail/jump duels remain). A commit-grade FINALIZE pass (tight
-  // solves + exports at the final accepted point) rebuilds the reported
-  // linearization before return -- committed posteriors never come from a
-  // capped eval.
+  // The shared outer step and later nuisance corrections alternate. Cold
+  // paths and warmup passes use full inner budgets. Capped evaluations skip
+  // plateau/periodic comparisons but retain rescue, stranding and jump checks.
+  // A final full-budget solve/export refreshes the reported linearization;
+  // failure to finish it is not permission to report a capped posterior.
   bool fused_schur = false;
   int fused_warmup_passes = 1;
-  /// Inner iterations for capped warm evals. 1 = pure back-substitution proxy;
-  /// it lacks the -Hnn^-1 Hnp dp feedforward (the p-step's effect on z), so in
-  /// p-moving stages the warm path loses cold duels (measured at A0: cold
-  /// wins 140/156). 2 gives the composed step a second Newton correction.
+  /// Inner iterations for capped warm evaluations. These are correction
+  /// steps, not an exact nuisance solution or implicit differentiation.
   int fused_iters = 1;
-  /// Defer QUALITY duels (strand/cert/plateau/anchor/jump on healthy warm
-  /// evals) until the candidate is ACCEPTED on warm-only merit: a rejected
-  /// candidate's duel results are discarded entirely, so ~half of the
-  /// designed two-path cost was spent arbitrating points that never ship
-  /// (measured at A0: cold was 154/304 evals in every variant). RESCUE duels
-  /// (no-warm first evals, warm failures) stay inline -- they are the only
-  /// path for those windows. Trade, named: a candidate rejected on warm-only
-  /// merit could have been accepted after duel improvements; it is re-seeded
-  /// at the next pass instead. Off by default; profiles arm it only after
-  /// Wald-gate + kalibr adjudication.
+  /// Experimental deferral of healthy-warm fresh-seed comparisons until
+  /// warm-only merit accepts the candidate. Rescue solves remain immediate.
+  /// A rejected warm candidate might have improved with a fresh seed, so this
+  /// changes arbitration. Incompatible capped evaluations disable it.
   bool duel_on_accept = false;
-  /// Last N ACCEPTED steps run UNCAPPED (full inner solves): the fused
-  /// trajectory re-converges toward the legacy point before the stage exits.
-  /// Measured need: a capped A-chain lands a shifted point (p z +1.7 mm)
-  /// whose different B entry costs +38 s downstream -- polish only the stage
-  /// whose output feeds B (A1b-full), not the gate-validated interior stages.
+  /// Last N accepted steps use the full inner budget. This provides extra
+  /// refinement without guaranteeing convergence to an uncapped trajectory.
   int fused_polish_accepts = 0;
-  /// Export-on-accept ("eoa"): window evaluations run COST-ONLY; after a
-  /// candidate is ACCEPTED on merit, ONE export pass produces the
-  /// (Lambda, g, qn) the outer consumes, at the unchanged kept optima.
-  /// Measured rationale: export was ~21% of window thread-CPU while ~41-45%
-  /// of passes were rejected, and duel LOSERS exported when only the
-  /// winner's bytes could be folded. Both accept-time sources are legacy
-  /// bits: cert-on stages REUSE path A's INLINE export (the certificate
-  /// consumes wrA.qn pre-accept; q_n must be the export's exact bits -- a
-  /// calib-column-free variant measured 1 ulp off under -ffast-math, see
-  /// Problem::ExportReducedInformation); everything else re-enters via
-  /// WindowBA state_at, byte-equal to the inline legacy export (pinned:
-  /// W1/W2 in test_export_parity). Arbitration and the accepted-point
-  /// linearization are byte-identical ON vs OFF. Failure doctrine: a failed
-  /// export VETOES a candidate and KILLS a window at the entry point (see
-  /// the accept branch in JointCalib.cpp). duel_on_accept DISARMS this flag:
-  /// its incremental duel fold (Lsum += d_L - L) keeps the loser's export in
-  /// legacy's rounding, so exact parity would need the loser exported too --
-  /// the very work eoa elides (J4 in test_export_parity pins this).
+  /// Defer reduced-information export until candidate acceptance. A warm
+  /// path needing q_n for the stationarity check still exports inline; other
+  /// paths export at their retained nuisance solution. Export failure vetoes
+  /// a candidate, or removes an invalid entry window. Deferred-duel mode
+  /// disables this optimization because its incremental information fold
+  /// also uses the losing export.
   bool export_on_accept = true;
   double stop_step_winf = 0.01;  ///< ||dp/prior_sigma||_inf below this = stable step
   double stop_merit_rel = 3e-4;  ///< relative merit change below this = stable
   double stop_lambda_max = 1e-2; ///< lambda must be at/below this (not climbing a wall)
-  /// Consume/produce a JointWarmCarry when the session provides one.
-  /// DEFAULT OFF by evidence (two sims, isolated by A/B with cert held on):
-  /// warm-carrying nuisance states across staged free-set boundaries anchors
-  /// each sub-problem in its predecessor's basin -- the warm strand WINS the
-  /// entry duel on cost while sitting in a subtly biased basin, so cost
-  /// arbitration cannot police it. Measured: a post-A1a carry flips the
-  /// split-half falsifier (dqA 0.551/0.265 vs 0.235 carry-free); a B-chain
-  /// carry walks the flattest cam dof (cy +1.03 px vs +0.70 carry-free,
-  /// gate 0.9) at ANY cert/early-stop/alternation setting. Its duel count is
-  /// neutral ('first' -> 'jump' one-for-one), so the runtime rent is
-  /// inner-iteration savings only -- not worth a basin bias. Full consume
-  /// stays sound (and available) for SAME-shape re-solves:
-  /// p_stamp + noise_stamp + layout_sig witnessed.
+  /// Optional nuisance carry across calls. Comparable values, noise and
+  /// layout stamps permit full reuse; other accepted carry becomes warm-only
+  /// and receives a fresh-seed entry comparison. Cross-stage basins can still
+  /// change even when local merit improves. Disabled by default.
   bool use_carry = false;
   /// Seeder config for the per-evaluation re-seeds. The SESSION must thread its
   /// (possibly bootstrap-adapted) LinearSeedConfig here: a default-constructed
   /// config silently drops bias_presolve and the widened no-still-baseline
   /// gates in exactly the stages that produce the committed answer.
   LinearSeedConfig seed;
-  /// Worker threads for the per-window evaluation loop. Windows are independent
-  /// given p and results are reduced in fixed window order, so serial ==
-  /// parallel BIT-IDENTICAL (see ov_init::zbft_sfm::ParallelExecutor). <=1 runs
-  /// inline (no threads created) -- the RT default for on-target flight profiles.
+  /// Per-window workers; results fold in fixed window order. Counts <=1 run
+  /// inline. Equal inputs do not guarantee identical results when deadlines,
+  /// compilers or floating-point execution differ; compare completed solves.
   int num_threads = 4;
   /// Wall-clock budget for ONE solve() call [s]; 0 = unlimited, <0 = skip.
   /// Admit another complete pass only when its measured cost, with headroom,
@@ -192,10 +130,9 @@ struct JointConfig {
   /// inside first-order validity regardless of how confident the fused
   /// information is (re-preintegration refreshes between outers). These caps
   /// bind together with the whitened 3-prior-sigma trust region (min of both).
-  /// tg cap/prior scales: MEMS-class g-sensitivity elements sit at ~1e-4-5e-4 (rad/s)/(m/s^2)
-  /// (a representative chain measured 0.23 deg/s @ 1g; kalibr repeats scatter +/-5e-4). The
-  /// 2e-4 step cap is half the part-class scale (first-order validity, mirrors dw's ratio); the
-  /// 1e-3 prior admits any physical value at <1 sigma from a blind (zero) start.
+  /// Tg's 2e-4 cap and 1e-3 prior are historical ICM/reference policy scales,
+  /// not universal MEMS bounds or BMI270 accuracy validation. They control
+  /// local optimization and seeding, separately from the commit ceiling.
   std::map<std::string, double> step_cap = {{"dw", 5e-3},     {"da", 5e-3},  {"q_AtoI", 5e-3}, {"q_ItoC", 0.01},
                                             {"p_IinC", 0.01}, {"td", 1e-3},  {"cam", 1.0},     {"tg", 2e-4}};
   /// Global seed priors (1-sigma), applied ONCE at fusion. Group name -> sigma.
@@ -217,12 +154,9 @@ struct JointConfig {
     return (Eigen::Matrix<double, 8, 1>() << 2, 2, 2, 2, 0.01, 0.01, 1e-9, 1e-9).finished();
   }
   /// Per-dof da prior override [d11 d12 d22 d13 d23 d33] (upper-tri packing).
-  /// The accel intrinsic chain splits by conditioning: the scale DIAGONAL is
-  /// driven by gravity magnitude across attitudes, while the off-diagonals and
-  /// q_AtoI need genuine dynamic excitation and otherwise absorb bias/gravity
-  /// residue (measured: percent-level junk on handheld data where kalibr
-  /// resolves 0.3-0.6%). The session's A1a stage information-freezes the off-diagonals
-  /// (sigma ~1e-9) unless the excitation gate opens the full chain (A1b).
+  /// A1a constrains the off-diagonals with tight priors while fitting the
+  /// diagonal scales. The full-chain gate controls their later release.
+  /// Gravity, bias and unmodeled dynamics can couple into either set.
   bool use_da_prior_vec = false;
   Eigen::Matrix<double, 6, 1> da_prior_vec = (Eigen::Matrix<double, 6, 1>() << 0.02, 1e-9, 0.02, 1e-9, 1e-9, 0.02).finished();
   /// Anchor the FREE cam dofs' prior at an explicit center instead of the
@@ -232,9 +166,8 @@ struct JointConfig {
   /// the anchor gives the whole phase ONE prior budget. Information-frozen
   /// dofs (sigma <= 1e-8) still center at entry: a freeze must HOLD the
   /// current value, never yank it back to the anchor mid-alternation.
-  /// One anchor PER CAMERA (each has its own factory intrinsics, so there is no shared center to
-  /// anchor at). The prior MASK above stays single: which intrinsic dofs the alternation opens is
-  /// a policy about the model, identical for every camera that has one.
+  /// Each camera has its own center and per-dof prior mask; coverage decisions
+  /// for one camera do not establish support for another.
   bool use_cam_prior_center = false;
   std::vector<Eigen::Matrix<double, 8, 1>> cam_prior_center;
 };
@@ -280,10 +213,9 @@ struct JointReport {
   long preint_hits = 0;
   long preint_misses = 0;
   double t_factor_sum = 0.0;
-  /// Inner solves ended by the wall-clock hang guard: MUST be 0 on a healthy
-  /// run -- a nonzero count means machine load leaked into the iterate and the
-  /// run is tainted for A/B, replay-parity, and falsifier purposes (the
-  /// session evidence table prints a loud warning).
+  /// Inner solves stopped by the wall-clock guard. Their accepted iterates
+  /// depend on available runtime; compare this count and completion status
+  /// before interpreting replay or thread-count differences.
   long time_stops = 0;
   int accepted_passes = 0;       ///< accepted outer steps (passes - accepted = rejected/vetoed)
   int dim_p = 0;                 ///< free shared-parameter local dims this solve
@@ -306,11 +238,9 @@ struct JointReport {
 /// the carry demotes to WARM-ONLY: warm states init the warm strand, but
 /// seeds stay stage-fresh and every window runs one 'jump' duel at entry
 /// (cause 'j'). Kept-path seeds must never cross a free-set boundary: the
-/// restricted stage's arbitration would anchor BOTH strands of the expanded
-/// stage's duels, removing the fresh-seed cold anchor (measured: sim
-/// split-half dqA 0.551 deg INCONSISTENT with carried seeds vs 0.235 deg
-/// CONSISTENT without; real data insensitive).
-/// Seed-field snapshot (anchors of record -- never the full window payload).
+/// restricted stage's arbitration would otherwise initialize both paths of
+/// the expanded stage and remove its independent fresh-seed comparison.
+/// Seed-field snapshot (anchors only, without full window payload).
 struct SeedSnap {
   bool has = false;
   std::vector<Eigen::Vector4d> q;
@@ -332,11 +262,9 @@ struct JointWarmCarry {
 class JointCalib {
 public:
   /**
-   * @param store optional session preint store (PreintCache.h). Pure
-   *        memoization -- a hit returns the exact bytes recomputation would
-   *        produce, so it is legal in the A-chain legacy stages (unlike
-   *        cert/carry/early-stop, which change arbitration). Slots resolve by
-   *        WindowData::uid on the main thread before the pool starts.
+   * @param store optional value-keyed preintegration cache. Reuse must match
+   *        the interval, calibration and noise inputs. Resolve WindowData::uid
+   *        slots on the calling thread before workers access distinct entries.
    */
   /**
    * @param warm_out optional: on success receives the per-window nuisance

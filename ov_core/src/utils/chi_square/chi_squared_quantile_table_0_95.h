@@ -14,9 +14,9 @@
  *
  * The updaters used a 1..499 constructor table plus a runtime boost::math::quantile call for
  * larger residuals; this table covers dof 1..4095 so the runtime path is a plain load too
- * (the largest reachable dof classes -- per-feature gates and the ZUPT window at 800 Hz --
- * sit far below it). Beyond-table dof clamps to the last entry with a loud one-time warning:
- * a residual that large is degenerate long before the threshold's exactness matters.
+ * (normal per-feature gates and short ZUPT windows sit below it). Long ZUPT windows
+ * use the Wilson-Hilferty approximation beyond the table. Clamping there would
+ * spuriously reject stationary data as the number of IMU samples increases.
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -27,7 +27,7 @@
 #ifndef OV_CORE_CHI_SQUARED_QUANTILE_TABLE_0_95_H
 #define OV_CORE_CHI_SQUARED_QUANTILE_TABLE_0_95_H
 
-#include <cstdio>
+#include <cmath>
 
 namespace ov_core {
 namespace chi2_detail {
@@ -1065,17 +1065,15 @@ static const double CHI2_QUANTILE_0_95[4096] = {
 } // namespace chi2_detail
 
 /// 0.95 chi-squared quantile for the given degrees of freedom (>= 1). Table load for the
-/// entire reachable range; clamps + warns once above dof 4095 (degenerate residual class).
+/// normal range. Above 4095 use Wilson-Hilferty (relative error below 5.5e-8
+/// at the boundary and decreasing in the tested large-dof range).
 inline double chi_squared_quantile_0_95(int dof) {
   if (dof < 1)
     return 0.0;
   if (dof > 4095) {
-    static bool warned = false;
-    if (!warned) {
-      warned = true;
-      fprintf(stderr, "chi_squared_quantile_0_95: dof %d beyond table (4095), clamping\n", dof);
-    }
-    dof = 4095;
+    const double n = static_cast<double>(dof);
+    const double t = 1.0 - 2.0 / (9.0 * n) + 1.6448536269514722 * std::sqrt(2.0 / (9.0 * n));
+    return n * t * t * t;
   }
   return chi2_detail::CHI2_QUANTILE_0_95[dof];
 }
