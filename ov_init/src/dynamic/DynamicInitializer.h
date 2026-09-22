@@ -25,6 +25,7 @@
 
 #include "init/InertialInitializerOptions.h"
 #include "init/ResetPrior.h"
+#include "utils/InitializerPhysicalWarmResult.h"
 
 namespace ov_core {
 class FeatureDatabase;
@@ -88,9 +89,17 @@ public:
    */
   bool initialize(double &timestamp, Eigen::MatrixXd &covariance, std::vector<std::shared_ptr<ov_type::Type>> &order,
                   std::shared_ptr<ov_type::IMU> &_imu, std::map<double, std::shared_ptr<ov_type::PoseJPL>> &_clones_IMU,
-                  std::unordered_map<size_t, std::shared_ptr<ov_type::Landmark>> &_features_SLAM);
+                  std::unordered_map<size_t, std::shared_ptr<ov_type::Landmark>> &_features_SLAM,
+                  const ov_core::InitPhysicalWarmRequest *physical_request = nullptr,
+                  ov_core::InitPhysicalWarmResult *physical_result = nullptr);
 
 private:
+  bool initialize_impl(double &timestamp, Eigen::MatrixXd &covariance, std::vector<std::shared_ptr<ov_type::Type>> &order,
+                       std::shared_ptr<ov_type::IMU> &_imu, std::map<double, std::shared_ptr<ov_type::PoseJPL>> &_clones_IMU,
+                       std::unordered_map<size_t, std::shared_ptr<ov_type::Landmark>> &_features_SLAM,
+                       const ov_core::InitPhysicalWarmRequest *physical_request,
+                       ov_core::InitPhysicalWarmResult *physical_result);
+
   /// Initialization parameters
   InertialInitializerOptions params;
 

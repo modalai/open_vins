@@ -73,6 +73,13 @@ public:
    * @param dx Correction vector (orientation then position)
    */
   void update(const Eigen::VectorXd &dx) override {
+    Eigen::Matrix<double, 7, 1> proposed;
+    propose_update(dx, proposed);
+    set_value(proposed);
+  }
+
+  void propose_update(const Eigen::Ref<const Eigen::VectorXd> &dx,
+                      Eigen::Ref<Eigen::VectorXd> proposed) const override {
 
     assert(dx.rows() == _size);
 
@@ -88,7 +95,7 @@ public:
     // Update position
     newX.block(4, 0, 3, 1) += dx.block(3, 0, 3, 1);
 
-    set_value(newX);
+    proposed = newX;
   }
 
   /**

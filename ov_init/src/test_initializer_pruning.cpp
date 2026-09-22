@@ -3,6 +3,7 @@
  * Exercise production buffer updates against the historical erase-loop result.
  */
 #include <cstdio>
+#include <limits>
 #include "dynamic/DynamicInitializer.h"
 #include "feat/Feature.h"
 #include "feat/FeatureDatabase.h"
@@ -118,10 +119,62 @@ void prefix_checks() {
     }
   }
 }
+
+void camera_offset_checks() {
+  ov_init::InertialInitializerOptions options;
+  options.init_window_time = 1.0;
+  options.init_max_disparity = 1.0; // sparse fixture returns after public pruning
+  options.calib_camimu_dt = .125;
+  options.camera_imu_dt = {{0, .125}, {1, -.25}, {2, .375}};
+  auto db = std::make_shared<ov_core::FeatureDatabase>();
+  // The latest raw observation maps to 2.875 in the reference clock. The cam2
+  // observation maps to 2.15 and belongs to that one-second window, despite
+  // lying before the legacy raw cleanup cutoff of 2.15.
+  db->update_feature(1, 1.90, 2, 320, 240, 0, 0);
+  db->update_feature(1, 3.25, 1, 322, 240, .01f, 0);
+  const Samples samples = make_samples({0.0, 1.0, 1.2, 1.3, 1.6, 2.5, 3.0, 4.0});
+  InspectInitializer initializer(options, db);
+  initializer.feed_imu_batch(samples);
+  double timestamp = -1;
+  Eigen::MatrixXd covariance;
+  std::vector<std::shared_ptr<ov_type::Type>> order;
+  auto imu = std::make_shared<ov_type::IMU>();
+  std::map<double, std::shared_ptr<ov_type::PoseJPL>> clones;
+  std::unordered_map<size_t, std::shared_ptr<ov_type::Landmark>> landmarks;
+  check(!initializer.initialize(timestamp, covariance, order, imu, clones, landmarks), "unequal camera fixture rejects before solve");
+  const auto retained = db->get_feature(1);
+  check(retained && retained->timestamps.at(2) == std::vector<double>({1.90}) &&
+        retained->timestamps.at(1) == std::vector<double>({3.25}),
+        "public pruning preserves required per-camera measurements in original raw clocks");
+  Samples expected(samples.begin()+2, samples.end());
+  check(equal(initializer.samples(), expected), "unequal offsets retain conservative IMU coverage including interpolation predecessor");
+  check(!equal(initializer.samples(), historical_prefix(samples, 3.25-1.0-.1+.125)),
+        "negative control catches scalar-reference-only IMU pruning");
+
+  // Explicit equal offsets preserve the historical prefix contents exactly.
+  options.camera_imu_dt = {{0, .125}, {1, .125}};
+  auto equal_db = std::make_shared<ov_core::FeatureDatabase>();
+  equal_db->update_feature(1, 3.25, 1, 320, 240, 0, 0);
+  InspectInitializer equal_initializer(options, equal_db);
+  equal_initializer.feed_imu_batch(samples);
+  check(!equal_initializer.initialize(timestamp, covariance, order, imu, clones, landmarks) &&
+        equal(equal_initializer.samples(), historical_prefix(samples, 3.25-1.0-.1+.125)),
+        "explicit equal camera offsets preserve exact legacy public pruning");
+
+  options.camera_imu_dt[1] = std::numeric_limits<double>::quiet_NaN();
+  auto invalid_db = std::make_shared<ov_core::FeatureDatabase>();
+  invalid_db->update_feature(1, 1.0, 1, 320, 240, 0, 0);
+  invalid_db->update_feature(1, 3.25, 1, 320, 240, 0, 0);
+  InspectInitializer invalid_initializer(options, invalid_db);
+  invalid_initializer.feed_imu_batch(samples);
+  check(!invalid_initializer.initialize(timestamp, covariance, order, imu, clones, landmarks) &&
+        equal(invalid_initializer.samples(), samples) && invalid_db->get_feature(1)->timestamps.at(1).size() == 2,
+        "nonfinite camera offset refuses initialization before pruning shared data");
+}
 } // namespace
 
 int main() {
   ov_core::Printer::setPrintLevel("ERROR");
-  feed_checks(); prefix_checks();
+  feed_checks(); prefix_checks(); camera_offset_checks();
   return failures ? EXIT_FAILURE : EXIT_SUCCESS;
 }

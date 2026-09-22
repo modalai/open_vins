@@ -28,7 +28,7 @@
 
 namespace ov_init {
 
-#if CERES_VERSION_MAJOR >= 2 && CERES_VERSION_MINOR >= 1
+#if CERES_VERSION_MAJOR > 2 || (CERES_VERSION_MAJOR == 2 && CERES_VERSION_MINOR >= 1)
 /**
  * @brief JPL quaternion CERES Manifold (Ceres 2.1+)
  */

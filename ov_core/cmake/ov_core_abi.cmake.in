@@ -1,0 +1,6 @@
+# Keep installed catkin consumers consistent with the library's public types.
+set(ov_core_DEFINITIONS @OV_EIGEN_ABI_DEFINITIONS@
+    HAVE_OPENCL=@OV_USE_MODAL_FLOW@ OV_HAVE_MODAL_FLOW=@OV_USE_MODAL_FLOW@)
+foreach(definition ${ov_core_DEFINITIONS})
+    add_definitions(-D${definition})
+endforeach()

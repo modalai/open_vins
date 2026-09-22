@@ -113,6 +113,13 @@ public:
    * @param dx Axis-angle representation of the perturbing quaternion
    */
   void update(const Eigen::VectorXd &dx) override {
+    Eigen::Matrix<double, 4, 1> proposed;
+    propose_update(dx, proposed);
+    set_value(proposed);
+  }
+
+  void propose_update(const Eigen::Ref<const Eigen::VectorXd> &dx,
+                      Eigen::Ref<Eigen::VectorXd> proposed) const override {
 
     assert(dx.rows() == _size);
 
@@ -122,7 +129,7 @@ public:
     dq = ov_core::quatnorm(dq);
 
     // Update estimate and recompute R
-    set_value(ov_core::quat_multiply(dq, _value));
+    proposed = ov_core::quat_multiply(dq, _value);
   }
 
   /**

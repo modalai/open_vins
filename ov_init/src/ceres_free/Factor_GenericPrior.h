@@ -50,6 +50,9 @@ public:
   Eigen::MatrixXd sqrtI;
   Eigen::MatrixXd b;
 
+  /// Invalid input makes Evaluate fail without terminating the VINS process.
+  bool valid = false;
+
   Factor_GenericPrior(const Eigen::MatrixXd &x_lin_, const std::vector<std::string> &x_type_, const Eigen::MatrixXd &prior_Info,
                       const Eigen::MatrixXd &prior_grad);
 

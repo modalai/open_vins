@@ -23,6 +23,7 @@
 #ifndef OV_MSCKF_VIOMANAGEROPTIONS_H
 #define OV_MSCKF_VIOMANAGEROPTIONS_H
 
+#include "utils/finite.h"
 #include <Eigen/Eigen>
 #include <iostream>
 #include <memory>
@@ -34,7 +35,7 @@
 // builds do not have it: gate on header presence, mirroring ov_core's optional-OpenCL handling
 // (TrackOCL is only compiled when OpenCL/modal_flow exist). All TUs in a given environment agree
 // on this macro, so the struct layout stays consistent within every build.
-#if defined(__has_include)
+#if !defined(OV_HAVE_MODAL_FLOW) && defined(__has_include)
 #if __has_include(<modal_flow/StereoMatcher.hpp>)
 #define OV_HAVE_MODAL_FLOW 1
 #endif
@@ -80,6 +81,7 @@ struct VioManagerOptions {
   void print_and_load(const std::shared_ptr<ov_core::YamlParser> &parser = nullptr) {
     print_and_load_estimator(parser);
     print_and_load_trackers(parser);
+    resolve_camera_epoch_mode(parser);
     print_and_load_noise(parser);
 
     // needs to be called last
@@ -137,7 +139,6 @@ struct VioManagerOptions {
     if (parser != nullptr) {
       parser->parse_config("dt_slam_delay", dt_slam_delay);
       parser->parse_config("try_zupt", try_zupt);
-      parser->parse_config("epoch_mode", epoch_mode, false);
       parser->parse_config("epoch_bind_factor", epoch_bind_factor, false);
       parser->parse_config("epoch_bridge_bias_cols", epoch_bridge_bias_cols, false);
       parser->parse_config("async_ring_size", async_ring_size, false);
@@ -153,7 +154,6 @@ struct VioManagerOptions {
       parser->parse_config("record_timing_filepath", record_timing_filepath);
     }
     PRINT_DEBUG("  - dt_slam_delay: %.1f\n", dt_slam_delay);
-    PRINT_DEBUG("  - epoch_mode: %d\n", epoch_mode);
     PRINT_DEBUG("  - epoch_bind_factor: %.2f\n", epoch_bind_factor);
     PRINT_DEBUG("  - epoch_bridge_bias_cols: %d\n", epoch_bridge_bias_cols);
     PRINT_DEBUG("  - async_ring_size: %d\n", async_ring_size);
@@ -250,6 +250,41 @@ struct VioManagerOptions {
   /// unsynced multi-camera rigs (defect B1). Frames with no bindable epoch fall back to cloning.
   bool epoch_mode = false;
 
+  /// Opt-in stochastic clone at every independent camera's raw frame time.
+  /// Normal propagation owns the complete clone covariance and cross blocks.
+  /// This bypasses epoch bridges and expands only the total pose capacity;
+  /// per-camera feature graduation still uses the configured max_clones.
+  /// Pose time remains raw frame time + reference td; the existing relative
+  /// per-camera td and rolling-shutter transport models remain in use.
+  /// Default off until timing, memory and trajectory comparisons are validated.
+  bool async_frame_clones = false;
+
+  /// Group hardware-synchronized views at the reference camera's timestamp
+  /// while retaining independent mono tracking when use_stereo is false.
+  bool force_camera_sync = false;
+
+  bool synchronize_camera_timestamps() const { return state_options.num_cameras > 1 && (force_camera_sync || use_stereo); }
+  bool use_async_frame_clones() const { return async_frame_clones && state_options.num_cameras > 1 && !synchronize_camera_timestamps(); }
+  bool use_epoch_clones() const { return epoch_mode && !synchronize_camera_timestamps() && !use_async_frame_clones() && !state_options.physical_camera_clones; }
+
+  /// Resolve only after camera count and tracker association mode are known.
+  /// Independent cameras otherwise consume separate clones and can halve each
+  /// view's temporal baseline, preventing persistent landmark initialization.
+  /// An explicit YAML/ROS setting wins; programmatic options remain untouched.
+  void resolve_camera_epoch_mode(const std::shared_ptr<ov_core::YamlParser> &parser = nullptr) {
+    if (parser != nullptr) {
+      parser->parse_config("force_camera_sync", force_camera_sync, false);
+      epoch_mode = state_options.num_cameras > 1 && !synchronize_camera_timestamps();
+      parser->parse_config("epoch_mode", epoch_mode, false);
+      parser->parse_config("async_frame_clones", async_frame_clones, false);
+      parser->parse_config("physical_camera_clones", state_options.physical_camera_clones, false);
+    }
+    PRINT_DEBUG("  - epoch_mode: %d\n", epoch_mode);
+    PRINT_DEBUG("  - force_camera_sync: %d\n", force_camera_sync);
+    PRINT_DEBUG("  - async_frame_clones: %d\n", async_frame_clones);
+    PRINT_DEBUG("  - physical_camera_clones: %d\n", state_options.physical_camera_clones);
+  }
+
   /// Epoch binding horizon as a multiple of the reference camera's frame period
   double epoch_bind_factor = 1.2;
 
@@ -318,7 +353,7 @@ struct VioManagerOptions {
     Eigen::Matrix3d Da = Ta.colPivHouseholderQr().solve(Eigen::Matrix3d::Identity());
     Eigen::Matrix3d R_ACCtoIMU = R_IMUtoACC.transpose();
     Eigen::Matrix3d R_GYROtoIMU = R_IMUtoGYRO.transpose();
-    if (std::isnan(Tw.norm()) || std::isnan(Dw.norm())) {
+    if (!ov_core::numeric::finite_matrix(Tw) || !ov_core::numeric::finite_matrix(Dw)) {
       std::stringstream ss;
       ss << "gyroscope has bad intrinsic values!" << std::endl;
       ss << "Tw - " << std::endl << Tw << std::endl << std::endl;
@@ -326,7 +361,7 @@ struct VioManagerOptions {
       PRINT_DEBUG(RED "" RESET, ss.str().c_str());
       std::exit(EXIT_FAILURE);
     }
-    if (std::isnan(Ta.norm()) || std::isnan(Da.norm())) {
+    if (!ov_core::numeric::finite_matrix(Ta) || !ov_core::numeric::finite_matrix(Da)) {
       std::stringstream ss;
       ss << "accelerometer has bad intrinsic values!" << std::endl;
       ss << "Ta - " << std::endl << Ta << std::endl << std::endl;
@@ -430,7 +465,7 @@ struct VioManagerOptions {
         parser->parse_config("cam" + std::to_string(i) + "_shutter", shutter, false);
         double fps = 0.0;
         parser->parse_config("cam" + std::to_string(i) + "_fps", fps, false);
-        if (fps < 0.0 || !std::isfinite(fps)) {
+        if (fps < 0.0 || !ov_core::numeric::finite(fps)) {
           PRINT_ERROR(RED "VioManager(): cam%d_fps (%.3f) must be a finite rate in Hz (or omitted)\n" RESET, i, fps);
           std::exit(EXIT_FAILURE);
         }

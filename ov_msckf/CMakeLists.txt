@@ -1,6 +1,8 @@
 cmake_minimum_required(VERSION 3.5)
 project(ov_msckf)
 
+include(${CMAKE_CURRENT_SOURCE_DIR}/../ov_core/cmake/EigenAbi.cmake)
+
 # Include libraries (if we don't have opencv 4, then fallback to opencv 3)
 # The OpenCV version needs to match the one used by cv_bridge otherwise you will get a segmentation fault!
 find_package(Eigen3 REQUIRED)

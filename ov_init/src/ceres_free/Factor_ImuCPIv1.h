@@ -51,6 +51,7 @@ public:
 
   // Preintegrated bias jacobians
   Eigen::Matrix3d J_q; // orientation wrt bias w
+  Eigen::Matrix3d H_q; // orientation wrt raw accel bias through Tg
   Eigen::Matrix3d J_a; // position wrt bias w
   Eigen::Matrix3d J_b; // velocity wrt bias w
   Eigen::Matrix3d H_a; // position wrt bias a
@@ -58,6 +59,9 @@ public:
 
   // Sqrt of the preintegration information
   Eigen::Matrix<double, 15, 15> sqrtI_save;
+
+  /// A malformed preintegral must reject the attempt, never stop VINS.
+  bool valid = false;
 
   // Gravity columns of sqrtI folded once at construction (see .cpp):
   // J_grav = sqrtI * [0; 0; R_1*dt; 0; 0.5*R_1*dt^2] == sqrtI_grav_fold * R_1
@@ -68,7 +72,8 @@ public:
 
   Factor_ImuCPIv1(double deltatime, Eigen::Vector3d &grav, Eigen::Vector3d &alpha, Eigen::Vector3d &beta, Eigen::Vector4d &q_KtoK1,
                   Eigen::Vector3d &ba_lin, Eigen::Vector3d &bg_lin, Eigen::Matrix3d &J_q, Eigen::Matrix3d &J_beta, Eigen::Matrix3d &J_alpha,
-                  Eigen::Matrix3d &H_beta, Eigen::Matrix3d &H_alpha, Eigen::Matrix<double, 15, 15> &covariance);
+                  Eigen::Matrix3d &H_beta, Eigen::Matrix3d &H_alpha, Eigen::Matrix<double, 15, 15> &covariance,
+                  const Eigen::Matrix3d &H_q = Eigen::Matrix3d::Zero());
 
   virtual ~Factor_ImuCPIv1() {}
 

@@ -30,7 +30,8 @@
  *
  * Usage:
  *   test_async_dual <config.yaml> [--traj <traj.txt>] [--mono] [--phase1 <s>] [--dt0 <s>] [--dt1 <s>]
- *                   [--readout1 <s>] [--jitter] [--seed <n>] [--csv <out.csv>] [--name <label>]
+ *                   [--readout1 <s>] [--jitter] [--epoch|--no-epoch|--frame-clones] [--seed <n>] [--csv <out.csv>]
+ *                   [--global-features] [--name <label>]
  *                   [--assert-pos-rmse <m>] [--assert-ori-rmse <deg>] [--assert-nees-max <v>]
  */
 
@@ -40,6 +41,7 @@
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <iomanip>
 #include <memory>
 #include <string>
 #include <vector>
@@ -47,6 +49,7 @@
 #include "core/VioManager.h"
 #include "core/VioManagerOptions.h"
 #include "sim/Simulator.h"
+#include "sim/SimulationTruthTime.h"
 #include "state/State.h"
 #include "state/StateHelper.h"
 #include "utils/colors.h"
@@ -74,6 +77,10 @@ int main(int argc, char **argv) {
   std::string traj_path, csv_path, name = "run";
   double phase1 = 0.0, readout1 = 0.0;
   bool has_dt0 = false, has_dt1 = false, mono = false, jitter = false, epoch = false;
+  bool frame_clones = false;
+  bool physical_clones = false;
+  bool no_epoch = false;
+  bool global_features = false;
   double dt0 = 0.0, dt1 = 0.0;
   int seed = -1;
   double assert_pos_rmse = -1, assert_ori_rmse = -1, assert_nees_max = -1;
@@ -102,6 +109,14 @@ int main(int argc, char **argv) {
       jitter = true;
     else if (arg == "--epoch")
       epoch = true;
+    else if (arg == "--physical-clones")
+      physical_clones = true;
+    else if (arg == "--frame-clones")
+      frame_clones = true;
+    else if (arg == "--no-epoch")
+      no_epoch = true;
+    else if (arg == "--global-features")
+      global_features = true;
     else if (arg == "--seed")
       seed = std::atoi(argv[++i]);
     else if (arg == "--assert-pos-rmse")
@@ -114,6 +129,11 @@ int main(int argc, char **argv) {
       std::fprintf(stderr, "unknown option: %s\n", arg.c_str());
       return EXIT_FAILURE;
     }
+  }
+
+  if (int(epoch) + int(no_epoch) + int(frame_clones) + int(physical_clones) > 1) {
+    std::fprintf(stderr, "--epoch, --no-epoch, --frame-clones and --physical-clones are mutually exclusive\n");
+    return EXIT_FAILURE;
   }
 
   // -------------------- configuration --------------------
@@ -129,8 +149,24 @@ int main(int argc, char **argv) {
     params.sim_traj_path = traj_path;
   if (mono)
     params.use_stereo = false;
-  if (epoch)
+  if (epoch) {
     params.epoch_mode = true;
+    params.async_frame_clones = false;
+  }
+  if (frame_clones)
+    params.async_frame_clones = true;
+  if (no_epoch) {
+    params.epoch_mode = false;
+    params.async_frame_clones = false;
+  }
+  params.state_options.physical_camera_clones = physical_clones;
+  // Explicit comparison only: normal runs retain the representations from YAML.
+  // Both GLOBAL_3D and ANCHORED_MSCKF_INVERSE_DEPTH use three landmark parameters.
+  if (global_features) {
+    params.state_options.feat_rep_msckf = ov_type::LandmarkRepresentation::Representation::GLOBAL_3D;
+    params.state_options.feat_rep_slam = ov_type::LandmarkRepresentation::Representation::GLOBAL_3D;
+    params.state_options.feat_rep_aruco = ov_type::LandmarkRepresentation::Representation::GLOBAL_3D;
+  }
   if (seed >= 0) {
     params.sim_seed_measurements = seed;
     params.sim_seed_state_init = seed + 1;
@@ -157,15 +193,20 @@ int main(int argc, char **argv) {
   const VioManagerOptions truth = sim->get_true_parameters();
 
   // -------------------- ground-truth initialization --------------------
-  // State clock runs in the (reference) camera clock: subtract cam0's TRUE offset
+  // State clock runs in the configured reference camera clock.
   double next_imu_time = sim->current_timestamp() + 1.0 / params.sim_freq_imu;
   Eigen::Matrix<double, 17, 1> imustate;
   if (!sim->get_state(next_imu_time, imustate)) {
     std::fprintf(stderr, "[SIM]: could not initialize the filter to the first state\n");
     return EXIT_FAILURE;
   }
-  imustate(0, 0) -= truth.sim_camimu_dts.at(0);
-  sys->initialize_with_gt(imustate);
+  const int reference_cam = sys->get_state()->cam_imu_dt_ref_camid();
+  if (physical_clones) {
+    sys->initialize_with_gt_imu(imustate);
+  } else {
+    imustate(0, 0) -= truth.sim_camimu_dts.at((size_t)reference_cam);
+    sys->initialize_with_gt(imustate);
+  }
 
   // -------------------- metrics state --------------------
   const double settle_s = 5.0;
@@ -179,19 +220,23 @@ int main(int argc, char **argv) {
   std::ofstream csv;
   if (!csv_path.empty()) {
     csv.open(csv_path);
-    csv << "t,cam,pos_err,ori_err_deg,nees,clones,window_s\n";
+    csv << std::setprecision(17); // retain subsecond resolution at Unix timestamps
+    csv << "t,cam,pos_err,ori_err_deg,nees,clones,window_s,t_imu_truth\n";
   }
 
-  // Evaluate estimate vs truth after an update triggered by camera `camid` at stamp `t_state`
-  auto evaluate = [&](int camid, double t_state) {
+  // A snapped/declined camera update may return a state at another key. Always
+  // score that returned IMU state, independently of which camera triggered it.
+  auto evaluate = [&](int camid) {
     auto state = sys->get_state();
     if (state == nullptr || !sys->initialized())
       return;
+    const double t_state = state->_timestamp;
     if (t_state - t_start_camclock < settle_s)
       return;
-    // Truth at the IMU-clock instant of this camera stamp
+    // Both cameras updating one epoch must use the same physical truth instant.
+    const double t_imu_truth = simulation_truth_time(*state, truth.sim_camimu_dts);
     Eigen::Matrix<double, 17, 1> gt;
-    if (!sim->get_state(t_state + truth.sim_camimu_dts.at(camid), gt))
+    if (!sim->get_state(t_imu_truth, gt))
       return;
     // Errors in the OpenVINS/JPL error convention: q_true = dq(+dtheta/2) x q_est ; dp = p_true - p_est
     Eigen::Vector4d q_est = state->_imu->quat();
@@ -222,16 +267,20 @@ int main(int argc, char **argv) {
       }
     }
     // Window statistics
-    double clones = (double)state->_clones_IMU.size();
+    double clones = (double)state->clone_count();
     double window = 0.0;
-    if (state->_clones_IMU.size() >= 2)
-      window = state->_clones_IMU.rbegin()->first - state->_clones_IMU.begin()->first;
+    if (state->clone_count() >= 2) {
+      if (state->uses_physical_clones())
+        window = state->_exposure_poses.back().imu_time - state->_exposure_poses.front().imu_time;
+      else
+        window = state->_clones_IMU.rbegin()->first - state->_clones_IMU.begin()->first;
+    }
     sum_clones += clones;
     sum_window += window;
     n_statesamples++;
     if (csv.is_open())
       csv << t_state << "," << camid << "," << pos_err << "," << ori_err_deg << "," << (n_nees ? sum_nees / n_nees : -1) << "," << clones
-          << "," << window << "\n";
+          << "," << window << "," << t_imu_truth << "\n";
   };
 
   // Feed one buffered event into the estimator (counting prospective out-of-order drops)
@@ -239,7 +288,7 @@ int main(int argc, char **argv) {
     if (ev.time_cam < 0)
       return;
     auto state = sys->get_state();
-    if (state != nullptr && sys->initialized() && state->_timestamp > ev.time_cam)
+    if (state != nullptr && sys->initialized() && !state->uses_physical_clones() && state->_timestamp > ev.time_cam)
       drops_out_of_order++;
     sys->feed_measurement_simulation(ev.time_cam, ev.camids, ev.feats);
     events_fed++;
@@ -247,7 +296,7 @@ int main(int argc, char **argv) {
       if (cid >= 0 && cid < num_cams)
         updates_per_cam.at(cid)++;
     if (!ev.camids.empty())
-      evaluate(ev.camids.front(), ev.time_cam);
+      evaluate(ev.camids.front());
     ev = CamEvent();
   };
 
@@ -295,10 +344,17 @@ int main(int argc, char **argv) {
   double est_rd1 = (st != nullptr && num_cams > 1) ? st->_calib_camera_readout.at(1)->value()(0) : 0.0;
   std::printf("[RESULT] name=%s pos_rmse=%.4f ori_rmse=%.4f nees_avg=%.2f updates_cam0=%zu updates_cam1=%zu drops=%zu "
               "clones_avg=%.1f window_avg=%.3f events=%zu samples=%zu est_dt0=%.6f est_dt1=%.6f est_rd1=%.6f kin_miss=%" PRIu64
-              " snapped=%" PRIu64 " fallbacks=%" PRIu64 "\n",
+              " snapped=%" PRIu64 " fallbacks=%" PRIu64
+              " time_basis=%s ref_cam=%d true_ref_td=%.6f frame_clones=%d pose_cap=%d max_track=%d"
+              " feat_rep_msckf=%s feat_rep_slam=%s\n",
               name.c_str(), pos_rmse, ori_rmse, nees_avg, updates_per_cam.at(0), (num_cams > 1 ? updates_per_cam.at(1) : 0),
               drops_out_of_order, clones_avg, window_avg, events_fed, n_err, est_dt0, est_dt1, est_rd1,
-              (st != nullptr) ? st->_kin_miss_count : 0, sys->epoch_snapped, sys->epoch_fallbacks);
+              (st != nullptr) ? st->_kin_miss_count : 0, sys->epoch_snapped, sys->epoch_fallbacks,
+              physical_clones ? "stored_deterministic_imu_endpoint" : "returned_state_plus_true_ref_td",
+              reference_cam, truth.sim_camimu_dts.at((size_t)reference_cam), params.use_async_frame_clones(),
+              (st != nullptr) ? st->_options.max_pose_clones() : 0, params.state_options.max_clone_size,
+              ov_type::LandmarkRepresentation::as_string(params.state_options.feat_rep_msckf).c_str(),
+              ov_type::LandmarkRepresentation::as_string(params.state_options.feat_rep_slam).c_str());
 
   // -------------------- assertions --------------------
   bool ok = true;

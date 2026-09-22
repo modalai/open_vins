@@ -26,6 +26,8 @@
 #include <Eigen/Eigen>
 #include <map>
 #include <memory>
+#include "utils/InitializerPhysicalWarmResult.h"
+#include "State.h"
 
 namespace ov_type {
 class Type;
@@ -68,6 +70,37 @@ public:
    */
   static std::shared_ptr<State> clone_state(std::shared_ptr<State> state);
 
+  /// Explicit ownership-only setup; no runtime option/caller enables sampled
+  /// propagation yet. Allocates two persistent zero Vec6 slots once. Repeating
+  /// with the same nonzero stream is a no-op; a different stream is rejected.
+  static bool prepare_sampled_imu_boundary(std::shared_ptr<State> state, uint64_t stream_episode);
+
+  /// First use is independent of all existing variables and starts at zero
+  /// mean with the full finite symmetric PSD raw-axis prior (singular allowed).
+  /// Active identical repeats return the same posterior without resetting it.
+  /// Changed/retired identities, nonmonotonic records, and a third live sample
+  /// are rejected without mutation. Admission/retirement reuse fixed slots.
+  static std::shared_ptr<ov_type::Vec> admit_sampled_imu_noise(std::shared_ptr<State> state,
+                                                             const State::SampledImuRecord &record);
+
+  /// Integrate out the older of two live samples at the exact successor's raw
+  /// knot, already accepted in State. The caller must have completed all direct
+  /// factors/outputs using the retired sample. Other means and covariance
+  /// blocks remain verbatim; the vacated permanent slot becomes deterministic
+  /// zero. Generic marginalize cannot remove these reserved coordinates.
+  static bool retire_sampled_imu_noise_at_knot(std::shared_ptr<State> state, uint64_t sequence);
+
+  static bool valid_sampled_imu_record(const State::SampledImuRecord &record);
+
+  /// Disabled-runtime sampled propagation transaction. Stages admission of
+  /// both original records and the augmented covariance product before any
+  /// mutation. Fixed IMU calibration only: Phi columns are [IMU15, left6, right6].
+  /// Invalid records, nonfinite arithmetic or invalid independent Q preserve
+  /// covariance, sample means/metadata and admission watermarks.
+  static bool EKFPropagationSampled(std::shared_ptr<State> state,
+                                    const std::array<State::SampledImuRecord, 2> &records,
+                                    const Eigen::MatrixXd &Phi, const Eigen::MatrixXd &Q);
+
   /**
    * @brief Performs EKF propagation of the state covariance.
    *
@@ -95,20 +128,28 @@ public:
    * @param order_OLD Variable ordering used in the state transition
    * @param Phi State transition matrix (size order_NEW by size order_OLD)
    * @param Q Additive state propagation noise matrix (size order_NEW by size order_NEW)
+   * @return False before changing covariance on invalid ownership, dimensions
+   * or arithmetic. The caller owns mean staging/rollback. No full state-sized
+   * covariance copy is made; allocation failure/concurrent mutation are excluded.
    */
-  static void EKFPropagation(std::shared_ptr<State> state, const std::vector<std::shared_ptr<ov_type::Type>> &order_NEW,
+  static bool EKFPropagation(std::shared_ptr<State> state, const std::vector<std::shared_ptr<ov_type::Type>> &order_NEW,
                              const std::vector<std::shared_ptr<ov_type::Type>> &order_OLD, const Eigen::MatrixXd &Phi,
                              const Eigen::MatrixXd &Q);
 
   /**
    * @brief Performs EKF update of the state (see @ref linear-meas page)
+   * The optional temporal excitation gate applies a Schmidt update: full measurement columns
+   * remain present, temporal means and their joint prior covariance stay fixed, and their
+   * cross-covariance with updated variables follows the ordinary posterior.
    * @param state Pointer to state
    * @param H_order Variable ordering used in the compressed Jacobian
    * @param H Condensed Jacobian of updating measurement
    * @param res Residual of updating measurement
-   * @param R Updating measurement covariance
+   * @param R Updating measurement covariance (PSD; the innovation must be SPD)
+   * @return False on invalid arithmetic with live means, covariance and FEJ unchanged.
+   * Allocation failure and concurrent state mutation are outside this contract.
    */
-  static void EKFUpdate(std::shared_ptr<State> state, const std::vector<std::shared_ptr<ov_type::Type>> &H_order, const Eigen::MatrixXd &H,
+  static bool EKFUpdate(std::shared_ptr<State> state, const std::vector<std::shared_ptr<ov_type::Type>> &H_order, const Eigen::MatrixXd &H,
                         const Eigen::VectorXd &res, const Eigen::MatrixXd &R);
 
   /**
@@ -121,9 +162,45 @@ public:
   static void set_initial_covariance(std::shared_ptr<State> state, const Eigen::MatrixXd &covariance,
                                      const std::vector<std::shared_ptr<ov_type::Type>> &order);
 
+  /// Validate a recovered navigation covariance before handing it to the filter.
+  /// Requires finite entries, positive diagonal, symmetry and PSD to roundoff.
+  /// Exact singular joint covariances are permitted; no jitter is introduced.
+  /// This is an initialization boundary check, not a per-update factorization.
+  static bool valid_initial_covariance(const Eigen::Ref<const Eigen::MatrixXd> &covariance);
+  static bool valid_initial_covariance(const Eigen::Ref<const Eigen::MatrixXd> &covariance, bool allow_zero_diagonal);
+
+  /// Snapshot an empty physical episode's complete camera consider prior.
+  /// Camera values must match FEJ. Nonzero bias/calibration cross covariance
+  /// requires the exact immutable reset snapshot; other navigation cross terms
+  /// are unsupported. This never changes state or a failed output.
+  static bool make_initial_physical_warm_request(std::shared_ptr<State> state, uint64_t episode_id,
+                                                ov_core::InitPhysicalWarmRequest &request,
+                                                std::shared_ptr<const ov_core::InitPhysicalResetPrior> reset_prior = {});
+
+  /// Stage a new physical reset episode and its complete bias/camera marginal.
+  /// Retains camera values/Pcc, explicitly rebases FEJ, and never changes the
+  /// old state or either failed output. Raw support provenance is caller-owned.
+  static bool make_physical_reset_state(std::shared_ptr<State> state, uint64_t snapshot_id,
+                                        const std::vector<double> &raw_watermarks, double imu_raw_cutoff,
+                                        const Eigen::Matrix<double,6,1> &bias_rw_variance, int cause,
+                                        std::shared_ptr<State> &replacement,
+                                        std::shared_ptr<const ov_core::InitPhysicalResetPrior> &prior);
+
+  /// Atomically install a bounded physical initializer result.
+  /// Requires a fresh empty physical state and the caller's current nonzero
+  /// episode. No augmentation/process Q is added. Consume the exact image
+  /// receipt only after success. Camera consider priors retain their complete
+  /// covariance and cross terms. A joint reset requires the caller's identical
+  /// snapshot and new likelihood boundary; fitted calibration means are unsupported.
+  static bool set_initial_state_physical_warm(std::shared_ptr<State> state,
+                                             const ov_core::InitPhysicalWarmResult &result,
+                                             uint64_t expected_episode_id,
+                                             std::shared_ptr<const ov_core::InitPhysicalResetPrior> expected_reset_prior = {});
+
   /**
    * @brief Warm-start seed: inject the active IMU state **and** the initializer's window clones with
-   * their full joint covariance, so the EKF can update immediately instead of cold-starting.
+   * their full joint covariance. Subsequent updates may use only observations not already
+   * assimilated by that initializer posterior.
    *
    * The dynamic initializer recovers the landmark-marginalized navigation covariance over the IMU and
    * every window clone. This grows the covariance once, registers each clone (id, _variables,
@@ -135,7 +212,7 @@ public:
    * @param state Pointer to state (its _imu is assumed already valued by the initializer)
    * @param covariance Joint covariance, ordered [IMU, clones-ascending]
    * @param clones_IMU Window clone poses (valued), keyed by imaging time (ascending)
-   * @return True on success; false if the size/ordering contract is violated (caller should cold-start)
+   * @return True on success; false without mutation on an invalid ownership or finite/PSD contract.
    */
   static bool set_initial_state_warmstart(std::shared_ptr<State> state, const Eigen::MatrixXd &covariance,
                                           const std::map<double, std::shared_ptr<ov_type::PoseJPL>> &clones_IMU);
@@ -165,6 +242,16 @@ public:
    * @return Covariance of current state
    */
   static Eigen::MatrixXd get_full_covariance(std::shared_ptr<State> state);
+
+  /// Read-only fixed output projection over [IMU15, slot0 noise6, slot1 noise6].
+  /// Inactive noise columns must be zero. State covariance is the valid prior;
+  /// singular output covariance is permitted, with floating-point roundoff.
+  /// Optional state_cross must already be n by 12; no caller output is resized.
+  /// Numerical/ownership/dimension refusal preserves all outputs and State.
+  /// Fixed marginal scratch; optional full cross uses O(n times 12) scratch.
+  static bool project_sampled_imu_output(std::shared_ptr<State> state, const Eigen::Matrix<double, 12, 27> &H,
+                                         Eigen::Matrix<double, 12, 12> &covariance,
+                                         Eigen::MatrixXd *state_cross = nullptr);
 
   /**
    * @brief Marginalizes a variable, properly modifying the ordering/covariances in the state
@@ -221,8 +308,10 @@ public:
    * @param H_L Jacobian of initializing measurements wrt new variable (needs to be invertible)
    * @param R Covariance of initializing measurements
    * @param res Residual of initializing measurements
+   * @return False on invalid or numerically rank-deficient input; state and the
+   * proposed variable remain unchanged. True after successful augmentation.
    */
-  static void initialize_invertible(std::shared_ptr<State> state, std::shared_ptr<ov_type::Type> new_variable,
+  static bool initialize_invertible(std::shared_ptr<State> state, std::shared_ptr<ov_type::Type> new_variable,
                                     const std::vector<std::shared_ptr<ov_type::Type>> &H_order, const Eigen::MatrixXd &H_R,
                                     const Eigen::MatrixXd &H_L, const Eigen::MatrixXd &R, const Eigen::VectorXd &res);
 
@@ -257,6 +346,15 @@ public:
                             Eigen::Matrix<double, 3, 1> last_w_fej);
 
   /**
+   * Append an owned pose view with sparse Jacobian E_pose + [omega; v] e_clock^T.
+   * The owner camera's active clock, including every state/clock cross block,
+   * enters this deterministic augmentation. Fixed clocks add no clock column.
+   * No independent noise or registry entry is added; the caller owns the handle.
+   */
+  static std::shared_ptr<ov_type::PoseJPL> augment_pose_view(std::shared_ptr<State> state, size_t clock_cam_id,
+                                                           const Eigen::Vector3d &omega);
+
+  /**
    * @brief Remove the oldest clone, if we have more then the max clone count!!
    *
    * This will marginalize the clone from our covariance, and remove it from our state.
@@ -274,6 +372,12 @@ public:
   static void marginalize_slam(std::shared_ptr<State> state);
 
 private:
+  // Validate covariance ownership before QR, marginal extraction or assigning
+  // the proposal a live ID. Does not allocate or touch measurement matrices.
+  static bool valid_initialization_order(const std::shared_ptr<State> &state,
+      const std::shared_ptr<ov_type::Type> &proposal,
+      const std::vector<std::shared_ptr<ov_type::Type>> &order, int columns);
+
   /**
    * All function in this class should be static.
    * Thus an instance of this class cannot be created.

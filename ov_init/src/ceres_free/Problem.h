@@ -51,7 +51,7 @@ namespace zbft_sfm {
 struct SolverOptions {
   int max_num_iterations = 30;           ///< max accepted steps
   double max_solver_time_seconds = 0.05; ///< hard wall-clock budget (mirrors init_dyn_mle_max_time)
-  int num_threads = 4;                   ///< accumulation workers; 1 => fully inline/deterministic (the RT default)
+  int num_threads = 4;                   ///< accumulation workers; 1 executes inline
 
   /// Optional per-worker thread setup (CPU affinity / scheduling class) so workers
   /// never preempt the IMU/camera real-time threads. Called once per spawned worker.
@@ -70,8 +70,8 @@ struct SolverOptions {
   // lm_nu_growth (e.g. 4.0) accelerates the climb. Defaults preserve Ceres-exact behavior.
   double lm_nu_growth = 2.0;
 
-  // Powell dogleg trust region (default; the per-iteration win: ONE factorization per
-  // linearization, rejected trials are cheap GN/Cauchy blends). use_dogleg=false -> LM.
+  // Optional Powell dogleg trust region: one factorization per
+  // linearization, with GN/Cauchy blends for rejected trials. False selects LM.
   bool use_dogleg = false;
   double initial_radius = 1e4; // matches Ceres' DoglegStrategy default
   double max_radius = 1e16;
@@ -156,6 +156,27 @@ public:
   bool ComputeCovariance(const std::vector<double *> &blocks, Eigen::MatrixXd &covariance, const SolverOptions &options);
 
   /**
+   * @brief Covariance and calibration sensitivity of a fixed-calibration fit.
+   *
+   * The consider blocks must be registered, constant, non-landmark blocks. Their
+   * factor Jacobians are evaluated only for this final export; no parameter mean
+   * or optimizer constancy is changed. After the SAME landmark elimination as
+   * ComputeCovariance, solve Q = H_xx^-1 and S = -H_xx^-1 H_xc, marginalizing all
+   * active navigation variables that are not requested. Results use requested
+   * block order for rows and consider-block order for sensitivity columns.
+   *
+   * For a retained calibration prior Pc, the existing conditional estimator has
+   * Pxx = Q + S Pc S' and Pxc = S Pc. This is not a posterior that learns c.
+   * Correlated state/calibration priors must already be expressed in the factors
+   * (including their c derivatives); this method cannot invent those cross terms.
+   * Like ComputeCovariance, this is the frozen robust Gauss-Newton model, not the
+   * exact Hessian of a nonlinear robust optimum. All outputs are failure-atomic.
+   */
+  bool ComputeConditionalCovariance(const std::vector<double *> &blocks, const std::vector<double *> &consider,
+                                    Eigen::MatrixXd &conditional_covariance, Eigen::MatrixXd &sensitivity,
+                                    const SolverOptions &options);
+
+  /**
    * @brief Reduced information + gradient of the requested blocks at the CURRENT iterate.
    *
    * Linearizes once (undamped) and marginalizes EVERY other variable block -- landmarks
@@ -185,14 +206,10 @@ public:
     /// the window's degenerate-landmark load. Diagnostic only.
     int clamped_dirs = 0;
   };
-  // NOTE (export-on-accept): a "qn-only" variant of this export (empty keep
-  // set, calibration columns never formed) was built and MEASURED as NOT
-  // byte-equal: the smaller leading dimension of H (692 vs 722 on the probe
-  // window) shifts column base alignment mod 32 bytes, and under -ffast-math
-  // the SIMD head-peeling reassociates the accumulations -- H_zz drifts ~1 ulp
-  // and q_n follows (~1e-10 rel). q_n feeds thresholded duel arbitration, so
-  // cert-consuming evaluations keep the full export (see ov_zcalib JointCalib).
-  // Do not resurrect the qn-only path without emitted-loop byte parity first.
+  // Certificate arbitration consumes q_n from the full export. Omitting
+  // calibration columns changes matrix strides and SIMD accumulation order,
+  // so a smaller "qn-only" export need not reproduce the same decision near
+  // a threshold. Keep its linearization identical to the accepted export.
   bool ExportReducedInformation(const std::vector<double *> &blocks, Eigen::MatrixXd &Lambda, Eigen::VectorXd &gred,
                                 const SolverOptions &options, ExportStats *stats = nullptr);
 
@@ -217,8 +234,11 @@ protected: // protected (not private): the base-class seam for derived solvers (
   int block_index(double *values) const;
   void assign_ordering();                                    // fills offsets, n_nav_, n_land_, n_total_, land_diag_
   double evaluate_cost(ParallelExecutor &exec) const;        // 0.5 * sum rho(||r||^2) at current x (parallel, worker-ordered reduction)
-  void linearize(Eigen::MatrixXd &H, Eigen::VectorXd &grad, double &cost, // GN Hessian + gradient + robustified cost, one pass
+  bool linearize(Eigen::MatrixXd &H, Eigen::VectorXd &grad, double &cost, // GN Hessian + gradient + robustified cost, one pass
                  ParallelExecutor &exec) const;
+  // Uses the current ordering. Shared by ordinary and conditional covariance
+  // exports so landmark rank treatment, robust weighting and QR selection agree.
+  bool covariance_information(Eigen::MatrixXd &Hred, const SolverOptions &options);
   /// Solve (H + lambda*diag(H)) delta = -grad. Uses the visibility-aware arrowhead Schur
   /// complement when landmark blocks are present, else a plain damped dense Cholesky.
   bool solve_step(const Eigen::MatrixXd &H, const Eigen::VectorXd &grad, double lambda, Eigen::VectorXd &delta) const;
@@ -236,7 +256,7 @@ protected: // protected (not private): the base-class seam for derived solvers (
   std::vector<const LossFunction *> owned_loss_;
   std::vector<const LocalParameterization *> owned_param_;
 
-  // Preallocated solver scratch -- REAL-TIME: no heap allocation in the iteration loop.
+  // Reusable solver scratch avoids rebuilding large matrices for each trial.
   // (On aarch64/glibc, a fresh n_total x n_total MatrixXd each trial exceeds the 128 KB
   //  mmap threshold and would trigger mmap/munmap syscalls + page-zeroing every solve.)
   mutable std::vector<Eigen::MatrixXd> Hw_;    // per-worker Hessian accumulators
@@ -260,16 +280,10 @@ protected: // protected (not private): the base-class seam for derived solvers (
 
   // FIXED-SIZE (3x3) Schur scratch -- the fast path.
   //
-  // In the inner solve EVERY block a landmark touches is a clone pose (q or p), so every
-  // adjacency has lsize == 3, yet with the Dynamic scratch above the O(P^2) fill-in
-  // `Hred.block(...) -= Ma * W_b` compiles to Eigen's dynamic gemm: runtime dispatch
-  // wrapped around 54 flops. PROFILED on one production session record: 73.5 million such
-  // products at 1.42 GFLOP/s (~2% of machine peak), 36% of solve_step's wall, while the
-  // dense Cholesky beside it runs at 58% of peak -- the loop pays dispatch, not arithmetic.
-  // (Ceres template-specializes its SchurEliminator on block shape for the same reason.)
-  // Fixed-size buffers give the compiler 3x3 at compile time: full unroll, SIMD, no
-  // dispatch. The Dynamic path stays for the EXPORT, where the calibration blocks are
-  // variable and adjacencies really can be 1 (td), 3 (quat/pos) or 8 (camera) wide.
+  // Clone rotation/position adjacencies have three local coordinates. Use
+  // fixed 3x3 products when every adjacency has that shape to avoid dynamic
+  // GEMM dispatch in the landmark fill-in loop. The dynamic path also handles
+  // exports with scalar clocks and camera calibration blocks.
   mutable std::vector<Eigen::Matrix3d> schur_W3_, schur_Ma3_;
   std::vector<char> land_all3_; // per landmark: every adjacency is lsize 3 (=> fixed-size path)
 
@@ -281,14 +295,10 @@ protected: // protected (not private): the base-class seam for derived solvers (
   //   * the S2 gravity block couples to EVERY clone and is registered LAST (WindowBA.cpp),
   //     landing at the end of the nav partition                        -> a rank-2 BORDER.
   //
-  // Whether that is worth exploiting is a property of the WINDOW SHAPE: at 70 clones /
-  // 40-obs tracks the fill reaches ~600 of 1052 dofs (57% dense) and banded buys nothing --
-  // rejecting it there was correct. The flight shape caps tracks at 10 obs / 32 clones,
-  // where the MEASURED half-bandwidth is 74 of 467 (16%): n*b^2 = 2.6 MFLOP vs n^3/3 =
-  // 33.9 MFLOP, 13x fewer. So the choice is never hard-coded to a profile: analyze_band()
-  // measures the actual fill and enables the banded path ONLY when it is cheaper; long-track
-  // windows fall back to the dense LLT automatically. The band is also 280 KB instead of
-  // 1.75 MB -- it fits in L2, which matters more on the target than the flop count does.
+  // analyze_band() measures actual structural fill and compares estimated
+  // banded and dense costs. Short tracks can reduce storage and factorization
+  // work; long tracks fall back to dense LLT. Selection depends on the window
+  // structure rather than a profile name.
   mutable Eigen::MatrixXd band_AB_; // (b+1) x nb, lower band storage: AB(k,j) = B(j+k, j)
   mutable Eigen::MatrixXd band_C_;  // nb x nbord   border columns
   mutable Eigen::MatrixXd band_Y_;  // nb x nbord   = B^-1 C

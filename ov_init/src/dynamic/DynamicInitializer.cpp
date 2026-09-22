@@ -21,6 +21,11 @@
  */
 
 #include "DynamicInitializer.h"
+#include "ConditionalPhysicalWarm.h"
+#include "GravityAlignment.h"
+#include "init/PhysicalResetWindow.h"
+#include "init/MarginalResetPrior.h"
+#include <set>
 
 #ifndef USE_CERES_FREE_INIT
 #include "ceres/Factor_GenericPrior.h"
@@ -31,6 +36,10 @@
 #include "utils/helper.h"
 
 #include "cpi/CpiV1.h"
+#include "RawImuCpi.h"
+#include "init/InitializerCameraClock.h"
+#include "init/InitializerPoseSelection.h"
+#include "init/InitializerGeometry.h"
 #include "feat/Feature.h"
 #include "feat/FeatureDatabase.h"
 #include "types/IMU.h"
@@ -55,6 +64,8 @@ using namespace ov_init;
 // (guarded by #ifdef USE_CERES_FREE_INIT).
 // ===================================================================================
 #ifdef USE_CERES_FREE_INIT
+#include "ceres_free/Factor_ImageReprojPhysical.h"
+#include "ceres_free/Factor_ConditionalBiasPrior.h"
 #include "ceres_free/Factor_GenericPrior.h"
 #include "ceres_free/Factor_ImageReprojCalib.h"
 #include "ceres_free/Factor_ImuCPIv1.h"
@@ -82,55 +93,286 @@ using MleCauchy = ceres::CauchyLoss;
 
 bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covariance, std::vector<std::shared_ptr<ov_type::Type>> &order,
                                     std::shared_ptr<ov_type::IMU> &_imu, std::map<double, std::shared_ptr<ov_type::PoseJPL>> &_clones_IMU,
-                                    std::unordered_map<size_t, std::shared_ptr<ov_type::Landmark>> &_features_SLAM) {
+                                    std::unordered_map<size_t, std::shared_ptr<ov_type::Landmark>> &_features_SLAM,
+                                    const InitPhysicalWarmRequest *physical_request, InitPhysicalWarmResult *physical_result) {
+  if (!physical_request)
+    return initialize_impl(timestamp, covariance, order, _imu, _clones_IMU, _features_SLAM, nullptr, nullptr);
+  if (!physical_result || !imu_data || !_db) return false;
+  // A physical attempt is a transaction, including the legacy out arguments
+  // and receipt. Physical interval selection never prunes the input IMU vector,
+  // avoiding another time-series copy after the caller's attempt snapshot.
+  auto reset_snapshot = std::make_shared<ResetContext>();
+  if (reset_ctx) reset_snapshot->arm(reset_ctx->prior());
+  DynamicInitializer attempt(params, _db, imu_data, reset_snapshot);
+  double next_time = -1.;
+  Eigen::MatrixXd next_covariance;
+  std::vector<std::shared_ptr<Type>> next_order;
+  auto next_imu = std::make_shared<IMU>();
+  std::map<double, std::shared_ptr<PoseJPL>> next_clones;
+  std::unordered_map<size_t, std::shared_ptr<Landmark>> next_features;
+  InitPhysicalWarmResult next_result;
+  if (!attempt.initialize_impl(next_time, next_covariance, next_order, next_imu, next_clones, next_features,
+                               physical_request, &next_result)) return false;
+  timestamp = next_time;
+  covariance = std::move(next_covariance);
+  // Preserve handle identity: InertialInitializer's public IMU argument is a
+  // shared_ptr passed by value. Only the accepted mean/FEJ is committed here.
+  if (_imu) {
+    _imu->set_value(next_imu->value());
+    _imu->set_fej(next_imu->fej());
+  } else _imu = std::move(next_imu);
+  next_order.front() = _imu;
+  order = std::move(next_order);
+  _clones_IMU = std::move(next_clones);
+  _features_SLAM = std::move(next_features);
+  *physical_result = std::move(next_result);
+  return true;
+}
+
+bool DynamicInitializer::initialize_impl(double &timestamp, Eigen::MatrixXd &covariance, std::vector<std::shared_ptr<Type>> &order,
+                                         std::shared_ptr<IMU> &_imu, std::map<double, std::shared_ptr<PoseJPL>> &_clones_IMU,
+                                         std::unordered_map<size_t, std::shared_ptr<Landmark>> &_features_SLAM,
+                                         const InitPhysicalWarmRequest *physical_request, InitPhysicalWarmResult *physical_result) {
+  const bool physical = physical_request != nullptr;
+  const bool considered = physical && !physical_request->consider.empty();
+  const auto reset_snapshot=reset_ctx ? reset_ctx->prior() : ResetBiasPrior();
+  const auto joint_reset=physical ? physical_request->reset_prior : nullptr;
+  if (reset_snapshot.joint!=joint_reset || (joint_reset && (!params.init_dyn_reset_prior_use ||
+      params.init_dyn_fix_ba_on_reset || !valid_physical_reset_prior(*joint_reset)))) return false;
+  conditional_bias::Conditioned reset_conditional;
+  int consider_dimension = 0;
+  std::map<size_t,int> clock_columns;
+  Eigen::MatrixXd calibration_sensitivity;
+  InitPhysicalWarmResult physical_output;
+  std::map<std::pair<size_t, uint64_t>, InitExposureOwner> physical_owners;
+  if (physical) {
+#ifndef USE_CERES_FREE_INIT
+    PRINT_WARNING(YELLOW "[init-d]: physical warm export requires the local solver backend\n" RESET);
+    return false;
+#endif
+    if (imu_data->size() < 2) return false;
+    for (size_t i = 0; i < imu_data->size(); ++i) {
+      const auto &sample = imu_data->at(i);
+      if (!finite_initializer_time(sample.timestamp) || !gravity_export::finite(sample.wm) || !gravity_export::finite(sample.am) ||
+          (i && sample.timestamp <= imu_data->at(i-1).timestamp)) return false;
+    }
+    if (!params.init_warmstart_inject || !physical_request->episode_id || !physical_request->max_retained_owners ||
+        physical_request->max_retained_owners > size_t(std::numeric_limits<int>::max() / 6) ||
+        params.init_dyn_num_pose < 2 || params.init_dyn_num_pose > 4096 || params.num_cameras <= 0 ||
+        params.init_dyn_mle_opt_calib ||
+        (params.init_dyn_reset_prior_use && reset_snapshot.valid && !joint_reset)) {
+      PRINT_WARNING(YELLOW "[init-d]: physical warm export requires fixed calibration means and a supported bias prior\n" RESET);
+      return false;
+    }
+    physical_output.episode_id = physical_request->episode_id;
+    physical_output.reference_clock_mean = params.calib_camimu_dt;
+    physical_output.imu_accel_map = params.init_imu_accel_map;
+    physical_output.imu_gyro_map = params.init_imu_gyro_map;
+    physical_output.imu_tg = params.init_imu_tg;
+    for (int camera = 0; camera < params.num_cameras; ++camera) {
+      const auto intrinsic = params.camera_intrinsics.find(camera);
+      const auto extrinsic = params.camera_extrinsics.find(camera);
+      if (intrinsic == params.camera_intrinsics.end() || !intrinsic->second || extrinsic == params.camera_extrinsics.end() ||
+          extrinsic->second.size() != 7 || intrinsic->second->get_value().size() != 8) return false;
+      InitFixedCameraCalibration calibration;
+      calibration.camera_id = camera;
+      const auto offset = params.camera_imu_dt.find(camera);
+      calibration.clock_mean = offset == params.camera_imu_dt.end() ? params.calib_camimu_dt : offset->second;
+      calibration.fisheye = std::dynamic_pointer_cast<CamEqui>(intrinsic->second) != nullptr;
+      calibration.width = intrinsic->second->w(); calibration.height = intrinsic->second->h();
+      calibration.intrinsics = intrinsic->second->get_value(); calibration.extrinsics = extrinsic->second;
+      if (!gravity_export::finite(calibration.intrinsics) || !gravity_export::finite(calibration.extrinsics) ||
+          std::abs(calibration.extrinsics.head<4>().norm() - 1.) > 1e-10) return false;
+      physical_output.calibration.push_back(std::move(calibration));
+    }
+    std::set<std::pair<size_t,InitCameraCalibrationKind>> keys;
+    for (const auto &block : physical_request->consider) {
+      if (block.camera_id >= physical_output.calibration.size() || !block.local_size() ||
+          block.mean.size() != block.value_size() || block.fej.size() != block.value_size() ||
+          !gravity_export::finite(block.mean) || !gravity_export::finite(block.fej) ||
+          !(block.mean.array() == block.fej.array()).all() || !keys.emplace(block.camera_id,block.kind).second) return false;
+      const auto &camera = physical_output.calibration[block.camera_id];
+      Eigen::VectorXd mean;
+      if (block.kind == InitCameraCalibrationKind::Clock) {
+        mean = Eigen::VectorXd::Constant(1,camera.clock_mean);
+        clock_columns.emplace(block.camera_id,consider_dimension);
+      } else if (block.kind == InitCameraCalibrationKind::Extrinsics) mean = camera.extrinsics;
+      else mean = camera.intrinsics;
+      if (!(mean.array() == block.mean.array()).all()) return false;
+      consider_dimension += block.local_size();
+    }
+    if (physical_request->calibration_covariance.rows() != consider_dimension ||
+        physical_request->calibration_covariance.cols() != consider_dimension ||
+        !conditional_warm::valid_psd(physical_request->calibration_covariance)) return false;
+    physical_output.consider = physical_request->consider;
+    physical_output.calibration_covariance = physical_request->calibration_covariance;
+    if(joint_reset) {
+      // Request order may differ from the immutable snapshot's semantic order.
+      std::vector<int> columns;
+      for(const auto &block:physical_request->consider) {
+        int at=0;bool found=false;
+        for(const auto &old:joint_reset->consider) {
+          if(old.camera_id==block.camera_id && old.kind==block.kind) {
+            for(int k=0;k<block.local_size();++k)columns.push_back(at+k);
+            found=true;break;
+          }
+          at+=old.local_size();
+        }
+        if(!found)return false;
+      }
+      if(columns.size()!=size_t(joint_reset->calibration_covariance.rows()) ||
+          joint_reset->calibration.size()!=physical_output.calibration.size() ||
+          joint_reset->calibration[joint_reset->reference_camera_id].clock_mean!=params.calib_camimu_dt ||
+          !(joint_reset->imu_accel_map.array()==params.init_imu_accel_map.array()).all() ||
+          !(joint_reset->imu_gyro_map.array()==params.init_imu_gyro_map.array()).all() ||
+          !(joint_reset->imu_tg.array()==params.init_imu_tg.array()).all()) return false;
+      for(int r=0;r<consider_dimension;++r)
+        for(int c=0;c<consider_dimension;++c)
+          if(initializer_time_bits(physical_output.calibration_covariance(r,c))!=
+              initializer_time_bits(joint_reset->calibration_covariance(columns[r],columns[c]))) return false;
+      for(size_t i=0;i<physical_output.calibration.size();++i) {
+        const auto &a=physical_output.calibration[i];const auto &b=joint_reset->calibration[i];
+        if(a.clock_mean!=b.clock_mean || a.fisheye!=b.fisheye || a.width!=b.width || a.height!=b.height ||
+            !(a.extrinsics.array()==b.extrinsics.array()).all() || !(a.intrinsics.array()==b.intrinsics.array()).all()) return false;
+      }
+      physical_output.reset_prior=joint_reset;
+    }
+  }
+  const double graph_to_imu_offset = physical ? 0. : params.calib_camimu_dt;
+
+  RawImuCpiModel imu_model;
+  if (!imu_model.set_calibration(params.init_imu_accel_map, params.init_imu_gyro_map, params.init_imu_tg)) {
+    PRINT_WARNING(YELLOW "[init-d]: invalid fixed IMU calibration\n" RESET);
+    return false;
+  }
+  const auto raw_sample_at = [&](double time, Eigen::Vector3d &wm, Eigen::Vector3d &am) {
+    const auto upper = std::lower_bound(imu_data->begin(), imu_data->end(), time,
+                                      [](const ImuData &sample, double t) { return sample.timestamp < t; });
+    if (upper == imu_data->end() || (upper == imu_data->begin() && upper->timestamp != time)) return false;
+    wm = upper->wm; am = upper->am;
+    if (upper->timestamp != time) {
+      const auto lower = std::prev(upper);
+      const double alpha = (time-lower->timestamp)/(upper->timestamp-lower->timestamp);
+      wm = (1.-alpha)*lower->wm+alpha*upper->wm;
+      am = (1.-alpha)*lower->am+alpha*upper->am;
+    }
+    return true;
+  };
+  const Eigen::Vector4d imu_sigmas(params.sigma_w, params.sigma_wb, params.sigma_a, params.sigma_ab);
+
+  InitializerCameraClock camera_clock;
+  if (!camera_clock.configure(params.camera_imu_dt, params.calib_camimu_dt)) {
+    PRINT_WARNING(YELLOW "[init-d]: invalid camera/IMU clock calibration\n" RESET);
+    return false;
+  }
 
   // Get the newest and oldest timestamps we will try to initialize between!
   auto rT1 = ov_core::prof_now();
-  double newest_cam_time = -1;
-  for (auto const &feat : _db->get_internal_data()) {
+  // Work on one deep snapshot. Retiming only this private copy keeps the live
+  // tracker's raw-camera timestamps and future filter update ownership intact.
+  InitializerFeatureMap features = _db->clone_features();
+  if(params.init_dyn_reset_prior_use && reset_snapshot.valid && reset_snapshot.filter && !joint_reset) {
+    if(!valid_filter_reset_prior(*reset_snapshot.filter,params.num_cameras) || params.init_dyn_mle_opt_calib ||
+        params.init_dyn_fix_ba_on_reset)return false;
+    // Direct callers obey the same exact raw ownership as make_attempt.
+    for(auto it=features.begin();it!=features.end();) {
+      auto &feature=*it->second;size_t count=0;
+      for(auto &camera:feature.timestamps) {
+        auto uv=feature.uvs.find(camera.first),norm=feature.uvs_norm.find(camera.first);
+        if(uv==feature.uvs.end() || norm==feature.uvs_norm.end() || uv->second.size()!=camera.second.size() ||
+            norm->second.size()!=camera.second.size())return false;
+        const auto offset=params.camera_imu_dt.find(camera.first);
+        const double td=offset==params.camera_imu_dt.end() ? params.calib_camimu_dt : offset->second;
+        size_t write=0;
+        for(size_t read=0;read<camera.second.size();++read)
+          if(marginal_reset_future_row(*reset_snapshot.filter,camera.first,camera.second[read],td)) {
+            camera.second[write]=camera.second[read];uv->second[write]=uv->second[read];norm->second[write]=norm->second[read];++write;
+          }
+        camera.second.resize(write);uv->second.resize(write);norm->second.resize(write);count+=write;
+      }
+      if(!count)it=features.erase(it);else ++it;
+    }
+  }
+  if(joint_reset) {
+    // This is a private snapshot. Historical posterior-conditioned rows cannot
+    // enter another likelihood or consumed receipt, even after a clock update.
+    for(auto it=features.begin();it!=features.end();) {
+      auto &feature=*it->second;size_t count=0;
+      for(auto &camera:feature.timestamps) {
+        auto uv=feature.uvs.find(camera.first),norm=feature.uvs_norm.find(camera.first);
+        if(camera.first>=joint_reset->calibration.size() || uv==feature.uvs.end() || norm==feature.uvs_norm.end() ||
+            uv->second.size()!=camera.second.size() || norm->second.size()!=camera.second.size())return false;
+        size_t write=0;
+        for(size_t read=0;read<camera.second.size();++read)
+          if(physical_reset_future_row(*joint_reset,camera.first,camera.second[read])) {
+            camera.second[write]=camera.second[read];uv->second[write]=uv->second[read];norm->second[write]=norm->second[read];++write;
+          }
+        camera.second.resize(write);uv->second.resize(write);norm->second.resize(write);count+=write;
+      }
+      if(!count)it=features.erase(it);else ++it;
+    }
+  }
+  double newest_raw_time = -1;
+  for (auto const &feat : features) {
     for (auto const &camtimepair : feat.second->timestamps) {
       for (auto const &time : camtimepair.second) {
-        newest_cam_time = std::max(newest_cam_time, time);
+        newest_raw_time = std::max(newest_raw_time, time);
       }
     }
   }
+  if ((physical || camera_clock.unequal_offsets) && imu_data->empty()) return false;
+  // Never return a corrected reference-clock state ahead of the live camera
+  // queue or covering IMU. Equal offsets retain the original timestamp path.
+  const double horizon = camera_clock.unequal_offsets ?
+      std::min(newest_raw_time, imu_data->back().timestamp-params.calib_camimu_dt) : std::numeric_limits<double>::infinity();
+  InitializerFeatureTimeBounds feature_times;
+  InitializerRawTimeSidecar raw_keys;
+  if (physical) {
+    double first_support=imu_data->front().timestamp;
+    if(joint_reset) {
+      const auto fresh=std::upper_bound(imu_data->begin(),imu_data->end(),joint_reset->imu_raw_cutoff,
+                                      [](double t,const ImuData &sample){return t<sample.timestamp;});
+      if(fresh==imu_data->end())return false;
+      first_support=fresh->timestamp;
+    }
+    if (!prepare_physical_initializer_features(features, params.camera_imu_dt, params.calib_camimu_dt,
+                                               first_support, imu_data->back().timestamp,
+                                               params.init_window_time, feature_times, raw_keys)) return false;
+    for (const auto &feature : features)
+      for (const auto &camera : feature.second->timestamps)
+        if (camera.first >= size_t(params.num_cameras)) return false;
+  } else if (!retime_initializer_features(features, camera_clock, feature_times, horizon) || !feature_times.observation_count) return false;
+  const double newest_cam_time = feature_times.newest_ref_time;
   double oldest_time = newest_cam_time - params.init_window_time;
   if (newest_cam_time < 0 || oldest_time < 0) {
     return false;
   }
 
-  // Remove all measurements that are older than our initialization window
-  // Then we will try to use all features that are in the feature database!
-  _db->cleanup_measurements(oldest_time);
+  // Prune the private window in its common reference clock. A single cutoff
+  // applied to the live heterogeneous camera clocks would discard valid data.
+  for (auto it=features.begin(); !physical && it!=features.end();) {
+    it->second->clean_older_measurements(oldest_time);
+    size_t remaining=0;
+    for (const auto &camera:it->second->timestamps) remaining+=camera.second.size();
+    if (!remaining) it=features.erase(it); else ++it;
+  }
   bool have_old_imu_readings = false;
   auto it_imu = imu_data->begin();
-  while (it_imu != imu_data->end() && it_imu->timestamp < oldest_time + params.calib_camimu_dt) {
+  while (it_imu != imu_data->end() && it_imu->timestamp < oldest_time + graph_to_imu_offset) {
     have_old_imu_readings = true;
     ++it_imu;
   }
-  imu_data->erase(imu_data->begin(), it_imu);
-  if (_db->get_internal_data().size() < 0.75 * params.init_max_features) {
-    PRINT_WARNING(RED "[init-d]: only %zu valid features of required (%.0f thresh)!!\n" RESET, _db->get_internal_data().size(),
+  // Keep the interpolation predecessor for the corrected first interval.
+  if ((physical || camera_clock.unequal_offsets) && it_imu!=imu_data->begin()) --it_imu;
+  if (!physical) imu_data->erase(imu_data->begin(), it_imu);
+  if (features.size() < 0.75 * params.init_max_features) {
+    PRINT_WARNING(RED "[init-d]: only %zu valid features of required (%.0f thresh)!!\n" RESET, features.size(),
                   0.95 * params.init_max_features);
     return false;
   }
   if (imu_data->size() < 2 || !have_old_imu_readings) {
     PRINT_DEBUG("[init-d]: waiting for the IMU window (%zu readings, have_old=%d)\n", imu_data->size(), (int)have_old_imu_readings);
     return false;
-  }
-
-  // Now we will make a copy of our features here
-  // We do this to ensure that the feature database can continue to have new
-  // measurements appended to it in an async-manor so this initialization
-  // can be performed in a secondary thread while feature tracking is still performed.
-  std::unordered_map<size_t, std::shared_ptr<Feature>> features;
-  for (const auto &feat : _db->get_internal_data()) {
-    auto feat_new = std::make_shared<Feature>();
-    feat_new->featid = feat.second->featid;
-    feat_new->uvs = feat.second->uvs;
-    feat_new->uvs_norm = feat.second->uvs_norm;
-    feat_new->timestamps = feat.second->timestamps;
-    features.insert({feat.first, feat_new});
   }
 
   // ======================================================
@@ -168,7 +410,7 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
         }
         // either this pose is a new one at the desired frequency
         // or it is a timestamp that we already have, thus can use for free
-        if (time_dt >= pose_dt_avg || time_dt == 0.0) {
+        if (initializer_pose_spacing(time_dt, pose_dt_avg, newest_cam_time)) {
           times.push_back(time);
           camids[camtime.first] = true;
         }
@@ -201,6 +443,9 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
     PRINT_DEBUG("[init-d]: only %zu of %d required poses selected\n", map_camera_times.size(), params.init_dyn_num_pose);
     return false;
   }
+  // A hard graph allocation bound supplements the spacing heuristic. Owner
+  // output has a separate caller-supplied cap and is marginalized below.
+  if (physical && map_camera_times.size() > size_t(params.init_dyn_num_pose) + 2) return false;
   if (count_valid_features < min_valid_features) {
     PRINT_WARNING(RED "[init-d]: only %zu valid features of required %d!!\n" RESET, count_valid_features, min_valid_features);
     return false;
@@ -213,21 +458,68 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
   // gravity and ba trade off. The prior is gated -- validity, norm bounds, sigma caps after
   // random-walk AGE inflation, divergence inflation -- so a corrupted filter degrades exactly
   // to the legacy config-seed behavior.
-  ResetBiasPrior reset_prior = (reset_ctx != nullptr) ? reset_ctx->prior() : ResetBiasPrior();
+  ResetBiasPrior reset_prior = reset_snapshot;
   bool use_reset_prior = params.init_dyn_reset_prior_use && reset_prior.valid;
+  if(joint_reset) {
+    reset_prior.bg=joint_reset->bias_mean.head<3>();reset_prior.ba=joint_reset->bias_mean.tail<3>();
+    use_reset_prior=true;
+  }
   Eigen::Vector3d reset_sig_bg = Eigen::Vector3d::Zero(), reset_sig_ba = Eigen::Vector3d::Zero();
-  if (use_reset_prior) {
-    const double age = std::max(0.0, newest_cam_time - reset_prior.t_snapshot);
-    reset_sig_bg = (reset_prior.sigma_bg.array().square() + params.sigma_wb * params.sigma_wb * age).sqrt().matrix();
-    reset_sig_ba = (reset_prior.sigma_ba.array().square() + params.sigma_ab * params.sigma_ab * age).sqrt().matrix();
-    if (reset_prior.cause == 1) { // divergence-triggered reset: distrust the snapshot
-      reset_sig_bg *= params.init_dyn_reset_prior_divergence_infl;
-      reset_sig_ba *= params.init_dyn_reset_prior_divergence_infl;
+  conditional_bias::Conditioned marginal_prior;
+  if(joint_reset) {
+    const double gap=oldest_camera_time-joint_reset->imu_endpoint;
+    conditional_bias::Vector6 expected_rw;
+    expected_rw.head<3>().setConstant(params.sigma_wb*params.sigma_wb);
+    expected_rw.tail<3>().setConstant(params.sigma_ab*params.sigma_ab);
+    if(!(expected_rw.array()==joint_reset->bias_rw_variance.array()).all())return false;
+    conditional_bias::Vector6 floors;
+    floors.head<3>().setConstant(params.init_dyn_reset_prior_sigma_floor_bg);
+    floors.tail<3>().setConstant(params.init_dyn_reset_prior_sigma_floor_ba);
+    const double scale=joint_reset->cause==1 ? params.init_dyn_reset_prior_divergence_infl : 1.;
+    if(!conditional_bias::condition(joint_reset->bias_covariance,joint_reset->bias_calibration_covariance,
+        joint_reset->calibration_covariance,gap,joint_reset->bias_rw_variance,scale,floors,reset_conditional)) return false;
+    reset_sig_bg=reset_conditional.bias_covariance.diagonal().head<3>().cwiseSqrt();
+    reset_sig_ba=reset_conditional.bias_covariance.diagonal().tail<3>().cwiseSqrt();
+    if(reset_prior.bg.norm()>params.init_dyn_reset_prior_max_bg || reset_prior.ba.norm()>params.init_dyn_reset_prior_max_ba ||
+        reset_sig_bg.maxCoeff()>params.init_dyn_reset_prior_max_sigma_bg ||
+        reset_sig_ba.maxCoeff()>params.init_dyn_reset_prior_max_sigma_ba) return false;
+    auto support=std::lower_bound(imu_data->begin(),imu_data->end(),oldest_camera_time,
+                                 [](const ImuData &sample,double t){return sample.timestamp<t;});
+    if(support==imu_data->end())return false;
+    if(support->timestamp!=oldest_camera_time) {
+      if(support==imu_data->begin())return false;
+      --support;
     }
-    use_reset_prior = reset_prior.bg.norm() <= params.init_dyn_reset_prior_max_bg &&
-                      reset_prior.ba.norm() <= params.init_dyn_reset_prior_max_ba &&
-                      reset_sig_bg.maxCoeff() <= params.init_dyn_reset_prior_max_sigma_bg &&
-                      reset_sig_ba.maxCoeff() <= params.init_dyn_reset_prior_max_sigma_ba;
+    if(!(support->timestamp>joint_reset->imu_raw_cutoff))return false;
+    physical_output.reset_first_imu_time=oldest_camera_time;
+    physical_output.reset_first_imu_support_time=support->timestamp;
+    PRINT_INFO("[init-d]: joint reset prior ACTIVE (future gap %.6fs, calibration rank %d)\n",gap,reset_conditional.calibration_rank);
+  } else if (use_reset_prior) {
+    const double first_imu=oldest_camera_time+graph_to_imu_offset;
+    const double snapshot_imu=reset_prior.filter ? reset_prior.filter->imu_endpoint : reset_prior.t_snapshot+params.calib_camimu_dt;
+    const double age=first_imu-snapshot_imu;
+    conditional_bias::Vector6 rw,floors;
+    rw.head<3>().setConstant(params.sigma_wb*params.sigma_wb);rw.tail<3>().setConstant(params.sigma_ab*params.sigma_ab);
+    floors.head<3>().setConstant(params.init_dyn_reset_prior_sigma_floor_bg);
+    floors.tail<3>().setConstant(params.init_dyn_reset_prior_sigma_floor_ba);
+    use_reset_prior=condition_marginal_reset_prior(reset_prior,first_imu,params.calib_camimu_dt,rw,
+        params.init_dyn_reset_prior_divergence_infl,floors,marginal_prior);
+    if(reset_prior.filter) {
+      auto support=std::lower_bound(imu_data->begin(),imu_data->end(),first_imu,
+                                   [](const ImuData &sample,double time){return sample.timestamp<time;});
+      if(support==imu_data->end() || (support==imu_data->begin() && support->timestamp!=first_imu))return false;
+      if(support->timestamp!=first_imu)--support;
+      // Wait for future support instead of reusing the last old raw record.
+      if(!(support->timestamp>reset_prior.filter->imu_raw_cutoff))return false;
+    }
+    if(use_reset_prior) {
+      reset_sig_bg=marginal_prior.bias_covariance.diagonal().head<3>().cwiseSqrt();
+      reset_sig_ba=marginal_prior.bias_covariance.diagonal().tail<3>().cwiseSqrt();
+      use_reset_prior=reset_prior.bg.norm()<=params.init_dyn_reset_prior_max_bg &&
+          reset_prior.ba.norm()<=params.init_dyn_reset_prior_max_ba &&
+          reset_sig_bg.maxCoeff()<=params.init_dyn_reset_prior_max_sigma_bg &&
+          reset_sig_ba.maxCoeff()<=params.init_dyn_reset_prior_max_sigma_ba;
+    }
     if (use_reset_prior) {
       PRINT_INFO("[init-d]: reset bias prior ACTIVE (age %.2fs, max sig_bg %.4f, max sig_ba %.4f, cause %d)\n", age,
                  reset_sig_bg.maxCoeff(), reset_sig_ba.maxCoeff(), reset_prior.cause);
@@ -245,16 +537,18 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
   // Check that we have some angular velocity / orientation change
   double accel_inI_norm = 0.0;
   double theta_inI_norm = 0.0;
-  double time0_in_imu = oldest_camera_time + params.calib_camimu_dt;
-  double time1_in_imu = newest_cam_time + params.calib_camimu_dt;
+  double time0_in_imu = oldest_camera_time + graph_to_imu_offset;
+  double time1_in_imu = newest_cam_time + graph_to_imu_offset;
   std::vector<ov_core::ImuData> readings = InitializerHelper::select_imu_readings(*imu_data, time0_in_imu, time1_in_imu);
-  assert(readings.size() > 2);
+  if (readings.size() < 2 || std::abs(readings.front().timestamp-time0_in_imu)>1e-9 ||
+      std::abs(readings.back().timestamp-time1_in_imu)>1e-9) return false;
   for (size_t k = 0; k < readings.size() - 1; k++) {
     auto imu0 = readings.at(k);
     auto imu1 = readings.at(k + 1);
     double dt = imu1.timestamp - imu0.timestamp;
-    Eigen::Vector3d wm = 0.5 * (imu0.wm + imu1.wm) - gyroscope_bias;
-    Eigen::Vector3d am = 0.5 * (imu0.am + imu1.am) - accelerometer_bias;
+    Eigen::Vector3d wm, am;
+    if (!(dt>0) || !imu_model.correct(0.5*(imu0.wm+imu1.wm),0.5*(imu0.am+imu1.am),gyroscope_bias,accelerometer_bias,wm,am))
+      return false;
     theta_inI_norm += (-wm * dt).norm();
     accel_inI_norm += am.norm();
   }
@@ -321,7 +615,7 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
   // factors take those from the interval CPIs, unchanged).
   assert(oldest_camera_time < newest_cam_time);
   double last_camera_timestamp = 0.0;
-  std::map<double, std::shared_ptr<ov_core::CpiV1>> map_camera_cpi_I0toIi, map_camera_cpi_IitoIi1;
+  std::map<double, std::shared_ptr<RawBiasCpiV1>> map_camera_cpi_I0toIi, map_camera_cpi_IitoIi1;
   double comp_DT = 0.0;                                          // running I0->Ii composition
   Eigen::Matrix3d comp_R_I0toIk = Eigen::Matrix3d::Identity();   // R_I0toIk
   Eigen::Vector3d comp_alpha = Eigen::Vector3d::Zero();          // alpha_I0toIk (in I0)
@@ -338,10 +632,9 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
     }
 
     // Perform our preintegration from Ii to Ii1 (used in the mle optimization, composed below)
-    double cpiIitoIi1_time0_in_imu = last_camera_timestamp + params.calib_camimu_dt;
-    double cpiIitoIi1_time1_in_imu = current_time + params.calib_camimu_dt;
-    auto cpiIitoIi1 = std::make_shared<ov_core::CpiV1>(params.sigma_w, params.sigma_wb, params.sigma_a, params.sigma_ab, true);
-    cpiIitoIi1->setLinearizationPoints(gyroscope_bias, accelerometer_bias);
+    double cpiIitoIi1_time0_in_imu = last_camera_timestamp + graph_to_imu_offset;
+    double cpiIitoIi1_time1_in_imu = current_time + graph_to_imu_offset;
+    std::shared_ptr<RawBiasCpiV1> cpiIitoIi1;
     std::vector<ov_core::ImuData> cpiIitoIi1_readings =
         InitializerHelper::select_imu_readings(*imu_data, cpiIitoIi1_time0_in_imu, cpiIitoIi1_time1_in_imu);
     if (cpiIitoIi1_readings.size() < 2) {
@@ -350,15 +643,16 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
       return false;
     }
     double cpiIitoIi1_dt_imu = cpiIitoIi1_readings.at(cpiIitoIi1_readings.size() - 1).timestamp - cpiIitoIi1_readings.at(0).timestamp;
-    if (std::abs(cpiIitoIi1_dt_imu - (cpiIitoIi1_time1_in_imu - cpiIitoIi1_time0_in_imu)) > 0.01) {
+    if (std::abs(cpiIitoIi1_readings.front().timestamp-cpiIitoIi1_time0_in_imu)>1e-9 ||
+        std::abs(cpiIitoIi1_readings.back().timestamp-cpiIitoIi1_time1_in_imu)>1e-9 ||
+        std::abs(cpiIitoIi1_dt_imu - (cpiIitoIi1_time1_in_imu - cpiIitoIi1_time0_in_imu)) > 1e-9) {
       PRINT_DEBUG(YELLOW "[init-d]: camera IMU was only propagated %.3f of %.3f\n" RESET, cpiIitoIi1_dt_imu,
                   (cpiIitoIi1_time1_in_imu - cpiIitoIi1_time0_in_imu));
       return false;
     }
-    for (size_t k = 0; k < cpiIitoIi1_readings.size() - 1; k++) {
-      auto imu0 = cpiIitoIi1_readings.at(k);
-      auto imu1 = cpiIitoIi1_readings.at(k + 1);
-      cpiIitoIi1->feed_IMU(imu0.timestamp, imu1.timestamp, imu0.wm, imu0.am, imu1.wm, imu1.am);
+    if (!imu_model.preintegrate(cpiIitoIi1_readings, gyroscope_bias, accelerometer_bias, imu_sigmas, cpiIitoIi1)) {
+      PRINT_WARNING(YELLOW "[init-d]: calibrated raw-bias CPI failed\n" RESET);
+      return false;
     }
 
     // Compose the I0->Ii values from this interval's result:
@@ -369,7 +663,7 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
     comp_beta += comp_R_I0toIk.transpose() * cpiIitoIi1->beta_tau;
     comp_R_I0toIk = cpiIitoIi1->R_k2tau * comp_R_I0toIk;
     comp_DT += cpiIitoIi1->DT;
-    auto cpiI0toIi1 = std::make_shared<ov_core::CpiV1>(params.sigma_w, params.sigma_wb, params.sigma_a, params.sigma_ab, true);
+    auto cpiI0toIi1 = std::make_shared<RawBiasCpiV1>(params.sigma_w, params.sigma_wb, params.sigma_a, params.sigma_ab, true);
     cpiI0toIi1->setLinearizationPoints(gyroscope_bias, accelerometer_bias);
     cpiI0toIi1->DT = comp_DT;
     cpiI0toIi1->R_k2tau = comp_R_I0toIk;
@@ -612,6 +906,7 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
   // Check if gravity is pointing in an acceptable direction (prevents upside-down initialization)
   // gravity_inI0 is the actual gravity vector, so it should point in -Z for an upright IMU
   Eigen::Vector3d expected_gravity_dir(0, 0, -1); // Expected: gravity points in -Z direction in IMU frame
+  expected_gravity_dir = (params.init_imu_accel_map * expected_gravity_dir).eval();
   if (!InitializerHelper::check_gravity_direction(gravity_inI0, expected_gravity_dir, params.init_gravity_max_angle)) {
     double angle_deg = std::acos(std::max(-1.0, std::min(1.0, (gravity_inI0.normalized()).dot(expected_gravity_dir.normalized())))) * 180.0 / M_PI;
     PRINT_WARNING(YELLOW "[init-d]: gravity direction check failed! Angle from expected: %.1f deg (max: %.1f deg)\n" RESET,
@@ -748,11 +1043,11 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
   auto *gravity_s2_param = new MleGravityS2(params.gravity_mag);
   problem.AddParameterBlock(var_gravity, 3, gravity_s2_param);
 
-  // Weak prior pulling gravity toward its +Z seed (0,0,G). Fights the gravity<->accel-bias ambiguity
-  // and the flipped-gravity basin so the post-solve flip gate is robust (NEES gold standard,
-  // test_init_consistency: flip rejection 42/50 -> 49/50 at sigma=0.5, grav err unchanged). It does NOT
-  // fix the free-S2 NEES overconfidence (that is weak gravity/bias observability over the init window,
-  // mitigated by the init_dyn_inflation_* congruence). Disabled if init_dyn_grav_prior_sigma <= 0.
+  // Weak regularizer pulling gravity toward its data-derived +Z seed (0,0,G),
+  // conditioning the gravity/accel-bias ambiguity. This seed is not an independent
+  // gravity measurement, and a final gravity-direction check alone cannot certify
+  // the physical solution. The optimized observation geometry is checked below.
+  // Disabled if init_dyn_grav_prior_sigma <= 0.
   if (params.init_dyn_grav_prior_sigma > 0.0) {
     Eigen::MatrixXd g_lin(3, 1);
     g_lin << var_gravity[0], var_gravity[1], var_gravity[2];
@@ -829,7 +1124,7 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
 
     // Get our predicted state at the requested camera timestep
     double timestamp_k1 = timepair.first;
-    std::shared_ptr<ov_core::CpiV1> cpi = map_camera_cpi_IitoIi1.at(timestamp_k1);
+    std::shared_ptr<RawBiasCpiV1> cpi = map_camera_cpi_IitoIi1.at(timestamp_k1);
     Eigen::Matrix<double, 16, 1> state_k1;
     state_k1.block(0, 0, 4, 1) = ori_GtoIi.at(timestamp_k1);
     state_k1.block(4, 0, 3, 1) = pos_IiinG.at(timestamp_k1);
@@ -900,6 +1195,8 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
         prior_Info(6 + j, 6 + j) = 1.0 / std::pow(sbg, 2); // bias_g prior
         prior_Info(9 + j, 9 + j) = 1.0 / std::pow(sba, 2); // bias_a prior
       }
+      if(use_reset_prior && !joint_reset)
+        prior_Info.block<6,6>(6,6)=marginal_prior.sqrt_information.transpose()*marginal_prior.sqrt_information;
 
       // Construct state type and ceres parameter pointers
       std::vector<std::string> x_types;
@@ -913,6 +1210,11 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
       factor_params.push_back(var_bias_a);
       x_types.emplace_back("vec3");
 
+      if(joint_reset) {
+        // The joint conditional factor below owns all six bias rows once.
+        x_lin.conservativeResize(7,1);prior_Info.conservativeResize(6,6);prior_grad.conservativeResize(6,1);
+        x_types.resize(2);factor_params.resize(2);
+      }
       // Append it to the problem
       auto *factor_prior = new MlePrior(x_lin, x_types, prior_Info, prior_grad);
       problem.AddResidualBlock(factor_prior, nullptr, factor_params);
@@ -937,6 +1239,8 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
         prior_Info(4 + j, 4 + j) = 1.0 / std::pow(sbg, 2); // bias_g prior
         prior_Info(7 + j, 7 + j) = 1.0 / std::pow(sba, 2); // bias_a prior
       }
+      if(use_reset_prior && !joint_reset)
+        prior_Info.block<6,6>(4,4)=marginal_prior.sqrt_information.transpose()*marginal_prior.sqrt_information;
 
       // Construct state type and ceres parameter pointers
       std::vector<std::string> x_types;
@@ -987,7 +1291,7 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
       factor_params.push_back(var_gravity);
 #endif
       auto *factor_imu = new MleImuFactor(cpi->DT, gravity, cpi->alpha_tau, cpi->beta_tau, cpi->q_k2tau, cpi->b_a_lin, cpi->b_w_lin,
-                                          cpi->J_q, cpi->J_b, cpi->J_a, cpi->H_b, cpi->H_a, cpi->P_meas);
+                                          cpi->J_q, cpi->J_b, cpi->J_a, cpi->H_b, cpi->H_a, cpi->P_meas, cpi->H_q);
       problem.AddResidualBlock(factor_imu, nullptr, factor_params);
     }
 
@@ -995,9 +1299,20 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
     timestamp_k = timestamp_k1;
   }
 
+  // Consider export retains even an unobserved camera's prior/cross-covariance.
+  // Its constant graph blocks have zero measurement columns, not invented data.
+  std::set<size_t> calibration_cameras;
+  for (const auto &entry : map_camera_ids) calibration_cameras.insert(entry.first);
+  if (considered)
+    for (const auto &entry : physical_output.calibration) calibration_cameras.insert(entry.camera_id);
+  std::vector<double> physical_clocks(considered ? params.num_cameras : 0);
+  for (const auto &entry : clock_columns) {
+    physical_clocks[entry.first] = physical_output.calibration[entry.first].clock_mean;
+    problem.AddParameterBlock(&physical_clocks[entry.first],1);
+    problem.SetParameterBlockConstant(&physical_clocks[entry.first]);
+  }
   // First make sure we have calibration states added
-  for (auto const &idpair : map_camera_ids) {
-    size_t cam_id = idpair.first;
+  for (size_t cam_id : calibration_cameras) {
     if (map_calib_cam2imu.find(cam_id) == map_calib_cam2imu.end()) {
       auto *var_calib_ori = new double[4];
       for (int j = 0; j < 4; j++) {
@@ -1034,8 +1349,10 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
       x_types.emplace_back("quat");
       factor_params.push_back(var_calib_pos);
       x_types.emplace_back("vec3");
-      auto *factor_prior = new MlePrior(x_lin, x_types, prior_Info, prior_grad);
-      problem.AddResidualBlock(factor_prior, nullptr, factor_params);
+      if (!considered) {
+        auto *factor_prior = new MlePrior(x_lin, x_types, prior_Info, prior_grad);
+        problem.AddResidualBlock(factor_prior, nullptr, factor_params);
+      }
       if (!params.init_dyn_mle_opt_calib) {
         problem.SetParameterBlockConstant(var_calib_ori);
         problem.SetParameterBlockConstant(var_calib_pos);
@@ -1065,14 +1382,36 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
       std::vector<double *> factor_params;
       factor_params.push_back(var_calib_cam);
       x_types.emplace_back("vec8");
-      auto *factor_prior = new MlePrior(x_lin, x_types, prior_Info, prior_grad);
-      problem.AddResidualBlock(factor_prior, nullptr, factor_params);
+      if (!considered) {
+        auto *factor_prior = new MlePrior(x_lin, x_types, prior_Info, prior_grad);
+        problem.AddResidualBlock(factor_prior, nullptr, factor_params);
+      }
       if (!params.init_dyn_mle_opt_calib) {
         problem.SetParameterBlockConstant(var_calib_cam);
       }
     }
   }
   assert(map_calib_cam2imu.size() == map_calib_cam.size());
+#ifdef USE_CERES_FREE_INIT
+  if(joint_reset) {
+    std::vector<double *> blocks={ceres_vars_bias_g.front(),ceres_vars_bias_a.front()};
+    for(const auto &block:joint_reset->consider) {
+      if(block.kind==InitCameraCalibrationKind::Clock) blocks.push_back(&physical_clocks.at(block.camera_id));
+      else if(block.kind==InitCameraCalibrationKind::Extrinsics) {
+        const int at=map_calib_cam2imu.at(block.camera_id);
+        blocks.push_back(ceres_vars_calib_cam2imu_ori.at(at));blocks.push_back(ceres_vars_calib_cam2imu_pos.at(at));
+      } else blocks.push_back(ceres_vars_calib_cam_intrinsics.at(map_calib_cam.at(block.camera_id)));
+    }
+    problem.AddResidualBlock(new zbft_sfm::Factor_ConditionalBiasPrior(joint_reset->bias_mean,reset_conditional,joint_reset->consider),
+                             nullptr,blocks);
+  }
+#endif
+  std::map<double,std::pair<Eigen::Vector3d,Eigen::Vector3d>> physical_raw_samples;
+  if (!clock_columns.empty())
+    for (const auto &node : map_states) {
+      auto &sample = physical_raw_samples[node.first];
+      if (!raw_sample_at(node.first,sample.first,sample.second)) { free_state_memory(); return false; }
+    }
 
   // Then, append new feature observations factors seen from all cameras
   for (auto const &feat : features) {
@@ -1124,9 +1463,31 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
         factor_params.push_back(ceres_vars_calib_cam2imu_ori.at(map_calib_cam2imu.at(cam_id)));
         factor_params.push_back(ceres_vars_calib_cam2imu_pos.at(map_calib_cam2imu.at(cam_id)));
         factor_params.push_back(ceres_vars_calib_cam_intrinsics.at(map_calib_cam.at(cam_id)));
-        auto *factor_pinhole = new MleReprojFactor(uv_raw, params.sigma_pix, is_fisheye);
         MleLoss *loss_function = new MleCauchy(1.0);
-        problem.AddResidualBlock(factor_pinhole, loss_function, factor_params);
+#ifdef USE_CERES_FREE_INIT
+        if (clock_columns.count(cam_id)) {
+          factor_params.push_back(&physical_clocks[cam_id]);
+          factor_params.push_back(ceres_vars_vel.at(map_states.at(time)));
+          factor_params.push_back(ceres_vars_bias_g.at(map_states.at(time)));
+          factor_params.push_back(ceres_vars_bias_a.at(map_states.at(time)));
+          const auto &sample = physical_raw_samples.at(time);
+          auto *factor = new zbft_sfm::Factor_ImageReprojPhysical(uv_raw,params.sigma_pix,is_fisheye,
+              physical_clocks[cam_id],sample.first,sample.second,params.init_imu_accel_map,params.init_imu_gyro_map,params.init_imu_tg);
+          problem.AddResidualBlock(factor,loss_function,factor_params);
+        } else
+#endif
+        {
+          auto *factor_pinhole = new MleReprojFactor(uv_raw, params.sigma_pix, is_fisheye);
+          problem.AddResidualBlock(factor_pinhole, loss_function, factor_params);
+        }
+        if (physical) {
+          const double raw = raw_keys.at(feat_id).at(cam_id).at(i);
+          physical_output.consumed_observations.push_back({feat_id, cam_id, raw});
+          InitExposureOwner owner;
+          owner.camera_id = cam_id; owner.raw_time = raw; owner.nominal_imu_time = time;
+          owner.graph_node = map_states.at(time);
+          physical_owners.emplace(std::make_pair(cam_id, initializer_time_bits(raw)), std::move(owner));
+        }
       }
     }
   }
@@ -1134,6 +1495,59 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
   assert(ceres_vars_ori.size() == ceres_vars_vel.size());
   assert(ceres_vars_ori.size() == ceres_vars_bias_a.size());
   assert(ceres_vars_ori.size() == ceres_vars_pos.size());
+
+  if (physical) {
+    for (const auto &entry : physical_owners) physical_output.owners.push_back(entry.second);
+    std::sort(physical_output.owners.begin(), physical_output.owners.end(), [](const InitExposureOwner &a, const InitExposureOwner &b) {
+      if (a.nominal_imu_time != b.nominal_imu_time) return a.nominal_imu_time < b.nominal_imu_time;
+      if (a.camera_id != b.camera_id) return a.camera_id < b.camera_id;
+      return initializer_time_bits(a.raw_time) < initializer_time_bits(b.raw_time);
+    });
+    if (physical_output.owners.empty()) { free_state_memory(); return false; }
+    if (physical_output.owners.size() > physical_request->max_retained_owners)
+      physical_output.owners.erase(physical_output.owners.begin(), physical_output.owners.end() - physical_request->max_retained_owners);
+    std::sort(physical_output.consumed_observations.begin(), physical_output.consumed_observations.end());
+    physical_output.graph_node_count = map_states.size();
+    physical_output.accepted_imu_endpoint = newest_cam_time;
+    physical_output.reference_clock_label = newest_cam_time - params.calib_camimu_dt;
+  }
+
+  // The linear seed's front-of-camera check does not survive an unconstrained
+  // MLE automatically: perspective division is also defined at negative depth.
+  // Check exactly the observations included in this graph, using the optimized
+  // poses AND extrinsics. This is a bounded residual-only geometry pass, with no
+  // new allocations, state dimensions, statistical gates or per-iteration work.
+  const auto valid_optimized_geometry = [&]() {
+    for (const auto &feature : features) {
+      const auto fit = map_features.find(feature.first);
+      if (fit == map_features.end())
+        continue;
+      const Eigen::Vector3d p_FinG = Eigen::Map<const Eigen::Vector3d>(ceres_vars_feat.at(fit->second));
+      for (const auto &camera : feature.second->timestamps) {
+        const auto calibration = map_calib_cam2imu.find(camera.first);
+        if (calibration == map_calib_cam2imu.end())
+          continue; // This camera contributed no selected observation to the graph.
+        const int calibration_index = calibration->second;
+        const Eigen::Matrix3d R_ItoC = quat_2_Rot(
+            Eigen::Map<const Eigen::Vector4d>(ceres_vars_calib_cam2imu_ori.at(calibration_index)));
+        const Eigen::Vector3d p_IinC = Eigen::Map<const Eigen::Vector3d>(ceres_vars_calib_cam2imu_pos.at(calibration_index));
+        for (double time : camera.second) {
+          const auto pose = map_states.find(time);
+          if (pose == map_states.end())
+            continue;
+          const Eigen::Matrix3d R_GtoI = quat_2_Rot(Eigen::Map<const Eigen::Vector4d>(ceres_vars_ori.at(pose->second)));
+          const Eigen::Vector3d p_IinG = Eigen::Map<const Eigen::Vector3d>(ceres_vars_pos.at(pose->second));
+          const Eigen::Vector3d p_FinC = R_ItoC * R_GtoI * (p_FinG - p_IinG) + p_IinC;
+          if (!InitializerGeometry::valid_camera_point(p_FinC)) {
+            PRINT_WARNING(YELLOW "[init-d]: invalid optimized feature geometry (feature %zu, camera %zu, time %.6f); rejecting init\n" RESET,
+                          feature.first, camera.first, time);
+            return false;
+          }
+        }
+      }
+    }
+    return true;
+  };
   auto rT5 = ov_core::prof_now();
 
   // Optimize the graph
@@ -1142,6 +1556,10 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
   PRINT_INFO("[init-d]: %d iterations | %zu states, %zu feats (%zu valid) | cost %.4e => %.4e\n", summary.iterations,
              map_states.size(), map_features.size(), count_valid_features, summary.initial_cost, summary.final_cost);
   auto rT6 = ov_core::prof_now();
+  if (!valid_optimized_geometry()) {
+    free_state_memory();
+    return false;
+  }
   timestamp = newest_cam_time;
   if (params.init_dyn_mle_max_iter != 0 && !summary.converged) {
     PRINT_WARNING(YELLOW "[init-d]: opt failed: %s!\n" RESET, summary.message.c_str());
@@ -1155,14 +1573,25 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
   // an un-rotated gravity block -> an off-optimum, internally inconsistent covariance (exactly in the
   // 0.1-30 deg tilt band where it matters). We recover it here and carry it through the re-align via a
   // closed-form similarity transform (below). [theta, p, v, bg, ba], local error coordinates.
+  // Retain the 2D gravity tangent until the gravity-dependent output map has been applied.
   // When warm-starting we recover the FULL joint covariance over [IMU(15), clones(6 each, ascending
-  // time)] in a single shot. ComputeCovariance already inverts the entire landmark-marginalized
+  // time), gravity(2)] in a single shot. ComputeCovariance already inverts the entire landmark-marginalized
   // reduced navigation Hessian and merely slices the requested blocks, so asking for every clone costs
-  // no extra factorization -- only a larger slice. The IMU 15x15 stays the top-left block, identical
-  // to the legacy seed, so the cold path is bit-for-bit unchanged. [theta,p,v,bg,ba | theta_i,p_i ...]
-  const bool warmstart = params.init_warmstart_inject;
-  const int n_clones = (int)map_states.size();
-  Eigen::MatrixXd cov_inject; // 15x15 (legacy) or (15 + 6*n_clones) (warm). ComputeCovariance sizes it.
+  // no extra factorization -- only a larger slice. The conditional IMU 15x15 stays the top-left
+  // block; active gravity realignment below now includes the previously omitted uncertainty.
+  // Shifted local pose keys cannot be injected as live raw-camera clone keys.
+  // Unequal offsets therefore export the exact latest IMU marginal only; the
+  // filter builds a fresh clone window on its original timestamp convention.
+  const bool warmstart = physical || (params.init_warmstart_inject && !camera_clock.unequal_offsets);
+  std::vector<double> export_pose_times;
+  if (physical) {
+    for (const auto &owner : physical_output.owners) export_pose_times.push_back(owner.nominal_imu_time);
+  } else if (warmstart) {
+    for (const auto &entry : map_states) export_pose_times.push_back(entry.first);
+  }
+  const int n_clones = (int)export_pose_times.size();
+  const int output_cov_dim = 15 + (warmstart ? 6 * n_clones : 0);
+  Eigen::MatrixXd cov_inject; // output_cov_dim plus gravity(2) until the output-map congruence.
   bool cov_ok = false;
   {
     int sidx = map_states[newest_cam_time];
@@ -1174,12 +1603,47 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
     if (warmstart) {
       // Clones in ascending-time order -> matches _clones_IMU (std::map) iteration, the inflation/
       // T-transform block layout, and the injection contract in StateHelper::set_initial_state_warmstart.
-      for (auto const &sp : map_states) {
-        cb.push_back(ceres_vars_ori[sp.second]);
-        cb.push_back(ceres_vars_pos[sp.second]);
+      for (double time : export_pose_times) {
+        const int index = map_states.at(time);
+        cb.push_back(ceres_vars_ori[index]);
+        cb.push_back(ceres_vars_pos[index]);
       }
     }
-    cov_ok = problem.ComputeCovariance(cb, cov_inject, options);
+    cb.push_back(var_gravity);
+    if (considered) {
+      // Coincident exposure owners and the current IMU repeat graph pointers.
+      // Conditional export requests each solved block ONCE, then scatters into
+      // the exact output owner order before the gravity output map is applied.
+      std::vector<double *> unique, consider;
+      std::map<double *,int> unique_rows;
+      std::vector<std::pair<int,int>> spans;
+      int unique_dimension = 0;
+      for (double *block : cb) {
+        const int dimension = block == var_gravity ? 2 : 3;
+        auto inserted = unique_rows.emplace(block,unique_dimension);
+        if (inserted.second) { unique.push_back(block); unique_dimension += dimension; }
+        spans.emplace_back(inserted.first->second,dimension);
+      }
+      for (const auto &block : physical_request->consider) {
+        if (block.kind == InitCameraCalibrationKind::Clock) consider.push_back(&physical_clocks[block.camera_id]);
+        else if (block.kind == InitCameraCalibrationKind::Extrinsics) {
+          const int index = map_calib_cam2imu.at(block.camera_id);
+          consider.push_back(ceres_vars_calib_cam2imu_ori[index]);
+          consider.push_back(ceres_vars_calib_cam2imu_pos[index]);
+        } else consider.push_back(ceres_vars_calib_cam_intrinsics[map_calib_cam.at(block.camera_id)]);
+      }
+      Eigen::MatrixXd Q, S;
+      cov_ok = problem.ComputeConditionalCovariance(unique,consider,Q,S,options);
+      if (cov_ok) {
+        Eigen::MatrixXd scatter = Eigen::MatrixXd::Zero(output_cov_dim+2,unique_dimension);
+        int row = 0;
+        for (const auto &span : spans) {
+          scatter.block(row,span.first,span.second,span.second).setIdentity(); row += span.second;
+        }
+        cov_inject = scatter*Q*scatter.transpose();
+        calibration_sensitivity = scatter*S;
+      }
+    } else cov_ok = problem.ComputeCovariance(cb, cov_inject, options);
     if (!cov_ok) {
       PRINT_WARNING(YELLOW "[init-d]: covariance recovery failed...\n" RESET);
       free_state_memory();
@@ -1190,7 +1654,7 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
       // variance and ZERO cross-covariance -- BEFORE the realign similarity and the congruence
       // inflation, which both index the [theta,p,v,bg,ba | clones...] layout. A zero ba variance
       // here would freeze ba in the EKF forever; the prior variance keeps it honest.
-      const int n_in = (int)cov_inject.rows(); // 12 (+ 6*n_clones when warm)
+      const int n_in = (int)cov_inject.rows(); // 12 (+ 6*n_clones when warm) + gravity(2)
       Eigen::MatrixXd cov_full = Eigen::MatrixXd::Zero(n_in + 3, n_in + 3);
       cov_full.topLeftCorner(12, 12) = cov_inject.topLeftCorner(12, 12);
       for (int j = 0; j < 3; j++)
@@ -1205,15 +1669,18 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
     }
   }
 
-  // GRAVITY DIRECTION GATE + CONDITIONAL RE-ALIGN
+  // GRAVITY DIRECTION GATE + SMOOTH RE-ALIGN
   // Reject if the optimized gravity is too far from +Z (the expected pole).
   // A flipped or badly tilted gravity will corrupt downstream attitude (especially PX4 NED).
-  // If tilt is moderate, re-align all states so gravity returns to +Z before injection.
+  // Re-align all accepted states so gravity returns to +Z before injection.
   {
     Eigen::Vector3d g_opt(var_gravity[0], var_gravity[1], var_gravity[2]);
-    Eigen::Vector3d g_expected(0.0, 0.0, params.gravity_mag);
-    double cos_angle = g_opt.dot(g_expected) / (g_opt.norm() * g_expected.norm());
-    double angle_rad = std::acos(std::min(1.0, std::max(-1.0, cos_angle)));
+    if (!gravity_export::finite(g_opt) || !gravity_export::finite(g_opt.norm()) || g_opt.norm() <= 1e-12) {
+      PRINT_WARNING(YELLOW "[init-d]: nonfinite or zero optimized gravity; rejecting initialization\n" RESET);
+      free_state_memory();
+      return false;
+    }
+    double angle_rad = std::atan2(g_opt.head<2>().norm(), g_opt.z());
     double angle_deg = angle_rad * 180.0 / M_PI;
 
     // Hard reject if gravity is more than the configured gate off — catches flipped/corrupted gravity
@@ -1226,66 +1693,75 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
       return false;
     }
 
-    // Conditional re-align: if tilt > 0.1°, rotate all states so gravity returns to +Z.
-    // This ensures downstream (propagator, PX4) sees a gravity-aligned world frame.
-    const double kRealignThresholdDeg = 0.1;
-    if (angle_deg > kRealignThresholdDeg) {
-      // Compute rotation from g_opt to g_expected using Rodrigues
-      Eigen::Vector3d g_opt_norm = g_opt.normalized();
-      Eigen::Vector3d g_exp_norm = g_expected.normalized();
-      Eigen::Vector3d axis = g_opt_norm.cross(g_exp_norm);
-      double axis_norm = axis.norm();
-      if (axis_norm > 1e-9) {
-        axis /= axis_norm;
-        // R_realign rotates g_opt to g_expected
-        Eigen::Matrix3d R_realign = Eigen::AngleAxisd(angle_rad, axis).toRotationMatrix();
-
-        // Carry the recovered-at-optimum covariance through this world-frame re-align via the
-        // closed-form similarity T = blkdiag(I, R_realign, R_realign, I, I): delta-theta is the
-        // body-frame (left-JPL) error, invariant under the right-multiply world rotation
-        // (R_new = R_old * R_realign^T); delta-p and delta-v are world vectors (-> R_realign); the
-        // biases are body-frame (-> I). O(1) and provably consistent with the rotated state.
-        if (cov_ok) {
-          // Closed-form similarity over [IMU(15) | clones(6 each)]. IMU: blkdiag(I,R,R,I,I) over
-          // [theta,p,v,bg,ba]. Each clone: blkdiag(I,R) over [theta,p] -- the orientation error is the
-          // body-frame (left-JPL) error, invariant under the right-multiply world rotation
-          // (R_new = R_old * R_realign^T); the clone position is a world vector -> R_realign. T_theta=I
-          // is validated by the realign-consistency NEES case. O(1) and consistent with the rotated state.
-          Eigen::MatrixXd Tre = Eigen::MatrixXd::Identity(cov_inject.rows(), cov_inject.cols());
-          Tre.block(3, 3, 3, 3) = R_realign; // IMU p
-          Tre.block(6, 6, 3, 3) = R_realign; // IMU v
-          if (warmstart) {
-            for (int c = 0; c < n_clones; ++c)
-              Tre.block(15 + 6 * c + 3, 15 + 6 * c + 3, 3, 3) = R_realign; // clone p
-          }
-          cov_inject = (Tre * cov_inject * Tre.transpose()).eval();
-        }
-
-        // Rotate all clone poses and velocities
-        for (auto &var_q : ceres_vars_ori) {
-          Eigen::Matrix3d R_old = ov_core::quat_2_Rot(Eigen::Map<Eigen::Vector4d>(var_q));
-          Eigen::Matrix3d R_new = R_old * R_realign.transpose(); // world frame rotation
-          Eigen::Vector4d q_new = ov_core::rot_2_quat(R_new);
-          for (int j = 0; j < 4; j++) var_q[j] = q_new(j);
-        }
-        for (auto &var_p : ceres_vars_pos) {
-          Eigen::Vector3d p_old = Eigen::Map<Eigen::Vector3d>(var_p);
-          Eigen::Vector3d p_new = R_realign * p_old;
-          for (int j = 0; j < 3; j++) var_p[j] = p_new(j);
-        }
-        for (auto &var_v : ceres_vars_vel) {
-          Eigen::Vector3d v_old = Eigen::Map<Eigen::Vector3d>(var_v);
-          Eigen::Vector3d v_new = R_realign * v_old;
-          for (int j = 0; j < 3; j++) var_v[j] = v_new(j);
-        }
-        for (auto &var_f : ceres_vars_feat) {
-          Eigen::Vector3d f_old = Eigen::Map<Eigen::Vector3d>(var_f);
-          Eigen::Vector3d f_new = R_realign * f_old;
-          for (int j = 0; j < 3; j++) var_f[j] = f_new(j);
-        }
-
-        PRINT_INFO("[init-d]: Re-aligned states by %.2f° to restore gravity to +Z\n", angle_deg);
+    // The filter uses a fixed +Z gravity direction. Align at every accepted tilt,
+    // including zero: uncertain fitted gravity still contributes to output covariance
+    // even when the nominal rotation is identity. A 0.1-degree deadband would both leave
+    // a deterministic acceleration error and introduce a discontinuous covariance map.
+    {
+      Eigen::Matrix3d R_realign;
+      if (!gravity_export::alignment_rotation(g_opt, R_realign)) {
+        PRINT_WARNING(YELLOW "[init-d]: undefined gravity alignment; rejecting initialization\n" RESET);
+        free_state_memory();
+        return false;
       }
+      // The applied rotation depends on the uncertain optimized gravity. A deterministic
+      // world rotation alone would omit its attitude/position/velocity uncertainty and all
+      // gravity cross terms. Apply the full output Jacobian BEFORE marginalizing gravity.
+      if (cov_ok) {
+        const Eigen::Matrix<double, 3, 2> gravity_basis = gravity_s2_param->PlusJacobian(var_gravity);
+        Eigen::Matrix<double, 3, 2> J_align;
+        if (!gravity_export::alignment_left_jacobian(g_opt, gravity_basis, R_realign, J_align)) {
+          PRINT_WARNING(YELLOW "[init-d]: gravity covariance output map failed...\n" RESET);
+          free_state_memory();
+          return false;
+        }
+        Eigen::MatrixXd Jout = Eigen::MatrixXd::Zero(output_cov_dim, output_cov_dim + 2);
+        Jout.leftCols(output_cov_dim).setIdentity();
+        const int newest_index = map_states.at(newest_cam_time);
+        gravity_export::pose_rows(Jout, 0,
+            ov_core::quat_2_Rot(Eigen::Map<const Eigen::Vector4d>(ceres_vars_ori[newest_index])),
+            Eigen::Map<const Eigen::Vector3d>(ceres_vars_pos[newest_index]), R_realign, J_align);
+        gravity_export::velocity_rows(Jout, 6,
+            Eigen::Map<const Eigen::Vector3d>(ceres_vars_vel[newest_index]), R_realign, J_align);
+        if (warmstart) {
+          int row = 15;
+          for (double time : export_pose_times) {
+            const int index = map_states.at(time);
+            gravity_export::pose_rows(Jout, row,
+                ov_core::quat_2_Rot(Eigen::Map<const Eigen::Vector4d>(ceres_vars_ori[index])),
+                Eigen::Map<const Eigen::Vector3d>(ceres_vars_pos[index]), R_realign, J_align);
+            row += 6;
+          }
+        }
+        cov_inject = (Jout * cov_inject * Jout.transpose()).eval();
+        if (considered) calibration_sensitivity = (Jout*calibration_sensitivity).eval();
+      }
+
+      // Rotate all clone poses and velocities
+      for (auto &var_q : ceres_vars_ori) {
+        Eigen::Matrix3d R_old = ov_core::quat_2_Rot(Eigen::Map<Eigen::Vector4d>(var_q));
+        Eigen::Matrix3d R_new = R_old * R_realign.transpose(); // world frame rotation
+        Eigen::Vector4d q_new = ov_core::rot_2_quat(R_new);
+        for (int j = 0; j < 4; j++) var_q[j] = q_new(j);
+      }
+      for (auto &var_p : ceres_vars_pos) {
+        Eigen::Vector3d p_old = Eigen::Map<Eigen::Vector3d>(var_p);
+        Eigen::Vector3d p_new = R_realign * p_old;
+        for (int j = 0; j < 3; j++) var_p[j] = p_new(j);
+      }
+      for (auto &var_v : ceres_vars_vel) {
+        Eigen::Vector3d v_old = Eigen::Map<Eigen::Vector3d>(var_v);
+        Eigen::Vector3d v_new = R_realign * v_old;
+        for (int j = 0; j < 3; j++) var_v[j] = v_new(j);
+      }
+      for (auto &var_f : ceres_vars_feat) {
+        Eigen::Vector3d f_old = Eigen::Map<Eigen::Vector3d>(var_f);
+        Eigen::Vector3d f_new = R_realign * f_old;
+        for (int j = 0; j < 3; j++) var_f[j] = f_new(j);
+      }
+
+      if (angle_deg > 0.1)
+        PRINT_INFO("[init-d]: Re-aligned states by %.2f° to restore gravity to +Z\n", angle_deg);
     }
 
     if (angle_deg > 5.0) {
@@ -1323,6 +1799,10 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
   auto rT6 = ov_core::prof_now();
 
   // Return if we have failed!
+  if (!valid_optimized_geometry()) {
+    free_state_memory();
+    return false;
+  }
   timestamp = newest_cam_time;
   if (params.init_dyn_mle_max_iter != 0 && summary.termination_type != ceres::CONVERGENCE) {
     PRINT_WARNING(YELLOW "[init-d]: opt failed: %s!\n" RESET, summary.message.c_str());
@@ -1350,6 +1830,22 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
     return state_imu;
   };
 
+  if (physical) {
+    for (auto &owner : physical_output.owners) {
+      const Eigen::VectorXd node = get_pose(owner.nominal_imu_time);
+      owner.pose_mean = node.head<7>();
+      owner.velocity_world = node.segment<3>(7);
+      // Endpoint angular rate uses the actual raw sample interpolation and this
+      // optimized node's raw biases. Historical velocity is never a secant.
+      Eigen::Vector3d wm, am;
+      if (!raw_sample_at(owner.nominal_imu_time,wm,am)) { free_state_memory(); return false; }
+      Eigen::Vector3d corrected_accel;
+      if (!imu_model.correct(wm, am, node.segment<3>(10), node.segment<3>(13), owner.omega_body, corrected_accel)) {
+        free_state_memory(); return false;
+      }
+    }
+  }
+
   // Our most recent state is the IMU state!
   assert(map_states.find(newest_cam_time) != map_states.end());
   if (_imu == nullptr) {
@@ -1361,6 +1857,7 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
 
   // Append our IMU clones (includes most recent)
   for (auto const &statepair : map_states) {
+    if (physical) break; // Physical ownership is returned separately, never as retimed raw keys.
     Eigen::VectorXd pose = get_pose(statepair.first);
     if (_clones_IMU.find(statepair.first) == _clones_IMU.end()) {
       auto _pose = std::make_shared<ov_type::PoseJPL>();
@@ -1375,6 +1872,7 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
 
   // Append features as SLAM features!
   for (auto const &featpair : map_features) {
+    if (physical) break;
     Eigen::Vector3d feature;
     feature << ceres_vars_feat[featpair.second][0], ceres_vars_feat[featpair.second][1], ceres_vars_feat[featpair.second][2];
     if (_features_SLAM.find(featpair.first) == _features_SLAM.end()) {
@@ -1390,6 +1888,12 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
       _features_SLAM.at(featpair.first)->set_from_xyz(feature, false);
       _features_SLAM.at(featpair.first)->set_from_xyz(feature, true);
     }
+  }
+
+  if (!physical && camera_clock.unequal_offsets) {
+    _clones_IMU.clear();
+    _features_SLAM.clear();
+    PRINT_INFO("[init-d]: unequal camera offsets: returning reference-clock IMU marginal; cold clone window\n");
   }
 
   // If we optimized calibration, we should also save it to our state
@@ -1547,11 +2051,31 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
       sd.segment<3>(o).setConstant(std::sqrt(params.init_dyn_inflation_orientation));
       sd.segment<3>(o + 3).setConstant(std::sqrt(params.init_dyn_inflation_position));
     }
-    covariance = (sd.asDiagonal() * covariance * sd.asDiagonal()).eval();
+    if (physical) physical_output.pose_error_scale = sd.head<6>();
+    if (considered) {
+      Eigen::MatrixXd direct = Eigen::MatrixXd::Zero(covariance.rows(),consider_dimension);
+      for (size_t i = 0; i < physical_output.owners.size(); ++i) {
+        const auto &owner = physical_output.owners[i];
+        const auto clock = clock_columns.find(owner.camera_id);
+        if (clock != clock_columns.end()) {
+          direct.block<3,1>(15+6*i,clock->second) = owner.omega_body;
+          direct.block<3,1>(18+6*i,clock->second) = owner.velocity_world;
+        }
+      }
+      Eigen::MatrixXd joint;
+      if (!conditional_warm::assemble(covariance,calibration_sensitivity,
+              Eigen::MatrixXd::Identity(covariance.rows(),covariance.rows()),direct,
+              physical_request->calibration_covariance,sd,joint)) {
+        PRINT_WARNING(YELLOW "[init-d]: conditional camera covariance assembly failed\n" RESET);
+        free_state_memory(); return false;
+      }
+      covariance = std::move(joint);
+    } else covariance = (sd.asDiagonal() * covariance * sd.asDiagonal()).eval();
   }
 
   // we are done >:D
   covariance = 0.5 * (covariance + covariance.transpose());
+  if (considered) covariance.bottomRightCorner(consider_dimension,consider_dimension) = physical_request->calibration_covariance;
   Eigen::Vector3d sigmas_vel = covariance.block(6, 6, 3, 3).diagonal().transpose().cwiseSqrt();
   Eigen::Vector3d sigmas_bg = covariance.block(9, 9, 3, 3).diagonal().transpose().cwiseSqrt();
   Eigen::Vector3d sigmas_ba = covariance.block(12, 12, 3, 3).diagonal().transpose().cwiseSqrt();
@@ -1564,6 +2088,16 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
   x.block(4, 0, 3, 1).setZero();
   _imu->set_value(x);
   _imu->set_fej(x);
+
+  if (physical) {
+    physical_output.imu_mean = _imu->value();
+    physical_output.joint_covariance = covariance;
+    // Legacy out arguments stay an unambiguous IMU marginal. Only the staged
+    // physical result owns the physical window and its factor receipt.
+    covariance = covariance.topLeftCorner(15, 15).eval();
+    timestamp = physical_output.reference_clock_label;
+    *physical_result = std::move(physical_output);
+  }
 
   // Debug timing information about how long it took to initialize!!
   auto rT7 = ov_core::prof_now();

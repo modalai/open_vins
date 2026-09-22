@@ -25,6 +25,7 @@
 
 #include <Eigen/Eigen>
 #include <iostream>
+#include <map>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -112,8 +113,8 @@ struct InertialInitializerOptions {
   double init_dyn_inflation_bias_accel = 100.0;
 
   /// Warm-start injection: if true, the dynamic initializer returns the FULL joint covariance over the
-  /// IMU state + all window clones (landmark-marginalized) and the EKF is seeded with those clones, so
-  /// the filter can update immediately instead of cold-starting and re-collecting a fresh window. The
+  /// IMU state + all window clones (landmark-marginalized) and the EKF is seeded with those clones.
+  /// Only unused observations may update that posterior: assimilated init pixels are consumed. The
   /// joint covariance, the gravity re-align similarity transform, and the congruence inflation are all
   /// extended consistently to the clone blocks. Off => legacy IMU-only (15x15) seed, bit-for-bit.
   bool init_warmstart_inject = false;
@@ -141,10 +142,9 @@ struct InertialInitializerOptions {
   /// init_gravity_max_angle (legacy coupled behavior).
   double init_static_gravity_max_angle = 5.0;
 
-  /// Weak prior sigma (m/s^2) pulling the ceres-free dynamic-init S2 gravity toward its +Z seed. Fights
-  /// the gravity<->accel-bias ambiguity and, critically, the flipped-gravity basin: at sigma~0.5 (~3 deg)
-  /// the post-solve flip gate goes 42/50 -> 49/50 in the NEES gold standard with negligible accuracy
-  /// cost (grav err 2.62 vs 2.64 deg). <= 0 disables it. Only used on the ceres-free (S2) dynamic path.
+  /// Weak regularizer sigma (m/s^2) pulling ceres-free dynamic-init S2 gravity toward its data-derived
+  /// +Z seed. Conditions the gravity/accel-bias ambiguity; this is not an independent gravity
+  /// measurement or a guarantee of the correct solution basin. <= 0 disables the regularizer.
   double init_dyn_grav_prior_sigma = 0.5;
 
   /// Post-solve gravity reject gate (deg) for the ceres-free dynamic init: reject if the optimized
@@ -349,6 +349,18 @@ struct InertialInitializerOptions {
   /// Gravity magnitude in the global frame (i.e. should be 9.81 typically)
   double gravity_mag = 9.81;
 
+  /// Fixed calibration supplied by VioManager from its loaded state before construction.
+  /// Static initialization uses a_I = init_imu_accel_map * (a_raw - ba) and
+  /// w_I = R_GYROtoIMU * Dw * (w_raw - bg - init_imu_tg * a_I).
+  /// Biases and all buffered measurements remain in raw sensor axes. These are
+  /// derived values, not additional YAML settings or online calibration states.
+  /// Dynamic CPI applies the fixed 6D sensor map internally with the complete
+  /// white/RW covariance, then pulls all bias Jacobians and covariance back to
+  /// raw coordinates. Never pre-correct the shared input samples.
+  Eigen::Matrix3d init_imu_accel_map = Eigen::Matrix3d::Identity();
+  Eigen::Matrix3d init_imu_gyro_map = Eigen::Matrix3d::Identity(); ///< R_GYROtoIMU * Dw
+  Eigen::Matrix3d init_imu_tg = Eigen::Matrix3d::Zero();
+
   /// Number of distinct cameras that we will observe features in
   int num_cameras = 1;
 
@@ -358,8 +370,13 @@ struct InertialInitializerOptions {
   /// Will half the resolution all tracking image (aruco will be 1/4 instead of halved if dowsize_aruoc also enabled)
   bool downsample_cameras = false;
 
-  /// Time offset between camera and IMU (t_imu = t_cam + t_off)
+  /// Reference camera time offset (t_imu = t_reference + t_off).
   double calib_camimu_dt = 0.0;
+
+  /// Fixed per-camera offsets (t_imu = t_cam_i + td_i). Missing entries use
+  /// calib_camimu_dt. Dynamic initialization converts private feature copies
+  /// to the reference clock; raw tracker/database timestamps stay unchanged.
+  std::map<size_t, double> camera_imu_dt;
 
   /// Map between camid and camera intrinsics (fx, fy, cx, cy, d1...d4, cam_w, cam_h)
   std::unordered_map<size_t, std::shared_ptr<ov_core::CamBase>> camera_intrinsics;
@@ -379,13 +396,16 @@ struct InertialInitializerOptions {
       parser->parse_config("max_cameras", num_cameras); // might be redundant
       parser->parse_config("use_stereo", use_stereo);
       parser->parse_config("downsample_cameras", downsample_cameras);
+      camera_imu_dt.clear();
       for (int i = 0; i < num_cameras; i++) {
 
-        // Time offset (use the first one)
-        // TODO: support multiple time offsets between cameras
-        if (i == 0) {
-          parser->parse_external("relative_config_imucam", "cam" + std::to_string(i), "timeshift_cam_imu", calib_camimu_dt, false);
-        }
+        // Standalone initialization uses camera 0 as the reference. VioManager
+        // replaces both the map and reference scalar from its loaded state.
+        double camera_td = calib_camimu_dt;
+        parser->parse_external("relative_config_imucam", "cam" + std::to_string(i), "timeshift_cam_imu", camera_td, false);
+        if (i == 0)
+          calib_camimu_dt = camera_td;
+        camera_imu_dt.emplace(i, camera_td);
 
         // Distortion model
         std::string dist_model = "radtan";
@@ -445,6 +465,7 @@ struct InertialInitializerOptions {
     PRINT_DEBUG("  - calib_camimu_dt: %.4f\n", calib_camimu_dt);
     for (int n = 0; n < num_cameras; n++) {
       std::stringstream ss;
+      ss << "cam_" << n << "_imu_dt:" << (camera_imu_dt.count(n) ? camera_imu_dt.at(n) : calib_camimu_dt) << std::endl;
       ss << "cam_" << n << "_fisheye:" << (std::dynamic_pointer_cast<ov_core::CamEqui>(camera_intrinsics.at(n)) != nullptr) << std::endl;
       ss << "cam_" << n << "_wh:" << std::endl << camera_intrinsics.at(n)->w() << " x " << camera_intrinsics.at(n)->h() << std::endl;
       ss << "cam_" << n << "_intrinsic(0:3):" << std::endl

@@ -58,6 +58,12 @@ public:
     set_value(_value + dx);
   }
 
+  void propose_update(const Eigen::Ref<const Eigen::VectorXd> &dx,
+                      Eigen::Ref<Eigen::VectorXd> proposed) const override {
+    assert(dx.rows() == _size && proposed.rows() == _value.rows());
+    proposed = _value + dx;
+  }
+
   /**
    * @brief Performs all the cloning
    */

@@ -144,7 +144,7 @@ public:
   Eigen::Vector2f distort_f(const Eigen::Vector2f &uv_norm) override {
 
     // Get our camera parameters
-    Eigen::MatrixXd cam_d = camera_values;
+    const auto &cam_d = camera_values;
 
     // Calculate distorted coordinates for fisheye
     double r = std::sqrt(uv_norm(0) * uv_norm(0) + uv_norm(1) * uv_norm(1));
@@ -165,6 +165,13 @@ public:
     return uv_dist;
   }
 
+  Eigen::Vector2d distort_d(const Eigen::Vector2d &uv_norm) override {
+    double scale;
+    radial_terms(uv_norm.squaredNorm(), scale);
+    return Eigen::Vector2d(camera_values(0) * uv_norm(0) * scale + camera_values(2),
+                           camera_values(1) * uv_norm(1) * scale + camera_values(3));
+  }
+
   /**
    * @brief Computes the derivative of raw distorted to normalized coordinate.
    * @param uv_norm Normalized coordinates we wish to distort
@@ -172,82 +179,59 @@ public:
    * @param H_dz_dzeta Derivative of measurement z in respect to intrinic parameters
    */
   void compute_distort_jacobian(const Eigen::Vector2d &uv_norm, Eigen::MatrixXd &H_dz_dzn, Eigen::MatrixXd &H_dz_dzeta) override {
+    const auto &cam_d = camera_values;
+    double scale, derivative_over_r, coefficients[4];
+    radial_terms(uv_norm.squaredNorm(), scale, &derivative_over_r, coefficients);
+    const double x = uv_norm(0), y = uv_norm(1);
+    H_dz_dzn.resize(2, 2);
+    H_dz_dzn(0, 0) = cam_d(0) * (scale + x * x * derivative_over_r);
+    H_dz_dzn(0, 1) = cam_d(0) * x * y * derivative_over_r;
+    H_dz_dzn(1, 0) = cam_d(1) * x * y * derivative_over_r;
+    H_dz_dzn(1, 1) = cam_d(1) * (scale + y * y * derivative_over_r);
+    H_dz_dzeta.setZero(2, 8);
+    H_dz_dzeta(0, 0) = x * scale;
+    H_dz_dzeta(1, 1) = y * scale;
+    H_dz_dzeta(0, 2) = H_dz_dzeta(1, 3) = 1.0;
+    for (int k = 0; k < 4; ++k) {
+      H_dz_dzeta(0, 4 + k) = cam_d(0) * x * coefficients[k];
+      H_dz_dzeta(1, 4 + k) = cam_d(1) * y * coefficients[k];
+    }
+  }
 
-    // Get our camera parameters
-    Eigen::MatrixXd cam_d = camera_values;
-
-    // Calculate distorted coordinates for fisheye
-    double r = std::sqrt(uv_norm(0) * uv_norm(0) + uv_norm(1) * uv_norm(1));
-    // The forward model uses cdist=1 at the optical center. Its derivative is
-    // therefore the pinhole limit, not theta_d/r with an artificial inv_r=1
-    // (which incorrectly made centered features contribute zero pose information).
-    if (r <= 1e-8) {
-      H_dz_dzn = Eigen::Matrix2d::Zero();
-      H_dz_dzn(0, 0) = cam_d(0);
-      H_dz_dzn(1, 1) = cam_d(1);
-      H_dz_dzeta = Eigen::MatrixXd::Zero(2, 8);
-      H_dz_dzeta(0, 0) = uv_norm(0);
-      H_dz_dzeta(1, 1) = uv_norm(1);
-      H_dz_dzeta(0, 2) = H_dz_dzeta(1, 3) = 1;
+private:
+  // theta_d/r and (d/dr(theta_d/r))/r, with a common analytic center limit.
+  // The series is in s=r^2 and retains every intrinsic coefficient. At the
+  // cutoff its omitted O(r^10) term is far below double precision.
+  void radial_terms(double s, double &scale, double *derivative_over_r = nullptr, double *coefficients = nullptr) const {
+    const auto &k = camera_values;
+    if (s < 1e-8) {
+      const double c2 = k(4) - 1.0 / 3.0;
+      const double c4 = k(5) - k(4) + 1.0 / 5.0;
+      const double c6 = k(6) - (5.0 / 3.0) * k(5) + (14.0 / 15.0) * k(4) - 1.0 / 7.0;
+      const double c8 = k(7) - (7.0 / 3.0) * k(6) + (19.0 / 9.0) * k(5) - (818.0 / 945.0) * k(4) + 1.0 / 9.0;
+      scale = 1.0 + s * (c2 + s * (c4 + s * (c6 + s * c8)));
+      if (derivative_over_r)
+        *derivative_over_r = 2.0 * c2 + s * (4.0 * c4 + s * (6.0 * c6 + s * 8.0 * c8));
+      if (coefficients) {
+        coefficients[0] = s * (1.0 + s * (-1.0 + s * (14.0 / 15.0 - s * (818.0 / 945.0))));
+        coefficients[1] = s * s * (1.0 + s * (-5.0 / 3.0 + s * (19.0 / 9.0)));
+        coefficients[2] = s * s * s * (1.0 - s * (7.0 / 3.0));
+        coefficients[3] = s * s * s * s;
+      }
       return;
     }
-    double theta = std::atan(r);
-    double theta_d = theta + cam_d(4) * std::pow(theta, 3) + cam_d(5) * std::pow(theta, 5) + cam_d(6) * std::pow(theta, 7) +
-                     cam_d(7) * std::pow(theta, 9);
-
-    // Handle when r is small (meaning our xy is near the camera center)
-    double inv_r = (r > 1e-8) ? 1.0 / r : 1.0;
-    double cdist = (r > 1e-8) ? theta_d * inv_r : 1.0;
-
-    // Jacobian of distorted pixel to "normalized" pixel
-    Eigen::Matrix<double, 2, 2> duv_dxy = Eigen::Matrix<double, 2, 2>::Zero();
-    duv_dxy << cam_d(0), 0, 0, cam_d(1);
-
-    // Jacobian of "normalized" pixel to normalized pixel
-    Eigen::Matrix<double, 2, 2> dxy_dxyn = Eigen::Matrix<double, 2, 2>::Zero();
-    dxy_dxyn << theta_d * inv_r, 0, 0, theta_d * inv_r;
-
-    // Jacobian of "normalized" pixel to r
-    Eigen::Matrix<double, 2, 1> dxy_dr = Eigen::Matrix<double, 2, 1>::Zero();
-    dxy_dr << -uv_norm(0) * theta_d * inv_r * inv_r, -uv_norm(1) * theta_d * inv_r * inv_r;
-
-    // Jacobian of r pixel to normalized xy
-    Eigen::Matrix<double, 1, 2> dr_dxyn = Eigen::Matrix<double, 1, 2>::Zero();
-    dr_dxyn << uv_norm(0) * inv_r, uv_norm(1) * inv_r;
-
-    // Jacobian of "normalized" pixel to theta_d
-    Eigen::Matrix<double, 2, 1> dxy_dthd = Eigen::Matrix<double, 2, 1>::Zero();
-    dxy_dthd << uv_norm(0) * inv_r, uv_norm(1) * inv_r;
-
-    // Jacobian of theta_d to theta
-    double dthd_dth = 1 + 3 * cam_d(4) * std::pow(theta, 2) + 5 * cam_d(5) * std::pow(theta, 4) + 7 * cam_d(6) * std::pow(theta, 6) +
-                      9 * cam_d(7) * std::pow(theta, 8);
-
-    // Jacobian of theta to r
-    double dth_dr = 1 / (r * r + 1);
-
-    // Total Jacobian wrt normalized pixel coordinates
-    H_dz_dzn = Eigen::MatrixXd::Zero(2, 2);
-    H_dz_dzn = duv_dxy * (dxy_dxyn + (dxy_dr + dxy_dthd * dthd_dth * dth_dr) * dr_dxyn);
-
-    // Calculate distorted coordinates for fisheye
-    double x1 = uv_norm(0) * cdist;
-    double y1 = uv_norm(1) * cdist;
-
-    // Compute the Jacobian in respect to the intrinsics
-    H_dz_dzeta = Eigen::MatrixXd::Zero(2, 8);
-    H_dz_dzeta(0, 0) = x1;
-    H_dz_dzeta(0, 2) = 1;
-    H_dz_dzeta(0, 4) = cam_d(0) * uv_norm(0) * inv_r * std::pow(theta, 3);
-    H_dz_dzeta(0, 5) = cam_d(0) * uv_norm(0) * inv_r * std::pow(theta, 5);
-    H_dz_dzeta(0, 6) = cam_d(0) * uv_norm(0) * inv_r * std::pow(theta, 7);
-    H_dz_dzeta(0, 7) = cam_d(0) * uv_norm(0) * inv_r * std::pow(theta, 9);
-    H_dz_dzeta(1, 1) = y1;
-    H_dz_dzeta(1, 3) = 1;
-    H_dz_dzeta(1, 4) = cam_d(1) * uv_norm(1) * inv_r * std::pow(theta, 3);
-    H_dz_dzeta(1, 5) = cam_d(1) * uv_norm(1) * inv_r * std::pow(theta, 5);
-    H_dz_dzeta(1, 6) = cam_d(1) * uv_norm(1) * inv_r * std::pow(theta, 7);
-    H_dz_dzeta(1, 7) = cam_d(1) * uv_norm(1) * inv_r * std::pow(theta, 9);
+    const double r = std::sqrt(s), theta = std::atan(r), t = theta * theta;
+    const double theta_over_r = theta / r;
+    scale = theta_over_r * (1.0 + t * (k(4) + t * (k(5) + t * (k(6) + t * k(7)))));
+    if (derivative_over_r) {
+      const double dtheta_d = 1.0 + t * (3.0 * k(4) + t * (5.0 * k(5) + t * (7.0 * k(6) + t * 9.0 * k(7))));
+      *derivative_over_r = (dtheta_d / (1.0 + s) - scale) / s;
+    }
+    if (coefficients) {
+      coefficients[0] = theta_over_r * t;
+      for (int i = 1; i < 4; ++i)
+        coefficients[i] = coefficients[i - 1] * t;
+    }
   }
 };
 

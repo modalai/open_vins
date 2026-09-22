@@ -21,6 +21,7 @@
  */
 
 #include "Factor_ImageReprojCalib.h"
+#include "QuaternionTangent.h"
 
 #include "ceres_free/DistortDouble.h"
 #include "utils/quat_ops.h"
@@ -107,8 +108,7 @@ bool Factor_ImageReprojCalib::Evaluate(double const *const *parameters, double *
     // Jacobian wrt q_GtoIi
     if (jacobians[0]) {
       Eigen::Map<Eigen::Matrix<double, 2, 4, Eigen::RowMajor>> jacobian(jacobians[0]);
-      jacobian.block(0, 0, 2, 3) = H_dz_dpfc * R_ItoC * ov_core::skew_x(p_FinIi);
-      jacobian.block(0, 3, 2, 1).setZero();
+      jacobian = H_dz_dpfc * R_ItoC * ov_core::skew_x(p_FinIi) * jpl_tangent_lift(q_GtoIi);
     }
 
     // Jacobian wrt p_IiinG
@@ -126,8 +126,7 @@ bool Factor_ImageReprojCalib::Evaluate(double const *const *parameters, double *
     // Jacbian wrt IMU-camera transform q_ItoC
     if (jacobians[3]) {
       Eigen::Map<Eigen::Matrix<double, 2, 4, Eigen::RowMajor>> jacobian(jacobians[3]);
-      jacobian.block(0, 0, 2, 3) = H_dz_dpfc * ov_core::skew_x(R_ItoC * p_FinIi);
-      jacobian.block(0, 3, 2, 1).setZero();
+      jacobian = H_dz_dpfc * ov_core::skew_x(R_ItoC * p_FinIi) * jpl_tangent_lift(q_ItoC);
     }
 
     // Jacbian wrt IMU-camera transform p_IinC

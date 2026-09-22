@@ -22,6 +22,9 @@
 
 #include "StaticInitializer.h"
 
+#include <cstdint>
+#include <cstring>
+
 #include "utils/helper.h"
 
 #include "feat/FeatureHelper.h"
@@ -35,11 +38,42 @@ using namespace ov_core;
 using namespace ov_type;
 using namespace ov_init;
 
+namespace {
+// This translation unit is built with -ffast-math; floating-point predicates
+// can be folded away, so inspect the representation before doing arithmetic.
+bool finite_scalar(double value) {
+  std::uint64_t bits;
+  static_assert(sizeof(bits) == sizeof(value), "64-bit IEEE double required");
+  std::memcpy(&bits, &value, sizeof(bits));
+  return (bits & UINT64_C(0x7ff0000000000000)) != UINT64_C(0x7ff0000000000000);
+}
+template <typename Derived> bool finite_matrix(const Eigen::MatrixBase<Derived> &value) {
+  for (int c = 0; c < value.cols(); ++c)
+    for (int r = 0; r < value.rows(); ++r)
+      if (!finite_scalar(value(r, c))) return false;
+  return true;
+}
+} // namespace
+
 bool StaticInitializer::initialize(double &timestamp, Eigen::MatrixXd &covariance, std::vector<std::shared_ptr<Type>> &order,
                                    std::shared_ptr<IMU> t_imu, bool wait_for_jerk) {
 
   // Return if we don't have any measurements
   if (imu_data->size() < 2) {
+    return false;
+  }
+
+  const Eigen::Matrix3d &A = params.init_imu_accel_map;
+  const Eigen::Matrix3d &Tg = params.init_imu_tg;
+  if (!finite_matrix(A) || !finite_matrix(Tg) || !finite_scalar(params.gravity_mag) || params.gravity_mag <= 0.0) {
+    PRINT_WARNING(YELLOW "[init-s]: invalid fixed IMU calibration or gravity magnitude\n" RESET);
+    return false;
+  }
+  const bool identity_accel = (A.array() == Eigen::Matrix3d::Identity().array()).all();
+  const bool zero_tg = (Tg.array() == 0.0).all();
+  Eigen::FullPivLU<Eigen::Matrix3d> accel_lu(A);
+  if (!accel_lu.isInvertible() || !(A.determinant() > 0.0) || !(accel_lu.rcond() > 1e-12)) {
+    PRINT_WARNING(YELLOW "[init-s]: singular or reflected fixed accelerometer calibration\n" RESET);
     return false;
   }
 
@@ -56,6 +90,7 @@ bool StaticInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarianc
   // First lets collect a window of IMU readings from the newest measurement to the oldest
   std::vector<ImuData> window_1to0, window_2to1;
   for (const ImuData &data : *imu_data) {
+    if (!finite_scalar(data.timestamp) || !finite_matrix(data.am) || !finite_matrix(data.wm)) return false;
     if (data.timestamp > newesttime - 0.5 * params.init_window_time && data.timestamp <= newesttime - 0.0 * params.init_window_time) {
       window_1to0.push_back(data);
     }
@@ -78,7 +113,12 @@ bool StaticInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarianc
   a_avg_1to0 /= (int)window_1to0.size();
   double a_var_1to0 = 0;
   for (const ImuData &data : window_1to0) {
-    a_var_1to0 += (data.am - a_avg_1to0).dot(data.am - a_avg_1to0);
+    if (identity_accel) {
+      a_var_1to0 += (data.am - a_avg_1to0).dot(data.am - a_avg_1to0);
+    } else {
+      const Eigen::Vector3d residual = A * (data.am - a_avg_1to0);
+      a_var_1to0 += residual.dot(residual);
+    }
   }
   a_var_1to0 = std::sqrt(a_var_1to0 / ((int)window_1to0.size() - 1));
 
@@ -93,9 +133,16 @@ bool StaticInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarianc
   w_avg_2to1 = w_avg_2to1 / window_2to1.size();
   double a_var_2to1 = 0;
   for (const ImuData &data : window_2to1) {
-    a_var_2to1 += (data.am - a_avg_2to1).dot(data.am - a_avg_2to1);
+    if (identity_accel) {
+      a_var_2to1 += (data.am - a_avg_2to1).dot(data.am - a_avg_2to1);
+    } else {
+      const Eigen::Vector3d residual = A * (data.am - a_avg_2to1);
+      a_var_2to1 += residual.dot(residual);
+    }
   }
   a_var_2to1 = std::sqrt(a_var_2to1 / ((int)window_2to1.size() - 1));
+  if (!finite_matrix(a_avg_2to1) || !finite_matrix(w_avg_2to1) ||
+      !finite_scalar(a_var_1to0) || !finite_scalar(a_var_2to1)) return false;
   PRINT_DEBUG(YELLOW "[init-s]: IMU excitation stats: %.3f,%.3f\n" RESET, a_var_2to1, a_var_1to0);
 
   // If it is below the threshold and we want to wait till we detect a jerk
@@ -119,37 +166,50 @@ bool StaticInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarianc
     return false;
   }
 
-  // Check if gravity is pointing in an acceptable direction (prevents upside-down initialization)
-  // The accelerometer measures -gravity when stationary, so a_avg_2to1 should be approximately [0,0,+g] for upright
-  // This means the IMU's Z-axis points up (opposite to gravity direction)
+  // Check gravity in the corrected IMU frame. The legacy mounting reference is
+  // raw -Z; transport it with A too so a pure body-gauge rotation cannot change
+  // this acceptance decision. The angle and stationarity thresholds are unchanged.
   // Static-specific gravity gate. The static initializer assumes a near-level, stationary platform, so
   // it must stay tight even when the dynamic S2 path is allowed to (re)init at any attitude. Use the
   // dedicated init_static_gravity_max_angle when set (>=0), else fall back to init_gravity_max_angle
   // (legacy coupled behavior). See InertialInitializerOptions.h.
   double static_grav_max_angle =
       (params.init_static_gravity_max_angle >= 0.0) ? params.init_static_gravity_max_angle : params.init_gravity_max_angle;
-  Eigen::Vector3d expected_gravity_dir(0, 0, -1); // Expected: gravity points in -Z direction in IMU frame
-  if (!InitializerHelper::check_gravity_direction(a_avg_2to1, expected_gravity_dir, static_grav_max_angle)) {
-    double angle_deg = std::acos(std::max(-1.0, std::min(1.0, (a_avg_2to1.normalized()).dot(expected_gravity_dir.normalized())))) * 180.0 / M_PI;
+  Eigen::Vector3d a_corrected = a_avg_2to1;
+  Eigen::Vector3d expected_gravity_dir(0, 0, -1);
+  if (!identity_accel) {
+    a_corrected = A * a_avg_2to1;
+    expected_gravity_dir = (A * expected_gravity_dir).eval();
+  }
+  if (!finite_matrix(a_corrected) || !finite_scalar(a_corrected.norm()) || !(a_corrected.norm() > 1e-12) ||
+      !finite_matrix(expected_gravity_dir) || !finite_scalar(expected_gravity_dir.norm()) ||
+      !(expected_gravity_dir.norm() > 1e-12)) return false;
+  if (!InitializerHelper::check_gravity_direction(a_corrected, expected_gravity_dir, static_grav_max_angle)) {
+    double angle_deg = std::acos(std::max(-1.0, std::min(1.0, (a_corrected.normalized()).dot(expected_gravity_dir.normalized())))) * 180.0 / M_PI;
     PRINT_WARNING(YELLOW "[init-s]: gravity direction check failed! tilt %.1f deg > static max %.1f deg -- static init "
                          "denied; awaiting near-level attitude or enough motion for dynamic init\n" RESET,
                   angle_deg, static_grav_max_angle);
     PRINT_WARNING(YELLOW "[init-s]: measured gravity direction: [%.3f, %.3f, %.3f]\n" RESET,
-                  a_avg_2to1(0) / a_avg_2to1.norm(), a_avg_2to1(1) / a_avg_2to1.norm(), a_avg_2to1(2) / a_avg_2to1.norm());
+                  a_corrected(0) / a_corrected.norm(), a_corrected(1) / a_corrected.norm(), a_corrected(2) / a_corrected.norm());
     return false;
   }
 
   // Get rotation with z axis aligned with -g (z_in_G=0,0,1)
-  Eigen::Vector3d z_axis = a_avg_2to1 / a_avg_2to1.norm();
+  Eigen::Vector3d z_axis = a_corrected / a_corrected.norm();
   Eigen::Matrix3d Ro;
   InitializerHelper::gram_schmidt(z_axis, Ro);
   Eigen::Vector4d q_GtoI = rot_2_quat(Ro);
 
-  // Set our biases equal to our noise (subtract our gravity from accelerometer bias)
+  // Solve the calibrated stationary equations while keeping biases in the raw
+  // sensor axes used by propagation: A*(a-ba)=R*g and w-bg-Tg*(R*g)=0.
   Eigen::Vector3d gravity_inG;
   gravity_inG << 0.0, 0.0, params.gravity_mag;
   Eigen::Vector3d bg = w_avg_2to1;
   Eigen::Vector3d ba = a_avg_2to1 - quat_2_Rot(q_GtoI) * gravity_inG;
+  const Eigen::Vector3d force_inI = quat_2_Rot(q_GtoI) * gravity_inG;
+  if (!identity_accel) ba = a_avg_2to1 - accel_lu.solve(force_inI);
+  if (!zero_tg) bg -= Tg * force_inI;
+  if (!finite_matrix(q_GtoI) || !finite_matrix(bg) || !finite_matrix(ba)) return false;
 
   // Set our state variables
   timestamp = window_2to1.at(window_2to1.size() - 1).timestamp;

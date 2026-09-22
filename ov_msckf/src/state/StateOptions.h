@@ -25,6 +25,8 @@
 
 #include <map>
 
+#include <limits>
+
 #include "types/LandmarkRepresentation.h"
 #include "utils/opencv_yaml_parse.h"
 #include "utils/print.h"
@@ -76,6 +78,10 @@ struct StateOptions {
   /// Analytic IMU-bias columns from the preintegration bridge (see VioManagerOptions)
   bool epoch_bridge_bias_cols = true;
 
+  /// Retain a stochastic pose at each camera's physical exposure time. Raw
+  /// observation keys stay camera-owned. Currently global-shutter only.
+  bool physical_camera_clones = false;
+
   /// Rolling-shutter row-anchor convention: which image row the frame stamp refers to. Row v
   /// samples at stamp + (v/h - rs_row_anchor) * readout. Parsed from "rs_convention":
   ///   top    (anchor 0.0) -- stamp is the raw HAL3 SOF (top row, start of readout). The
@@ -88,7 +94,8 @@ struct StateOptions {
   /// cannot disagree.
   double rs_row_anchor = 0.5;
 
-  /// Freeze dt/readout Jacobian columns while the window motion is degenerate for temporal
+  /// Freeze dt/readout mean-gain rows while retaining their uncertainty and full measurement
+  /// Jacobians (Schmidt update) when the window motion is degenerate for temporal
   /// calibration (MVIS degenerate motions: static / constant velocity / slow pure rotation).
   /// Opt-in (default off): rigs enable it explicitly in their estimator config.
   bool dt_calib_gate = false;
@@ -111,8 +118,24 @@ struct StateOptions {
   /// What model our IMU intrinsics are
   ImuModel imu_model = ImuModel::KALIBR;
 
-  /// Max clone size of sliding window
+  /// Configured per-view track graduation length and legacy clone-window size.
   int max_clone_size = 11;
+
+  /// Resolve the total pose capacity once, without changing max_clone_size.
+  /// Independent frame cloning needs one window per camera. Synchronized and
+  /// single-camera configurations retain the configured capacity.
+  bool configure_clone_policy(bool async_frame_clones, bool synchronized_cameras) {
+    if (max_clone_size < 1 || num_cameras < 1)
+      return false;
+    const int multiplier = physical_camera_clones || (async_frame_clones && !synchronized_cameras) ? num_cameras : 1;
+    if (max_clone_size > std::numeric_limits<int>::max() / multiplier)
+      return false;
+    pose_clone_capacity = max_clone_size * multiplier;
+    return true;
+  }
+
+  /// Direct State users retain legacy behavior until a manager resolves policy.
+  int max_pose_clones() const { return pose_clone_capacity > 0 ? pose_clone_capacity : max_clone_size; }
 
   /// Max number of estimated SLAM features
   int max_slam_features = 25;
@@ -254,6 +277,9 @@ struct StateOptions {
     PRINT_DEBUG("  - feat_rep_slam: %s\n", ov_type::LandmarkRepresentation::as_string(feat_rep_slam).c_str());
     PRINT_DEBUG("  - feat_rep_aruco: %s\n", ov_type::LandmarkRepresentation::as_string(feat_rep_aruco).c_str());
   }
+
+private:
+  int pose_clone_capacity = 0;
 };
 
 } // namespace ov_msckf

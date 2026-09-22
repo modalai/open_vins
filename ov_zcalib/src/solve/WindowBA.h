@@ -221,7 +221,7 @@ struct WindowSolveReport {
   bool ok = false;
   double cost_final = 0.0;
   int iterations = 0;
-  Eigen::MatrixXd Lambda; ///< reduced information on the free calib blocks
+  Eigen::MatrixXd Lambda; ///< reduced information on free calib blocks, then optional boundary biases
   Eigen::VectorXd gred;   ///< matching reduced gradient
   // wall-clock split of this call (solver-time program instrumentation)
   double t_preint = 0.0, t_inner = 0.0, t_export = 0.0;
@@ -244,12 +244,12 @@ struct WindowSolveReport {
   double export_min_pivot = 0.0;
   int export_nuis_dim = 0;
   int export_clamped = 0;
-  /// Local dim of the calibration free-block layout THIS call solved under
+  /// Local dim of the exported free-block layout THIS call solved under
   /// (set on every successful call, export or eval-only). The fusion's
   /// dimension-consistency checks read this instead of Lambda.rows():
   /// eval-only reports carry no Lambda (export-on-accept), and for exporting
   /// calls the two are equal by construction (Lambda is built over the same
-  /// free_blocks() layout).
+  /// free_blocks() layout, followed by 12 boundary-bias coordinates when supplied).
   int free_dim = 0;
   // Preint cache evidence: whether this call reused the window's cached
   // preintegration, and the IMU-factor construction time (whitener build /
@@ -276,6 +276,24 @@ struct WindowWarmState {
 struct WindowBiasPrior {
   Eigen::Vector3d bg = Eigen::Vector3d::Zero();
   Eigen::Vector3d ba = Eigen::Vector3d::Zero();
+};
+
+struct WindowEvaluationContext;
+
+/// Optional outer variables for a bias-continuous window graph. The inner
+/// solve holds these four endpoint biases fixed; the joint Schur export
+/// keeps them AFTER the existing SharedCalib::free_blocks() ordering.
+struct WindowBoundaryBias {
+  Eigen::Vector3d bg_first = Eigen::Vector3d::Zero();
+  Eigen::Vector3d ba_first = Eigen::Vector3d::Zero();
+  Eigen::Vector3d bg_last = Eigen::Vector3d::Zero();
+  Eigen::Vector3d ba_last = Eigen::Vector3d::Zero();
+  /// A linked chain includes its immutable physical first-bias prior once.
+  /// False removes this window's first-bias evidence, retaining pose anchors.
+  bool include_first_prior = true;
+  /// Optional fixed IMU weights only. The context's prior/anchors are ignored:
+  /// boundary training owns those separately. Must outlive this solve call.
+  const WindowEvaluationContext *imu_weights = nullptr;
 };
 
 struct WindowEvaluationContext {
@@ -313,12 +331,26 @@ public:
    * @param bias_prior optional physical bias-prior means, separate from the
    *        initialization seeds. JointCalib holds these fixed while re-seeding
    *        its nuisance states. An evaluation context takes precedence.
+   * @param boundary optional fixed endpoint biases for the conditional inner
+   *        solve. They override warm/seed and state_at endpoint values, and are
+   *        returned unchanged in warm. Export ordering is calibration first,
+   *        then [bg_first(3), ba_first(3), bg_last(3), ba_last(3)]; free_dim is
+   *        calib.local_dim()+12, also for eval-only calls. First-bias priors use
+   *        the existing immutable bias_prior/seed means and calib sigmas when
+   *        include_first_prior is true; otherwise their weights are zero.
+   *        Uses a call-local graph while retaining pc's preintegration cache.
+   *        imu_weights, when supplied, freezes full covariance transport;
+   *        these weights never overwrite pc's ordinary training whiteners.
+   *        Cannot be combined with evaluation: held-out scoring has a separate
+   *        bias-prior policy, so that unsupported combination returns false.
+   *        nullptr preserves the existing independent-window solve/export.
    */
   static bool solve_and_export(const WindowData &win, SharedCalib &calib, bool export_info, WindowSolveReport &rep,
                                int max_iters = 30, bool verbose = false, WindowWarmState *warm = nullptr,
                                WindowPreint *pc = nullptr, const WindowWarmState *state_at = nullptr,
                                const WindowEvaluationContext *evaluation = nullptr,
-                               const WindowBiasPrior *bias_prior = nullptr);
+                               const WindowBiasPrior *bias_prior = nullptr,
+                               const WindowBoundaryBias *boundary = nullptr);
 };
 
 } // namespace ov_zcalib

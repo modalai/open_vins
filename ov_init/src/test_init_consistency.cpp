@@ -42,6 +42,7 @@
 #include "ceres_free/LossFunction.h"
 #include "ceres_free/Problem.h"
 #include "ceres_free/State_JPLQuatLocal.h"
+#include "init/InitializerGeometry.h"
 
 #include "cpi/CpiV1.h"
 #include "utils/quat_ops.h"
@@ -307,7 +308,7 @@ static Factor_GenericPrior *make_prior_s2(const double *q0, const double *p0, co
 }
 
 struct Result {
-  bool ok = false, cov_ok = false, rejected_flip = false;
+  bool ok = false, cov_ok = false, rejected_flip = false, rejected_geometry = false;
   int iters = 0;
   std::string msg;
   Eigen::Matrix<double, 15, 1> err = Eigen::Matrix<double, 15, 1>::Zero();
@@ -401,6 +402,22 @@ static Result run_init(const Sim &s, const InitGuess &g, int gmode, bool fixed_b
     r.ok = r.ok && finite_matrix(q[i]) && finite_matrix(p[i]) && finite_matrix(v[i]) && finite_matrix(bg[i]) && finite_matrix(ba[i]);
   for (const auto &point : lm) r.ok = r.ok && finite_matrix(point);
   if (!r.ok) return r;
+
+  // Perspective division aliases front/back rays. A plausible gravity direction,
+  // stationary cost and SPD local covariance cannot validate an observed point
+  // behind its camera. Use the same projection-domain check as the public path;
+  // the independently constructed truth/ordinary optimum stays the oracle.
+  for (int i = 0; i < s.N; ++i) {
+    const Eigen::Matrix3d R = quat_2_Rot(q[i]);
+    for (const auto &observation : s.obs[i]) {
+      if (!ov_init::InitializerGeometry::valid_camera_point(R * (lm[observation.first] - p[i]))) {
+        r.ok = false;
+        r.rejected_geometry = true;
+        r.msg += "; optimized observation has invalid cheirality";
+        return r;
+      }
+    }
+  }
 
   // Do not accept the solver's "max damping (stationary)" label without
   // checking the remaining GN correction. The tolerance is the solver's own
@@ -588,7 +605,7 @@ static int run_test(int argc, char **argv) {
 
   // An erroneous initial guess is recoverable. Keep the same measurements and
   // physical prior centers; changing the gravity guess does not change a prior.
-  int flips = 50, matched = 0, other_basin = 0, refused = 0, references_ok = 0, rejected_bad_final = 0;
+  int flips = 50, matched = 0, other_basin = 0, refused = 0, references_ok = 0, rejected_bad_final = 0, invalid_geometry = 0;
   double accepted_flip_nees = 0;
   bool known_recovery_ok = false;
   for (int t = 0; t < flips; ++t) {
@@ -599,7 +616,16 @@ static int run_test(int argc, char **argv) {
     const bool reference_ok = reference.ok && reference.cov_ok && !reference.rejected_flip;
     references_ok += reference_ok;
     g.grav = s.gmag * (-s.grav + randn3(rng, 0.5)).normalized();
+    // The bad basin is created by optimization, not an invalid feature seed.
+    // Flipping only gravity preserves the initial camera/landmark geometry.
+    for (int i = 0; i < s.N; ++i) {
+      const Eigen::Matrix3d R = quat_2_Rot(g.q[i]);
+      for (const auto &observation : s.obs[i])
+        require(ov_init::InitializerGeometry::valid_camera_point(R * (g.lm[observation.first] - g.p[i])),
+                "adversarial fixture did not start with valid observed feature geometry");
+    }
     Result r = run_init(s, g, 0); // explicitly free S² for this recovery check
+    require(!r.rejected_geometry || !r.cov_ok, "invalid optimized geometry reached covariance recovery");
     if (r.ok && r.cov_ok && !r.rejected_flip) {
       accepted_flip_nees += nees(r.err, r.cov);
       bool same_optimum = false;
@@ -621,19 +647,20 @@ static int run_test(int argc, char **argv) {
       else ++other_basin;
     } else {
       ++refused;
+      invalid_geometry += r.rejected_geometry;
     }
     const Result bad = run_init(s, g, 0, true);
     if (bad.rejected_flip && !bad.cov_ok) ++rejected_bad_final;
   }
-  std::printf("ADVERSARIAL FLIPPED STARTS (diagnostic): %d match ordinary optimum, %d finite/SPD other basins, %d refused\n",
-              matched, other_basin, refused);
+  std::printf("ADVERSARIAL FLIPPED STARTS: %d match ordinary optimum, %d finite/SPD other basins, %d refused (%d invalid geometry)\n",
+              matched, other_basin, refused, invalid_geometry);
   std::printf("  accepted-flip ANEES %.3f; selection/basin diagnostic, not calibrated coverage\n",
               accepted_flip_nees / std::max(1, matched + other_basin));
-  std::printf("  LIMITATION: convergence + SPD + final gravity <30deg do not guarantee the correct basin; public initializer not exercised\n");
+  std::printf("  physical-domain regression: no accepted other basin; public initializer not exercised by this Gaussian fixture\n");
   std::printf("FIXED INVALID FINAL GRAVITY: %d/%d rejected without covariance\n", rejected_bad_final, flips);
 
   return (realign_ok && consistent && ok == K && cov_ok == K && used == K && references_ok == flips &&
-          known_recovery_ok && rejected_bad_final == flips) ? 0 : 1;
+          known_recovery_ok && other_basin == 0 && rejected_bad_final == flips) ? 0 : 1;
 }
 
 int main(int argc, char **argv) {

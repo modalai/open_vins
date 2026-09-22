@@ -47,15 +47,16 @@ Eigen::Matrix<double, 3, 1> Landmark::get_xyz(bool getfej) const {
   // CASE: Anchored MSCKF inverse depth feature representation
   if (_feat_representation == LandmarkRepresentation::Representation::ANCHORED_MSCKF_INVERSE_DEPTH) {
     Eigen::Matrix<double, 3, 1> p_FinA;
-    Eigen::Matrix<double, 3, 1> p_invFinA = value();
+    Eigen::Matrix<double, 3, 1> p_invFinA = (getfej) ? fej() : value();
     p_FinA << (1 / p_invFinA(2)) * p_invFinA(0), (1 / p_invFinA(2)) * p_invFinA(1), 1 / p_invFinA(2);
     return p_FinA;
   }
 
   // CASE: Estimate single depth of the feature using the initial bearing
   if (_feat_representation == LandmarkRepresentation::Representation::ANCHORED_INVERSE_DEPTH_SINGLE) {
-    // if(getfej) return 1.0/fej()(0)*uv_norm_zero_fej;
-    return 1.0 / value()(0) * uv_norm_zero;
+    // Reanchoring changes the bearing as well as depth. Each linearization
+    // therefore owns its matching bearing/depth pair.
+    return getfej ? 1.0 / fej()(0) * uv_norm_zero_fej : 1.0 / value()(0) * uv_norm_zero;
   }
 
   // Failure

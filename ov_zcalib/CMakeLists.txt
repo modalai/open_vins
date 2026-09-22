@@ -37,6 +37,7 @@ set(OV_ZCALIB_LIB_SOURCES
         src/solve/Factor_ImuAci3.cpp
         src/solve/WindowBA.cpp
         src/solve/JointCalib.cpp
+        src/solve/BiasLinkedCalib.cpp
         src/window/LinearSeed.cpp
         src/window/WindowHarvester.cpp
         src/window/WindowScorer.cpp
@@ -67,8 +68,23 @@ install(TARGETS ov_zcalib_lib
 
 # Test oracles. Target names carry the zcalib_ prefix; ctest names match the targets.
 option(OV_ZCALIB_BUILD_TESTS "Build ov_zcalib test/oracle executables (dev/CI only)" ON)
+if (OV_ZCALIB_BUILD_TESTS)
+    enable_testing()
+    # Header-only numerical boundary oracle; needs neither tracker nor shared libraries.
+    add_executable(zcalib_test_relrot_numeric src/test_relrot_numeric.cpp)
+    add_test(NAME zcalib_test_relrot_numeric COMMAND zcalib_test_relrot_numeric)
+endif ()
 if (OV_ZCALIB_BUILD_TESTS AND NOT DISABLE_TRACK_KLT)
     enable_testing()
+    add_executable(zcalib_test_joint_numeric src/test_joint_numeric.cpp)
+    target_link_libraries(zcalib_test_joint_numeric ov_zcalib_lib)
+    add_test(NAME zcalib_test_joint_numeric COMMAND zcalib_test_joint_numeric)
+    add_executable(zcalib_test_window_bias_separator src/test_window_bias_separator.cpp)
+    target_link_libraries(zcalib_test_window_bias_separator ov_zcalib_lib)
+    add_test(NAME zcalib_test_window_bias_separator COMMAND zcalib_test_window_bias_separator)
+    add_executable(zcalib_test_bias_linked_calib src/test_bias_linked_calib.cpp)
+    target_link_libraries(zcalib_test_bias_linked_calib ov_zcalib_lib)
+    add_test(NAME zcalib_test_bias_linked_calib COMMAND zcalib_test_bias_linked_calib)
     add_executable(zcalib_test_report_json src/test_report_json.cpp)
     target_link_libraries(zcalib_test_report_json ov_zcalib_lib)
     add_test(NAME zcalib_test_report_json COMMAND zcalib_test_report_json)

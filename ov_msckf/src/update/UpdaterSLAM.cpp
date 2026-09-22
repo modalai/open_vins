@@ -23,6 +23,7 @@
 #include "UpdaterSLAM.h"
 
 #include "UpdaterHelper.h"
+#include "LegacyExposure.h"
 #include "RejectStats.h"
 
 #include "feat/Feature.h"
@@ -32,6 +33,7 @@
 #include "types/Landmark.h"
 #include "types/LandmarkRepresentation.h"
 #include "utils/colors.h"
+#include "utils/innovation.h"
 #include "utils/print.h"
 #include "utils/quat_ops.h"
 
@@ -76,13 +78,19 @@ void UpdaterSLAM::delayed_init(std::shared_ptr<State> state, std::vector<std::sh
   for (const auto &clone_imu : state->_clones_IMU) {
     clonetimes.emplace_back(clone_imu.first);
   }
+  if (state->uses_physical_clones()) {
+    for (const auto &view : state->_exposure_poses)
+      clonetimes.push_back(view.raw_time);
+    std::sort(clonetimes.begin(), clonetimes.end());
+    clonetimes.erase(std::unique(clonetimes.begin(), clonetimes.end()), clonetimes.end());
+  }
 
   // 1. Clean all feature measurements and make sure they all have valid clone times
   auto it0 = feature_vec.begin();
   while (it0 != feature_vec.end()) {
 
     // Clean the feature
-    (*it0)->clean_old_measurements(clonetimes);
+    UpdaterHelper::clean_feature_measurements(state, **it0, clonetimes);
 
     // Count how many measurements
     int ct_meas = 0;
@@ -104,35 +112,101 @@ void UpdaterSLAM::delayed_init(std::shared_ptr<State> state, std::vector<std::sh
   // RS row-anchor convention (rs_convention: top 0.0 / center 0.5 / bottom 1.0)
   const double rs_row_anchor = state->_options.rs_row_anchor;
   std::unordered_map<size_t, std::unordered_map<double, FeatureInitializer::ClonePose>> clones_cam;
+  // Delayed initialization triangulates the whole batch before sequential EKF
+  // updates begin. Keep its virtual anchor transforms at that same snapshot:
+  // later successful initializations can move the live clones and extrinsics.
+  // Reuse contiguous fixed-size poses, not covariance states or noise matrices.
+  const bool uses_virtual_anchors = LandmarkRepresentation::is_relative_representation(state->_options.feat_rep_slam) ||
+      (state->_options.max_aruco_features > 0 && LandmarkRepresentation::is_relative_representation(state->_options.feat_rep_aruco));
+  const size_t clone_count = clonetimes.size();
+  const size_t camera_count = static_cast<size_t>(state->_options.num_cameras);
+  const size_t clone_bound = std::max(clone_count, static_cast<size_t>(state->_options.max_pose_clones()) + 1);
+  if (uses_virtual_anchors) {
+    const size_t capacity_needed = camera_count * clone_bound;
+    if (_virtual_anchor_scratch.capacity() < capacity_needed)
+      _virtual_anchor_scratch.reserve(capacity_needed);
+    _virtual_anchor_scratch.resize(camera_count * clone_count);
+  }
+
+  bool has_rolling_shutter = false;
+  for (const auto &pair : state->_calib_camera_readout) {
+    if (std::abs(pair.second->value()(0)) > 1e-10) {
+      has_rolling_shutter = true;
+      break;
+    }
+  }
+  if (has_rolling_shutter) {
+    if (_row_camera_scratch.capacity() < camera_count)
+      _row_camera_scratch.reserve(camera_count);
+    _row_camera_scratch.resize(camera_count);
+    for (auto &camera : _row_camera_scratch)
+      camera.active = false;
+    if (_row_motion_scratch.capacity() < camera_count * clone_bound)
+      _row_motion_scratch.reserve(camera_count * clone_bound);
+    _row_motion_scratch.resize(camera_count * clone_count);
+  }
   for (const auto &clone_calib : state->_calib_IMUtoCAM) {
+
+    if (has_rolling_shutter) {
+      auto &camera = _row_camera_scratch.at(clone_calib.first);
+      const auto readout = state->_calib_camera_readout.find(clone_calib.first);
+      const auto intrinsics = state->_cam_intrinsics_cameras.find(clone_calib.first);
+      if (readout != state->_calib_camera_readout.end() && intrinsics != state->_cam_intrinsics_cameras.end()) {
+        camera.readout = readout->second->value()(0);
+        camera.inverse_height = 1.0 / static_cast<double>(intrinsics->second->h());
+        camera.R_ItoC = clone_calib.second->Rot();
+        camera.p_IinC = clone_calib.second->pos();
+        camera.active = std::abs(camera.readout) > 1e-10;
+      }
+    }
 
     // For this camera, create the vector of camera poses
     std::unordered_map<double, FeatureInitializer::ClonePose> clones_cami;
-    const double dt_cam_delta = state->cam_imu_dt_delta(clone_calib.first);
-    for (const auto &clone_imu : state->_clones_IMU) {
+    const double dt_cam_delta = state->uses_physical_clones() ? 0.0 : state->cam_imu_dt_delta(clone_calib.first);
+    state->for_each_clone(clone_calib.first, [&](double clone_time, const std::shared_ptr<PoseJPL> &clone_pose) {
 
       // Get current IMU pose corrected to this camera's sampling instant: EXACT bridge
       // composition when the frame was epoch-snapped (bias correction unnecessary at
       // triangulation accuracy), else the constant-kinematics exact-SO(3) model over the full correction
-      Eigen::Matrix<double, 3, 3> R_GtoIi = clone_imu.second->Rot();
-      Eigen::Matrix<double, 3, 1> p_IiinG = clone_imu.second->pos();
-      const PreintBridgeData *br = state->epoch_bridge(clone_calib.first, clone_imu.first);
-      const double dt_extra = dt_cam_delta + ((br == nullptr) ? state->epoch_residual(clone_calib.first, clone_imu.first) : 0.0);
-      auto kin_it = state->_clones_kinematics.find(clone_imu.first);
-      const bool have_kin = (kin_it != state->_clones_kinematics.end());
+      Eigen::Matrix<double, 3, 3> R_GtoIi = clone_pose->Rot();
+      Eigen::Matrix<double, 3, 1> p_IiinG = clone_pose->pos();
+      const size_t clone_index = static_cast<size_t>(std::lower_bound(clonetimes.begin(), clonetimes.end(), clone_time) - clonetimes.begin());
+      if (uses_virtual_anchors) {
+        auto &anchor = _virtual_anchor_scratch[clone_calib.first * clone_count + clone_index];
+        anchor.R_GtoC = clone_calib.second->Rot() * R_GtoIi;
+        anchor.p_CinG = p_IiinG - anchor.R_GtoC.transpose() * clone_calib.second->pos();
+      }
+      const PreintBridgeData *br = state->epoch_bridge(clone_calib.first, clone_time);
+      const double dt_extra = dt_cam_delta + ((br == nullptr) ? state->epoch_residual(clone_calib.first, clone_time) : 0.0);
+      const auto *kin = state->clone_kinematics(clone_calib.first, clone_time);
+      const bool have_kin = kin != nullptr;
+      if (has_rolling_shutter) {
+        auto &motion = _row_motion_scratch[clone_calib.first * clone_count + clone_index];
+        motion.available = have_kin;
+        if (have_kin) {
+          motion.omega = br != nullptr ? br->w_end : kin->omega;
+          motion.velocity = kin->vel;
+          if (br != nullptr)
+            motion.velocity += br->v_grav + R_GtoIi.transpose() * br->beta;
+        }
+      }
       if (br != nullptr && have_kin) {
         const Eigen::Matrix3d R_clone = R_GtoIi;
         R_GtoIi = br->DR * R_clone;
-        p_IiinG = p_IiinG + kin_it->second.vel * br->dt + br->p_grav + R_clone.transpose() * br->alpha;
+        p_IiinG = p_IiinG + kin->vel * br->dt + br->p_grav + R_clone.transpose() * br->alpha;
         if (std::abs(dt_extra) > 1e-10) {
-          const Eigen::Vector3d v_end = kin_it->second.vel + br->v_grav + R_clone.transpose() * br->beta;
+          const Eigen::Vector3d v_end = kin->vel + br->v_grav + R_clone.transpose() * br->beta;
           R_GtoIi = exp_so3(-br->w_end * dt_extra) * R_GtoIi;
           p_IiinG = p_IiinG + v_end * dt_extra;
         }
       } else if (std::abs(dt_extra) > 1e-10) {
         if (have_kin) {
-          R_GtoIi = exp_so3(-kin_it->second.omega * dt_extra) * R_GtoIi;
-          p_IiinG = p_IiinG + kin_it->second.vel * dt_extra;
+          if (legacy_exposure::uses_body_velocity(*state, clone_calib.first, br != nullptr)) {
+            legacy_exposure::warp_pose(R_GtoIi, p_IiinG, clone_pose->Rot_fej(), kin->vel, kin->omega, dt_extra);
+          } else {
+            R_GtoIi = exp_so3(-kin->omega * dt_extra) * R_GtoIi;
+            p_IiinG = p_IiinG + kin->vel * dt_extra;
+          }
         } else {
           state->_kin_miss_count++;
         }
@@ -143,78 +217,62 @@ void UpdaterSLAM::delayed_init(std::shared_ptr<State> state, std::vector<std::sh
       Eigen::Matrix<double, 3, 1> p_CioinG = p_IiinG - R_GtoCi.transpose() * clone_calib.second->pos();
 
       // Append to our map
-      clones_cami.insert({clone_imu.first, FeatureInitializer::ClonePose(R_GtoCi, p_CioinG)});
-    }
+      clones_cami.insert({clone_time, FeatureInitializer::ClonePose(R_GtoCi, p_CioinG)});
+    });
 
     // Append to our map
     clones_cam.insert({clone_calib.first, clones_cami});
   }
 
-  // Check if any camera has rolling shutter (for triangulation RS correction)
-  bool has_rolling_shutter = false;
-  for (const auto &pair : state->_calib_camera_readout) {
-    if (std::abs(pair.second->value()(0)) > 1e-10) {
-      has_rolling_shutter = true;
-      break;
+  // One temporary row-pose map serves both normal triangulation and mono retry.
+  // Everything it reads is from the pre-update batch snapshot: earlier accepted
+  // landmarks can change live clones, extrinsics, readout and bridge end velocity.
+  std::unordered_map<size_t, std::unordered_map<double, FeatureInitializer::ClonePose>> clones_cam_rs;
+  auto triangulation_poses = [&](const Feature &feature) {
+    if (!has_rolling_shutter)
+      return &clones_cam;
+    clones_cam_rs = clones_cam;
+    for (const auto &obs_pair : feature.timestamps) {
+      size_t cam_id = obs_pair.first;
+      const auto &camera = _row_camera_scratch.at(cam_id);
+      if (!camera.active) continue;
+      const Eigen::Matrix3d &R_ItoC = camera.R_ItoC;
+      const Eigen::Vector3d &p_IinC = camera.p_IinC;
+      for (size_t m = 0; m < obs_pair.second.size(); m++) {
+        double clone_time = obs_pair.second.at(m);
+        if (clones_cam_rs.find(cam_id) == clones_cam_rs.end()) continue;
+        if (clones_cam_rs.at(cam_id).find(clone_time) == clones_cam_rs.at(cam_id).end()) continue;
+        const auto time = std::lower_bound(clonetimes.begin(), clonetimes.end(), clone_time);
+        if (time == clonetimes.end() || *time != clone_time) continue;
+        const size_t clone_index = static_cast<size_t>(time - clonetimes.begin());
+        const auto &motion = _row_motion_scratch.at(cam_id * clone_count + clone_index);
+        if (!motion.available) continue;
+        double v_pixel = static_cast<double>(feature.uvs.at(cam_id).at(m)(1));
+        double dt_rs = (v_pixel * camera.inverse_height - rs_row_anchor) * camera.readout;
+        if (std::abs(dt_rs) < 1e-10) continue;
+        // Recover IMU pose from camera pose (undo camera transform)
+        Eigen::Matrix3d R_GtoCi = clones_cam_rs.at(cam_id).at(clone_time).Rot();
+        Eigen::Vector3d p_CiinG = clones_cam_rs.at(cam_id).at(clone_time).pos();
+        Eigen::Matrix3d R_GtoIi = R_ItoC.transpose() * R_GtoCi;
+        Eigen::Vector3d p_IiinG = p_CiinG + R_GtoCi.transpose() * p_IinC;
+        // The bridge endpoint, or clone-time cache without a bridge, is the
+        // same motion model used by this batch's original residual geometry.
+        R_GtoIi = exp_so3(-motion.omega * dt_rs) * R_GtoIi;
+        p_IiinG = p_IiinG + motion.velocity * dt_rs;
+        // Recompute camera pose
+        R_GtoCi = R_ItoC * R_GtoIi;
+        p_CiinG = p_IiinG - R_GtoCi.transpose() * p_IinC;
+        clones_cam_rs[cam_id][clone_time] = FeatureInitializer::ClonePose(R_GtoCi, p_CiinG);
+      }
     }
-  }
+    return &clones_cam_rs;
+  };
 
   // 3. Try to triangulate all MSCKF or new SLAM features that have measurements
   RejectCounters rc; // DIAGNOSTIC: stereo-vs-mono gate-level reject accounting
   auto it1 = feature_vec.begin();
   while (it1 != feature_vec.end()) {
-
-    // Apply per-observation rolling shutter correction to clone poses for this feature
-    std::unordered_map<size_t, std::unordered_map<double, FeatureInitializer::ClonePose>> clones_cam_rs;
-    auto *clones_for_tri = &clones_cam;
-    if (has_rolling_shutter) {
-      clones_cam_rs = clones_cam;
-      for (const auto &obs_pair : (*it1)->timestamps) {
-        size_t cam_id = obs_pair.first;
-        if (state->_calib_camera_readout.find(cam_id) == state->_calib_camera_readout.end()) continue;
-        double t_readout = state->_calib_camera_readout.at(cam_id)->value()(0);
-        if (std::abs(t_readout) < 1e-10) continue;
-        if (state->_cam_intrinsics_cameras.find(cam_id) == state->_cam_intrinsics_cameras.end()) continue;
-        double inv_img_h = 1.0 / (double)state->_cam_intrinsics_cameras.at(cam_id)->h();
-        Eigen::Matrix3d R_ItoC = state->_calib_IMUtoCAM.at(cam_id)->Rot();
-        Eigen::Vector3d p_IinC = state->_calib_IMUtoCAM.at(cam_id)->pos();
-        for (size_t m = 0; m < obs_pair.second.size(); m++) {
-          double clone_time = obs_pair.second.at(m);
-          if (clones_cam_rs.find(cam_id) == clones_cam_rs.end()) continue;
-          if (clones_cam_rs.at(cam_id).find(clone_time) == clones_cam_rs.at(cam_id).end()) continue;
-          if (state->_clones_kinematics.find(clone_time) == state->_clones_kinematics.end()) continue;
-          double v_pixel = (double)(*it1)->uvs.at(cam_id).at(m)(1);
-          double dt_rs = (v_pixel * inv_img_h - rs_row_anchor) * t_readout;
-          if (std::abs(dt_rs) < 1e-10) continue;
-          // Recover IMU pose from camera pose (undo camera transform)
-          Eigen::Matrix3d R_GtoCi = clones_cam_rs.at(cam_id).at(clone_time).Rot();
-          Eigen::Vector3d p_CiinG = clones_cam_rs.at(cam_id).at(clone_time).pos();
-          Eigen::Matrix3d R_GtoIi = R_ItoC.transpose() * R_GtoCi;
-          Eigen::Vector3d p_IiinG = p_CiinG + R_GtoCi.transpose() * p_IinC;
-          // Apply RS correction in IMU frame -- at the SAME kinematics the residual path
-          // transports this row time with: bridge ENDPOINT (w_end, v_end) when the frame was
-          // epoch-snapped, else the clone-time cache. Triangulating the row warp at clone-time
-          // kinematics while the update linearizes it at the endpoint left the landmark init
-          // inconsistent with the measurement model at O((w_end - w_clone) * dt_rs).
-          const State::CloneKinematics &kin = state->_clones_kinematics.at(clone_time);
-          Eigen::Vector3d w_rs = kin.omega;
-          Eigen::Vector3d v_rs = kin.vel;
-          const PreintBridgeData *br_rs = state->epoch_bridge(cam_id, clone_time);
-          if (br_rs != nullptr && state->_clones_IMU.find(clone_time) != state->_clones_IMU.end()) {
-            const Eigen::Matrix3d R_clone = state->_clones_IMU.at(clone_time)->Rot();
-            w_rs = br_rs->w_end;
-            v_rs = kin.vel + br_rs->v_grav + R_clone.transpose() * br_rs->beta;
-          }
-          R_GtoIi = exp_so3(-w_rs * dt_rs) * R_GtoIi;
-          p_IiinG = p_IiinG + v_rs * dt_rs;
-          // Recompute camera pose
-          R_GtoCi = R_ItoC * R_GtoIi;
-          p_CiinG = p_IiinG - R_GtoCi.transpose() * p_IinC;
-          clones_cam_rs[cam_id][clone_time] = FeatureInitializer::ClonePose(R_GtoCi, p_CiinG);
-        }
-      }
-      clones_for_tri = &clones_cam_rs;
-    }
+    auto *clones_for_tri = triangulation_poses(**it1);
 
     // DIAGNOSTIC: feature is "stereo" this update if observed in >1 camera.
     bool is_stereo = (*it1)->timestamps.size() > 1;
@@ -285,8 +343,17 @@ void UpdaterSLAM::delayed_init(std::shared_ptr<State> state, std::vector<std::sh
     if (LandmarkRepresentation::is_relative_representation(feat.feat_representation)) {
       feat.anchor_cam_id = f.anchor_cam_id;
       feat.anchor_clone_timestamp = f.anchor_clone_timestamp;
-      feat.p_FinA = f.p_FinA;
-      feat.p_FinA_fej = f.p_FinA;
+      // This handoff also runs after stereo-to-mono retriangulation using the
+      // prebuilt exposure-pose map. Both routes use its matching virtual-anchor
+      // snapshot; reading live poses here would redefine later feature seeds
+      // after earlier insertions update the state. Leave frontend p_FinA intact.
+      const auto anchor_time = std::lower_bound(clonetimes.begin(), clonetimes.end(), feat.anchor_clone_timestamp);
+      if (anchor_time == clonetimes.end() || *anchor_time != feat.anchor_clone_timestamp)
+        return false;
+      const size_t anchor_index = static_cast<size_t>(anchor_time - clonetimes.begin());
+      const auto &anchor = _virtual_anchor_scratch.at(static_cast<size_t>(feat.anchor_cam_id) * clone_count + anchor_index);
+      feat.p_FinA = anchor.R_GtoC * (f.p_FinG - anchor.p_CinG);
+      feat.p_FinA_fej = feat.p_FinA;
     } else {
       feat.p_FinG = f.p_FinG;
       feat.p_FinG_fej = f.p_FinG;
@@ -425,9 +492,10 @@ void UpdaterSLAM::delayed_init(std::shared_ptr<State> state, std::vector<std::sh
       }
     }
     // re-triangulate the now single-camera (temporal) track
+    auto *mono_poses = triangulation_poses(*mono);
     bool ok = mono->timestamps.count(anchor) && mono->timestamps.at(anchor).size() >= 2 &&
-              initializer_feat->single_triangulation(mono, clones_cam) &&
-              (!initializer_feat->config().refine_features || initializer_feat->single_gaussnewton(mono, clones_cam));
+              initializer_feat->single_triangulation(mono, *mono_poses) &&
+              (!initializer_feat->config().refine_features || initializer_feat->single_gaussnewton(mono, *mono_poses));
     return ok ? mono : nullptr;
   };
   auto mark_demoted = [&](size_t featid) {
@@ -502,7 +570,7 @@ void UpdaterSLAM::update(std::shared_ptr<State> state, std::vector<std::shared_p
   while (it0 != feature_vec.end()) {
 
     // Clean the feature
-    (*it0)->clean_old_measurements(clonetimes);
+    UpdaterHelper::clean_feature_measurements(state, **it0, clonetimes);
 
     // Count how many measurements
     int ct_meas = 0;
@@ -592,9 +660,7 @@ void UpdaterSLAM::update(std::shared_ptr<State> state, std::vector<std::shared_p
       feat.anchor_cam_id = landmark->_anchor_cam_id;
       feat.anchor_clone_timestamp = landmark->_anchor_clone_timestamp;
       feat.p_FinA = landmark->get_xyz(false);
-      // (*it2)->p_FinA = feat.p_FinA;
       feat.p_FinA_fej = landmark->get_xyz(true);
-      (*it2)->p_FinA = feat.p_FinA_fej;
     } else {
       feat.p_FinG = landmark->get_xyz(false);
       feat.p_FinG_fej = landmark->get_xyz(true);
@@ -643,7 +709,9 @@ void UpdaterSLAM::update(std::shared_ptr<State> state, std::vector<std::shared_p
     bool is_stereo = feat.timestamps.size() > 1; // for the reject-diag accounting below
     double sigma_pix_sq = is_aruco ? _options_aruco.sigma_pix_sq : _options_slam.sigma_pix_sq;
     S.diagonal() += sigma_pix_sq * Eigen::VectorXd::Ones(S.rows());
-    double chi2 = res.dot(S.llt().solve(res));
+    double chi2;
+    const bool valid_innovation = innovation_chi2(S, res, chi2) &&
+                                  ov_core::numeric::finite(sigma_pix_sq) && sigma_pix_sq > 0.0;
 
     // Get our threshold (we precompute up to 500 but handle the case that it is more)
     // Threshold from the baked quantile table (full reachable dof range; no runtime solve)
@@ -651,7 +719,8 @@ void UpdaterSLAM::update(std::shared_ptr<State> state, std::vector<std::shared_p
 
     // Check if we should delete or not
     double chi2_multipler = is_aruco ? _options_aruco.chi2_multipler : _options_slam.chi2_multipler;
-    if (chi2 > chi2_multipler * chi2_check) {
+    const double chi2_limit = chi2_multipler * chi2_check;
+    if (!valid_innovation || !valid_innovation_limit(chi2_limit) || chi2 > chi2_limit) {
       if (kEnableRejectDiag) { if (is_stereo) rc.s_chi2++; else rc.m_chi2++; }
       if ((int)feat.featid < state->_options.max_aruco_features) {
         PRINT_WARNING(YELLOW "[SLAM-UP]: rejecting aruco tag %d for chi2 thresh (%.3f > %.3f)\n" RESET, (int)feat.featid, chi2,
@@ -717,7 +786,11 @@ void UpdaterSLAM::update(std::shared_ptr<State> state, std::vector<std::shared_p
   R_big.conservativeResize(ct_meas, ct_meas);
 
   // 5. With all good SLAM features update the state
-  StateHelper::EKFUpdate(state, Hx_order_big, Hx_big, res_big, R_big);
+  if (!StateHelper::EKFUpdate(state, Hx_order_big, Hx_big, res_big, R_big)) {
+    PRINT_WARNING(YELLOW "[UPDATE]: rejected invalid combined measurement update\n" RESET);
+    feature_vec.clear(); // rejected batch is discarded, not reported as applied
+    return;
+  }
   rT3 = ov_core::prof_now();
 
   // Debug print timing information
@@ -731,7 +804,7 @@ void UpdaterSLAM::update(std::shared_ptr<State> state, std::vector<std::shared_p
 void UpdaterSLAM::change_anchors(std::shared_ptr<State> state) {
 
   // Return if we do not have enough clones
-  if ((int)state->_clones_IMU.size() <= state->_options.max_clone_size) {
+  if ((int)state->clone_count() <= state->_options.max_pose_clones()) {
     return;
   }
 
@@ -739,25 +812,55 @@ void UpdaterSLAM::change_anchors(std::shared_ptr<State> state) {
   // NOTE: for now we have anchor the feature in the same camera as it is before
   // NOTE: this also does not change the representation of the feature at all right now
   double marg_timestep = state->margtimestep();
-  for (auto &f : state->_features_SLAM) {
+  for (auto it = state->_features_SLAM.begin(); it != state->_features_SLAM.end();) {
+    auto &f = *it;
     // Skip any features that are in the global frame
     if (f.second->_feat_representation == LandmarkRepresentation::Representation::GLOBAL_3D ||
-        f.second->_feat_representation == LandmarkRepresentation::Representation::GLOBAL_FULL_INVERSE_DEPTH)
+        f.second->_feat_representation == LandmarkRepresentation::Representation::GLOBAL_FULL_INVERSE_DEPTH) {
+      ++it;
       continue;
-    // Else lets see if it is anchored in the clone that will be marginalized
-    assert(marg_timestep <= f.second->_anchor_clone_timestamp);
-    if (f.second->_anchor_clone_timestamp == marg_timestep) {
-      perform_anchor_change(state, f.second, state->_timestamp, f.second->_anchor_cam_id);
     }
+    // Else lets see if it is anchored in the clone that will be marginalized
+    if (!state->uses_physical_clones())
+      assert(marg_timestep <= f.second->_anchor_clone_timestamp);
+    const bool owner_matches = !state->uses_physical_clones() ||
+        static_cast<size_t>(f.second->_anchor_cam_id) == state->_exposure_poses.front().camera_id;
+    if (f.second->_anchor_clone_timestamp == marg_timestep && owner_matches) {
+      const double new_time = state->uses_physical_clones() ? state->latest_clone_time(f.second->_anchor_cam_id) : state->_timestamp;
+      if (new_time == marg_timestep) {
+        // A stale camera lost its final retained owner. It cannot keep a
+        // landmark anchored to a removed pose or change a mono track's camera.
+        // Ordinary tracking loss preserves ArUco tags in marginalize_slam(),
+        // but that exemption cannot preserve an invalid anchor. Remove this
+        // landmark and its covariance before its final pose owner is retired.
+        StateHelper::marginalize(state, f.second);
+        it = state->_features_SLAM.erase(it);
+        continue;
+      } else {
+        if (!perform_anchor_change(state, f.second, new_time, f.second->_anchor_cam_id)) {
+          // The old owner is about to retire. A refused reparameterization
+          // cannot leave a persistent landmark pointing at that removed pose.
+          StateHelper::marginalize(state, f.second);
+          it = state->_features_SLAM.erase(it);
+          continue;
+        }
+      }
+    }
+    ++it;
   }
+  if (state->uses_physical_clones())
+    StateHelper::marginalize_slam(state);
 }
 
-void UpdaterSLAM::perform_anchor_change(std::shared_ptr<State> state, std::shared_ptr<Landmark> landmark, double new_anchor_timestamp,
+bool UpdaterSLAM::perform_anchor_change(std::shared_ptr<State> state, std::shared_ptr<Landmark> landmark, double new_anchor_timestamp,
                                         size_t new_cam_id) {
 
-  // Assert that this is an anchored representation
-  assert(LandmarkRepresentation::is_relative_representation(landmark->_feat_representation));
-  assert(landmark->_anchor_cam_id != -1);
+  if (!state || !landmark || !LandmarkRepresentation::is_relative_representation(landmark->_feat_representation) ||
+      landmark->_anchor_cam_id < 0 || !ov_core::numeric::finite(new_anchor_timestamp) ||
+      !state->find_pose(landmark->_anchor_cam_id, landmark->_anchor_clone_timestamp) ||
+      !state->find_pose(new_cam_id, new_anchor_timestamp) ||
+      state->_calib_IMUtoCAM.find(landmark->_anchor_cam_id) == state->_calib_IMUtoCAM.end() ||
+      state->_calib_IMUtoCAM.find(new_cam_id) == state->_calib_IMUtoCAM.end()) return false;
 
   // Create current feature representation
   UpdaterHelper::UpdaterHelperFeature old_feat;
@@ -767,6 +870,7 @@ void UpdaterSLAM::perform_anchor_change(std::shared_ptr<State> state, std::share
   old_feat.anchor_clone_timestamp = landmark->_anchor_clone_timestamp;
   old_feat.p_FinA = landmark->get_xyz(false);
   old_feat.p_FinA_fej = landmark->get_xyz(true);
+  if (!ov_core::numeric::finite_matrix(old_feat.p_FinA) || !ov_core::numeric::finite_matrix(old_feat.p_FinA_fej)) return false;
 
   // Get Jacobians of p_FinG wrt old representation
   Eigen::MatrixXd H_f_old;
@@ -784,16 +888,19 @@ void UpdaterSLAM::perform_anchor_change(std::shared_ptr<State> state, std::share
   //==========================================================================
   //==========================================================================
 
+  // Anchors are virtual cameras at retained clone epochs. Reparameterization
+  // uses these unwarped poses for both mean and covariance; observation timing
+  // belongs exclusively to the observing-pose model.
   // OLD: anchor camera position and orientation
-  Eigen::Matrix<double, 3, 3> R_GtoIOLD = state->_clones_IMU.at(old_feat.anchor_clone_timestamp)->Rot();
+  Eigen::Matrix<double, 3, 3> R_GtoIOLD = state->pose_for_camera(old_feat.anchor_cam_id, old_feat.anchor_clone_timestamp)->Rot();
   Eigen::Matrix<double, 3, 3> R_GtoOLD = state->_calib_IMUtoCAM.at(old_feat.anchor_cam_id)->Rot() * R_GtoIOLD;
-  Eigen::Matrix<double, 3, 1> p_OLDinG = state->_clones_IMU.at(old_feat.anchor_clone_timestamp)->pos() -
+  Eigen::Matrix<double, 3, 1> p_OLDinG = state->pose_for_camera(old_feat.anchor_cam_id, old_feat.anchor_clone_timestamp)->pos() -
                                          R_GtoOLD.transpose() * state->_calib_IMUtoCAM.at(old_feat.anchor_cam_id)->pos();
 
   // NEW: anchor camera position and orientation
-  Eigen::Matrix<double, 3, 3> R_GtoINEW = state->_clones_IMU.at(new_feat.anchor_clone_timestamp)->Rot();
+  Eigen::Matrix<double, 3, 3> R_GtoINEW = state->pose_for_camera(new_feat.anchor_cam_id, new_feat.anchor_clone_timestamp)->Rot();
   Eigen::Matrix<double, 3, 3> R_GtoNEW = state->_calib_IMUtoCAM.at(new_feat.anchor_cam_id)->Rot() * R_GtoINEW;
-  Eigen::Matrix<double, 3, 1> p_NEWinG = state->_clones_IMU.at(new_feat.anchor_clone_timestamp)->pos() -
+  Eigen::Matrix<double, 3, 1> p_NEWinG = state->pose_for_camera(new_feat.anchor_cam_id, new_feat.anchor_clone_timestamp)->pos() -
                                          R_GtoNEW.transpose() * state->_calib_IMUtoCAM.at(new_feat.anchor_cam_id)->pos();
 
   // Calculate transform between the old anchor and new one
@@ -805,21 +912,31 @@ void UpdaterSLAM::perform_anchor_change(std::shared_ptr<State> state, std::share
   //==========================================================================
 
   // OLD: anchor camera position and orientation
-  Eigen::Matrix<double, 3, 3> R_GtoIOLD_fej = state->_clones_IMU.at(old_feat.anchor_clone_timestamp)->Rot_fej();
+  Eigen::Matrix<double, 3, 3> R_GtoIOLD_fej = state->pose_for_camera(old_feat.anchor_cam_id, old_feat.anchor_clone_timestamp)->Rot_fej();
   Eigen::Matrix<double, 3, 3> R_GtoOLD_fej = state->_calib_IMUtoCAM.at(old_feat.anchor_cam_id)->Rot() * R_GtoIOLD_fej;
-  Eigen::Matrix<double, 3, 1> p_OLDinG_fej = state->_clones_IMU.at(old_feat.anchor_clone_timestamp)->pos_fej() -
+  Eigen::Matrix<double, 3, 1> p_OLDinG_fej = state->pose_for_camera(old_feat.anchor_cam_id, old_feat.anchor_clone_timestamp)->pos_fej() -
                                              R_GtoOLD_fej.transpose() * state->_calib_IMUtoCAM.at(old_feat.anchor_cam_id)->pos();
 
   // NEW: anchor camera position and orientation
-  Eigen::Matrix<double, 3, 3> R_GtoINEW_fej = state->_clones_IMU.at(new_feat.anchor_clone_timestamp)->Rot_fej();
+  Eigen::Matrix<double, 3, 3> R_GtoINEW_fej = state->pose_for_camera(new_feat.anchor_cam_id, new_feat.anchor_clone_timestamp)->Rot_fej();
   Eigen::Matrix<double, 3, 3> R_GtoNEW_fej = state->_calib_IMUtoCAM.at(new_feat.anchor_cam_id)->Rot() * R_GtoINEW_fej;
-  Eigen::Matrix<double, 3, 1> p_NEWinG_fej = state->_clones_IMU.at(new_feat.anchor_clone_timestamp)->pos_fej() -
+  Eigen::Matrix<double, 3, 1> p_NEWinG_fej = state->pose_for_camera(new_feat.anchor_cam_id, new_feat.anchor_clone_timestamp)->pos_fej() -
                                              R_GtoNEW_fej.transpose() * state->_calib_IMUtoCAM.at(new_feat.anchor_cam_id)->pos();
 
   // Calculate transform between the old anchor and new one
   Eigen::Matrix<double, 3, 3> R_OLDtoNEW_fej = R_GtoNEW_fej * R_GtoOLD_fej.transpose();
   Eigen::Matrix<double, 3, 1> p_OLDinNEW_fej = R_GtoNEW_fej * (p_OLDinG_fej - p_NEWinG_fej);
   new_feat.p_FinA_fej = R_OLDtoNEW_fej * landmark->get_xyz(true) + p_OLDinNEW_fej;
+
+  // Stage the actual representation conversion, including the separate FEJ
+  // bearing for single-depth landmarks, before changing any live covariance.
+  Landmark proposed(landmark->size());
+  proposed._feat_representation = landmark->_feat_representation;
+  proposed.set_from_xyz(new_feat.p_FinA, false);
+  proposed.set_from_xyz(new_feat.p_FinA_fej, true);
+  if (!ov_core::numeric::finite_matrix(proposed.value()) || !ov_core::numeric::finite_matrix(proposed.fej()) ||
+      (landmark->_feat_representation == LandmarkRepresentation::Representation::ANCHORED_INVERSE_DEPTH_SINGLE &&
+       (!ov_core::numeric::finite_matrix(proposed.uv_norm_zero) || !ov_core::numeric::finite_matrix(proposed.uv_norm_zero_fej)))) return false;
 
   // Get Jacobians of p_FinG wrt new representation
   Eigen::MatrixXd H_f_new;
@@ -865,9 +982,13 @@ void UpdaterSLAM::perform_anchor_change(std::shared_ptr<State> state, std::share
   // pf_new_error = Hfnew^{-1}*(Hfold*pf_olderror+Hxold*x_olderror-Hxnew*x_newerror)
   Eigen::MatrixXd H_f_new_inv;
   if (phisize == 1) {
+    if (!ov_core::numeric::finite_matrix(H_f_new) || !(H_f_new.squaredNorm() > 0.)) return false;
     H_f_new_inv = 1.0 / H_f_new.squaredNorm() * H_f_new.transpose();
   } else {
-    H_f_new_inv = H_f_new.colPivHouseholderQr().solve(Eigen::Matrix<double, 3, 3>::Identity());
+    if (!ov_core::numeric::finite_matrix(H_f_new)) return false;
+    const auto factor = H_f_new.colPivHouseholderQr();
+    if (factor.rank() != 3) return false;
+    H_f_new_inv = factor.solve(Eigen::Matrix<double, 3, 3>::Identity());
   }
 
   // Place Jacobians for old anchor
@@ -884,14 +1005,19 @@ void UpdaterSLAM::perform_anchor_change(std::shared_ptr<State> state, std::share
   }
 
   // Perform covariance propagation
-  StateHelper::EKFPropagation(state, phi_order_NEW, phi_order_OLD, Phi, Q);
+  if (!StateHelper::EKFPropagation(state, phi_order_NEW, phi_order_OLD, Phi, Q)) return false;
 
   // Set state from new feature
   landmark->_featid = new_feat.featid;
   landmark->_feat_representation = new_feat.feat_representation;
   landmark->_anchor_cam_id = new_feat.anchor_cam_id;
   landmark->_anchor_clone_timestamp = new_feat.anchor_clone_timestamp;
-  landmark->set_from_xyz(new_feat.p_FinA, false);
-  landmark->set_from_xyz(new_feat.p_FinA_fej, true);
+  landmark->set_value(proposed.value());
+  landmark->set_fej(proposed.fej());
+  if (landmark->_feat_representation == LandmarkRepresentation::Representation::ANCHORED_INVERSE_DEPTH_SINGLE) {
+    landmark->uv_norm_zero = proposed.uv_norm_zero;
+    landmark->uv_norm_zero_fej = proposed.uv_norm_zero_fej;
+  }
   landmark->has_had_anchor_change = true;
+  return true;
 }

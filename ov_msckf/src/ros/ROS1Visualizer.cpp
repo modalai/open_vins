@@ -25,10 +25,12 @@
 #include "core/VioManager.h"
 #include "ros/ROSVisualizerHelper.h"
 #include "sim/Simulator.h"
+#include "sim/SimulationTruthTime.h"
 #include "state/Propagator.h"
 #include "state/State.h"
 #include "state/StateHelper.h"
 #include "utils/dataset_reader.h"
+#include "utils/finite.h"
 #include "utils/print.h"
 #include "utils/sensor_data.h"
 
@@ -37,7 +39,7 @@ using namespace ov_type;
 using namespace ov_msckf;
 
 ROS1Visualizer::ROS1Visualizer(std::shared_ptr<ros::NodeHandle> nh, std::shared_ptr<VioManager> app, std::shared_ptr<Simulator> sim)
-    : _nh(nh), _app(app), _sim(sim), thread_update_running(false) {
+    : _nh(nh), _app(app), _sim(sim) {
 
   // Setup our transform broadcaster
   mTfBr = std::make_shared<tf::TransformBroadcaster>();
@@ -136,17 +138,41 @@ ROS1Visualizer::ROS1Visualizer(std::shared_ptr<ros::NodeHandle> nh, std::shared_
     }
   }
 
-  // Start thread for the image publishing
+  // Publication must observe a completed update, not an enqueue that may
+  // wait for another camera or for IMU coverage in the manager's bounded ring.
+  _app->set_camera_processed_callback([this](const ov_core::CameraData &, bool processed) {
+    if (processed)
+      visualize();
+    return true;
+  });
+
   if (_app->get_params().use_multi_threading_pubs) {
-    std::thread thread([&] {
-      ros::Rate loop_rate(20);
-      while (ros::ok()) {
+    image_publisher = std::thread([this] {
+      // A wall-clock wait remains cancellable when replay /clock stops.
+      std::unique_lock<std::mutex> wait_lock(image_wait_mtx);
+      while (!stop_image_publisher.load(std::memory_order_acquire) && ros::ok()) {
+        const auto next = std::chrono::steady_clock::now() + std::chrono::milliseconds(50);
+        wait_lock.unlock();
         publish_images();
-        loop_rate.sleep();
+        wait_lock.lock();
+        image_wait_cv.wait_until(wait_lock, next, [this] { return stop_image_publisher.load(std::memory_order_acquire); });
       }
     });
-    thread.detach();
   }
+}
+
+ROS1Visualizer::~ROS1Visualizer() {
+  {
+    std::lock_guard<std::mutex> wait_lock(image_wait_mtx);
+    stop_image_publisher.store(true, std::memory_order_release);
+  }
+  image_wait_cv.notify_all();
+  if (image_publisher.joinable())
+    image_publisher.join();
+  // The application may outlive the visualizer; remove the captured this.
+  std::lock_guard<std::mutex> producers(camera_ingress_mtx);
+  std::lock_guard<std::recursive_mutex> state_lock(state_mtx);
+  _app->set_camera_processed_callback({});
 }
 
 void ROS1Visualizer::setup_subscribers(std::shared_ptr<ov_core::YamlParser> parser) {
@@ -196,11 +222,12 @@ void ROS1Visualizer::setup_subscribers(std::shared_ptr<ov_core::YamlParser> pars
 }
 
 void ROS1Visualizer::visualize() {
+  std::lock_guard<std::recursive_mutex> state_lock(state_mtx);
 
   // Return if we have already visualized
-  if (last_visualization_timestamp == _app->get_state()->_timestamp && _app->initialized())
+  if (last_visualization_timestamp == _app->get_state()->imu_endpoint() && _app->initialized())
     return;
-  last_visualization_timestamp = _app->get_state()->_timestamp;
+  last_visualization_timestamp = _app->get_state()->imu_endpoint();
 
   // Start timing
   // boost::posix_time::ptime rT0_1, rT0_2;
@@ -244,6 +271,7 @@ void ROS1Visualizer::visualize() {
 }
 
 void ROS1Visualizer::visualize_odometry(double timestamp) {
+  std::lock_guard<std::recursive_mutex> state_lock(state_mtx);
 
   // Return if we have not inited
   if (!_app->initialized())
@@ -351,6 +379,7 @@ void ROS1Visualizer::visualize_odometry(double timestamp) {
 }
 
 void ROS1Visualizer::visualize_final() {
+  std::lock_guard<std::recursive_mutex> state_lock(state_mtx);
 
   // Final time offset value
   if (_app->get_state()->_options.do_calib_camera_timeoffset) {
@@ -437,6 +466,7 @@ void ROS1Visualizer::visualize_final() {
 }
 
 void ROS1Visualizer::callback_inertial(const sensor_msgs::Imu::ConstPtr &msg) {
+  std::lock_guard<std::recursive_mutex> state_lock(state_mtx);
 
   // convert into correct format
   ov_core::ImuData message;
@@ -448,55 +478,11 @@ void ROS1Visualizer::callback_inertial(const sensor_msgs::Imu::ConstPtr &msg) {
   _app->feed_measurement_imu(message);
   visualize_odometry(message.timestamp);
 
-  // If the processing queue is currently active / running just return so we can keep getting measurements
-  // Otherwise create a second thread to do our update in an async manor
-  // The visualization of the state, images, and features will be synchronous with the update!
-  if (thread_update_running)
-    return;
-  thread_update_running = true;
-  std::thread thread([&] {
-    // Lock on the queue (prevents new images from appending)
-    std::lock_guard<std::mutex> lck(camera_queue_mtx);
-
-    // Count how many unique image streams
-    std::map<int, bool> unique_cam_ids;
-    for (const auto &cam_msg : camera_queue) {
-      unique_cam_ids[cam_msg.sensor_ids.at(0)] = true;
-    }
-
-    // If we do not have enough unique cameras then we need to wait
-    // We should wait till we have one of each camera to ensure we propagate in the correct order
-    auto params = _app->get_params();
-    size_t num_unique_cameras = (params.state_options.num_cameras == 2) ? 1 : params.state_options.num_cameras;
-    if (unique_cam_ids.size() == num_unique_cameras) {
-
-      // Loop through our queue and see if we are able to process any of our camera measurements
-      // We are able to process if we have at least one IMU measurement greater than the camera time
-      double timestamp_imu_inC = message.timestamp - _app->get_state()->_calib_dt_CAMtoIMU->value()(0);
-      while (!camera_queue.empty() && camera_queue.at(0).timestamp < timestamp_imu_inC) {
-        auto rT0_1 = boost::posix_time::microsec_clock::local_time();
-        double update_dt = 100.0 * (timestamp_imu_inC - camera_queue.at(0).timestamp);
-        _app->feed_measurement_camera(camera_queue.at(0));
-        visualize();
-        camera_queue.pop_front();
-        auto rT0_2 = boost::posix_time::microsec_clock::local_time();
-        double time_total = (rT0_2 - rT0_1).total_microseconds() * 1e-6;
-        PRINT_INFO(BLUE "[TIME]: %.4f seconds total (%.1f hz, %.2f ms behind)\n" RESET, time_total, 1.0 / time_total, update_dt);
-      }
-    }
-    thread_update_running = false;
-  });
-
-  // If we are single threaded, then run single threaded
-  // Otherwise detach this thread so it runs in the background!
-  if (!_app->get_params().use_multi_threading_subs) {
-    thread.join();
-  } else {
-    thread.detach();
-  }
 }
 
 void ROS1Visualizer::callback_monocular(const sensor_msgs::ImageConstPtr &msg0, int cam_id0) {
+  std::lock_guard<std::mutex> producer_lock(camera_ingress_mtx);
+
 
   // Check if we should drop this image
   double timestamp = msg0->header.stamp.toSec();
@@ -504,7 +490,6 @@ void ROS1Visualizer::callback_monocular(const sensor_msgs::ImageConstPtr &msg0, 
   if (camera_last_timestamp.find(cam_id0) != camera_last_timestamp.end() && timestamp < camera_last_timestamp.at(cam_id0) + time_delta) {
     return;
   }
-  camera_last_timestamp[cam_id0] = timestamp;
 
   // Get the image
   cv_bridge::CvImageConstPtr cv_ptr;
@@ -529,14 +514,14 @@ void ROS1Visualizer::callback_monocular(const sensor_msgs::ImageConstPtr &msg0, 
     message.masks.push_back(cv::Mat::zeros(cv_ptr->image.rows, cv_ptr->image.cols, CV_8UC1));
   }
 
-  // append it to our queue of images
-  std::lock_guard<std::mutex> lck(camera_queue_mtx);
-  camera_queue.push_back(message);
-  std::sort(camera_queue.begin(), camera_queue.end());
+  camera_last_timestamp[cam_id0] = timestamp;
+  _app->feed_measurement_camera(message);
 }
 
 void ROS1Visualizer::callback_stereo(const sensor_msgs::ImageConstPtr &msg0, const sensor_msgs::ImageConstPtr &msg1, int cam_id0,
                                      int cam_id1) {
+  std::lock_guard<std::mutex> producer_lock(camera_ingress_mtx);
+
 
   // Check if we should drop this image
   double timestamp = msg0->header.stamp.toSec();
@@ -544,7 +529,6 @@ void ROS1Visualizer::callback_stereo(const sensor_msgs::ImageConstPtr &msg0, con
   if (camera_last_timestamp.find(cam_id0) != camera_last_timestamp.end() && timestamp < camera_last_timestamp.at(cam_id0) + time_delta) {
     return;
   }
-  camera_last_timestamp[cam_id0] = timestamp;
 
   // Get the image
   cv_bridge::CvImageConstPtr cv_ptr0;
@@ -583,10 +567,25 @@ void ROS1Visualizer::callback_stereo(const sensor_msgs::ImageConstPtr &msg0, con
     message.masks.push_back(cv::Mat::zeros(cv_ptr1->image.rows, cv_ptr1->image.cols, CV_8UC1));
   }
 
-  // append it to our queue of images
-  std::lock_guard<std::mutex> lck(camera_queue_mtx);
-  camera_queue.push_back(message);
-  std::sort(camera_queue.begin(), camera_queue.end());
+  camera_last_timestamp[cam_id0] = timestamp;
+  const double timestamp1 = cv_ptr1->header.stamp.toSec();
+  camera_last_timestamp[cam_id1] = timestamp1;
+  if (timestamp1 == message.timestamp) {
+    _app->feed_measurement_camera(message);
+  } else {
+    // ApproximateTime pairs are not necessarily simultaneous. CameraData has
+    // one raw stamp, so preserve both headers in separate owned messages.
+    ov_core::CameraData right;
+    right.timestamp = timestamp1;
+    right.sensor_ids = {cam_id1};
+    right.images = {message.images[1]};
+    right.masks = {message.masks[1]};
+    message.sensor_ids.resize(1);
+    message.images.resize(1);
+    message.masks.resize(1);
+    _app->feed_measurement_camera(message);
+    _app->feed_measurement_camera(right);
+  }
 }
 
 void ROS1Visualizer::publish_state() {
@@ -594,10 +593,8 @@ void ROS1Visualizer::publish_state() {
   // Get the current state
   std::shared_ptr<State> state = _app->get_state();
 
-  // We want to publish in the IMU clock frame
-  // The timestamp in the state will be the last camera time
-  double t_ItoC = state->_calib_dt_CAMtoIMU->value()(0);
-  double timestamp_inI = state->_timestamp + t_ItoC;
+  // Navigation time is the accepted IMU endpoint, unaffected by later clock updates.
+  double timestamp_inI = state->imu_endpoint();
 
   // Create pose of IMU (note we use the bag time)
   geometry_msgs::PoseWithCovarianceStamped poseIinM;
@@ -650,13 +647,14 @@ void ROS1Visualizer::publish_state() {
 }
 
 void ROS1Visualizer::publish_images() {
+  std::lock_guard<std::recursive_mutex> state_lock(state_mtx);
 
   // Return if we have already visualized
   if (_app->get_state() == nullptr)
     return;
-  if (last_visualization_timestamp_image == _app->get_state()->_timestamp && _app->initialized())
+  if (last_visualization_timestamp_image == _app->get_state()->imu_endpoint() && _app->initialized())
     return;
-  last_visualization_timestamp_image = _app->get_state()->_timestamp;
+  last_visualization_timestamp_image = _app->get_state()->imu_endpoint();
 
   // Check if we have subscribers
   if (it_pub_tracks.getNumSubscribers() == 0)
@@ -714,10 +712,8 @@ void ROS1Visualizer::publish_groundtruth() {
   // Our groundtruth state
   Eigen::Matrix<double, 17, 1> state_gt;
 
-  // We want to publish in the IMU clock frame
-  // The timestamp in the state will be the last camera time
-  double t_ItoC = _app->get_state()->_calib_dt_CAMtoIMU->value()(0);
-  double timestamp_inI = _app->get_state()->_timestamp + t_ItoC;
+  // Navigation time is the accepted IMU endpoint, unaffected by later clock updates.
+  double timestamp_inI = _app->get_state()->imu_endpoint();
 
   // Check that we have the timestamp in our GT file [time(sec),q_GtoI,p_IinG,v_IinG,b_gyro,b_accel]
   if (_sim == nullptr && (gt_states.empty() || !DatasetReader::get_gt_state(timestamp_inI, state_gt, gt_states))) {
@@ -727,7 +723,7 @@ void ROS1Visualizer::publish_groundtruth() {
   // Get the simulated groundtruth
   // NOTE: we get the true time in the IMU clock frame
   if (_sim != nullptr) {
-    timestamp_inI = _app->get_state()->_timestamp + _sim->get_true_parameters().calib_camimu_dt;
+    timestamp_inI = simulation_truth_time(*_app->get_state(), _sim->get_true_parameters().sim_camimu_dts);
     if (!_sim->get_state(timestamp_inI, state_gt))
       return;
   }
@@ -820,7 +816,7 @@ void ROS1Visualizer::publish_groundtruth() {
   //==========================================================================
 
   // Update our average variables
-  if (!std::isnan(ori_nees) && !std::isnan(pos_nees)) {
+  if (ov_core::numeric::finite(ori_nees) && ov_core::numeric::finite(pos_nees)) {
     summed_mse_ori += err_ori * err_ori;
     summed_mse_pos += err_pos * err_pos;
     summed_nees_ori += ori_nees;
@@ -850,10 +846,11 @@ void ROS1Visualizer::publish_loopclosure_information() {
   _app->get_active_image(active_tracks_time2, active_cam0_image);
   if (active_tracks_time1 == -1)
     return;
-  if (_app->get_state()->_clones_IMU.find(active_tracks_time1) == _app->get_state()->_clones_IMU.end())
+  const auto active_pose = _app->get_state()->find_pose(0, active_tracks_time1);
+  if (!active_pose)
     return;
-  Eigen::Vector4d quat = _app->get_state()->_clones_IMU.at(active_tracks_time1)->quat();
-  Eigen::Vector3d pos = _app->get_state()->_clones_IMU.at(active_tracks_time1)->pos();
+  Eigen::Vector4d quat = active_pose->quat();
+  Eigen::Vector3d pos = active_pose->pos();
   if (active_tracks_time1 != active_tracks_time2)
     return;
 

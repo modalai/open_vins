@@ -39,6 +39,8 @@ list(APPEND LIBRARY_SOURCES
         src/dummy.cpp
         src/init/InertialInitializer.cpp
         src/dynamic/DynamicInitializer.cpp
+        src/dynamic/RawImuCpi.cpp
+        src/dynamic/SampledCpiStatistics.cpp
         src/static/StaticInitializer.cpp
         src/sim/SimulatorInit.cpp
 )
@@ -66,6 +68,7 @@ else()
 endif()
 file(GLOB_RECURSE LIBRARY_HEADERS "src/*.h")
 add_library(ov_init_lib SHARED ${LIBRARY_SOURCES} ${LIBRARY_HEADERS})
+target_compile_definitions(ov_init_lib PUBLIC ${OV_EIGEN_ABI_DEFINITIONS})
 ament_target_dependencies(ov_init_lib rclcpp ov_core cv_bridge)
 target_link_libraries(ov_init_lib ${thirdparty_libraries})
 target_include_directories(ov_init_lib PUBLIC src/)
@@ -80,6 +83,8 @@ install(DIRECTORY src/
 )
 ament_export_include_directories(include)
 ament_export_libraries(ov_init_lib)
+ament_export_dependencies(rclcpp cv_bridge ov_core Eigen3)
+ament_export_definitions(${OV_EIGEN_ABI_DEFINITIONS})
 
 ##################################################
 # Make binary files!
@@ -109,4 +114,3 @@ install(DIRECTORY launch/ DESTINATION share/${PROJECT_NAME}/launch/)
 
 # finally define this as the package
 ament_package()
-

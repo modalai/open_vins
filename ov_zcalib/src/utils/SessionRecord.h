@@ -2,14 +2,11 @@
  * OpenVINS: An Open Platform for Visual-Inertial Research
  * Copyright (C) 2025-2026 Joao Leonardo Silva Cotta
  *
- * ov_zcalib: session record -- the MANDATORY disk mirror of every live session
- * and the replay input (CI path). The record stores the post-tracking streams
- * (RawImu + FrameObs) in ARRIVAL order plus the seed-calibration snapshot the
- * live session used, so a replay reproduces the downstream computation
- * bit-identically (same numbers in, same deterministic reduction). Images are
- * NOT stored by design (budget; the tracker already ran). Little-endian
- * fixed-layout records, no compression: a 10-min session is ~40 MB IMU +
- * ~15 MB tracks. Live-vs-replay bit-parity is a hard release gate.
+ * Session recording and replay of post-tracking IMU and feature observations.
+ * Records preserve arrival order, calibration/noise seeds and a base profile.
+ * Images and the full solver configuration are not stored. Reproduction also
+ * requires the producing overrides and compatible numerical execution; the
+ * record alone does not guarantee identical iterates or gate decisions.
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -29,11 +26,9 @@
 
 namespace ov_zcalib {
 
-/// The effective PROFILE a session ran under. A record that carries only the seed is NOT
-/// replayable -- the config is half the computation, and replaying a device session under library
-/// defaults silently scores a DIFFERENT estimator (measured: the euroc record aborts instantly on
-/// replay). The profile tag makes the record self-describing, so `--replay <bin>` reproduces the
-/// session that produced it, by construction.
+/// Base profile used by the recording. Replay reconstructs this profile before
+/// applying explicit overrides. The record does not contain every SessionConfig
+/// setting; reproducing nondefault settings also requires the producing config.
 enum class SessionProfile : uint8_t { LIBRARY = 0, VOXL = 1, VOXL_FLIGHT = 2, EUROC = 3 };
 
 /// Seed snapshot stored in the record header (what the live session ran with).
@@ -46,8 +41,7 @@ enum class SessionProfile : uint8_t { LIBRARY = 0, VOXL = 1, VOXL_FLIGHT = 2, EU
 /// session. Formats 5/6 remain readable, with completeness explicitly unknown at ordinary EOF.
 struct SessionSeed {
   SharedCalib calib; ///< seed calibration for the whole rig: N cameras + the one IMU
-  /// The effective configuration. A seed-only record is NOT replayable -- the config is half the
-  /// computation (see SessionProfile).
+  /// Base profile, not a complete serialization of SessionConfig.
   SessionProfile profile = SessionProfile::LIBRARY;
   int cam_mode = -1; ///< effective cam_mode (-1 = take the profile's own default)
 };

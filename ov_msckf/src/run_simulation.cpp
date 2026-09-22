@@ -25,6 +25,7 @@
 
 #include "core/VioManager.h"
 #include "sim/Simulator.h"
+#include "state/State.h"
 #include "utils/colors.h"
 #include "utils/dataset_reader.h"
 #include "utils/print.h"
@@ -124,12 +125,14 @@ int main(int argc, char **argv) {
     std::exit(EXIT_FAILURE);
   }
 
-  // Since the state time is in the camera frame of reference
-  // Subtract out the imu to camera time offset
-  imustate(0, 0) -= sim->get_true_parameters().calib_camimu_dt;
-
-  // Initialize our filter with the groundtruth
-  sys->initialize_with_gt(imustate);
+  // Physical mode receives the known IMU instant directly; it must not depend
+  // on the perturbed camera offset. Preserve the legacy reference-clock path.
+  if (sys->get_state()->uses_physical_clones()) {
+    sys->initialize_with_gt_imu(imustate);
+  } else {
+    imustate(0, 0) -= sim->get_true_parameters().calib_camimu_dt;
+    sys->initialize_with_gt(imustate);
+  }
 
   //===================================================================================
   //===================================================================================

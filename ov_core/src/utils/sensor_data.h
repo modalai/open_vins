@@ -24,7 +24,10 @@
 #define OV_CORE_SENSOR_DATA_H
 
 #include <Eigen/Eigen>
+#include <cstdint>
 #include <opencv2/opencv.hpp>
+#include <memory>
+#include <utility>
 #include <vector>
 #if HAVE_OPENCL
 #include <CL/cl.h>
@@ -51,16 +54,26 @@ struct ImuData {
   bool operator<(const ImuData &other) const { return timestamp < other.timestamp; }
 };
 
+/// Stable feature id and original distorted pixel coordinates. Normalization is performed
+/// by TrackSIM using the camera calibration active when this observation is consumed.
+using FeatureObservations = std::vector<std::pair<size_t, Eigen::VectorXf>>;
+
 /**
  * @brief Struct for a collection of camera measurements.
  *
  * For each image we have a camera id and timestamp that it occured at.
- * If there are multiple cameras we will treat it as pair-wise stereo tracking.
+ * Multiple cameras may use independent mono tracking or stereo association.
  */
 struct CameraData {
 
   /// Timestamp of the reading
   double timestamp;
+
+  /// Optional hardware exposure-start stamp used ONLY to associate forced-sync views.
+  /// Producers retain each view's own timestamp above. The synchronized consumer
+  /// assigns the reference view's timestamp to the complete group. -1 means the
+  /// source has no separate trigger stamp (already-synchronized messages still work).
+  int64_t sync_timestamp_ns = -1;
 
   /// Camera ids for each of the images collected
   std::vector<int> sensor_ids;
@@ -83,14 +96,22 @@ struct CameraData {
   /// because the thread holding the driver metadata is not, in general, the thread that consumes
   /// the image -- an async ingest hands frames to a different consumer entirely.
   ///
-  /// *** PROVENANCE ONLY -- DO NOT CONSUME THIS IN VIO OR THE CALIBRATOR. ***
+  /// *** PROVENANCE ONLY -- DO NOT APPLY ANOTHER EXPOSURE SHIFT DOWNSTREAM. ***
   /// The PRODUCER already applied it: `timestamp` is the frame's center-row mid-exposure instant
   /// (HAL3 start-of-exposure + (readout + exposure)/2, stamped at ingest), the calibrated
   /// `calib_camimu_dt` is defined against that convention, and per-row rolling-shutter time is
   /// the CENTERED deviation (v/h - 0.5) * t_readout around it. Shifting camera times by any
   /// exposure or readout term downstream DOUBLE-COUNTS what the stamp already contains, silently
-  /// biasing every clone. This field exists for diagnostics (AE behavior, session evidence).
+  /// biasing every clone. Forced-sync VIO instead uses the reference view's producer
+  /// timestamp for the entire group, deliberately approximating coincident exposures.
+  /// Each view's original exposure remains here for diagnostics and session evidence.
   std::vector<float> exposures;
+
+  /// Optional observation-replay payload, parallel to sensor_ids (empty for ordinary images).
+  /// One immutable vector is owned per camera frame. Buffer split/bundle/drop operations share
+  /// or move this owner, never copy feature vectors; the queue bounds the number of live frames.
+  /// Replay images/masks contain aligned empty cv::Mat headers, not fabricated sensor images.
+  std::vector<std::shared_ptr<const FeatureObservations>> observations;
 
   /// Sort function to allow for using of STL containers
   bool operator<(const CameraData &other) const {

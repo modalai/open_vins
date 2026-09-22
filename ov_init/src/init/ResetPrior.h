@@ -29,6 +29,18 @@
 
 #include <Eigen/Dense>
 #include <mutex>
+#include "utils/InitializerPhysicalWarmResult.h"
+
+namespace ov_init {
+/// Provenance of a prior produced by a live filter. External marginal priors
+/// without this receipt must be independent of the new graph's measurements.
+struct ResetFilterPrior {
+  Eigen::Matrix<double,6,6> covariance=Eigen::Matrix<double,6,6>::Zero();
+  double imu_endpoint=0.;
+  double imu_raw_cutoff=0.;
+  std::vector<double> raw_watermarks;
+};
+}
 
 namespace ov_init {
 
@@ -41,6 +53,10 @@ struct ResetBiasPrior {
   double t_snapshot = -1;                             ///< state timestamp at capture (camera clock)
   int cause = 0;                                      ///< 0 = client/unknown, 1 = divergence-triggered
   bool valid = false;                                 ///< false => consumers fall back to config seeds
+  std::shared_ptr<const ResetFilterPrior> filter;
+  /// Optional complete physical reset contract. A marginal-only prior never
+  /// gains invented camera cross terms merely because this field exists.
+  std::shared_ptr<const ov_core::InitPhysicalResetPrior> joint;
 };
 
 /// Episode-scoped reset context shared between VioManager (producer) and the initializer (consumer).

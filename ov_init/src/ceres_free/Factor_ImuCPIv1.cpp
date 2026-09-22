@@ -17,6 +17,7 @@
 #include "Factor_ImuCPIv1.h"
 
 #include "utils/quat_ops.h"
+#include "utils/finite.h"
 
 #include <cstdlib>
 #include <iostream>
@@ -26,7 +27,7 @@ using namespace ov_init::zbft_sfm;
 Factor_ImuCPIv1::Factor_ImuCPIv1(double deltatime, Eigen::Vector3d &grav, Eigen::Vector3d &alpha, Eigen::Vector3d &beta,
                                  Eigen::Vector4d &q_KtoK1, Eigen::Vector3d &ba_lin, Eigen::Vector3d &bg_lin, Eigen::Matrix3d &J_q,
                                  Eigen::Matrix3d &J_beta, Eigen::Matrix3d &J_alpha, Eigen::Matrix3d &H_beta, Eigen::Matrix3d &H_alpha,
-                                 Eigen::Matrix<double, 15, 15> &covariance) {
+                                 Eigen::Matrix<double, 15, 15> &covariance, const Eigen::Matrix3d &H_q) {
   // Save measurements
   this->alpha = alpha;
   this->beta = beta;
@@ -40,29 +41,11 @@ Factor_ImuCPIv1::Factor_ImuCPIv1(double deltatime, Eigen::Vector3d &grav, Eigen:
 
   // Save bias jacobians
   this->J_q = J_q;
+  this->H_q = H_q;
   this->J_a = J_alpha;
   this->J_b = J_beta;
   this->H_a = H_alpha;
   this->H_b = H_beta;
-
-  // Check that we have a valid covariance matrix that we can get the information of
-  Eigen::MatrixXd I = Eigen::MatrixXd::Identity(covariance.rows(), covariance.rows());
-  Eigen::MatrixXd information = covariance.llt().solve(I);
-  if (std::isnan(information.norm())) {
-    std::cerr << "P - " << std::endl << covariance << std::endl << std::endl;
-    std::cerr << "Pinv - " << std::endl << covariance.inverse() << std::endl << std::endl;
-    std::exit(EXIT_FAILURE);
-  }
-
-  // Get square-root of our information matrix
-  Eigen::LLT<Eigen::MatrixXd> lltOfI(information);
-  sqrtI_save = lltOfI.matrixL().transpose();
-
-  // Gravity enters the raw Jacobian only through rows 6-8 (R_1*dt) and 12-14 (0.5*R_1*dt^2),
-  // so fold the corresponding sqrtI columns ONCE here: J_grav = sqrtI_grav_fold * R_1 in
-  // Evaluate() -- replaces a dense 15x15 * 15x3 product per IMU factor per linearization.
-  sqrtI_grav_fold = deltatime * sqrtI_save.block<15, 3>(0, 6) +
-                    (0.5 * deltatime * deltatime) * sqrtI_save.block<15, 3>(0, 12);
 
   // Set the number of measurements, and the block sized
   set_num_residuals(15);
@@ -77,9 +60,42 @@ Factor_ImuCPIv1::Factor_ImuCPIv1(double deltatime, Eigen::Vector3d &grav, Eigen:
   mutable_parameter_block_sizes()->push_back(3); // ba_2
   mutable_parameter_block_sizes()->push_back(3); // p_I2inG
   mutable_parameter_block_sizes()->push_back(3); // gravity (S² with lsize=2, gsize=3)
+
+  // Input validation is independent of Release assertions and fast-math.
+  // Keep the factor registered, but fail Evaluate if the preintegral is invalid.
+  using ov_core::numeric::finite;
+  using ov_core::numeric::finite_matrix;
+  if (!finite(dt) || dt <= 0.0 || !finite_matrix(covariance) ||
+      !covariance.isApprox(covariance.transpose(), 1e-12) ||
+      !finite_matrix(alpha) || !finite_matrix(beta) || !finite_matrix(q_KtoK1) ||
+      q_KtoK1.squaredNorm() <= 0.0 || !finite_matrix(grav) ||
+      !finite_matrix(ba_lin) || !finite_matrix(bg_lin) || !finite_matrix(J_q) ||
+      !finite_matrix(J_beta) || !finite_matrix(J_alpha) || !finite_matrix(H_beta) ||
+      !finite_matrix(H_alpha) || !finite_matrix(H_q)) return;
+  Eigen::MatrixXd I = Eigen::MatrixXd::Identity(covariance.rows(), covariance.rows());
+  Eigen::LLT<Eigen::MatrixXd> lltOfP(covariance);
+  if (lltOfP.info() != Eigen::Success) return;
+  Eigen::MatrixXd information = lltOfP.solve(I);
+  if (!finite_matrix(information)) return;
+
+  // Get square-root of our information matrix
+  Eigen::LLT<Eigen::MatrixXd> lltOfI(information);
+  if (lltOfI.info() != Eigen::Success) return;
+  sqrtI_save = lltOfI.matrixL().transpose();
+  if (!finite_matrix(sqrtI_save)) return;
+
+  // Gravity enters the raw Jacobian only through rows 6-8 (R_1*dt) and 12-14 (0.5*R_1*dt^2),
+  // so fold the corresponding sqrtI columns ONCE here: J_grav = sqrtI_grav_fold * R_1 in
+  // Evaluate() -- replaces a dense 15x15 * 15x3 product per IMU factor per linearization.
+  sqrtI_grav_fold = deltatime * sqrtI_save.block<15, 3>(0, 6) +
+                    (0.5 * deltatime * deltatime) * sqrtI_save.block<15, 3>(0, 12);
+
+  valid = finite_matrix(sqrtI_grav_fold);
+
 }
 
 bool Factor_ImuCPIv1::Evaluate(double const *const *parameters, double *residuals, double **jacobians) const {
+  if (!valid) return false;
 
   // Get the local variables (these would be different if we relinearized)
   // Gravity comes from parameters[10] (S² on the sphere, explicit optimization)
@@ -117,9 +133,10 @@ bool Factor_ImuCPIv1::Evaluate(double const *const *parameters, double *residual
 
   // Quaternion associated with the bias w correction
   Eigen::Vector4d q_b;
-  q_b.block(0, 0, 3, 1) = 0.5 * J_q * dbw;
+  q_b.block(0, 0, 3, 1) = 0.5 * (J_q * dbw + H_q * dba);
   q_b(3, 0) = 1.0;
-  q_b = q_b / q_b.norm();
+  const double q_b_norm = q_b.norm();
+  q_b = q_b / q_b_norm;
 
   // Relative orientation from state estimates
   Eigen::Vector4d q_1_to_2 = ov_core::quat_multiply(q_2, ov_core::Inv(q_1));
@@ -160,8 +177,14 @@ bool Factor_ImuCPIv1::Evaluate(double const *const *parameters, double *residual
     // Dtheta wrt theta 2
     Jacobian.block(0, 15, 3, 3) = q_res_plus(3, 0) * eye + ov_core::skew_x(q_res_plus.block(0, 0, 3, 1));
 
-    // Dtheta wrt bw 1
-    Jacobian.block(0, 3, 3, 3) = (q_res_minus(3, 0) * eye - ov_core::skew_x(q_res_minus.block(0, 0, 3, 1))) * J_q;
+    // Differentiate the normalized small-angle correction at its current bias
+    // displacement, including Tg's rotation/accel-bias coupling. The legacy
+    // Jacobian omitted normalization and was exact only at zero displacement.
+    const Eigen::Matrix3d D_bias_rotation =
+        (q_res_minus(3, 0) * eye - ov_core::skew_x(q_res_minus.head<3>()) -
+         q_res_plus.head<3>() * q_b.head<3>().transpose()) / q_b_norm;
+    Jacobian.block(0, 3, 3, 3) = D_bias_rotation * J_q;
+    Jacobian.block(0, 9, 3, 3) = D_bias_rotation * H_q;
 
     // Dbw wrt bw1 and bw2
     Jacobian.block(3, 3, 3, 3) = -eye;

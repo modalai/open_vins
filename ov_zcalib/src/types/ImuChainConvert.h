@@ -5,7 +5,7 @@
  * ov_zcalib: seed the IMU intrinsics from an OpenVINS/kalibr IMU chain.
  * ------------------------------------------------------------------------
  * The two shipped gauges describe the SAME physics in DIFFERENT body frames,
- * and converting between them is a real conjugation -- not a repacking:
+ * and conversion changes coordinates as well as triangular storage:
  *
  *   KALIBR gauge: IMU frame == ACCEL frame  (R_ACCtoIMU = I structural)
  *       w_hat = R_GYROtoIMU * Dw_k * (w_m - bg)      Dw_k, Da_k LOWER-tri
@@ -15,8 +15,8 @@
  *       w_hat =         Dw_r * (w_m - bg)            Dw_r, Da_r UPPER-tri
  *       a_hat = R_AtoI * Da_r * (a_m - ba)
  *
- * The two IMU frames differ by the physical gyro-vs-accel die misalignment R
- * (~0.8 deg on ICM-class parts): w_hat^K = R w_hat^R, a_hat^K = R a_hat^R.
+ * The two calibrated IMU gauges differ by a rotation R:
+ * w_hat^K = R w_hat^R and a_hat^K = R a_hat^R.
  * Matching gyro rows gives  R_GYROtoIMU * Dw_k = R * Dw_r ; accel rows give
  * R_ACCtoIMU * Da_k = R * R_AtoI * Da_r. Each is an "orthogonal x upper-
  * triangular" factorization of a KNOWN matrix -- i.e. a QR:
@@ -30,13 +30,11 @@
  * exactly.
  *
  * The active chain is an optional initializer, not calibration ground truth.
- * A historical single-session comparison favored intrinsic seeding on its
- * reference rig (see CalibConfigYaml.h); it establishes no accuracy guarantee
- * for another recording or rig. SeedPolicy independently selects the ported
+ * SeedPolicy independently selects the ported
  * Dw/Da/R_AtoI values or identity, and the ported Tg value or zero.
  *
- * When Tg (g-sensitivity) is seeded, the gauge change conjugates it on one
- * side only: in both models the bracket is (w_m - b_g - Tg * a_hat), where w_m
+ * When Tg (g-sensitivity) is seeded, the gauge change acts on its input
+ * coordinates only: in both models the bracket is (w_m - b_g - Tg * a_hat), where w_m
  * and b_g are RAW GYRO AXES quantities identical in either gauge, so only
  * a_hat's frame moves. With a_hat^K = Q_w a_hat^R,
  *

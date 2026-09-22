@@ -45,14 +45,22 @@ public:
       : TrackBase(cameras, 0, numaruco, false, HistogramMethod::NONE) {}
 
   /**
-   * @brief Process a new image
-   * @warning This function should not be used!! Use @ref feed_measurement_simulation() instead.
-   * @param message Contains our timestamp, images, and camera ids
+   * @brief Consume an observation message released by the common camera buffer.
+   * @warning Actual image messages are unsupported by this tracker.
+   * @param message Contains immutable per-camera distorted-pixel observation payloads.
    */
   void feed_new_camera(const CameraData &message) override {
-    PRINT_ERROR(RED "[SIM]: SIM TRACKER FEED NEW CAMERA CALLED!!!\n" RESET);
-    PRINT_ERROR(RED "[SIM]: THIS SHOULD NEVER HAPPEN!\n" RESET);
-    std::exit(EXIT_FAILURE);
+    if (message.observations.size() != message.sensor_ids.size() || message.observations.empty()) {
+      PRINT_ERROR(RED "[SIM]: observation tracker requires per-camera observation payloads\n" RESET);
+      std::exit(EXIT_FAILURE);
+    }
+    for (size_t i = 0; i < message.sensor_ids.size(); ++i) {
+      if (!message.observations.at(i)) {
+        PRINT_ERROR(RED "[SIM]: null camera observation payload\n" RESET);
+        std::exit(EXIT_FAILURE);
+      }
+      feed_measurement_simulation(message.timestamp, message.sensor_ids.at(i), *message.observations.at(i));
+    }
   }
 
   /**
@@ -63,6 +71,9 @@ public:
    */
   void feed_measurement_simulation(double timestamp, const std::vector<int> &camids,
                                    const std::vector<std::vector<std::pair<size_t, Eigen::VectorXf>>> &feats);
+
+  /// Consume one camera without rebuilding/copying a nested feature-vector batch.
+  void feed_measurement_simulation(double timestamp, int camera, const FeatureObservations &features);
 };
 
 } // namespace ov_core

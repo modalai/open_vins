@@ -1,0 +1,15 @@
+{
+  "source": "Original frozen deterministic simulation first visual EKF update, camera event 23 at 1521753107.1580033",
+  "source_runtime_msckf_sha256": "e901e983cac484314e9bb764c5ca82ffca5e122e3ed05e8e416b33b24cc0ae0a",
+  "snapshot_dimensions": [
+    183,
+    86
+  ],
+  "input_bytes": 390752,
+  "input_sha256": "503e5307e11b9d173560baa8790439b2817e271d933f91da66db34efe319526e",
+  "format": "little-endian; magic16, n/m/hcols/nvars/nowners uint64, P/H/res/R column-major double, vars(id/size/value_rows int32,value,FEJ doubles), owner IDs int32, reference P then dx doubles; oracle regenerates final reference block",
+  "reference": "70-digit dense joint conditioning with symmetric prior; see regenerate_ekf_snapshot_reference.py",
+  "reference_sha256": "38cc25c30c6ee1ea42083820124194799f0a4f46f0f29368fbe8f404e36a63f0",
+  "binary_sha256": "84cfae4dc99b0d121002fb112bcdfb99811921b8098c77e52432959d1504f0bc",
+  "prior_max_asymmetry": 6.505213034913027e-19
+}

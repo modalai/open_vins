@@ -435,24 +435,14 @@ bool JointCalib::solve(const std::vector<WindowData> &windows, SharedCalib &cali
   // Early-stop state: last applied step's post-cap whitened norm, predicted
   // reduction (undamped model), lambda, cap flag; consecutive-stable counter
   // and the deterministic cold stop-confirmation pass.
-  // STAGE-AWARE certificate eligibility: the legacy plateau/anchor cold-solves
-  // are pure waste ONLY where the shallow subspace (da off-diag, q_AtoI) is
-  // frozen -- cam/ext/td stages. Where the accel chain is FREE, the cold
-  // cross-checks are load-bearing (measured: 4.9-15.5% mean cold-win gains;
-  // an end-to-end sim regressed 0.074->0.100 deg ext / ->0.321 deg qA under
-  // a global certificate), so those solves keep the full legacy two-path.
-  // (single-window solves excluded: with N=1 the fused step IS the window
-  // step, the second-order argument collapses, and a single-window p_IinC
-  // probe measured 4.0 -> 4.8 mm under a global certificate)
+  // Keep cold-start arbitration for open accel-chain and small-window solves
+  // unless explicitly enabled. A small nuisance decrement is a local
+  // stationarity check; it cannot rule out a different calibration basin.
   const bool cert_on = cfg.use_cert && (cfg.cert_open_imu || (!calib.imu.calib_da && !calib.imu.calib_RAtoI)) &&
                        (int)windows.size() >= cfg.cert_min_windows;
-  // duel_on_accept is MEASURED-INCOMPATIBLE with fused (capped) evals: the
-  // strand duels are what make candidate merits comparable to the accepted
-  // baseline (full-vs-full); deferring them leaves 1-iter candidate merits
-  // against a full-solve baseline -> every candidate 'rises' -> entry
-  // deadlock (measured on real data: td frozen at its bootstrap value, zero
-  // accepts). A loose-vs-loose baseline would restore comparability; until
-  // one exists the flag self-disarms under fused_schur.
+  // Fused evaluations cap inner work. Deferring cold-start arbitration would
+  // compare a partially optimized candidate against a fully optimized
+  // baseline, so duel_on_accept is unsupported with fused_schur.
   JointConfig cfg_eff = cfg;
   if (cfg_eff.duel_on_accept && cfg_eff.fused_schur) {
     if (cfg.verbose)
@@ -587,7 +577,7 @@ bool JointCalib::solve(const std::vector<WindowData> &windows, SharedCalib &cali
         bool cert_fail = false;
         if (cert_on && okA && !strand) {
           const double qn_band =
-              std::max(cfg.cert_qn_rel * wrA.cost_final, std::isfinite(qn_ref[wi]) ? cfg.cert_ref_growth * qn_ref[wi] : 0.0);
+              std::max(cfg.cert_qn_rel * wrA.cost_final, finite_scalar(qn_ref[wi]) ? cfg.cert_ref_growth * qn_ref[wi] : 0.0);
           // Capped-regime certificate: a capped eval is structurally
           // !inner_converged, but qn -- the nuisance Newton decrement the
           // export computes AT the current point -- measures stationarity
@@ -734,7 +724,7 @@ bool JointCalib::solve(const std::vector<WindowData> &windows, SharedCalib &cali
       return false;
     }
     double merit = cost_total + prior_cost_now();
-    if (!std::isfinite(merit))
+    if (!finite_scalar(merit))
       veto = true; // a NaN/inf evaluation must never be accepted (NaN defeats comparisons)
 
     // ---- duel_on_accept: the deferred quality duels run ONLY for a candidate
@@ -1010,6 +1000,10 @@ bool JointCalib::solve(const std::vector<WindowData> &windows, SharedCalib &cali
         merit = cost_total + prior_cost_now();
       }
     }
+    // Deferred duels/exports may have rebuilt the merit and reduced system.
+    // Validate the final candidate before promotion, including overflow in the
+    // ordered reduction. Bit checks survive the production fast-math flags.
+    veto = veto || !finite_scalar(merit) || !finite_matrix(Lsum) || !finite_matrix(gsum);
     if (veto || merit > prev_merit * (1.0 + 1e-4)) {
       restore(accepted_p);
       lm_lambda = std::min(lm_lambda * 8.0, 1e5);
@@ -1049,7 +1043,7 @@ bool JointCalib::solve(const std::vector<WindowData> &windows, SharedCalib &cali
           // duels (paths agreed within cert_agree_rel) refresh it. Without the
           // init the growth clause never fires and the certificate degrades to
           // the absolute band alone.
-          if (!std::isfinite(qn_ref[wi]) || slots[wi].dual_agree)
+          if (!finite_scalar(qn_ref[wi]) || slots[wi].dual_agree)
             qn_ref[wi] = slots[wi].qn;
           // seed anchors of record, per KEPT path: a pass where B re-seeded
           // but A was kept must promote A's PRE-re-seed anchors -- the
@@ -1063,7 +1057,7 @@ bool JointCalib::solve(const std::vector<WindowData> &windows, SharedCalib &cali
       bool stop_after_accept = false;
       // ---- early-stop: consecutive stable accepted steps + confirmation ----
       if (estop_on && have_pending) {
-        const double actual = std::isfinite(merit_before) ? merit_before - merit : 0.0;
+        const double actual = finite_scalar(merit_before) ? merit_before - merit : 0.0;
         const double rel = std::abs(actual) / std::max(merit, 1.0);
         const bool stable = !pend_capped && pend_winf <= cfg.stop_step_winf && rel <= cfg.stop_merit_rel &&
                             pend_lambda <= cfg.stop_lambda_max;
@@ -1130,9 +1124,15 @@ bool JointCalib::solve(const std::vector<WindowData> &windows, SharedCalib &cali
     Eigen::MatrixXd Ld = accepted_L;
     Ld.diagonal() += lm_lambda * accepted_L.diagonal().cwiseMax(1e-12);
     Eigen::LDLT<Eigen::MatrixXd> ldlt(Ld);
-    if (ldlt.info() != Eigen::Success)
+    if (ldlt.info() != Eigen::Success || !finite_matrix(ldlt.vectorD()) || !(ldlt.vectorD().array() > 0.0).all()) {
+      restore(accepted_p);
       return false;
+    }
     Eigen::VectorXd dp = ldlt.solve(-accepted_g);
+    if (ldlt.info() != Eigen::Success || !finite_matrix(dp)) {
+      restore(accepted_p);
+      return false;
+    }
     const double wnorm = (dp.cwiseQuotient(rep.prior_sigma_vec)).lpNorm<Eigen::Infinity>();
     const double trust = 3.0; // max step = 3 prior-sigmas per dof
     if (wnorm > trust)
@@ -1260,7 +1260,8 @@ bool JointCalib::solve(const std::vector<WindowData> &windows, SharedCalib &cali
     }
   }
   // Validate before publishing warm states or a carry stamped as accepted.
-  if (have_lin && !posterior_sigmas(accepted_L, rep.sigma))
+  if (have_lin && (!finite_scalar(prev_merit) || !finite_matrix(accepted_g) ||
+                   !posterior_sigmas(accepted_L, rep.sigma)))
     have_lin = false;
   if (warm_out && have_lin)
     *warm_out = warm_acc; // == nuisance optima at accepted_p (promotion contract above)
@@ -1268,7 +1269,7 @@ bool JointCalib::solve(const std::vector<WindowData> &windows, SharedCalib &cali
   rep.wall_s = elapsed_s();
   rep.accepted_passes = accepted_steps;
   rep.dim_p = np;
-  if (std::isfinite(prev_merit))
+  if (finite_scalar(prev_merit))
     rep.final_merit = prev_merit;
   for (size_t wi = 0; wi < work.size(); ++wi)
     if (!dead[wi])
@@ -1287,7 +1288,7 @@ bool JointCalib::solve(const std::vector<WindowData> &windows, SharedCalib &cali
     carry->valid = true;
   }
   if (cfg.verbose) {
-    std::printf("[joint] done: %d accepted / %d passes, wall %.2fs | thread-cpu: seed %.2f preint %.2f inner %.2f (%ld iters) export %.2f\n",
+    std::printf("[joint] done: %d accepted / %d passes, wall %.2fs | summed worker elapsed: seed %.2f preint %.2f inner %.2f (%ld iters) export %.2f\n",
                 accepted_steps, rep.evaluation_passes, rep.wall_s, rep.t_seed_sum, rep.t_preint_sum, rep.t_inner_sum, rep.inner_iters_sum,
                 rep.t_export_sum);
     std::printf("[joint] paths: warm %ld cold %ld (first %ld fail %ld jump %ld strand %ld cert %ld plateau %ld anchor %ld) cold-won %ld "

@@ -11,6 +11,7 @@ find_package(sensor_msgs REQUIRED)
 find_package(nav_msgs REQUIRED)
 find_package(cv_bridge REQUIRED)
 find_package(image_transport REQUIRED)
+find_package(message_filters REQUIRED)
 find_package(ov_core REQUIRED)
 find_package(ov_init REQUIRED)
 
@@ -45,6 +46,7 @@ list(APPEND ament_libraries
         nav_msgs
         cv_bridge
         image_transport
+        message_filters
         ov_core
         ov_init
 )
@@ -70,6 +72,7 @@ list(APPEND LIBRARY_SOURCES
 list(APPEND LIBRARY_SOURCES src/ros/ROS2Visualizer.cpp src/ros/ROSVisualizerHelper.cpp)
 file(GLOB_RECURSE LIBRARY_HEADERS "src/*.h")
 add_library(ov_msckf_lib SHARED ${LIBRARY_SOURCES} ${LIBRARY_HEADERS})
+target_compile_definitions(ov_msckf_lib PUBLIC ${OV_EIGEN_ABI_DEFINITIONS})
 ament_target_dependencies(ov_msckf_lib ${ament_libraries})
 target_link_libraries(ov_msckf_lib ${thirdparty_libraries})
 target_include_directories(ov_msckf_lib PUBLIC src/)
@@ -84,6 +87,8 @@ install(DIRECTORY src/
 )
 ament_export_include_directories(include)
 ament_export_libraries(ov_msckf_lib)
+ament_export_dependencies(${ament_libraries} Eigen3)
+ament_export_definitions(${OV_EIGEN_ABI_DEFINITIONS})
 
 ##################################################
 # Make binary files!

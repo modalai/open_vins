@@ -48,17 +48,10 @@ struct HarvesterConfig {
   // frame health
   double max_frame_gap_s = 0.100;
   int max_consec_drops = 1; ///< tolerated missing frames (>= 2 splits)
-  /// Beyond this fraction of ITS OWN expected frames, a camera is EVICTED from the window -- the
-  /// window itself survives on whatever cameras are still healthy, and is invalidated only when
-  /// none are.
-  ///
-  /// Per camera by design: a pooled rig-level drop counter is not a health gate, it is a contagion
-  /// on rigs whose cameras have different ingest costs. MEASURED (dual-camera rig, 60 Hz rolling +
-  /// 30 Hz global sharing one tracker): the 60 Hz stream saturated the tracker and shed ~1500
-  /// frames, invalidating 71 windows against 3 for the same session with that camera removed --
-  /// the OTHER camera lost two thirds of its windows to a camera it shares no feature with
-  /// (weakest direction 8.10 -> 3.23, held-out VERIFY 71.7% -> 60.2%). A camera must be
-  /// answerable for its own frames and no one else's.
+  /// Evict a camera when its missing-frame fraction exceeds this limit.
+  /// Count expected frames per camera so a slow or overloaded stream cannot
+  /// discard another camera's observations. Invalidate the window only when
+  /// no healthy cameras remain.
   double max_drop_frac = 0.10;
   // solver budgets
   int max_clones = 70;

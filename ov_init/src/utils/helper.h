@@ -25,6 +25,11 @@
 
 #include "cpi/CpiV1.h"
 #include "types/IMU.h"
+#include "utils/sensor_data.h"
+
+#include <algorithm>
+#include <cstdint>
+#include <cstring>
 
 namespace ov_init {
 
@@ -65,64 +70,44 @@ public:
    * @return Vector of measurements (if we could compute them)
    */
   static std::vector<ov_core::ImuData> select_imu_readings(const std::vector<ov_core::ImuData> &imu_data_tmp, double time0, double time1) {
-    // Our vector imu readings
     std::vector<ov_core::ImuData> prop_data;
-
-    // Ensure we have some measurements in the first place!
-    if (imu_data_tmp.empty()) {
+    // Validate real coverage rather than extrapolating or returning a shortened
+    // interval. Bit checks remain effective with the production -ffast-math.
+    const auto finite_time = [](double value) {
+      std::uint64_t bits;
+      std::memcpy(&bits, &value, sizeof(bits));
+      return (bits & UINT64_C(0x7ff0000000000000)) != UINT64_C(0x7ff0000000000000);
+    };
+    if (imu_data_tmp.size() < 2 || !finite_time(time0) || !finite_time(time1) ||
+        !(time1 > time0) || !finite_time(time1 - time0))
       return prop_data;
+    for (size_t i = 0; i < imu_data_tmp.size(); ++i) {
+      if (!finite_time(imu_data_tmp[i].timestamp) ||
+          (i && (!(imu_data_tmp[i].timestamp > imu_data_tmp[i - 1].timestamp) ||
+                 !finite_time(imu_data_tmp[i].timestamp - imu_data_tmp[i - 1].timestamp))))
+        return prop_data;
     }
-
-    // Loop through and find all the needed measurements to propagate with
-    // Note we split measurements based on the given state time, and the update timestamp
-    for (size_t i = 0; i < imu_data_tmp.size() - 1; i++) {
-
-      // START OF THE INTEGRATION PERIOD
-      if (imu_data_tmp.at(i + 1).timestamp > time0 && imu_data_tmp.at(i).timestamp < time0) {
-        ov_core::ImuData data = interpolate_data(imu_data_tmp.at(i), imu_data_tmp.at(i + 1), time0);
-        prop_data.push_back(data);
-        continue;
-      }
-
-      // MIDDLE OF INTEGRATION PERIOD
-      if (imu_data_tmp.at(i).timestamp >= time0 && imu_data_tmp.at(i + 1).timestamp <= time1) {
-        prop_data.push_back(imu_data_tmp.at(i));
-        continue;
-      }
-
-      // END OF THE INTEGRATION PERIOD
-      if (imu_data_tmp.at(i + 1).timestamp > time1) {
-        if (imu_data_tmp.at(i).timestamp > time1 && i == 0) {
-          break;
-        } else if (imu_data_tmp.at(i).timestamp > time1) {
-          ov_core::ImuData data = interpolate_data(imu_data_tmp.at(i - 1), imu_data_tmp.at(i), time1);
-          prop_data.push_back(data);
-        } else {
-          prop_data.push_back(imu_data_tmp.at(i));
-        }
-        if (prop_data.at(prop_data.size() - 1).timestamp != time1) {
-          ov_core::ImuData data = interpolate_data(imu_data_tmp.at(i), imu_data_tmp.at(i + 1), time1);
-          prop_data.push_back(data);
-        }
-        break;
-      }
-    }
-
-    // Check that we have at least one measurement to propagate with
-    if (prop_data.empty()) {
+    if (time0 < imu_data_tmp.front().timestamp || time1 > imu_data_tmp.back().timestamp)
       return prop_data;
-    }
 
-    // Loop through and ensure we do not have an zero dt values
-    // This would cause the noise covariance to be Infinity
-    for (size_t i = 0; i < prop_data.size() - 1; i++) {
-      if (std::abs(prop_data.at(i + 1).timestamp - prop_data.at(i).timestamp) < 1e-12) {
-        prop_data.erase(prop_data.begin() + i);
-        i--;
-      }
-    }
-
-    // Success :D
+    // Keep exact samples at either endpoint byte-for-byte; otherwise interpolate
+    // each endpoint independently. This also handles both times lying within the
+    // final sampling interval, including when the buffer contains only two IMUs.
+    prop_data.reserve(imu_data_tmp.size());
+    size_t i = 0;
+    while (imu_data_tmp[i].timestamp < time0)
+      ++i;
+    if (imu_data_tmp[i].timestamp == time0)
+      prop_data.push_back(imu_data_tmp[i]);
+    else
+      prop_data.push_back(interpolate_data(imu_data_tmp[i - 1], imu_data_tmp[i], time0));
+    for (; i < imu_data_tmp.size() && imu_data_tmp[i].timestamp < time1; ++i)
+      if (imu_data_tmp[i].timestamp > time0)
+        prop_data.push_back(imu_data_tmp[i]);
+    if (imu_data_tmp[i].timestamp == time1)
+      prop_data.push_back(imu_data_tmp[i]);
+    else
+      prop_data.push_back(interpolate_data(imu_data_tmp[i - 1], imu_data_tmp[i], time1));
     return prop_data;
   }
 

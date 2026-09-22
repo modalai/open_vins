@@ -38,17 +38,22 @@
 #endif
 
 #include <map>
+#include <cstdint>
+#include <deque>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
 #include "AsyncCameraBuffer.h"
 #include "VioManagerOptions.h"
+#include "update/UpdaterZeroVelocity.h"
 #include "state/Propagator.h"     // Propagator::Snapshot nested type (VioManager::Snapshot)
 #include "track/TrackBase.h"      // TrackBase::FrontendState nested type (VioManager::Snapshot)
 #include "utils/ChronoProf.h"     // ProfTime members (rT1..rT7)
 
 namespace ov_core {
 struct ImuData;
+struct InitPhysicalResetPrior;
 struct CameraData;
 class TrackBase;
 class Feature;
@@ -56,6 +61,7 @@ class FeatureInitializer;
 } // namespace ov_core
 namespace ov_init {
 class InertialInitializer;
+struct ResetBiasPrior;
 } // namespace ov_init
 
 namespace ov_msckf {
@@ -83,6 +89,10 @@ public:
    */
   VioManager(VioManagerOptions &params_);
 
+  /// Sensor callbacks must be quiesced before destruction. Joins the owned
+  /// initializer before any input, state or tracker members can be released.
+  ~VioManager();
+
   /**
    * @brief Feed function for inertial data
    * @param message Contains our timestamp and inertial information
@@ -103,6 +113,8 @@ public:
    * @brief Per-frame post-processing hook, run on the VIO thread after a frame is consumed.
    * @param cb cb(msg, processed): processed=false for frames the ingest dropped (release any
    * external image handles there); return false to pause draining this round (e.g. reset pending).
+   * Physical-time groups finish all tracking and updates before these callbacks. A pause takes
+   * effect after the group; every callback in that completed group has processed=true.
    * NOTE: the processed=false path can also run on a producer thread (ring-full last resort).
    */
   void set_camera_processed_callback(std::function<bool(const ov_core::CameraData &msg, bool processed)> cb) {
@@ -119,6 +131,14 @@ public:
   /// Ingest buffer telemetry access
   std::shared_ptr<AsyncCameraBuffer> get_camera_buffer() { return camera_buffer; }
 
+  /// Select recorded-camera ordering before input, without replacing the image
+  /// tracker. Physical/forced-sync queues wait for data or EOF, not host time.
+  void prepare_camera_replay();
+
+  /// Terminal camera EOF: drain covered groups and dispose uncovered tails.
+  /// Call on the quiescent replay thread; no IMU extrapolation is performed.
+  void finish_camera_replay();
+
   /**
    * @brief Feed function for a synchronized simulated cameras
    * @param timestamp Time that this image was collected
@@ -127,6 +147,24 @@ public:
    */
   void feed_measurement_simulation(double timestamp, const std::vector<int> &camids,
                                    const std::vector<std::vector<std::pair<size_t, Eigen::VectorXf>>> &feats);
+
+  /// Install the observation-only tracker before the first IMU/camera input. Unlike the
+  /// legacy immediate simulation feed, queued replay must never replace an initializer
+  /// after it has accumulated IMU history. Call on the quiescent VIO thread.
+  /// In physical/forced-sync mode, only recorded timestamps/EOF decide ordering;
+  /// wall-clock stalls cannot expire a camera. Mark cameras absent from the
+  /// recording finished with get_camera_buffer()->finish_camera(camera_id).
+  void prepare_observation_replay();
+
+  /// Queue original distorted pixels through the same ordering/coverage/grouping path as
+  /// image input. Raw camera timestamps are unchanged. Feature vectors move into immutable
+  /// per-camera owners; no feature-vector copies are made when the buffer splits a bundle.
+  void feed_measurement_simulation_queued(double timestamp, const std::vector<int> &camids,
+                                         std::vector<ov_core::FeatureObservations> feats);
+
+  /// True terminal EOF only: close all camera producers, drain covered groups, then dispose
+  /// remaining frames (uncovered tails or a callback-requested pause). No IMU extrapolation.
+  void finish_observation_replay();
 
   /**
    * @brief Feed a batch of IMU measurements with optional downsampling
@@ -137,9 +175,13 @@ public:
 
   /**
    * @brief Given a state, this will initialize our IMU state.
-   * @param imustate State in the MSCKF ordering: [time(sec),q_GtoI,p_IinG,v_IinG,b_gyro,b_accel]
+   * @param imustate State in the MSCKF ordering: [reference-camera time(sec),q_GtoI,p_IinG,v_IinG,b_gyro,b_accel]
    */
   void initialize_with_gt(Eigen::Matrix<double, 17, 1> imustate);
+
+  /// Initialize a state whose timestamp is already in the IMU clock. In particular,
+  /// a simulator/ground-truth pose must not acquire the estimated camera-clock error.
+  void initialize_with_gt_imu(Eigen::Matrix<double, 17, 1> imustate);
 
   // ============================================================================================
   // Snapshot / restore / branch (offline replay harness -- "jump around the log")
@@ -160,13 +202,23 @@ public:
   // ============================================================================================
   struct Snapshot {
     std::shared_ptr<State> state;                                   // deep clone (StateHelper::clone_state)
+    std::shared_ptr<UpdaterZeroVelocity::Snapshot> zupt;
     Propagator::Snapshot prop;                                      // IMU history + prop time offset
     std::shared_ptr<ov_core::TrackBase::FrontendState> track_front; // tracker CPU last-frame state
     std::unordered_map<size_t, std::shared_ptr<ov_core::Feature>> feature_db; // deep-copied features
+    // Camera-owned raw replay cursors. A physical group can finish several raw
+    // timestamps before its first callback; one scalar cursor cannot represent it.
+    // Restore callers reload/prime every finite entry and skip only that camera's
+    // already consumed observations, not all cameras below a global raw cutoff.
+    std::vector<double> tracked_camera_times;
     // manager scalars
     bool is_initialized_vio = false;
+    bool warmstart_next_init = false;
+    std::shared_ptr<const ov_core::InitPhysicalResetPrior> physical_reset_prior;
+    std::shared_ptr<const ov_init::ResetBiasPrior> reset_prior;
     double timelastupdate = -1;
     double startup_time = -1;
+    double startup_imu_time = -1;
     double distance = 0;
     double newest_imu_time = -std::numeric_limits<double>::infinity();
     double last_ref_frame_time = -1;
@@ -180,9 +232,9 @@ public:
     bool has_moved_since_zupt = false;
     std::map<double, std::vector<std::shared_ptr<ov_core::Feature>>> used_features_map; // deep copies
     // NOT captured, by policy (restore() resets them instead): the async-init machinery
-    // (thread flags + queued init timestamps), the ZUPT updater's own IMU window and hold
-    // counters (it re-accumulates after a rewind), the initializer's IMU buffer (recreated on
-    // pre-init restores), the active-track retriangulation accumulators and viz outputs
+    // (thread flags + queued init timestamps), the initializer's private IMU buffer
+    // (joint pre-init restores seed it from the captured propagator history), the
+    // active-track retriangulation accumulators and viz outputs
     // (self-heal on the next base-cam frame), and telemetry counters (epoch_snapped etc. keep
     // counting across the rewind). trackARUCO state is neither captured nor reset -- snapshot()
     // warns when an aruco tracker is active, since its database would replay duplicated
@@ -200,7 +252,9 @@ public:
    * the propagator / feature database / tracker CPU state / scalars in place (object identities
    * preserved -- ZUPT/initializer alias them), and rebuilds the GPU previous-frame pyramid by
    * feeding @p prime_frames (the camera frame(s) at the snapshot cursor, re-read from the log by
-   * the caller). Pass the same frame(s) whose processing produced the snapshot.
+   * the caller). Prime each camera at its tracked_camera_times entry; equal-time
+   * physical groups may contain different raw timestamps. Replay skips consumed
+   * keys per camera using those entries, not one global raw-time cutoff.
    *
    * @param snap         Snapshot to restore
    * @param prime_frames Camera frame(s) at the snapshot cursor, in feed order (empty = skip GPU
@@ -337,6 +391,25 @@ protected:
    */
   void drain_camera_buffer();
 
+  /// Shared TrackSIM setup; the immediate legacy API retains its historical late-swap path.
+  void ensure_simulation_tracker();
+  bool observation_replay_prepared = false;
+
+  /// One physical exposure group is selected before any of its camera updates.
+  /// Its raw identities and nominal endpoint stay fixed through those updates.
+  void begin_physical_group(const std::vector<std::pair<size_t, double>> &keys, double imu_time);
+  bool prepare_physical_group();
+  void update_simulation_physical(const ov_core::CameraData &message,
+      const std::vector<std::vector<std::pair<size_t, Eigen::VectorXf>>> &feats);
+  std::vector<std::pair<size_t, double>> physical_group_keys;
+  std::vector<ov_core::CameraData> physical_tracked_group;
+  std::vector<double> tracked_camera_times;
+  double physical_group_imu_time = -1.0;
+  bool physical_group_prepared = false;
+  bool physical_group_valid = false;
+  bool physical_group_zupt = false;
+
+
   /**
    * @brief Epoch-anchored cloning decision for one incoming frame (VIO thread).
    *
@@ -384,6 +457,8 @@ protected:
    * @param message Contains our timestamp, images, and camera ids
    */
   void track_image_and_update(const ov_core::CameraData &message);
+  ov_core::CameraData track_camera(const ov_core::CameraData &message);
+  void update_tracked_camera(const ov_core::CameraData &message);
 
   /**
    * @brief This will do the propagation and feature updates to the state
@@ -402,6 +477,18 @@ protected:
    * @return True if we have successfully initialized
    */
   bool try_to_initialize(const ov_core::CameraData &message);
+
+  struct InitializationAttempt;
+  struct InitializationWorker;
+  static void compute_initialization(const std::shared_ptr<InitializationAttempt> &attempt);
+  static void run_initialization_worker(const std::shared_ptr<InitializationWorker> &worker);
+  bool initialization_completed() const;
+  bool finish_initialization(const std::shared_ptr<InitializationAttempt> &attempt);
+  void stop_initialization_worker();
+  void stop_initialization();
+  void queue_initialization_camera(const ov_core::CameraData &message);
+
+  void initialize_with_gt_at_endpoint(Eigen::Matrix<double, 17, 1> imustate, double imu_time);
 
   /**
    * @brief This function will will re-triangulate all features in the current frame
@@ -444,10 +531,9 @@ protected:
   /// Our zero velocity tracker
   std::shared_ptr<UpdaterZeroVelocity> updaterZUPT;
 
-  /// This is the queue of measurement times that have come in since we starting doing initialization
-  /// After we initialize, we will want to prop & update to the latest timestamp quickly
-  std::vector<double> camera_queue_init;
-  std::mutex camera_queue_init_mtx;
+  /// Consumer-owned catch-up window, capped at the configured pose count.
+  std::deque<double> camera_queue_init;
+  std::deque<std::pair<size_t, double>> camera_queue_init_owners;
 
   // Timing statistic file and variables
   std::ofstream of_statistics;
@@ -459,14 +545,19 @@ protected:
 
   // Startup time of the filter
   double startup_time = -1;
+  double startup_imu_time = -1;
 
-  // Threads and their atomics
+  // Exactly one owned worker/result. The worker touches only its detached
+  // attempt; import, propagation and these flags belong to the consumer.
+  std::thread initialization_thread;
+  std::shared_ptr<InitializationWorker> initialization_worker;
+  std::shared_ptr<InitializationAttempt> initialization_attempt;
+  uint64_t initialization_generation = 0;
   std::atomic<bool> thread_init_running, thread_init_success;
 
   // Set by soft_reset() (mid-ops re-init): the NEXT successful initialization is allowed to warm-start
   // (inject the window clones + joint covariance) instead of cold-starting. Cleared once we re-init.
-  // First boot and hard reset leave this false -> they always cold-start. Lock-free hand-off between
-  // the (health/main) thread that calls soft_reset() and the async init thread that consumes it.
+  // First boot and hard reset leave this false -> they always cold-start.
   std::atomic<bool> warmstart_next_init{false};
 
   // If we did a zero velocity update

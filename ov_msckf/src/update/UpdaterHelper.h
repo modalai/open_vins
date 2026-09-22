@@ -29,6 +29,8 @@
 
 #include "types/LandmarkRepresentation.h"
 
+namespace ov_core { class Feature; }
+
 namespace ov_type {
 class Type;
 } // namespace ov_type
@@ -49,6 +51,11 @@ class State;
  */
 class UpdaterHelper {
 public:
+  /// Remove measurements without a retained owner pose. Camera raw keys are
+  /// independent in physical-exposure mode; a same-time other camera is not a substitute.
+  static void clean_feature_measurements(const std::shared_ptr<State> &state, ov_core::Feature &feature,
+                                         const std::vector<double> &legacy_times);
+
   /**
    * @brief Feature object that our UpdaterHelper leverages, has all measurements and means
    */
@@ -78,10 +85,10 @@ public:
     /// Quality of the feature
     double quality = -1;
 
-    /// Triangulated position of this feature, in the anchor frame
+    /// Position in the virtual anchor camera at the retained clone epoch (no td/RS/bridge warp).
     Eigen::Vector3d p_FinA;
 
-    /// Triangulated position of this feature, in the anchor frame first estimate
+    /// First-estimate position in that same virtual anchor coordinate convention.
     Eigen::Vector3d p_FinA_fej;
 
     /// Triangulated position of this feature, in the global frame
@@ -90,6 +97,12 @@ public:
     /// Triangulated position of this feature, in the global frame first estimate
     Eigen::Vector3d p_FinG_fej;
   };
+
+  /// Convert a triangulated world point into the virtual anchor camera attached
+  /// to a retained clone. FeatureInitializer's p_FinA uses the exposure pose and
+  /// must not be copied into the estimator's anchored landmark parameterization.
+  static Eigen::Vector3d world_to_anchor(const std::shared_ptr<State> &state, size_t camera_id, double clone_time,
+                                         const Eigen::Vector3d &p_FinG);
 
   /**
    * @brief This gets the feature and state Jacobian in respect to the feature representation
@@ -139,6 +152,11 @@ public:
    * @param res Measurement residual
    */
   static void measurement_compress_inplace(Eigen::MatrixXd &H_x, Eigen::VectorXd &res);
+
+  /// Also retain the squared norm of residual rows orthogonal to the state
+  /// Jacobian. They carry no state update, but are required for an innovation
+  /// goodness-of-fit test. Inputs must have isotropic (whitened) noise.
+  static void measurement_compress_inplace(Eigen::MatrixXd &H_x, Eigen::VectorXd &res, double &discarded_residual_squared);
 };
 
 } // namespace ov_msckf

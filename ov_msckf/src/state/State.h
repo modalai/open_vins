@@ -23,12 +23,15 @@
 #ifndef OV_MSCKF_STATE_H
 #define OV_MSCKF_STATE_H
 
+#include "utils/finite.h"
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <stdexcept>
 #include <unordered_map>
 #include <vector>
 
@@ -40,6 +43,7 @@
 #include "types/PoseJPL.h"
 #include "types/Type.h"
 #include "types/Vec.h"
+#include "utils/InitializerPhysicalWarmResult.h"
 
 namespace ov_msckf {
 
@@ -54,6 +58,27 @@ namespace ov_msckf {
 class State {
 
 public:
+  /// Immutable first-use description of one original raw-axis IMU record.
+  /// This ownership foundation does not enable a sampled-noise runtime mode.
+  struct SampledImuRecord {
+    uint64_t stream_episode = 0, sequence = 0;
+    double timestamp = 0.;
+    Eigen::Matrix<double, 6, 1> measured = Eigen::Matrix<double, 6, 1>::Zero();
+    Eigen::Matrix<double, 6, 6> prior = Eigen::Matrix<double, 6, 6>::Zero();
+  };
+
+  struct SampledImuSlot {
+    bool active = false;
+    SampledImuRecord record;
+    // Always allocated in the covariance after explicit preparation. Inactive
+    // slots have zero mean, FEJ, covariance and cross rows. FEJ remains zero in
+    // the raw noise chart; value is the inferred sample-noise posterior mean.
+    std::shared_ptr<ov_type::Vec> noise;
+  };
+
+  bool has_sampled_imu_boundary() const { return _sampled_imu_stream_episode != 0; }
+  const std::array<SampledImuSlot, 2> &sampled_imu_slots() const { return _sampled_imu_slots; }
+
   /// Per-clone kinematic metadata (velocity and corrected angular rate at clone time, plus their
   /// FEJ twins). Consumed by the per-camera time-offset / rolling-shutter measurement models as the
   /// CLONE-SIDE Jacobian linearization point. Metadata only -- never in the state vector/covariance.
@@ -73,6 +98,76 @@ public:
     Eigen::Vector3d omega_fej = Eigen::Vector3d::Zero();
   };
 
+  /// One stochastic exposure view. Even equal nominal exposure times have
+  /// separate views when their camera clock errors are independent. Raw keys
+  /// never change after insertion; the view's ordinary EKF correction carries
+  /// its clock correlation. Entries are retained in physical creation order.
+  struct ExposurePose {
+    size_t camera_id = 0;
+    double raw_time = -1.0;
+    double imu_time = -1.0;
+    std::shared_ptr<ov_type::PoseJPL> pose;
+    CloneKinematics kinematics;
+  };
+
+  bool uses_physical_clones() const { return _options.physical_camera_clones; }
+  size_t clone_count() const { return uses_physical_clones() ? _exposure_poses.size() : _clones_IMU.size(); }
+
+  /// A pre-first-propagation state may still carry the initializer's camera
+  /// clock label. After any accepted propagation/ZUPT, the stored endpoint is
+  /// authoritative and cannot be relabeled by a camera-clock EKF update.
+  double imu_endpoint() const {
+    return _imu_endpoint_valid ? _imu_endpoint : _timestamp + cam_imu_dt_ref();
+  }
+
+  std::shared_ptr<ov_type::PoseJPL> find_pose(size_t camera_id, double raw_time) const {
+    if (!uses_physical_clones()) {
+      auto it = _clones_IMU.find(raw_time);
+      return it == _clones_IMU.end() ? nullptr : it->second;
+    }
+    for (const auto &view : _exposure_poses)
+      if (view.camera_id == camera_id && ov_core::initializer_time_bits(view.raw_time) == ov_core::initializer_time_bits(raw_time))
+        return view.pose;
+    return nullptr;
+  }
+
+  std::shared_ptr<ov_type::PoseJPL> pose_for_camera(size_t camera_id, double raw_time) const {
+    auto pose = find_pose(camera_id, raw_time);
+    if (!pose)
+      throw std::out_of_range("camera observation has no retained exposure pose");
+    return pose;
+  }
+
+  const CloneKinematics *clone_kinematics(size_t camera_id, double raw_time) const {
+    if (!uses_physical_clones()) {
+      auto it = _clones_kinematics.find(raw_time);
+      return it == _clones_kinematics.end() ? nullptr : &it->second;
+    }
+    for (const auto &view : _exposure_poses)
+      if (view.camera_id == camera_id && ov_core::initializer_time_bits(view.raw_time) == ov_core::initializer_time_bits(raw_time))
+        return &view.kinematics;
+    return nullptr;
+  }
+
+  /// Bounded allocation-free traversal. Legacy mode exposes its shared clone
+  /// window to every camera; physical mode exposes only that camera's owners.
+  template <typename Fn> void for_each_clone(size_t camera_id, Fn fn) const {
+    if (uses_physical_clones()) {
+      for (const auto &view : _exposure_poses)
+        if (view.camera_id == camera_id)
+          fn(view.raw_time, view.pose);
+    } else {
+      for (const auto &entry : _clones_IMU)
+        fn(entry.first, entry.second);
+    }
+  }
+
+  double latest_clone_time(size_t camera_id) const {
+    double time = -std::numeric_limits<double>::infinity();
+    for_each_clone(camera_id, [&](double t, const std::shared_ptr<ov_type::PoseJPL> &) { time = std::max(time, t); });
+    return time;
+  }
+
   /**
    * @brief Default Constructor (will initialize variables to defaults)
    * @param options_ Options structure containing filter options
@@ -89,6 +184,8 @@ public:
    */
   double margtimestep() {
     std::lock_guard<std::mutex> lock(_mutex_state);
+    if (uses_physical_clones())
+      return _exposure_poses.empty() ? INFINITY : _exposure_poses.front().raw_time;
     double time = INFINITY;
     for (const auto &clone_imu : _clones_IMU) {
       if (clone_imu.first < time) {
@@ -194,7 +291,7 @@ public:
     for (int i = 0; i < _options.num_cameras; i++) {
       dt_min = std::min(dt_min, cam_imu_dt((size_t)i));
     }
-    return std::isfinite(dt_min) ? dt_min : cam_imu_dt_ref();
+    return ov_core::numeric::finite(dt_min) ? dt_min : cam_imu_dt_ref();
   }
 
   /// Returns max dt among specific camera ids
@@ -209,7 +306,7 @@ public:
       }
       dt_max = std::max(dt_max, cam_imu_dt((size_t)cam_id));
     }
-    return std::isfinite(dt_max) ? dt_max : cam_imu_dt_ref();
+    return ov_core::numeric::finite(dt_max) ? dt_max : cam_imu_dt_ref();
   }
 
   /**
@@ -219,12 +316,32 @@ public:
    * windows the cam-IMU time offsets / readout are weakly observable and their estimates wander,
    * injecting correlated error (hover is the canonical case). The gate checks the CLONE WINDOW's
    * excitation from the stored kinematics: peak |omega| and the velocity spread (a window-scale
-   * acceleration proxy). Consumers freeze the dt/readout Jacobian COLUMNS while degenerate --
-   * the values keep being USED, they just stop being updated.
+   * acceleration proxy). StateHelper freezes dt/readout gain ROWS while degenerate (a Schmidt
+   * update). The full measurement model and their prior uncertainty remain in the update.
    */
   bool dt_calib_degenerate() const {
     if (!_options.dt_calib_gate) {
       return false;
+    }
+    if (uses_physical_clones()) {
+      if (_exposure_poses.empty()) {
+        return true;
+      }
+      double omega_max = 0.0;
+      Eigen::Vector3d vel_mean = Eigen::Vector3d::Zero();
+      for (const auto &view : _exposure_poses) {
+        omega_max = std::max(omega_max, view.kinematics.omega.norm());
+        vel_mean += view.kinematics.vel;
+      }
+      if (omega_max >= _options.dt_calib_gate_min_omega) {
+        return false;
+      }
+      vel_mean /= static_cast<double>(_exposure_poses.size());
+      double vel_spread = 0.0;
+      for (const auto &view : _exposure_poses) {
+        vel_spread = std::max(vel_spread, (view.kinematics.vel - vel_mean).norm());
+      }
+      return vel_spread < _options.dt_calib_gate_min_vel_spread;
     }
     if (_clones_kinematics.empty()) {
       return true; // no evidence of excitation -> freeze
@@ -256,6 +373,12 @@ public:
   /// Current timestamp (should be the last update time in camera clock frame!)
   double _timestamp = -1;
 
+  double _imu_endpoint = -1.0;
+  bool _imu_endpoint_valid = false;
+
+  /// Accepted physical initialization transaction, copied with snapshots.
+  uint64_t _initialization_episode_id = 0;
+
   /// Struct containing filter options
   StateOptions _options;
 
@@ -264,6 +387,10 @@ public:
 
   /// Map between imaging times and clone poses (q_GtoIi, p_IiinG)
   std::map<double, std::shared_ptr<ov_type::PoseJPL>> _clones_IMU;
+
+  /// Bounded owner registry for physical-camera mode. StateHelper owns pose
+  /// covariance insertion/removal; VioManager owns the raw observation aliases.
+  std::vector<ExposurePose> _exposure_poses;
 
   /// Our current set of SLAM features (3d positions)
   std::unordered_map<size_t, std::shared_ptr<ov_type::Landmark>> _features_SLAM;
@@ -291,6 +418,8 @@ public:
 
   /// KNOWN epoch time residual for (camera, clone time); 0 when none was recorded
   double epoch_residual(size_t cam_id, double clone_time) const {
+    if (uses_physical_clones())
+      return 0.0;
     auto it = _epoch_residuals.find(clone_time);
     if (it == _epoch_residuals.end()) {
       return 0.0;
@@ -305,6 +434,8 @@ public:
 
   /// Bridge lookup for (camera, clone time); nullptr when none exists (first-order fallback)
   const PreintBridgeData *epoch_bridge(size_t cam_id, double clone_time) const {
+    if (uses_physical_clones())
+      return nullptr;
     auto it = _epoch_bridges.find(clone_time);
     if (it == _epoch_bridges.end()) {
       return nullptr;
@@ -337,11 +468,24 @@ public:
   /// Rotation from accelerometer to the "IMU" gyroscope frame frame (rpng model)
   std::shared_ptr<ov_type::JPLQuat> _calib_imu_ACCtoIMU;
 
+protected:
+  /// Reusable Schmidt-update scratch, not estimator state. Allocated only on a requested freeze;
+  /// bounded by two scalar temporal variables per configured camera. Rebuilt after a snapshot.
+  std::vector<int> _temporal_schmidt_ids;
+  std::vector<double> _temporal_schmidt_prior;
+
 private:
   // Define that the state helper is a friend class of this class
   // This will allow it to access the below functions which should normally not be called
   // This prevents a developer from thinking that the "insert clone" will actually correctly add it to the covariance
   friend class StateHelper;
+
+  // Two permanent covariance slots avoid allocation and dimension changes at
+  // every raw knot. Only StateHelper admits/retires immutable sample metadata.
+  std::array<SampledImuSlot, 2> _sampled_imu_slots;
+  uint64_t _sampled_imu_stream_episode = 0;
+  uint64_t _sampled_imu_last_sequence = 0;
+  double _sampled_imu_last_timestamp = 0.;
 
   /// Covariance of all active variables
   Eigen::MatrixXd _Cov;
