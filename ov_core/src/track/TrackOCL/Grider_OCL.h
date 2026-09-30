@@ -279,9 +279,16 @@ class Grider_OCL {
         if (results.empty()) return;
         auto& det = results[0];
 
-        // sort detections by score descending
+        // sort detections by score descending. The GPU appends corners in atomic_inc order, which
+        // changes run to run, and scores tie often (integer FAST score), so break ties on (y, x):
+        // a strict total order makes per-cell selection, feature IDs and every downstream order
+        // (e.g. the RANSAC input order) independent of GPU scheduling.
         std::sort(det.keypoints.begin(), det.keypoints.end(),
-                [](auto &a, auto &b) { return a.score > b.score; });
+                [](const auto &a, const auto &b) {
+                    if (a.score != b.score) return a.score > b.score;
+                    if (a.y != b.y) return a.y < b.y;
+                    return a.x < b.x;
+                });
 
         // printf("in grid flow function, points; %d, grid_x: %d, grid_y; %d, num_feats_per_grid: %d\n", det.keypoints.size(), grid_x, grid_y, num_features_grid);
 
