@@ -85,7 +85,7 @@ namespace ov_core
       for (auto const &[camId, camPtr] : cameras)
       {
         //  assumes track input frames will be uint8_t grayscale
-        modal_flow::Camera cam{.id = camId, .width = camPtr->w(), .height = camPtr->h(), .format = modal_flow::PixelFormat::R8};
+        modal_flow::Camera cam{.id = static_cast<modal_flow::CameraId>(camId), .width = camPtr->w(), .height = camPtr->h(), .format = modal_flow::PixelFormat::R8};
         // Carry intrinsics so the tracker can do IMU-predicted nextPts seeding. Equidistant
         // fisheye (CamEqui) -> Fisheye4; other models leave intrinsics invalid (identity seed).
         if (auto eq = std::dynamic_pointer_cast<CamEqui>(camPtr))
