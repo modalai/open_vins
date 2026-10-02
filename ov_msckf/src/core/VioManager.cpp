@@ -180,6 +180,8 @@ VioManager::VioManager(VioManagerOptions &params_) : thread_init_running(false),
     state->_calib_camera_readout.at(i)->set_value(readout_val);
     state->_calib_camera_readout.at(i)->set_fej(readout_val);
   }
+  // Stereo-locked calibration: freeze T_01 from the camchain seed (cam1 is derived from cam0 from here on)
+  state->capture_stereo_lock();
 
   // The initializer runs in the reference camera's clock
   params.init_options.calib_camimu_dt = state->cam_imu_dt_ref();
@@ -450,6 +452,7 @@ void VioManager::soft_reset(SoftResetCause cause) {
       state->_calib_camera_readout.at(i)->set_value(readout_val);
       state->_calib_camera_readout.at(i)->set_fej(readout_val);
     }
+    state->capture_stereo_lock();
   }
 
   // A soft reset starts a NEW estimation episode on a continuous sensor clock: purge everything
@@ -1704,7 +1707,7 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
   if (state->_options.do_calib_camera_pose) {
     for (int i = 0; i < state->_options.num_cameras; i++) {
       std::shared_ptr<PoseJPL> calib = state->_calib_IMUtoCAM.at(i);
-      PRINT_INFO("cam%d extrinsics = %.3f,%.3f,%.3f,%.3f | %.3f,%.3f,%.3f\n", (int)i, calib->quat()(0), calib->quat()(1), calib->quat()(2),
+      PRINT_INFO("cam%d extrinsics = %.6f,%.6f,%.6f,%.6f | %.5f,%.5f,%.5f\n", (int)i, calib->quat()(0), calib->quat()(1), calib->quat()(2),
                  calib->quat()(3), calib->pos()(0), calib->pos()(1), calib->pos()(2));
     }
   }

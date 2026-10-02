@@ -21,6 +21,7 @@
  */
 
 #include "State.h"
+#include "utils/quat_ops.h"
 
 using namespace ov_core;
 using namespace ov_type;
@@ -127,8 +128,8 @@ State::State(StateOptions &options) {
     _calib_IMUtoCAM.insert({i, pose});
     _cam_intrinsics.insert({i, intrin});
 
-    // If calibrating camera-imu pose, add to variables
-    if (_options.do_calib_camera_pose) {
+    // If calibrating camera-imu pose, add to variables (a stereo-locked cam1 stays out: derived from cam0)
+    if (_options.calib_camera_pose_estimated((size_t)i)) {
       pose->set_local_id(current_id);
       _variables.push_back(pose);
       current_id += pose->size();
@@ -155,6 +156,13 @@ State::State(StateOptions &options) {
       _variables.push_back(readout);
       current_id += readout->size();
     }
+  }
+  // Soft stereo lock: the cam0->cam1 relation is a 6-DoF calibration state of its own
+  if (_options.calib_cam_stereo_lock_soft && _options.do_calib_camera_pose && _options.num_cameras == 2) {
+    _stereo_rel = std::make_shared<PoseJPL>();
+    _stereo_rel->set_local_id(current_id);
+    _variables.push_back(_stereo_rel);
+    current_id += _stereo_rel->size();
   }
   if (_calib_dt_CAMtoIMU == nullptr) {
     // No cameras configured: keep a detached variable so legacy call sites stay valid
@@ -184,10 +192,18 @@ State::State(StateOptions &options) {
   }
   if (_options.do_calib_camera_pose) {
     for (int i = 0; i < _options.num_cameras; i++) {
+      if (!_options.calib_camera_pose_estimated((size_t)i))
+        continue;
       _Cov.block(_calib_IMUtoCAM.at(i)->id(), _calib_IMUtoCAM.at(i)->id(), 3, 3) = std::pow(0.005, 2) * Eigen::MatrixXd::Identity(3, 3);
       _Cov.block(_calib_IMUtoCAM.at(i)->id() + 3, _calib_IMUtoCAM.at(i)->id() + 3, 3, 3) =
           std::pow(0.015, 2) * Eigen::MatrixXd::Identity(3, 3);
     }
+  }
+  if (_stereo_rel) {
+    _Cov.block(_stereo_rel->id(), _stereo_rel->id(), 3, 3) =
+        std::pow(_options.calib_cam_stereo_lock_sigma_rot, 2) * Eigen::MatrixXd::Identity(3, 3);
+    _Cov.block(_stereo_rel->id() + 3, _stereo_rel->id() + 3, 3, 3) =
+        std::pow(_options.calib_cam_stereo_lock_sigma_pos, 2) * Eigen::MatrixXd::Identity(3, 3);
   }
   if (_options.do_calib_camera_intrinsics) {
     for (int i = 0; i < _options.num_cameras; i++) {
@@ -205,4 +221,40 @@ State::State(StateOptions &options) {
       }
     }
   }
+}
+
+void State::capture_stereo_lock() {
+  _stereo_lock_valid = false;
+  if (!_options.do_calib_camera_pose || _options.num_cameras != 2 || _options.calib_camera_pose_estimated(1))
+    return;
+  const auto &c0 = _calib_IMUtoCAM.at(0);
+  const auto &c1 = _calib_IMUtoCAM.at(1);
+  // p_C1 = R_ItoC1 p_I + p_IinC1 = R_01 (R_ItoC0 p_I + p_IinC0) + t_01
+  _stereo_lock_R01 = c1->Rot() * c0->Rot().transpose();
+  _stereo_lock_t01 = c1->pos() - _stereo_lock_R01 * c0->pos();
+  if (_stereo_rel) {
+    Eigen::Matrix<double, 7, 1> rel;
+    rel.block<4, 1>(0, 0) = rot_2_quat(_stereo_lock_R01);
+    rel.block<3, 1>(4, 0) = _stereo_lock_t01;
+    _stereo_rel->set_value(rel);
+    _stereo_rel->set_fej(rel);
+  }
+  _stereo_lock_valid = true;
+  refresh_stereo_lock();
+}
+
+void State::refresh_stereo_lock() {
+  if (!_stereo_lock_valid)
+    return;
+  const auto &c0 = _calib_IMUtoCAM.at(0);
+  const auto &c1 = _calib_IMUtoCAM.at(1);
+  const Eigen::Matrix3d R01 = stereo_R01();
+  const Eigen::Vector3d t01 = stereo_t01();
+  Eigen::Matrix<double, 7, 1> value, fej;
+  value.block<4, 1>(0, 0) = rot_2_quat(R01 * c0->Rot());
+  value.block<3, 1>(4, 0) = R01 * c0->pos() + t01;
+  fej.block<4, 1>(0, 0) = rot_2_quat(R01 * c0->Rot_fej());
+  fej.block<3, 1>(4, 0) = R01 * c0->pos_fej() + t01;
+  c1->set_value(value);
+  c1->set_fej(fej);
 }

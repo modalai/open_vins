@@ -102,6 +102,9 @@ std::shared_ptr<State> StateHelper::clone_state(std::shared_ptr<State> state) {
   for (auto &slot : out->_sampled_imu_slots)
     slot.noise = std::dynamic_pointer_cast<Vec>(resolve(slot.noise));
   out->_options = state->_options;
+  out->_stereo_lock_valid = state->_stereo_lock_valid;
+  out->_stereo_lock_R01 = state->_stereo_lock_R01;
+  out->_stereo_lock_t01 = state->_stereo_lock_t01;
   out->_kin_miss_count = state->_kin_miss_count;
   out->_clones_kinematics = state->_clones_kinematics;
   out->_epoch_residuals = state->_epoch_residuals;
@@ -135,6 +138,7 @@ std::shared_ptr<State> StateHelper::clone_state(std::shared_ptr<State> state) {
   out->_calib_IMUtoCAM.clear();
   for (const auto &kv : state->_calib_IMUtoCAM)
     out->_calib_IMUtoCAM[kv.first] = std::dynamic_pointer_cast<PoseJPL>(resolve(kv.second));
+  out->_stereo_rel = std::dynamic_pointer_cast<PoseJPL>(resolve(state->_stereo_rel));
 
   out->_cam_intrinsics.clear();
   for (const auto &kv : state->_cam_intrinsics)
@@ -609,6 +613,8 @@ bool StateHelper::EKFUpdate(std::shared_ptr<State> state, const std::vector<std:
     var->set_value(proposed_values.segment(value_offset, var->value().rows()));
     value_offset += var->value().rows();
   }
+  // cam1 of a stereo-locked pair is derived from the (possibly just updated) cam0 extrinsic
+  state->refresh_stereo_lock();
 
   // If we are doing online intrinsic calibration we should update our camera objects
   // NOTE: is this the best place to put this update logic??? probably..
@@ -830,7 +836,7 @@ bool StateHelper::make_initial_physical_warm_request(std::shared_ptr<State> stat
       next.consider.push_back(std::move(block)); variables.push_back(type); return true;
     };
     if (!append(InitCameraCalibrationKind::Clock,clock->second,options.do_calib_camera_timeoffset) ||
-        !append(InitCameraCalibrationKind::Extrinsics,pose->second,options.do_calib_camera_pose) ||
+        !append(InitCameraCalibrationKind::Extrinsics,pose->second,options.calib_camera_pose_estimated((size_t)camera)) ||
         !append(InitCameraCalibrationKind::Intrinsics,intrinsics->second,options.do_calib_camera_intrinsics)) return false;
   }
   if (state->_variables.size() != 1+variables.size()) return false;
@@ -967,7 +973,7 @@ bool StateHelper::set_initial_state_physical_warm(std::shared_ptr<State> state, 
         intrinsic == state->_cam_intrinsics.end() || !intrinsic->second || readout == state->_calib_camera_readout.end() || !readout->second ||
         clock == state->_calib_dt_CAMtoIMU_map.end() || !clock->second ||
         (clock->second->id() >= 0) != options.do_calib_camera_timeoffset ||
-        (extrinsic->second->id() >= 0) != options.do_calib_camera_pose ||
+        (extrinsic->second->id() >= 0) != options.calib_camera_pose_estimated(camera) ||
         (intrinsic->second->id() >= 0) != options.do_calib_camera_intrinsics || readout->second->id() >= 0 ||
         !finite_matrix(readout->second->value()) || readout->second->value()(0) != 0. ||
         !finite_matrix(extrinsic->second->value()) || !finite_matrix(intrinsic->second->value()) ||

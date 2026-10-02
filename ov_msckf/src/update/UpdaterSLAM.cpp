@@ -877,6 +877,7 @@ bool UpdaterSLAM::perform_anchor_change(std::shared_ptr<State> state, std::share
   std::vector<Eigen::MatrixXd> H_x_old;
   std::vector<std::shared_ptr<Type>> x_order_old;
   UpdaterHelper::get_feature_jacobian_representation(state, old_feat, H_f_old, H_x_old, x_order_old);
+  UpdaterHelper::fold_stereo_lock(state, H_x_old, x_order_old);
 
   // Create future feature representation
   UpdaterHelper::UpdaterHelperFeature new_feat;
@@ -943,6 +944,7 @@ bool UpdaterSLAM::perform_anchor_change(std::shared_ptr<State> state, std::share
   std::vector<Eigen::MatrixXd> H_x_new;
   std::vector<std::shared_ptr<Type>> x_order_new;
   UpdaterHelper::get_feature_jacobian_representation(state, new_feat, H_f_new, H_x_new, x_order_new);
+  UpdaterHelper::fold_stereo_lock(state, H_x_new, x_order_new);
 
   //==========================================================================
   //==========================================================================

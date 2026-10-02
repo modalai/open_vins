@@ -130,6 +130,21 @@ public:
                                         Eigen::MatrixXd &H_x, Eigen::VectorXd &res, std::vector<std::shared_ptr<ov_type::Type>> &x_order);
 
   /**
+   * @brief Stereo-locked calibration: re-express cam1-extrinsic Jacobian columns on cam0's extrinsic
+   *
+   * With T_cam1 = T_01 * T_cam0 the JPL error states relate as dth1 = R_01 dth0 + dth01 and
+   * dp1 = R_01 dp0 + [R_01 p_IinC0]x dth01 + dt01, so H_cam1 folds into cam0 as H_cam1 * blkdiag(R_01, R_01)
+   * and, under the soft lock (T_01 is a state), into T_01 as H_cam1 * [[I, 0], [[R_01 p_IinC0]x, I]].
+   * No-op unless the lock is active. Stacked form: cam1's columns are removed and accumulated into the
+   * target variables' columns (appended if a target is absent).
+   */
+  static void fold_stereo_lock(std::shared_ptr<State> state, Eigen::MatrixXd &H_x, std::vector<std::shared_ptr<ov_type::Type>> &x_order);
+
+  /// Block-list form of fold_stereo_lock (as returned by get_feature_jacobian_representation); consumers accumulate by type
+  static void fold_stereo_lock(std::shared_ptr<State> state, std::vector<Eigen::MatrixXd> &H_x,
+                               std::vector<std::shared_ptr<ov_type::Type>> &x_order);
+
+  /**
    * @brief This will project the left nullspace of H_f onto the linear system.
    *
    * Please see the @ref update-null for details on how this works.

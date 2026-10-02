@@ -720,6 +720,9 @@ void UpdaterHelper::get_feature_jacobian_full(std::shared_ptr<State> state, Upda
       c++;
     }
   }
+
+  // A stereo-locked cam1 is not a state variable: move its columns onto cam0 before any consumer
+  fold_stereo_lock(state, H_x, x_order);
 }
 
 void UpdaterHelper::nullspace_project_inplace(Eigen::MatrixXd &H_f, Eigen::MatrixXd &H_x, Eigen::VectorXd &res) {
@@ -791,4 +794,84 @@ void UpdaterHelper::measurement_compress_inplace(Eigen::MatrixXd &H_x, Eigen::Ve
   discarded_residual_squared = res.tail(res.rows() - r).squaredNorm();
   H_x.conservativeResize(r, H_x.cols());
   res.conservativeResize(r, res.cols());
+}
+
+// cam1 = T_01 * cam0 in JPL error coordinates:
+//   dth1 = R_01 dth0 + dth01,   dp1 = R_01 dp0 + [R_01 p_IinC0]x dth01 + dt01
+// so a cam1 Jacobian block H1 maps to cam0 as H1 * M0 and (soft lock only) to T_01 as H1 * Mrel.
+static void stereo_lock_maps(const std::shared_ptr<State> &state, Eigen::Matrix<double, 6, 6> &M0, Eigen::Matrix<double, 6, 6> &Mrel) {
+  const Eigen::Matrix3d R01 = state->stereo_R01();
+  M0.setZero();
+  M0.block<3, 3>(0, 0) = R01;
+  M0.block<3, 3>(3, 3) = R01;
+  Mrel.setIdentity();
+  Mrel.block<3, 3>(3, 0) = skew_x(R01 * state->_calib_IMUtoCAM.at(0)->pos());
+}
+
+void UpdaterHelper::fold_stereo_lock(std::shared_ptr<State> state, Eigen::MatrixXd &H_x, std::vector<std::shared_ptr<Type>> &x_order) {
+  if (!state->stereo_locked_camera(1))
+    return;
+  const std::shared_ptr<Type> cam1 = state->_calib_IMUtoCAM.at(1);
+  int col = 0, col1 = -1;
+  size_t idx1 = 0;
+  for (size_t k = 0; k < x_order.size(); k++) {
+    if (x_order[k] == cam1) {
+      col1 = col;
+      idx1 = k;
+    }
+    col += x_order[k]->size();
+  }
+  if (col1 < 0)
+    return;
+  assert(col == H_x.cols());
+  Eigen::Matrix<double, 6, 6> M0, Mrel;
+  stereo_lock_maps(state, M0, Mrel);
+  const Eigen::MatrixXd H1 = H_x.middleCols(col1, 6);
+
+  // drop cam1's columns
+  const int n_right = (int)H_x.cols() - col1 - 6;
+  Eigen::MatrixXd H_new(H_x.rows(), H_x.cols() - 6);
+  H_new.leftCols(col1) = H_x.leftCols(col1);
+  H_new.rightCols(n_right) = H_x.rightCols(n_right);
+  x_order.erase(x_order.begin() + idx1);
+
+  // accumulate into a variable's columns, appending them if the variable is not in the system yet
+  auto add_block = [&](const std::shared_ptr<Type> &type, const Eigen::MatrixXd &B) {
+    int c = 0;
+    for (const auto &var : x_order) {
+      if (var == type) {
+        H_new.middleCols(c, 6) += B;
+        return;
+      }
+      c += var->size();
+    }
+    H_new.conservativeResize(Eigen::NoChange, H_new.cols() + 6);
+    H_new.rightCols(6) = B;
+    x_order.push_back(type);
+  };
+  add_block(state->_calib_IMUtoCAM.at(0), H1 * M0);
+  if (state->_stereo_rel)
+    add_block(state->_stereo_rel, H1 * Mrel);
+  H_x = H_new;
+}
+
+void UpdaterHelper::fold_stereo_lock(std::shared_ptr<State> state, std::vector<Eigen::MatrixXd> &H_x,
+                                     std::vector<std::shared_ptr<Type>> &x_order) {
+  if (!state->stereo_locked_camera(1))
+    return;
+  const std::shared_ptr<Type> cam1 = state->_calib_IMUtoCAM.at(1);
+  Eigen::Matrix<double, 6, 6> M0, Mrel;
+  stereo_lock_maps(state, M0, Mrel);
+  const size_t n = x_order.size();
+  for (size_t k = 0; k < n; k++) {
+    if (x_order[k] == cam1) {
+      const Eigen::MatrixXd H1 = H_x[k];
+      x_order[k] = state->_calib_IMUtoCAM.at(0);
+      H_x[k] = H1 * M0;
+      if (state->_stereo_rel) {
+        x_order.push_back(state->_stereo_rel);
+        H_x.push_back(H1 * Mrel);
+      }
+    }
+  }
 }

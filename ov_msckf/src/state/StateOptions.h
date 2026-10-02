@@ -51,6 +51,23 @@ struct StateOptions {
   /// Bool to determine whether or not to calibrate imu-to-camera pose
   bool do_calib_camera_pose = false;
 
+  /// Stereo-locked extrinsic calibration (2 cameras): only cam0's imu-to-camera pose is a state;
+  /// cam1's is derived as T_cam1 = T_01 * T_cam0 with T_01 frozen at its initial (camchain) value,
+  /// so online calibration refines the rig as one rigid body and the cam0->cam1 relation cannot drift.
+  bool calib_cam_stereo_locked = false;
+
+  /// Soft stereo lock (implies the lock): the cam0->cam1 relation T_01 is itself a 6-DoF state variable with a
+  /// tight prior (sigmas below) and no process noise, so it can refine slightly but not wander.
+  bool calib_cam_stereo_lock_soft = false;
+  double calib_cam_stereo_lock_sigma_rot = 0.0044; // rad (~0.25 deg)
+  double calib_cam_stereo_lock_sigma_pos = 0.002;  // m
+
+  /// True if camera cam_id's imu-to-camera pose is an estimated state variable
+  bool calib_camera_pose_estimated(size_t cam_id) const {
+    return do_calib_camera_pose &&
+           !((calib_cam_stereo_locked || calib_cam_stereo_lock_soft) && num_cameras == 2 && cam_id == 1);
+  }
+
   /// Bool to determine whether or not to calibrate camera intrinsics
   bool do_calib_camera_intrinsics = false;
 
@@ -183,6 +200,10 @@ struct StateOptions {
 
       // Calibration booleans
       parser->parse_config("calib_cam_extrinsics", do_calib_camera_pose);
+      parser->parse_config("calib_cam_stereo_locked", calib_cam_stereo_locked, false);
+      parser->parse_config("calib_cam_stereo_lock_soft", calib_cam_stereo_lock_soft, false);
+      parser->parse_config("calib_cam_stereo_lock_sigma_rot", calib_cam_stereo_lock_sigma_rot, false);
+      parser->parse_config("calib_cam_stereo_lock_sigma_pos", calib_cam_stereo_lock_sigma_pos, false);
       parser->parse_config("calib_cam_intrinsics", do_calib_camera_intrinsics);
       parser->parse_config("calib_cam_timeoffset", do_calib_camera_timeoffset);
       parser->parse_config("cam_imu_dt_ref_camid", cam_imu_dt_ref_camid, false);
@@ -257,6 +278,9 @@ struct StateOptions {
     PRINT_DEBUG("  - use_fej: %d\n", do_fej);
     PRINT_DEBUG("  - integration: %d\n", integration_method);
     PRINT_DEBUG("  - calib_cam_extrinsics: %d\n", do_calib_camera_pose);
+    PRINT_DEBUG("  - calib_cam_stereo_locked: %d\n", calib_cam_stereo_locked);
+    PRINT_DEBUG("  - calib_cam_stereo_lock_soft: %d (sigma rot %.4f rad, pos %.4f m)\n", calib_cam_stereo_lock_soft,
+                calib_cam_stereo_lock_sigma_rot, calib_cam_stereo_lock_sigma_pos);
     PRINT_DEBUG("  - calib_cam_intrinsics: %d\n", do_calib_camera_intrinsics);
     PRINT_DEBUG("  - calib_cam_timeoffset: %d\n", do_calib_camera_timeoffset);
     PRINT_DEBUG("  - cam_imu_dt_ref_camid: %d\n", cam_imu_dt_ref_camid);

@@ -447,6 +447,28 @@ public:
   /// Calibration poses for each camera (R_ItoC, p_IinC)
   std::unordered_map<size_t, std::shared_ptr<ov_type::PoseJPL>> _calib_IMUtoCAM;
 
+  /// Stereo-locked calibration (options.calib_cam_stereo_locked): cam1's pose is not a state variable
+  /// (id -1) but T_cam1 = T_01 * T_cam0. p_C1 = R_01 * p_C0 + t_01, frozen at capture_stereo_lock().
+  bool _stereo_lock_valid = false;
+  Eigen::Matrix3d _stereo_lock_R01 = Eigen::Matrix3d::Identity();
+  Eigen::Vector3d _stereo_lock_t01 = Eigen::Vector3d::Zero();
+
+  /// Soft lock only: T_01 as a state variable (q = R_01 as JPL, p = t_01); nullptr for the hard lock
+  std::shared_ptr<ov_type::PoseJPL> _stereo_rel;
+
+  /// Current cam0->cam1 relation (the state variable under the soft lock, the frozen value otherwise)
+  Eigen::Matrix3d stereo_R01() const { return _stereo_rel ? _stereo_rel->Rot() : _stereo_lock_R01; }
+  Eigen::Vector3d stereo_t01() const { return _stereo_rel ? Eigen::Vector3d(_stereo_rel->pos()) : _stereo_lock_t01; }
+
+  /// True if cam_id's extrinsic is derived from cam0's through the stereo lock
+  bool stereo_locked_camera(size_t cam_id) const { return _stereo_lock_valid && cam_id == 1; }
+
+  /// Freeze T_01 from the current cam0/cam1 extrinsic values (call after they are set from the camchain)
+  void capture_stereo_lock();
+
+  /// Re-derive cam1's value and FEJ from cam0's (call after every write to cam0's extrinsic)
+  void refresh_stereo_lock();
+
   /// Camera intrinsics
   std::unordered_map<size_t, std::shared_ptr<ov_type::Vec>> _cam_intrinsics;
 
