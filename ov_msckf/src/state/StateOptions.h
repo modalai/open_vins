@@ -58,7 +58,10 @@ struct StateOptions {
 
   /// Soft stereo lock (implies the lock): the cam0->cam1 relation T_01 is itself a 6-DoF state variable with a
   /// tight prior (sigmas below) and no process noise, so it can refine slightly but not wander.
+  /// Default: ON for a stereo-tracked 2-camera rig with extrinsic calibration (resolved in VioManager(), once the
+  /// final use_stereo is known); an explicit calib_cam_stereo_lock_soft in the YAML always wins.
   bool calib_cam_stereo_lock_soft = false;
+  bool calib_cam_stereo_lock_soft_explicit = false; ///< calib_cam_stereo_lock_soft was set in the YAML
   double calib_cam_stereo_lock_sigma_rot = 0.0044; // rad (~0.25 deg)
   double calib_cam_stereo_lock_sigma_pos = 0.002;  // m
 
@@ -201,7 +204,15 @@ struct StateOptions {
       // Calibration booleans
       parser->parse_config("calib_cam_extrinsics", do_calib_camera_pose);
       parser->parse_config("calib_cam_stereo_locked", calib_cam_stereo_locked, false);
-      parser->parse_config("calib_cam_stereo_lock_soft", calib_cam_stereo_lock_soft, false);
+      {
+        // presence check without a parser API: an absent key leaves both opposite defaults untouched
+        bool lo = false, hi = true;
+        parser->parse_config("calib_cam_stereo_lock_soft", lo, false);
+        parser->parse_config("calib_cam_stereo_lock_soft", hi, false);
+        calib_cam_stereo_lock_soft_explicit = (lo == hi);
+        if (calib_cam_stereo_lock_soft_explicit)
+          calib_cam_stereo_lock_soft = lo;
+      }
       parser->parse_config("calib_cam_stereo_lock_sigma_rot", calib_cam_stereo_lock_sigma_rot, false);
       parser->parse_config("calib_cam_stereo_lock_sigma_pos", calib_cam_stereo_lock_sigma_pos, false);
       parser->parse_config("calib_cam_intrinsics", do_calib_camera_intrinsics);

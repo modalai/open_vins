@@ -135,6 +135,17 @@ VioManager::VioManager(VioManagerOptions &params_) : thread_init_running(false),
   physical_tracked_group.reserve(static_cast<size_t>(params.state_options.num_cameras));
   tracked_camera_times.assign(static_cast<size_t>(params.state_options.num_cameras), -std::numeric_limits<double>::infinity());
 
+  // Soft stereo lock is the default for stereo tracking: the stereo measurements are only geometrically consistent if
+  // cam1's extrinsic stays tied to cam0's through T_01. Resolved here (not at parse time) because the owner may
+  // override use_stereo after loading the YAML; an explicit calib_cam_stereo_lock_soft keeps its value.
+  StateOptions &so = params.state_options;
+  if (!so.calib_cam_stereo_lock_soft_explicit)
+    so.calib_cam_stereo_lock_soft = params.use_stereo && so.num_cameras == 2 && so.do_calib_camera_pose && !so.calib_cam_stereo_locked;
+  if (so.calib_cam_stereo_locked || so.calib_cam_stereo_lock_soft)
+    PRINT_INFO("[stereo lock] %s lock on cam0->cam1 extrinsic%s (sigma rot %.4f rad, pos %.4f m)\n", so.calib_cam_stereo_locked ? "hard" : "soft",
+               so.calib_cam_stereo_lock_soft_explicit ? "" : " (stereo default)", so.calib_cam_stereo_lock_sigma_rot,
+               so.calib_cam_stereo_lock_sigma_pos);
+
   // Create the state!!
   state = std::make_shared<State>(params.state_options);
 
