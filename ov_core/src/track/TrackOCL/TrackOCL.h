@@ -155,8 +155,7 @@ namespace ov_core
     }
 
     // --- Frontend snapshot/restore (replay harness rewind/branch) ---
-    // Extends the base CPU frontend capture with TrackOCL's per-camera IMU-seeding state and the
-    // per-feature stereo priors. NOT captured (small first-frame transients, self-heal via re-fed
+    // Extends the base CPU frontend capture with TrackOCL's per-camera IMU-seeding state. NOT captured (small first-frame transients, self-heal via re-fed
     // IMU / re-matched stereo, and within the GPU run-to-run noise floor): the imu_rot_ gyro ring
     // (windowed integration re-selects fresh samples) and the GPU pyramid buffers (rebuilt by the
     // harness re-feeding the snapshot frame before restore). last_cam_time_ IS captured -- a stale
@@ -164,7 +163,6 @@ namespace ov_core
     struct OCLFrontendState : public FrontendState {
         std::unordered_map<size_t, Eigen::Matrix3d> R_ItoC;
         std::unordered_map<size_t, double> last_cam_time;
-        std::unordered_map<size_t, float> stereo_inv_depth_prior;
     };
 
     std::shared_ptr<FrontendState> capture_frontend() override {
@@ -172,7 +170,6 @@ namespace ov_core
         capture_frontend_base(*s);
         s->R_ItoC = R_ItoC_;
         s->last_cam_time = last_cam_time_;
-        s->stereo_inv_depth_prior = stereo_inv_depth_prior_;
         return s;
     }
 
@@ -183,7 +180,6 @@ namespace ov_core
         if (auto o = std::dynamic_pointer_cast<OCLFrontendState>(s)) {
             R_ItoC_ = o->R_ItoC;
             last_cam_time_ = o->last_cam_time;
-            stereo_inv_depth_prior_ = o->stereo_inv_depth_prior;
         }
     }
 
@@ -299,17 +295,6 @@ namespace ov_core
     // feature id.
     std::unordered_map<size_t, StereoConfidence> stereo_confidence_;
 
-    // DRIFT-CORRECTION state. Per-feature inverse-depth (1/Z) prior, keyed by feature id, seeded
-    // when a pair is first matched (detection) and refreshed on each successful correction.
-    // feed_stereo KLT-tracks BOTH cameras (so stereo pairs persist), then runs a narrow ZNCC
-    // re-match [prior +/- stereo_rho_half_width_] + L-R check as a CORRECTOR: a confident match that
-    // disagrees with the KLT right point snaps it to the matcher (kills drift); a rejected match
-    // does nothing (KLT keeps the pair alive). The match is never a per-frame survival gate -- that
-    // starves stereo, since the strict gates only need to be cleared once, at detection.
-    std::unordered_map<size_t, float> stereo_inv_depth_prior_;
-    // Inverse-depth half-window for the narrow re-match, = kRematchBandPx / (fx_left * baseline).
-    float stereo_rho_half_width_ = 0.f;
-
     // DIAGNOSTIC: count of mono-left -> stereo upgrades accepted in the most
     // recent perform_detection_stereo call (ZNCC "promote" pass). Read by
     // feed_stereo's per-frame track-stats log.
@@ -335,9 +320,8 @@ namespace ov_core
       float marg_min[3]{1e9f, 1e9f, 1e9f},  marg_max[3]{-1e9f, -1e9f, -1e9f};
       float lr_min[3]{1e9f, 1e9f, 1e9f},    lr_max[3]{-1e9f, -1e9f, -1e9f};
     };
-    bool  stereo_diag_on_     = false; // OFF by default. Set true to emit [STEREO EPI]/[STEREO DIAG]
-                                       // to /run/voxl-open-vins-stereo-diag.log (EPI also echoes to
-                                       // stdout) during R_lr bring-up / tilt validation.
+    bool  stereo_diag_on_     = false; // OFF by default. Set true to emit [STEREO DIAG]
+                                       // to /run/voxl-open-vins-stereo-diag.log.
     int   stereo_diag_period_ = 30;   // print every N perform_detection_stereo calls (~1/s @30Hz)
     int   stereo_diag_calls_  = 0;
     StereoRejectStats stereo_reject_stats_{};
@@ -360,24 +344,6 @@ namespace ov_core
     void accumulate_stereo_reject_(int pass, float peak, float margin, float lr,
                                    bool matcher_status, bool right_oob);
     void maybe_print_stereo_diag_();
-
-    // Drift-correction diagnostics (feed_stereo). Rolling counts over stereo_diag_period_ frames:
-    // pairs submitted to the corrector, matcher-accepted, and actually snapped (KLT/matcher
-    // disagreement > kCorrectSnapPx), plus snap-distance stats. Confirms the corrector is live.
-    long   corr_sub_ = 0, corr_acc_ = 0, corr_snap_ = 0;
-    double corr_snap_sum_ = 0.0;
-    float  corr_snap_max_ = 0.f;
-    int    corr_diag_frames_ = 0;
-
-    // R_lr epipolar-residual observable (Phase 0, read-only). Accumulates a weighted least-squares
-    // fit  perp_resid ~ a + b*x_center  over the corrector's accepted matches, printed each
-    // stereo_diag_period_ as [STEREO EPI]. x_center = src_x - img_w/2, so `a` is the image-centre
-    // residual (~ relative pitch) and b*img_w the edge-to-edge tilt (~ relative roll) -- the -5.36px
-    // signature under a mis-set R_lr. NOTE: perp_resid is clipped to +/-BAND (2px) by the kernel
-    // search, so this measures residual tilt WITHIN the band -- a drift watchdog around a good calib,
-    // attenuated for gross miscalibration (edge features beyond the band saturate or fail to match).
-    double epi_sw_ = 0, epi_swx_ = 0, epi_swxx_ = 0, epi_swr_ = 0, epi_swrx_ = 0, epi_swrr_ = 0;
-    long   epi_n_  = 0;
 
     // IMU-aided seeding diagnostic (feed_stereo). Every stereo_diag_period_ frames prints, for the
     // left camera: gyro-buffer liveness, the predicted rotation magnitude, and how much of the
