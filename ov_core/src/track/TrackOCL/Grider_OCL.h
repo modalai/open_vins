@@ -36,6 +36,7 @@
 #include <modal_flow_track_manager.h>
 #include <modal_flow/ocl/ManagerCL.hpp>
 #include <modal_flow/Types.hpp>
+#include "MaskAdapter.h"
 namespace ov_core {
 
 /**
@@ -273,6 +274,7 @@ class Grider_OCL {
         detect_in[0].cam_id  = cam_id;
         detect_in[0].img_buf = buf_id;
         detect_in[0].opts = dopt;
+        detect_in[0].mask = flow_mask_view(mask);
 
         // run the detection
         auto results = mgr.detect_many(detect_in);

@@ -211,7 +211,7 @@ namespace ov_core
      */
     void perform_matching(modal_flow::BufferId buf0, modal_flow::BufferId buf1,
                           std::vector<cv::KeyPoint> &pts0, std::vector<cv::KeyPoint> &pts1,
-                          size_t id0, size_t id1, std::vector<uchar> &mask_out,
+                          size_t id0, size_t id1, const cv::Mat &mask0, const cv::Mat &mask1, std::vector<uchar> &mask_out,
                           const modal_flow::RotationQuat &delta_q = {});
 
     // Camera-frame relative rotation for `cam_id` over [t_prev, t_curr], from the gyro buffer

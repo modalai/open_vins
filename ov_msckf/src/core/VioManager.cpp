@@ -44,6 +44,7 @@
 #include "utils/opencv_lambda_body.h"
 #include "utils/print.h"
 #include "utils/sensor_data.h"
+#include "utils/camera_masks.h"
 
 #include "init/InertialInitializer.h"
 
@@ -507,7 +508,28 @@ void VioManager::feed_measurement_camera(const ov_core::CameraData &message) {
   // or send fabricated images to a detector. Rejected input never enters the buffer.
   if (observation_replay_prepared != !message.observations.empty())
     throw std::invalid_argument("camera input kind does not match prepared observation replay mode");
+  bool valid = ov_core::camera_masks_valid(message);
+#if HAVE_OPENCL
+  // CPU placeholder images do not contain external-only pixels. Downsampling
+  // them would silently track zeros and upload the wrong image dimensions.
+  if (params.downsample_cameras && message.observations.empty())
+    for (const auto &frame : message.img_frames)
+      valid = valid && frame.img.handle_type == modal_flow::ExternalType::None;
+#endif
+  if (!valid) {
+    PRINT_ERROR(RED "[VioManager] rejected camera input: invalid mask/image geometry or external-only downsampling\n" RESET);
+    if (camera_processed_cb) camera_processed_cb(message, false);
+    return;
+  }
   if (camera_buffer != nullptr) {
+    for (const auto &mask : message.masks) {
+      if (!mask.empty() && mask.u == nullptr) {
+        ov_core::CameraData owned = message;
+        for (auto &m : owned.masks) m = ov_core::retain_camera_mask(m);
+        camera_buffer->push(owned);
+        return;
+      }
+    }
     camera_buffer->push(message);
   }
 }
@@ -1083,16 +1105,12 @@ ov_core::CameraData VioManager::track_camera(const ov_core::CameraData &message_
     assert(message_const.sensor_ids.at(i) != message_const.sensor_ids.at(i + 1));
   }
 
-  // Downsample if we are downsampling
   ov_core::CameraData message = message_const;
-  for (size_t i = 0; i < message.sensor_ids.size() && params.downsample_cameras && message.observations.empty(); i++) {
-    cv::Mat img = message.images.at(i);
-    cv::Mat mask = message.masks.at(i);
-    cv::Mat img_temp, mask_temp;
-    cv::pyrDown(img, img_temp, cv::Size(img.cols / 2.0, img.rows / 2.0));
-    message.images.at(i) = img_temp;
-    cv::pyrDown(mask, mask_temp, cv::Size(mask.cols / 2.0, mask.rows / 2.0));
-    message.masks.at(i) = mask_temp;
+  if (message.observations.empty()) {
+    // Combine static YAML exclusions with per-frame masks without changing
+    // producer-owned storage. Missing masks are an unmasked input, not an error.
+    if (params.use_mask) ov_core::prepare_camera_for_tracking(message, params.downsample_cameras, params.masks);
+    else ov_core::prepare_camera_for_tracking(message, params.downsample_cameras);
   }
 
   // Epoch-anchored cloning: only REFERENCE-camera frames define clone times; a non-reference

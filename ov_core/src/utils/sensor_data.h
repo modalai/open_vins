@@ -87,7 +87,9 @@ struct CameraData {
   std::vector<modal_flow::Frame> img_frames;
 #endif
 
-  /// Tracking masks for each camera we have
+  /// Immutable CV_8UC1 exclusion masks, aligned with sensor_ids and images.
+  /// 0..127 permit features, 128..255 exclude. Empty vector/entries mean no
+  /// per-frame exclusions; the backend also applies configured camera masks.
   std::vector<cv::Mat> masks;
 
   /// Exposure time [s] of each image (0 when the source does not publish one).
