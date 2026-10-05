@@ -31,6 +31,8 @@
 #include "../Grider_FAST.h"
 #include "../Grider_GRID.h"
 #include "Grider_OCL.h"
+#include "MaskAdapter.h"
+#include "utils/camera_masks.h"
 #include "cam/CamBase.h"
 #include "cam/CamEqui.h"
 #include "feat/Feature.h"
@@ -404,8 +406,12 @@ void TrackOCL::dump_stereo_epipolar_(const modal_flow::StereoMatchInput &in,
     }
 }
 
-void TrackOCL::feed_new_camera(const CameraData &message)
+void TrackOCL::feed_new_camera(const CameraData &message_const)
 {
+    CameraData message = message_const;
+    prepare_camera_masks(message);
+    if (message.img_frames.size() != message.sensor_ids.size())
+        throw std::invalid_argument("TrackOCL requires one image upload view per camera");
 
     // Error check that we have all the data
     if (message.sensor_ids.empty() ||
@@ -457,6 +463,14 @@ void TrackOCL::feed_new_camera(const CameraData &message)
                         "(n_img=%zu, n_cams=%zu)\n", sid, num_images, mtx_feeds.size());
             return;
         }
+    }
+
+    for (size_t i = 0; i < num_images; ++i) {
+        const auto dims = mgr_.get_cam_dim(message.sensor_ids[i]);
+        flow_mask_view(message.masks[i]).validate(dims.first, dims.second);
+        if (message.img_frames[i].cam != static_cast<modal_flow::CameraId>(message.sensor_ids[i]) ||
+            message.img_frames[i].img.desc.width != dims.first || message.img_frames[i].img.desc.height != dims.second)
+            throw std::invalid_argument("TrackOCL upload view must match its camera and mask dimensions");
     }
 
     for (size_t msg_id = 0; msg_id < num_images; msg_id++)
@@ -564,7 +578,7 @@ void TrackOCL::feed_monocular(const CameraData &message, size_t msg_id)
     const modal_flow::RotationQuat dq_pred = delta_q_for_cam(cam_id, last_cam_time_[cam_id], message.timestamp);
     last_cam_time_[cam_id] = message.timestamp;
     const modal_flow::RotationQuat dq = kImuAidedSeeding ? dq_pred : modal_flow::RotationQuat{};
-    perform_matching(img_buf_prev_[cam_id], img_buf_next_[cam_id], pts_left_old, pts_left_new, cam_id, cam_id, mask_ll, dq);
+    perform_matching(img_buf_prev_[cam_id], img_buf_next_[cam_id], pts_left_old, pts_left_new, cam_id, cam_id, img_mask_last[cam_id], mask, mask_ll, dq);
     assert(pts_left_new.size() == ids_left_old.size());
     int64_t t4 = _apps_time_monotonic_ns();
     rT4 = prof_now();
@@ -588,15 +602,9 @@ void TrackOCL::feed_monocular(const CameraData &message, size_t msg_id)
     // Loop through all left points
     for (size_t i = 0; i < pts_left_new.size(); i++)
     {
-        // Ensure we do not have any bad KLT tracks (i.e., points are negative)
-        if (pts_left_new.at(i).pt.x < 0 || pts_left_new.at(i).pt.y < 0 || (int)pts_left_new.at(i).pt.x >= cam_width ||
-            (int)pts_left_new.at(i).pt.y >= cam_height)
+        if (!flow_mask_view(mask).allows(pts_left_new[i].pt.x, pts_left_new[i].pt.y))
             continue;
-        // Check if it is in the mask
-        // NOTE: mask has max value of 255 (white) if it should be
-        if ((int)message.masks.at(msg_id).at<uint8_t>((int)pts_left_new.at(i).pt.y, (int)pts_left_new.at(i).pt.x) > 127)
-            continue;
-        // If it is a good track, and also tracked from left to right
+
         if (mask_ll[i])
         {
             good_left.push_back(pts_left_new[i]);
@@ -693,6 +701,9 @@ void TrackOCL::feed_stereo(const CameraData &message, size_t msg_id_left, size_t
         std::vector<size_t> good_ids_left, good_ids_right;
         perform_detection_stereo(img_buf_next_[cam_id_left], img_buf_next_[cam_id_right], mask_left, mask_right,
                                  cam_id_left, cam_id_right, good_left, good_right, good_ids_left, good_ids_right);
+        remove_masked_keypoints(mask_left, good_left, good_ids_left);
+        remove_masked_keypoints(mask_right, good_right, good_ids_right);
+
         // Save the current image and pyramid
         std::lock_guard<std::mutex> lckv(mtx_last_vars);
         // img_last / img_pyramid_last are unused by the OCL tracker (images stay on the GPU)
@@ -736,8 +747,8 @@ void TrackOCL::feed_stereo(const CameraData &message, size_t msg_id_left, size_t
     // [IMU-SEED] diagnostic below always measures dq_*_pred, so the OFF build logs the counterfactual.
     const modal_flow::RotationQuat dq_l = kImuAidedSeeding ? dq_l_pred : modal_flow::RotationQuat{};
     const modal_flow::RotationQuat dq_r = kImuAidedSeeding ? dq_r_pred : modal_flow::RotationQuat{};
-    perform_matching(img_buf_prev_[cam_id_left],  img_buf_next_[cam_id_left],  pts_left_old,  pts_left_new,  cam_id_left,  cam_id_left,  mask_ll, dq_l);
-    perform_matching(img_buf_prev_[cam_id_right], img_buf_next_[cam_id_right], pts_right_old, pts_right_new, cam_id_right, cam_id_right, mask_rr, dq_r);
+    perform_matching(img_buf_prev_[cam_id_left],  img_buf_next_[cam_id_left],  pts_left_old,  pts_left_new,  cam_id_left,  cam_id_left, img_mask_last[cam_id_left], mask_left, mask_ll, dq_l);
+    perform_matching(img_buf_prev_[cam_id_right], img_buf_next_[cam_id_right], pts_right_old, pts_right_new, cam_id_right, cam_id_right, img_mask_last[cam_id_right], mask_right, mask_rr, dq_r);
 
     // ---- IMU-aided seeding diagnostic (left camera; periodic) ----
     // reduction% = how much of the per-frame feature motion the IMU-predicted seed removed:
@@ -830,6 +841,8 @@ void TrackOCL::feed_stereo(const CameraData &message, size_t msg_id_left, size_t
         cin.target_cam_id  = (modal_flow::CameraId)cam_id_right;
         cin.source_img_buf  = img_buf_next_[cam_id_left];    // CURRENT frame, both cameras
         cin.target_img_buf = img_buf_next_[cam_id_right];
+        cin.source_mask = flow_mask_view(mask_left);
+        cin.target_mask = flow_mask_view(mask_right);
         cin.rho_half_width = stereo_rho_half_width_;
         std::vector<int> corr_li, corr_ri;                 // parallel: left idx, right idx
         for (size_t i = 0; i < pts_left_new.size(); i++) {
@@ -896,6 +909,8 @@ void TrackOCL::feed_stereo(const CameraData &message, size_t msg_id_left, size_t
         cin.target_cam_id  = (modal_flow::CameraId)cam_id_right;
         cin.source_img_buf = img_buf_next_[cam_id_left];    // CURRENT frame, both cameras
         cin.target_img_buf = img_buf_next_[cam_id_right];
+        cin.source_mask = flow_mask_view(mask_left);
+        cin.target_mask = flow_mask_view(mask_right);
         cin.rho_half_width = stereo_rho_half_width_;
         std::vector<size_t> cand_id;
         for (size_t i = 0; i < pts_left_new.size(); i++) {
@@ -1041,6 +1056,9 @@ void TrackOCL::feed_stereo(const CameraData &message, size_t msg_id_left, size_t
         good_ids_right.push_back(ids_right_old.at(i));
     }
     }
+
+    remove_masked_keypoints(mask_left, good_left, good_ids_left);
+    remove_masked_keypoints(mask_right, good_right, good_ids_right);
 
     // Update our feature database, with theses new observations
     for (size_t i = 0; i < good_left.size(); i++) {
@@ -1191,7 +1209,7 @@ void TrackOCL::perform_detection_monocular(modal_flow::BufferId& buf_id, const c
 
     // We also check a downsampled mask such that we don't extract in areas where it is all masked!
     cv::Mat mask0_grid;
-    cv::resize(mask0, mask0_grid, size_grid, 0.0, 0.0, cv::INTER_NEAREST);
+    mask0_grid = fully_masked_grid(mask0, size_grid);
 
     // Create grids we need to extract from and then extract our features (use fast with griding)
     int num_features_grid = (int)((double)num_features / (double)(grid_x * grid_y)) + 1;
@@ -1346,7 +1364,7 @@ void TrackOCL::perform_detection_stereo(modal_flow::BufferId buf_id_left, modal_
     if (num_featsneeded_0 > std::min(20, (int)(min_feat_percent * num_features))) {
         // We also check a downsampled mask such that we don't extract in areas where it is all masked!
         cv::Mat mask0_grid;
-        cv::resize(mask0, mask0_grid, size_grid0, 0.0, 0.0, cv::INTER_NEAREST);
+        mask0_grid = fully_masked_grid(mask0, size_grid0);
 
         // Create grids we need to extract from and then extract our features (use fast with griding)
         int num_features_grid = (int)((double)num_features / (double)(grid_x * grid_y)) + 1;
@@ -1405,6 +1423,8 @@ void TrackOCL::perform_detection_stereo(modal_flow::BufferId buf_id_left, modal_
         // carries accepted prev-frame pairs forward to current via temporal KLT.
         in.source_img_buf = buf_id_left;
         in.target_img_buf = buf_id_right;
+        in.source_mask = flow_mask_view(mask0);
+        in.target_mask = flow_mask_view(mask1);
 
         // Segment A: new detections (top-off). Static seed calib (see stereo_static_cam_left_),
         // NOT the online-calibrated camera_calib, so the ZNCC search stays on the same fixed
@@ -1527,7 +1547,7 @@ void TrackOCL::perform_detection_stereo(modal_flow::BufferId buf_id_left, modal_
     float size_y1 = (float)img_height1 / (float)grid_y;
     cv::Size size_grid1(grid_x, grid_y); // width x height
     cv::Mat grid_2d_grid1 = cv::Mat::zeros(size_grid1, CV_8UC1);
-    cv::Mat mask1_updated = mask0.clone();
+    cv::Mat mask1_updated = mask1.clone();
     it0 = pts1.begin();
     it1 = ids1.begin();
     
@@ -1597,7 +1617,7 @@ void TrackOCL::perform_detection_stereo(modal_flow::BufferId buf_id_left, modal_
 
         // We also check a downsampled mask such that we don't extract in areas where it is all masked!
         cv::Mat mask1_grid;
-        cv::resize(mask1, mask1_grid, size_grid1, 0.0, 0.0, cv::INTER_NEAREST);
+        mask1_grid = fully_masked_grid(mask1, size_grid1);
 
         // Create grids we need to extract from and then extract our features (use fast with griding)
         int num_features_grid = (int)((double)num_features / (double)(grid_x * grid_y)) + 1;
@@ -1655,6 +1675,8 @@ void TrackOCL::perform_detection_stereo(modal_flow::BufferId buf_id_left, modal_
         in.target_cam_id  = (modal_flow::CameraId)cam_id_left;   //          left is target
         in.source_img_buf = buf_id_right;
         in.target_img_buf = buf_id_left;
+        in.source_mask = flow_mask_view(mask1);
+        in.target_mask = flow_mask_view(mask0);
 
         // Map kept index in `in` -> index in pts1/ids1 so we can write the pair back.
         std::vector<size_t> src_idx;
@@ -1756,7 +1778,7 @@ modal_flow::RotationQuat TrackOCL::delta_q_for_cam(size_t cam_id, double t_prev,
     return out;
 }
 
-void TrackOCL::perform_matching(modal_flow::BufferId buf0, modal_flow::BufferId buf1, std::vector<cv::KeyPoint> &kpts0, std::vector<cv::KeyPoint> &kpts1, size_t id0, size_t id1, std::vector<uchar> &mask_out, const modal_flow::RotationQuat &delta_q)
+void TrackOCL::perform_matching(modal_flow::BufferId buf0, modal_flow::BufferId buf1, std::vector<cv::KeyPoint> &kpts0, std::vector<cv::KeyPoint> &kpts1, size_t id0, size_t id1, const cv::Mat &mask0, const cv::Mat &mask1, std::vector<uchar> &mask_out, const modal_flow::RotationQuat &delta_q)
 {
 
     // We must have equal vectors
@@ -1810,6 +1832,8 @@ void TrackOCL::perform_matching(modal_flow::BufferId buf0, modal_flow::BufferId 
     track_in[0].prev_img_buf = buf0;
     track_in[0].next_img_buf = buf1;
     track_in[0].prev_points = pts_in;
+    track_in[0].prev_mask = flow_mask_view(mask0);
+    track_in[0].next_mask = flow_mask_view(mask1);
     track_in[0].delta_q = delta_q;   // IMU-predicted seeding (identity => original behavior)
 
     auto res = mgr_.track_many(track_in);
@@ -1840,6 +1864,13 @@ void TrackOCL::perform_matching(modal_flow::BufferId buf0, modal_flow::BufferId 
             pts1_keep.push_back(pts1[i]);
             keep_idx.push_back((int)i);
         }
+    }
+
+    // Masking may remove every otherwise-successful LK track. Do not pass an
+    // empty/undersized correspondence set to findFundamentalMat.
+    if (pts0_keep.size() < 10) {
+        mask_out.assign(kpts0.size(), 0);
+        return;
     }
 
     // Normalize these points, so we can then do ransac

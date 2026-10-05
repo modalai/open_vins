@@ -37,6 +37,9 @@ set(OV_USE_MODAL_FLOW 0)
 if (OpenCL_FOUND AND MODAL_FLOW_INCLUDE_DIR AND MODAL_FLOW_LIBRARY
     AND EXISTS "${MODAL_FLOW_INCLUDE_DIR}/modal_flow/Types.hpp"
     AND EXISTS "${MODAL_FLOW_INCLUDE_DIR}/modal_flow/StereoMatcher.hpp")
+    if(NOT EXISTS "${MODAL_FLOW_INCLUDE_DIR}/modal_flow/Mask.hpp")
+        message(FATAL_ERROR "TrackOCL mask inputs require libmodal-flow >= 1.0.10")
+    endif()
     set(OV_USE_MODAL_FLOW 1)
     include_directories(${OpenCL_INCLUDE_DIRS} ${MODAL_FLOW_INCLUDE_DIR})
     list(APPEND thirdparty_libraries ${OpenCL_LIBRARIES} ${MODAL_FLOW_LIBRARY})
