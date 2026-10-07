@@ -281,6 +281,7 @@ struct VioManagerOptions {
   /// view's temporal baseline, preventing persistent landmark initialization.
   /// An explicit YAML/ROS setting wins; programmatic options remain untouched.
   void resolve_camera_epoch_mode(const std::shared_ptr<ov_core::YamlParser> &parser = nullptr) {
+    enforce_stereo_guard();
     if (parser != nullptr) {
       parser->parse_config("force_camera_sync", force_camera_sync, false);
       epoch_mode = state_options.num_cameras > 1 && !synchronize_camera_timestamps();
@@ -596,8 +597,17 @@ struct VioManagerOptions {
 
   // TRACKERS ===============================
 
-  /// If we should process two cameras are being stereo or binocular. If binocular, we do monocular feature tracking on each image.
-  bool use_stereo = true;
+  /// Stereo association is temporarily disabled; each camera tracks monocular features.
+  bool use_stereo = false;
+
+  /// Apply before resolving camera timing or constructing any tracker, including after configuration overrides.
+  void enforce_stereo_guard() {
+    if (use_stereo) {
+      PRINT_WARNING(YELLOW "Stereo Tracking is under R&D, release coming soon\n" RESET);
+    }
+    use_stereo = false;
+    init_options.use_stereo = false;
+  }
 
   /// If we should use KLT tracking, or descriptor matcher
   bool use_klt = true;
@@ -690,6 +700,7 @@ struct VioManagerOptions {
       parser->parse_config("knn_ratio", knn_ratio);
       parser->parse_config("track_frequency", track_frequency);
     }
+    enforce_stereo_guard();
     PRINT_DEBUG("FEATURE TRACKING PARAMETERS:\n");
     PRINT_DEBUG("  - use_stereo: %d\n", use_stereo);
     PRINT_DEBUG("  - use_klt: %d\n", use_klt);
