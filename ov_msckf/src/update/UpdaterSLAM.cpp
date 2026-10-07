@@ -37,8 +37,7 @@
 #include "utils/print.h"
 #include "utils/quat_ops.h"
 
-#include <boost/date_time/posix_time/posix_time.hpp>
-#include <boost/math/distributions/chi_squared.hpp>
+#include <cmath>
 #include <iterator>
 #include <set>
 
@@ -285,14 +284,14 @@ void UpdaterSLAM::delayed_init(std::shared_ptr<State> state, std::vector<std::sh
     if (initializer_feat->config().triangulate_1d) {
       success_tri = initializer_feat->single_triangulation_1d(*it1, *clones_for_tri);
     } else {
-      success_tri = initializer_feat->single_triangulation(*it1, clones_cam, &tri_reason);
+      success_tri = initializer_feat->single_triangulation(*it1, *clones_for_tri, &tri_reason);
     }
 
     // Gauss-newton refine the feature
     FeatureInitializer::FailReason gn_reason = FeatureInitializer::FailReason::NONE;
     bool success_refine = true;
     if (initializer_feat->config().refine_features) {
-      success_refine = initializer_feat->single_gaussnewton(*it1, clones_cam, &gn_reason);
+      success_refine = initializer_feat->single_gaussnewton(*it1, *clones_for_tri, &gn_reason);
     }
 
     // Remove the feature if not a success

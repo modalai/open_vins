@@ -1,9 +1,27 @@
-/**
- * @file TrackOCL.cpp
- * @brief GPU (OpenCL) FAST + pyramidal-KLT feature tracker for VOXL OpenVINS: stereo-gated
- *        detection, ZNCC epipolar stereo matching, and IMU-aided KLT seeding.
- * @author kyletyni
+/*
+ * OpenVINS: An Open Platform for Visual-Inertial Research
+ * Copyright (C) 2025-2026 Joao Leonardo Silva Cotta
+ * Copyright (C) 2025-2026 Kyle Tyni
+ * Copyright (C) 2018-2022 Patrick Geneva
+ * Copyright (C) 2018-2022 Guoquan Huang
+ * Copyright (C) 2018-2022 OpenVINS Contributors
+ * Copyright (C) 2018-2019 Kevin Eckenhoff
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
+ // TrackOCL.cpp -- GPU (OpenCL) FAST + pyramidal-KLT tracker: stereo-gated detection,
+ // ZNCC epipolar stereo matching, and IMU-aided KLT seeding.
 
 #include "TrackOCL.h"
 
@@ -20,6 +38,7 @@
 #include "feat/Feature.h"
 #include "feat/FeatureDatabase.h"
 #include "utils/opencv_lambda_body.h"
+#include <modal_flow/ocl/StereoMatcherCL.hpp>
 #include "utils/print.h"
 
 #include <cstdio>
@@ -781,6 +800,14 @@ void TrackOCL::feed_stereo(const CameraData &message, size_t msg_id_left, size_t
 
     rT4 = prof_now();
 
+    // left to right matching
+    // TODO: we should probably still do this to reject outliers
+    // TODO: maybe we should collect all tracks that are in both frames and make they pass this?
+    // std::vector<uchar> mask_lr;
+    // perform_matching(imgpyr_left, imgpyr_right, pts_left_new, pts_right_new, cam_id_left, cam_id_right, mask_lr);
+    rT5 = prof_now();
+
+    // If any of our masks are empty, that means we didn't have enough to do ransac, so just return
     if (mask_ll.empty() && mask_rr.empty()) {
         std::lock_guard<std::mutex> lckv(mtx_last_vars);
         img_mask_last[cam_id_left] = mask_left;
@@ -959,7 +986,7 @@ void TrackOCL::feed_stereo(const CameraData &message, size_t msg_id_left, size_t
         corr_sub_ = corr_acc_ = corr_snap_ = 0; corr_snap_sum_ = 0.0; corr_snap_max_ = 0.f;
         epi_sw_ = epi_swx_ = epi_swxx_ = epi_swr_ = epi_swrx_ = epi_swrr_ = 0.0; epi_n_ = 0;
     }
-    rT5 = boost::posix_time::microsec_clock::local_time();
+    rT5 = prof_now();
 
     // Get our "good tracks" (original assembly; pts_right_new may have been drift-corrected above).
     std::vector<cv::KeyPoint> good_left, good_right;

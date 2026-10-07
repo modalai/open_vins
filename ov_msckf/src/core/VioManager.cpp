@@ -24,6 +24,8 @@
 #include "init/PhysicalResetWindow.h"
 #include "init/MarginalResetPrior.h"
 
+#include <chrono>
+#include <thread>
 #include <unordered_map>
 
 #include "feat/Feature.h"
@@ -279,6 +281,20 @@ VioManager::VioManager(VioManagerOptions &params_) : thread_init_running(false),
       auto track_ocl = std::make_shared<TrackOCL>(state->_cam_intrinsics_cameras, init_max_features,
                                                   state->_options.max_aruco_features, params.use_stereo,
                                                   params.fast_threshold, params.grid_x, params.grid_y, params.min_px_dist);
+      // Bind the ZNCC epipolar-band stereo matcher whenever stereo is on and
+      // the calibration has been packed by VoxlConfigure. It is the only
+      // stereo-projection path in TrackOCL; without it, stereo features stay
+      // mono-only.
+      PRINT_DEBUG("[VioManager] stereo: use_stereo=%d  calib_valid=%d\n",
+                  (int)params.use_stereo, (int)params.stereo_calib_valid);
+      if (params.use_stereo && params.stereo_calib_valid) {
+        track_ocl->enable_zncc_stereo_matcher(params.stereo_calib,
+                                              params.stereo_z_min,
+                                              params.stereo_z_max);
+      } else if (params.use_stereo) {
+        fprintf(stderr, "[VioManager] stereo requested but stereo_calib not "
+                        "populated; stereo features will stay mono-only\n");
+      }
       trackFEATS = std::static_pointer_cast<TrackBase>(track_ocl);
 #endif
     } else {
@@ -555,6 +571,17 @@ std::shared_ptr<VioManager::Snapshot> VioManager::snapshot() {
       snap->feature_db = db->clone_features();
   }
 
+  // Aruco state is neither captured nor reset: its database would replay duplicated
+  // observations at the same clone times on a branch. Say so once instead of corrupting quietly.
+  if (trackARUCO != nullptr) {
+    static bool warned_aruco = false;
+    if (!warned_aruco) {
+      PRINT_WARNING(YELLOW "[snapshot]: trackARUCO is active but its state is NOT captured -- a restored branch "
+                           "will replay duplicated aruco observations. Disable use_aruco for replay work.\n" RESET);
+      warned_aruco = true;
+    }
+  }
+
   // Manager scalars
   snap->is_initialized_vio = is_initialized_vio;
   snap->physical_reset_prior=initializer ? initializer->physical_reset_prior() : nullptr;
@@ -569,7 +596,19 @@ std::shared_ptr<VioManager::Snapshot> VioManager::snapshot() {
   snap->last_ref_frame_time = last_ref_frame_time;
   snap->ref_period_ema = ref_period_ema;
   snap->epoch_marg_pending = epoch_marg_pending;
-  snap->used_features_map = used_features_map;
+  snap->did_zupt_update = did_zupt_update;
+  snap->has_moved_since_zupt = has_moved_since_zupt;
+
+  // used_features_map DEEP-copied: the live vectors hold shared_ptr<Feature> aliasing database
+  // objects that keep mutating after capture (new obs appended, to_delete flags) -- a shallow
+  // copy would hand the restored branch evidence rewritten by the abandoned future.
+  snap->used_features_map.clear();
+  for (const auto &kv : used_features_map) {
+    auto &dst = snap->used_features_map[kv.first];
+    dst.reserve(kv.second.size());
+    for (const auto &f : kv.second)
+      dst.push_back(f ? std::make_shared<ov_core::Feature>(*f) : nullptr);
+  }
 
   return snap;
 }
@@ -585,7 +624,21 @@ void VioManager::restore(const std::shared_ptr<Snapshot> &snap, const std::vecto
   // 1) Install a FRESH clone of the snapshot state, so the snapshot node stays pristine and can
   //    be restored again to spawn a second branch. Swapping the shared_ptr is safe: no sub-object
   //    (updater/propagator/initializer) caches the State -- all take it as a per-call argument.
+  //    The ONE aliasing that must survive the swap is the camera intrinsic OBJECTS: the trackers
+  //    hold the pre-swap CamBase pointers (undistortion), and EKFUpdate syncs the estimated Vec
+  //    into whatever objects the STATE map names -- so keep the tracker's objects, write the
+  //    snapshot's values into them, and point the restored state at them. Without this, online
+  //    camera-intrinsic calibration updates objects the tracker never sees again.
+  auto prev_cam_objs = (state != nullptr) ? state->_cam_intrinsics_cameras
+                                          : std::unordered_map<size_t, std::shared_ptr<ov_core::CamBase>>();
   state = StateHelper::clone_state(snap->state);
+  for (auto &kv : state->_cam_intrinsics_cameras) {
+    auto it = prev_cam_objs.find(kv.first);
+    if (it != prev_cam_objs.end() && it->second != nullptr && kv.second != nullptr) {
+      it->second->set_value(kv.second->get_value());
+      kv.second = it->second;
+    }
+  }
 
   // 2) Propagator + scalars restored in place (Propagator object identity preserved -- ZUPT
   //    caches this exact pointer).
@@ -666,7 +719,9 @@ void VioManager::restore(const std::shared_ptr<Snapshot> &snap, const std::vecto
   //    (the next real feed then swaps it into img_buf_prev_, exactly as if we had never rewound).
   //    We first clear the CPU frontend so this priming feed DETECTS (it must not try to KLT-track
   //    from the stale post-snapshot pyramid); its detection output is overwritten in step 4.
-  if (trackFEATS != nullptr && !prime_frames.empty()) {
+  //    TrackSIM has no pyramid and hard-exits on an image feed -- the obs-replay tier passes
+  //    empty primes, but guard it structurally.
+  if (trackFEATS != nullptr && !prime_frames.empty() && std::dynamic_pointer_cast<TrackSIM>(trackFEATS) == nullptr) {
     trackFEATS->restore_frontend(std::make_shared<ov_core::TrackBase::FrontendState>());
     for (const auto &f : prime_frames)
       trackFEATS->feed_new_camera(f);
@@ -1440,7 +1495,7 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
     propagator->invalidate_cache();
   }
   feats_slam_UPDATE = feats_slam_UPDATE_TEMP;
-  rT5 = boost::posix_time::microsec_clock::local_time();
+  rT5 = ov_core::prof_now();
   // DIAGNOSTIC ONLY: hand delayed_init a featid->matcher-confidence lookup (see UpdaterSLAM.h) so
   // its reinit log can report whether a bad depth came from a confident-but-wrong match or an
   // unconfident one. Reached through the TrackBase interface -- stereo_confidence_map() is empty
@@ -1450,7 +1505,7 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
     stereo_conf_for_diag[kv.first] = StereoMatchConfidence{kv.second.peak_zncc, kv.second.margin, kv.second.lr_err};
   }
   updaterSLAM->delayed_init(state, feats_slam_DELAYED, &stereo_conf_for_diag);
-  rT6 = boost::posix_time::microsec_clock::local_time();
+  rT6 = ov_core::prof_now();
 
   //===================================================================================
   // Update our visualization feature set, and clean up the old features

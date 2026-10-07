@@ -1,9 +1,26 @@
-/**
- * @file TrackOCL.h
- * @brief GPU (OpenCL) FAST + pyramidal-KLT feature tracker for VOXL OpenVINS: stereo-gated
- *        detection, ZNCC epipolar stereo matching, and IMU-aided KLT seeding.
- * @author kyletyni
+/*
+ * OpenVINS: An Open Platform for Visual-Inertial Research
+ * Copyright (C) 2025-2026 Joao Leonardo Silva Cotta
+ * Copyright (C) 2025-2026 Kyle Tyni
+ * Copyright (C) 2018-2022 Patrick Geneva
+ * Copyright (C) 2018-2022 Guoquan Huang
+ * Copyright (C) 2018-2022 OpenVINS Contributors
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
+// TrackOCL.h -- GPU (OpenCL) FAST + pyramidal-KLT tracker: stereo-gated detection,
+// ZNCC epipolar stereo matching, and IMU-aided KLT seeding.
 #ifndef OV_CORE_TRACK_OCL_H
 #define OV_CORE_TRACK_OCL_H
 
@@ -13,6 +30,7 @@
 #include <modal_flow_ocl_manager.h>
 #include <modal_flow/ocl/OclDevice.hpp>
 #include <modal_flow/ocl/ManagerCL.hpp>
+#include <modal_flow/StereoMatcher.hpp>
 #include <modal_flow/Types.hpp>
 #include <modal_flow/Tracker.hpp>
 #include "ImuRotationIntegrator.h"

@@ -33,7 +33,6 @@
 #include <vector>
 
 #include <Eigen/Eigen>
-#include <boost/date_time/posix_time/posix_time.hpp>
 #include <opencv2/core/core.hpp>
 #include <opencv2/highgui/highgui.hpp>
 #include <opencv2/opencv.hpp>

@@ -49,6 +49,7 @@
 #include "update/UpdaterZeroVelocity.h"
 #include "state/Propagator.h"     // Propagator::Snapshot nested type (VioManager::Snapshot)
 #include "track/TrackBase.h"      // TrackBase::FrontendState nested type (VioManager::Snapshot)
+#include "utils/ChronoProf.h"     // ProfTime members (rT1..rT7)
 
 namespace ov_core {
 struct ImuData;
