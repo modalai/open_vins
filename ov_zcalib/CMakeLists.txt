@@ -129,6 +129,15 @@ if (OV_ZCALIB_BUILD_TESTS AND NOT DISABLE_TRACK_KLT)
     add_executable(zcalib_test_export_parity src/test_export_parity.cpp)
     target_link_libraries(zcalib_test_export_parity ov_zcalib_lib)
     add_test(NAME zcalib_test_export_parity COMMAND zcalib_test_export_parity)
+
+    # Full production-session replays and Monte Carlo sweeps belong to extended
+    # host validation. Keep their original records, assertions and solver settings.
+    set_tests_properties(zcalib_test_calib_e2e zcalib_test_session_e2e
+            zcalib_test_radtan_tangent zcalib_test_tg_e2e zcalib_test_wald_mc
+            zcalib_test_export_parity PROPERTIES LABELS "extended" RUN_SERIAL TRUE)
+    set_target_properties(zcalib_test_calib_e2e zcalib_test_session_e2e
+            zcalib_test_tg_e2e zcalib_test_wald_mc zcalib_test_export_parity
+            PROPERTIES OV_HOST_EXTENDED_TEST TRUE)
 endif ()
 
 # The CLI (upstream run_*.cpp entrypoint pattern). Builds on device too: --replay

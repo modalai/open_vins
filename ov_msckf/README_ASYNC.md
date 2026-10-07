@@ -135,13 +135,23 @@ mean-gain freezing while retaining temporal Jacobians and cross-covariance.
 
 Build host tests with ROS disabled and `OV_MSCKF_BUILD_TESTS=ON`.
 
-`.github/workflows/host-math.yml` builds and runs every registered core,
-initialization, estimator, and zcalib test on pull requests to `master` and pushes
-to `master` or `calibration-refinement`. It uses the production Release math
-flags, CPU trackers, the Ceres-free initializer, and all available runner CPUs
-for parallel builds and tests.
-Failures stop the job; JUnit results and CTest diagnostics are retained as
-artifacts. No device or deployment step is involved.
+`.github/workflows/host-math.yml` runs the fast host tier on pull requests to
+`master`: core, initialization, estimator and calibration numerical tests plus
+one complete 60 Hz RS / 30 Hz GS trajectory with its original accuracy and NEES
+gates. Full calibration session E2E, calibration Monte Carlo and the remaining
+VINS trajectories carry the CTest `extended` label. They run in a separate job
+after pushes to `master`, or through manual dispatch with `extended` enabled.
+The complete suite and its acceptance thresholds are retained.
+
+The dependency environment is a cached Docker image keyed by its Dockerfile,
+with a pinned Ubuntu base. Package installation runs only when that image is
+absent. A separate ccache stores compiled objects across source revisions;
+its key includes the dependency image and native CPU fingerprint. Both tiers
+use production Release math flags, CPU trackers, the Ceres-free initializer
+and all available runner CPUs. Full calibration sessions run one at a time
+because each already owns a parallel solver pool. PR commits trigger one run
+instead of duplicate branch-push and PR runs. Failures stop the job; JUnit and
+CTest diagnostics are retained. All execution stays on the host.
 
 The same host build can be run locally:
 
@@ -153,6 +163,10 @@ cmake -S . -B build-host -DCMAKE_BUILD_TYPE=Release -DENABLE_ROS=OFF \
 cmake --build build-host --target ov_host_tests --parallel "$(nproc)"
 ctest --test-dir build-host --output-on-failure --parallel "$(nproc)"
 ```
+
+For just the PR tier, build `ov_host_tests_fast` and pass `-LE extended` to
+CTest. To run the extended tier separately, build `ov_host_tests` and pass
+`-L extended`. A plain CTest invocation still runs every registered test.
 
 - `test_epoch_exposure_jacobian`: independent double-precision projection finite
   differences, pose/velocity/readout columns, and FEJ translation/yaw nullspaces.

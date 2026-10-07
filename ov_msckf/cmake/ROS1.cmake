@@ -408,6 +408,17 @@ if (OV_MSCKF_BUILD_TESTS)
             --phase1 0.0073 --dt1 0.012 --frame-clones --global-features
             --csv ${CMAKE_CURRENT_BINARY_DIR}/test_async_dual_frame_clones_global.csv
             --name async_frame_clones_global --assert-pos-rmse 0.60 --assert-ori-rmse 1.0 --assert-nees-max 25)
+
+    # Retain one complete 60 Hz RS / 30 Hz GS accuracy/NEES gate on every PR.
+    # Other full-trajectory policies and seeds remain in extended validation.
+    set_tests_properties(test_async_dual_epoch_mixed_rs_gs_6
+            PROPERTIES LABELS "vins;async;resource")
+    set_tests_properties(test_async_dual_synced
+            test_async_dual_unmodeled_timing_negative_control test_async_dual_epoch
+            test_async_dual_epoch_mixed_rs_gs_30 test_async_dual_epoch_mixed_rs_gs_40
+            test_async_dual_frame_clones test_async_dual_physical
+            test_async_dual_physical_global test_async_dual_frame_clones_global
+            PROPERTIES LABELS "extended")
 endif ()
 
 
