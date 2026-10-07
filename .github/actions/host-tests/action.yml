@@ -1,0 +1,92 @@
+name: Cached host math tests
+description: Reuse the host dependency image and compiler cache for fast or extended tests.
+inputs:
+  suite:
+    description: Test tier (fast or extended).
+    required: true
+runs:
+  using: composite
+  steps:
+    - name: Restore prepared host environment
+      id: environment
+      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: .ci-cache/host-environment.tar
+        key: host-environment-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('.github/ci/host-math.Dockerfile') }}
+    - name: Load prepared environment (install only on cache miss)
+      shell: bash
+      run: bash .github/ci/prepare-host-env.sh
+    - name: Save newly prepared host environment
+      if: steps.environment.outputs.cache-hit != 'true'
+      uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: .ci-cache/host-environment.tar
+        key: ${{ steps.environment.outputs.cache-primary-key }}
+    - name: Identify CPU and dependency image for native compiler cache
+      id: native
+      shell: bash
+      run: |
+        fingerprint=$( { bash .github/ci/host-container.sh c++ -march=native -Q --help=target; docker image inspect --format '{{.Id}}' ov-host-math:ci; } | sha256sum | cut -d ' ' -f 1)
+        echo "fingerprint=$fingerprint" >> "$GITHUB_OUTPUT"
+    - name: Restore compiled objects
+      id: compiler
+      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: .ci-cache/ccache
+        key: host-compiler-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.native.outputs.fingerprint }}-${{ github.sha }}-${{ inputs.suite }}
+        restore-keys: |
+          host-compiler-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.native.outputs.fingerprint }}-
+    - name: Configure numerical and calibration regressions
+      shell: bash
+      run: |
+        bash .github/ci/host-container.sh cmake -S . -B build-host -G Ninja \
+          -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+          -DENABLE_ROS=OFF -DENABLE_ARUCO_TAGS=ON -DDISABLE_MATPLOTLIB=ON \
+          -DOV_INIT_CERES_FREE=ON -DBUILD_OV_EVAL=OFF \
+          -DOV_CORE_BUILD_TESTS=ON -DOV_INIT_BUILD_TESTS=ON \
+          -DOV_MSCKF_BUILD_TESTS=ON -DOV_BUILD_CALIB=ON -DOV_ZCALIB_BUILD_TESTS=ON
+    - name: Build regression binaries using all CPUs
+      shell: bash
+      env:
+        SUITE: ${{ inputs.suite }}
+      run: |
+        case "$SUITE" in
+          fast) target=ov_host_tests_fast ;;
+          extended) target=ov_host_tests ;;
+          *) exit 2 ;;
+        esac
+        bash .github/ci/host-container.sh cmake --build build-host --target "$target" --parallel "$(nproc)"
+    - name: Save compiled objects before running regressions
+      if: steps.compiler.outputs.cache-hit != 'true'
+      uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: .ci-cache/ccache
+        key: ${{ steps.compiler.outputs.cache-primary-key }}
+    - name: Run regression tier
+      shell: bash
+      env:
+        SUITE: ${{ inputs.suite }}
+      run: |
+        case "$SUITE" in
+          fast) label=(-LE extended) ;;
+          extended) label=(-L extended) ;;
+          *) exit 2 ;;
+        esac
+        bash .github/ci/host-container.sh ctest --test-dir build-host \
+          --output-on-failure --no-tests=error --output-junit "host-math-$SUITE.xml" \
+          --parallel "$(nproc)" "${label[@]}"
+    - name: Compiler cache statistics
+      if: always()
+      shell: bash
+      run: bash .github/ci/host-container.sh ccache --show-stats
+    - name: Preserve regression evidence
+      if: always()
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+      with:
+        name: host-math-${{ inputs.suite }}-${{ github.sha }}
+        path: |
+          build-host/host-math-${{ inputs.suite }}.xml
+          build-host/Testing/Temporary/
+          build-host/ov_msckf/test_async_dual_frame_clones_global.csv
+        if-no-files-found: warn
+        retention-days: 14

@@ -2,6 +2,8 @@ cmake-build-*
 build
 Build
 build_*
+build-host/
+.ci-cache/
 *.*~
 .idea
 doxgen_generated
