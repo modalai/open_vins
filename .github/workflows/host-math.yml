@@ -43,11 +43,11 @@ jobs:
             -DOV_MSCKF_BUILD_TESTS=ON \
             -DOV_BUILD_CALIB=ON -DOV_ZCALIB_BUILD_TESTS=ON
       - name: Build host regression binaries
-        run: cmake --build build-host --target ov_host_tests --parallel 2
+        run: cmake --build build-host --target ov_host_tests --parallel "$(nproc)"
       - name: Run every registered regression
         working-directory: build-host
         run: |
-          ctest --output-on-failure --output-junit host-math.xml --parallel 2
+          ctest --output-on-failure --output-junit host-math.xml --parallel "$(nproc)"
       - name: Preserve regression evidence
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

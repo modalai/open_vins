@@ -138,7 +138,8 @@ Build host tests with ROS disabled and `OV_MSCKF_BUILD_TESTS=ON`.
 `.github/workflows/host-math.yml` builds and runs every registered core,
 initialization, estimator, and zcalib test on pull requests to `master` and pushes
 to `master` or `calibration-refinement`. It uses the production Release math
-flags, CPU trackers, the Ceres-free initializer, and two build/test workers.
+flags, CPU trackers, the Ceres-free initializer, and all available runner CPUs
+for parallel builds and tests.
 Failures stop the job; JUnit results and CTest diagnostics are retained as
 artifacts. No device or deployment step is involved.
 
@@ -149,8 +150,8 @@ cmake -S . -B build-host -DCMAKE_BUILD_TYPE=Release -DENABLE_ROS=OFF \
   -DOV_INIT_CERES_FREE=ON -DBUILD_OV_EVAL=OFF -DDISABLE_MATPLOTLIB=ON \
   -DOV_CORE_BUILD_TESTS=ON -DOV_INIT_BUILD_TESTS=ON -DOV_MSCKF_BUILD_TESTS=ON \
   -DOV_BUILD_CALIB=ON -DOV_ZCALIB_BUILD_TESTS=ON
-cmake --build build-host --target ov_host_tests --parallel 2
-ctest --test-dir build-host --output-on-failure --parallel 2
+cmake --build build-host --target ov_host_tests --parallel "$(nproc)"
+ctest --test-dir build-host --output-on-failure --parallel "$(nproc)"
 ```
 
 - `test_epoch_exposure_jacobian`: independent double-precision projection finite
