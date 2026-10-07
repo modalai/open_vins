@@ -24,9 +24,10 @@
 #define OPENCV_YAML_PARSER_H
 
 #include <Eigen/Eigen>
-#include <boost/filesystem.hpp>
 #include <memory>
 #include <opencv2/opencv.hpp>
+
+#include "FsLite.h"
 
 #if ROS_AVAILABLE == 1
 #include <ros/ros.h>
@@ -66,11 +67,11 @@ public:
   explicit YamlParser(const std::string &config_path, bool fail_if_not_found = true) : config_path_(config_path) {
 
     // Check if file exists
-    if (!fail_if_not_found && !boost::filesystem::exists(config_path)) {
+    if (!fail_if_not_found && !ov_core::fs_exists(config_path)) {
       config = nullptr;
       return;
     }
-    if (!boost::filesystem::exists(config_path)) {
+    if (!ov_core::fs_exists(config_path)) {
       PRINT_ERROR(RED "unable to open the configuration file!\n%s\n" RESET, config_path.c_str());
       std::exit(EXIT_FAILURE);
     }
@@ -411,6 +412,18 @@ private:
       }
       if (file_node[node_name].isInt() && (int)file_node[node_name] == 0) {
         node_result = false;
+        return;
+      }
+      // A trailing comment containing a COLON silently destroys the value: OpenCV's YAML reader
+      // tokenizes before it strips comments, so `key: false  # no-op: re-solved anyway` parses as
+      // a nested MAP and the scalar is gone. The node then reads back empty and the setting keeps
+      // its default -- a written config silently ignored, with no error. Catch it here and say
+      // exactly what to do, because the failure is otherwise invisible.
+      if (file_node[node_name].isMap()) {
+        PRINT_WARNING(YELLOW "the node %s parsed as a MAP, not a bool -- a ':' in its trailing comment?\n" RESET,
+                      node_name.c_str());
+        PRINT_WARNING(YELLOW "\tOpenCV's YAML reader splits on it. Move the comment to its own line above the key.\n" RESET);
+        all_params_found_successfully = false;
         return;
       }
       // NOTE: we select the first bit of text as there can be a comment afterwards

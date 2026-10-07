@@ -18,7 +18,7 @@ set -u
 
 REPO="${REPO:-/home/zbft/Documents/SFM_LIFE/voxl-open-vins-server}"
 OV="$REPO/external/open_vins"
-SCRATCH="${SCRATCH:-/tmp/claude-1000/-home-zbft-Documents-SFM-LIFE/254fb043-6360-41b2-bd29-f28d2a003679/scratchpad}"
+SCRATCH="${SCRATCH:-$(mktemp -d /tmp/ov_sim_ab.XXXXXX)}"
 BUILD="$SCRATCH/ovbuild"
 LOGS="$SCRATCH/simlogs"
 TRAJ="${TRAJ:-$OV/ov_data/sim/udel_gore.txt}"

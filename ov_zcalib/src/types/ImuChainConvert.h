@@ -1,0 +1,121 @@
+/*
+ * OpenVINS: An Open Platform for Visual-Inertial Research
+ * Copyright (C) 2025-2026 Joao Leonardo Silva Cotta
+ *
+ * ov_zcalib: seed the IMU intrinsics from an OpenVINS/kalibr IMU chain.
+ * ------------------------------------------------------------------------
+ * The two shipped gauges describe the SAME physics in DIFFERENT body frames,
+ * and conversion changes coordinates as well as triangular storage:
+ *
+ *   KALIBR gauge: IMU frame == ACCEL frame  (R_ACCtoIMU = I structural)
+ *       w_hat = R_GYROtoIMU * Dw_k * (w_m - bg)      Dw_k, Da_k LOWER-tri
+ *       a_hat =               Da_k * (a_m - ba)
+ *
+ *   RPNG gauge (== ov_zcalib's imu2): IMU frame == GYRO frame (R_GtoI = I)
+ *       w_hat =         Dw_r * (w_m - bg)            Dw_r, Da_r UPPER-tri
+ *       a_hat = R_AtoI * Da_r * (a_m - ba)
+ *
+ * The two calibrated IMU gauges differ by a rotation R:
+ * w_hat^K = R w_hat^R and a_hat^K = R a_hat^R.
+ * Matching gyro rows gives  R_GYROtoIMU * Dw_k = R * Dw_r ; accel rows give
+ * R_ACCtoIMU * Da_k = R * R_AtoI * Da_r. Each is an "orthogonal x upper-
+ * triangular" factorization of a KNOWN matrix -- i.e. a QR:
+ *
+ *   M := R_GYROtoIMU * Dw_chain          QR:  M = Q_w U_w   =>  R = Q_w,  Dw_r = U_w
+ *   N := Q_w^T * R_ACCtoIMU * Da_chain   QR:  N = Q_a U_a   =>  R_AtoI = Q_a, Da_r = U_a
+ *
+ * Scale factors are positive by construction, so the QR is sign-canonicalized
+ * (positive diagonal). An rpng-gauge chain is the identity case of this map
+ * (Q_w = I), so ONE path serves both models and a same-gauge chain round-trips
+ * exactly.
+ *
+ * The active chain is an optional initializer, not calibration ground truth.
+ * SeedPolicy independently selects the ported
+ * Dw/Da/R_AtoI values or identity, and the ported Tg value or zero.
+ *
+ * When Tg (g-sensitivity) is seeded, the gauge change acts on its input
+ * coordinates only: in both models the bracket is (w_m - b_g - Tg * a_hat), where w_m
+ * and b_g are RAW GYRO AXES quantities identical in either gauge, so only
+ * a_hat's frame moves. With a_hat^K = Q_w a_hat^R,
+ *
+ *   Tg_k * a_hat^K = Tg_k * Q_w * a_hat^R  ==  Tg_r * a_hat^R   =>   Tg_r = Tg_chain * Q_w
+ *
+ * and an rpng-gauge chain (Q_w = I) round-trips exactly, like Dw and Da. The
+ * port seeds Tg FIXED (calib_tg = false); whether a session ESTIMATES it is
+ * runner policy behind the A1b excitation gate. The later seed policy can
+ * choose zero instead without changing that estimation policy. The choice
+ * affects the initial corrected angular rate and can couple to gyro scale
+ * and bias during bootstrap, so it must be explicit in the session setup.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ */
+
+#ifndef OV_ZCALIB_IMU_CHAIN_CONVERT_H
+#define OV_ZCALIB_IMU_CHAIN_CONVERT_H
+
+#include <Eigen/Dense>
+
+#include "ImuIntrinsicModel.h"
+#include "utils/quat_ops.h"
+
+namespace ov_zcalib {
+
+/// Sign-canonical QR: A = Q * U with U upper-triangular and diag(U) > 0.
+inline void qr_positive_diag(const Eigen::Matrix3d &A, Eigen::Matrix3d &Q, Eigen::Matrix3d &U) {
+  Eigen::HouseholderQR<Eigen::Matrix3d> qr(A);
+  Q = qr.householderQ();
+  U = qr.matrixQR().triangularView<Eigen::Upper>();
+  for (int k = 0; k < 3; ++k) {
+    if (U(k, k) < 0.0) { // flip: Q.col(k) * U.row(k) is invariant under a joint sign flip
+      U.row(k) *= -1.0;
+      Q.col(k) *= -1.0;
+    }
+  }
+}
+
+/// Convert an OpenVINS IMU chain (EITHER gauge) into ov_zcalib's imu2 parameters.
+/// @param Dw_chain      full 3x3 Dw = Tw^-1 from the chain
+/// @param Da_chain      full 3x3 Da = Ta^-1 from the chain
+/// @param R_GYROtoIMU   chain's gyro->IMU rotation (identity in the rpng gauge)
+/// @param R_ACCtoIMU    chain's accel->IMU rotation (identity in the kalibr gauge)
+/// @param Tg_chain      full 3x3 g-sensitivity from the chain (Zero if the chain has none)
+/// @param[out] imu      dw/da (upper-tri packed) + q_AtoI + Tg, ready to seed SharedCalib
+/// @param[out] R_imu2_to_chain optional frame map: v_chain = R_imu2_to_chain * v_imu2.
+///                      Camera rotations must use R_C_imu2 = R_C_chain * R_imu2_to_chain.
+///                      Selecting identity intrinsic seeds later does not change this gauge.
+inline void imu_chain_to_calib(const Eigen::Matrix3d &Dw_chain, const Eigen::Matrix3d &Da_chain,
+                               const Eigen::Matrix3d &R_GYROtoIMU, const Eigen::Matrix3d &R_ACCtoIMU,
+                               const Eigen::Matrix3d &Tg_chain, ImuIntrinsicModel &imu,
+                               Eigen::Matrix3d *R_imu2_to_chain = nullptr) {
+  Eigen::Matrix3d Qw, Uw, Qa, Ua;
+  qr_positive_diag(R_GYROtoIMU * Dw_chain, Qw, Uw);            // gyro rows -> the frame rotation + upper-tri Dw
+  qr_positive_diag(Qw.transpose() * R_ACCtoIMU * Da_chain, Qa, Ua); // accel rows, in the GYRO frame
+  if (R_imu2_to_chain)
+    *R_imu2_to_chain = Qw;
+  imu.dw << Uw(0, 0), Uw(0, 1), Uw(1, 1), Uw(0, 2), Uw(1, 2), Uw(2, 2); // ut() packing [d11,d12,d22,d13,d23,d33]
+  imu.da << Ua(0, 0), Ua(0, 1), Ua(1, 1), Ua(0, 2), Ua(1, 2), Ua(2, 2);
+  imu.q_AtoI = ov_core::rot_2_quat(Qa);
+  imu.Tg = Tg_chain * Qw; // a_hat's frame is the only thing the gauge change moves (see header)
+  // The port only SEEDS the value. Whether the session may ESTIMATE tg is session policy
+  // (estimate_tg -> SessionConfig::free_tg), decided by the runner at construction and unlocked
+  // through the A1b excitation gate -- never by the chain port.
+  imu.calib_tg = false;
+}
+
+/// Inverse map: ov_zcalib's imu2 parameters -> the corrected-signal matrices a
+/// chain consumer needs. Returns the GYRO-frame (rpng) quantities directly --
+/// the caller converts to its own gauge if it is kalibr-modelled. Provided so a
+/// writeback (and the round-trip test) can close the loop without re-deriving.
+inline void calib_to_imu_chain(const ImuIntrinsicModel &imu, Eigen::Matrix3d &Dw_rpng, Eigen::Matrix3d &Da_rpng,
+                               Eigen::Matrix3d &R_ACCtoIMU_rpng) {
+  Dw_rpng = ImuIntrinsicModel::ut(imu.dw);
+  Da_rpng = ImuIntrinsicModel::ut(imu.da);
+  R_ACCtoIMU_rpng = ov_core::quat_2_Rot(imu.q_AtoI);
+}
+
+} // namespace ov_zcalib
+
+#endif // OV_ZCALIB_IMU_CHAIN_CONVERT_H

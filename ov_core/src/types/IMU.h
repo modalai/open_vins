@@ -77,6 +77,13 @@ public:
    * @param dx 15 DOF vector encoding update using the following order (q, p, v, bg, ba)
    */
   void update(const Eigen::VectorXd &dx) override {
+    Eigen::Matrix<double, 16, 1> proposed;
+    propose_update(dx, proposed);
+    set_value(proposed);
+  }
+
+  void propose_update(const Eigen::Ref<const Eigen::VectorXd> &dx,
+                      Eigen::Ref<Eigen::VectorXd> proposed) const override {
 
     assert(dx.rows() == _size);
 
@@ -93,7 +100,7 @@ public:
     newX.block(10, 0, 3, 1) += dx.block(9, 0, 3, 1);
     newX.block(13, 0, 3, 1) += dx.block(12, 0, 3, 1);
 
-    set_value(newX);
+    proposed = newX;
   }
 
   /**

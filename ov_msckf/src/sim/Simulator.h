@@ -150,11 +150,11 @@ protected:
   /**
    * @brief Rolling-shutter projection: each feature's row determines its sampling time.
    *
-   * Row v is sampled at time_event + (v/h)*readout (frame stamp = start of readout, matching the
-   * estimator's dt_rs convention). Solved per feature with a two-iteration fixed point on the row,
-   * re-sampling the spline pose each iteration.
+   * Row v is sampled at time_event + (v/h - 0.5)*readout (frame stamp = mid-frame / center row,
+   * matching the estimator's centered dt_rs convention). Solved per feature with a two-iteration
+   * fixed point on the row, re-sampling the spline pose each iteration.
    *
-   * @param time_event Frame event time (IMU clock) = start of readout
+   * @param time_event Frame event time (IMU clock) = mid-frame (center row)
    * @param camid Camera id of the camera sensor we want to project into
    * @param feats Our set of 3d features
    * @param readout Rolling-shutter readout time in seconds (> 0)

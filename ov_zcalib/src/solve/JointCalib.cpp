@@ -1,0 +1,1307 @@
+/*
+ * OpenVINS: An Open Platform for Visual-Inertial Research
+ * Copyright (C) 2025-2026 Joao Leonardo Silva Cotta
+ *
+ * ov_zcalib: cross-window VarPro fusion (see JointCalib.h).
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ */
+
+#include "JointCalib.h"
+#include "PosteriorChecks.h"
+
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <limits>
+
+#include "ceres_free/Parallel.h"
+
+#include "../window/LinearSeed.h"
+#include "utils/quat_ops.h"
+
+using namespace ov_zcalib;
+
+bool JointCalib::solve(const std::vector<WindowData> &windows, SharedCalib &calib, const JointConfig &cfg, JointReport &rep,
+                       JointWarmCarry *carry, PreintStore *store, std::vector<WindowWarmState> *warm_out) {
+
+  rep.ok = false;
+  if (cfg.max_wall_s < 0.0) { // session deadline already exhausted
+    rep.hit_wall_budget = true;
+    return false;
+  }
+
+  const auto t_entry = std::chrono::steady_clock::now();
+  auto elapsed_s = [&]() { return std::chrono::duration<double>(std::chrono::steady_clock::now() - t_entry).count(); };
+  auto budget_elapsed_s = [&]() { return cfg.budget_clock ? cfg.budget_clock() : elapsed_s(); };
+  std::atomic<bool> budget_cancelled{false};
+  auto budget_expired = [&]() {
+    if (cfg.max_wall_s <= 0.0)
+      return false;
+    if (budget_cancelled.load(std::memory_order_relaxed))
+      return true;
+    if (budget_elapsed_s() >= cfg.max_wall_s) {
+      budget_cancelled.store(true, std::memory_order_relaxed);
+      return true;
+    }
+    return false;
+  };
+
+  auto layout = calib.free_blocks();
+  const int np = calib.local_dim();
+  if (np == 0 || windows.empty())
+    return false;
+
+  // A cold initializer may update bg/ba at each candidate calibration. Keep
+  // its starting state separate from the physical prior so warm/cold duels
+  // and outer merit comparisons use the same objective. An unseeded window
+  // has the same zero-bias prior as WindowBA's cold fallback.
+  std::vector<WindowBiasPrior> bias_priors(windows.size());
+  for (size_t wi = 0; wi < windows.size(); ++wi)
+    if (windows[wi].has_seeds) {
+      bias_priors[wi].bg = windows[wi].seed_bg;
+      bias_priors[wi].ba = windows[wi].seed_ba;
+    }
+
+  // Freeze the noise linearization at fusion entry (weights must not chase p)
+  calib.noise_lin = calib.imu;
+  calib.noise_frozen = true;
+  // Entry whitener stamp (carry validity): cost values are comparable across
+  // stages ONLY under the identical noise_lin -- which freezes HERE, from the
+  // entry imu values, not from the recording stage's exit (A1a/A1b move imu,
+  // so their exit stamp matches the next entry while the whitener does not).
+  Eigen::Matrix<double, 25, 1> entry_noise;
+  entry_noise << calib.imu.dw, calib.imu.da, calib.imu.q_AtoI,
+      Eigen::Map<const Eigen::Matrix<double, 9, 1>>(calib.imu.Tg.data());
+  // Full-vector parameter stamp (ALL calib blocks, free or
+  // frozen). Window costs depend on the frozen blocks too, and the staged
+  // calls free DIFFERENT subsets -- a free-subset stamp can never match across
+  // a stage boundary and would demote every consume to jump duels. The full
+  // vector matches exactly when the calib object is untouched between calls,
+  // which is the condition under which carried costs are valid.
+  auto full_stamp = [&calib, &windows, &bias_priors]() {
+    std::vector<double> s;
+    s.reserve(27 + 18 * calib.cams.size() + windows.size());
+    auto push = [&s](const double *p, int n) { s.insert(s.end(), p, p + n); };
+    push(calib.imu.dw.data(), 6);
+    push(calib.imu.da.data(), 6);
+    push(calib.imu.q_AtoI.data(), 4);
+    push(calib.imu.Tg.data(), 9);
+    s.push_back(calib.tg_enabled ? 1.0 : 0.0);
+    s.push_back(calib.grav_mag);
+    s.push_back(calib.bg_prior_sigma);
+    s.push_back(calib.ba_prior_sigma);
+    s.push_back(calib.noise.sigma_w);
+    s.push_back(calib.noise.sigma_wb);
+    s.push_back(calib.noise.sigma_a);
+    s.push_back(calib.noise.sigma_ab);
+    for (const CamCalib &k : calib.cams) {
+      push(k.q_ItoC.data(), 4);
+      push(k.p_IinC.data(), 3);
+      push(k.cam.data(), 8);
+      s.push_back(k.td);
+      s.push_back(k.tr);
+      s.push_back(k.reprojection_sigma_px);
+    }
+    // Both override and legacy fallback are objective data: carried costs and
+    // nuisance certificates cannot be compared after either is reweighted.
+    for (const WindowData &w : windows)
+      s.push_back(w.pix_sigma);
+    // Prior means/scales are objective data too, even when the calibration,
+    // free layout and measurement weights have not changed between calls.
+    for (const WindowBiasPrior &prior : bias_priors) {
+      push(prior.bg.data(), 3);
+      push(prior.ba.data(), 3);
+    }
+    return s;
+  };
+  // Free-set signature: full consume is only sound between calls solving the
+  // SAME problem shape (kept-path seeds and cost references are arbitration
+  // products of that shape -- see JointWarmCarry docs). Keyed on the per-camera
+  // LABEL, so two cameras' blocks of the same physical kind stay distinguishable.
+  std::string layout_sig;
+  for (auto &b : layout)
+    layout_sig += b.label() + ":" + std::to_string(b.gsize) + ";";
+
+  // Seeds (for the once-applied global priors) and labels
+  std::vector<std::vector<double>> seed;
+  rep.labels.clear();
+  rep.prior_sigma_vec.resize(np);
+  {
+    int off = 0;
+    for (auto &b : layout) {
+      seed.emplace_back(b.ptr, b.ptr + b.gsize);
+      // Both the intrinsic prior MASK and its CENTER are per-camera: the mask because the k3/k4
+      // radial gate is a question about what THIS camera actually saw, the center because each
+      // camera has its own factory cal.
+      const bool has_cam_prior =
+          (b.name == "cam" && cfg.use_cam_prior_vec && b.cam >= 0 && (size_t)b.cam < cfg.cam_prior_vec.size());
+      if (has_cam_prior && cfg.use_cam_prior_center && (size_t)b.cam < cfg.cam_prior_center.size())
+        for (int k = 0; k < 8; ++k)
+          if (cfg.cam_prior_vec[(size_t)b.cam](k) > 1e-8) // free dof: anchor; frozen dof: hold at entry
+            seed.back()[k] = cfg.cam_prior_center[(size_t)b.cam](k);
+      // Policy maps are keyed on the PHYSICAL name, not the per-camera label: a prior sigma or a
+      // step cap describes the block's physics, and applies to every camera that has one.
+      const double sg = cfg.prior_sigma.count(b.name) ? cfg.prior_sigma.at(b.name) : 1.0;
+      for (int k = 0; k < b.lsize; ++k) {
+        rep.labels.push_back(b.label() + "[" + std::to_string(k) + "]");
+        rep.prior_sigma_vec(off + k) = has_cam_prior                               ? cfg.cam_prior_vec[(size_t)b.cam](k)
+                                       : (b.name == "da" && cfg.use_da_prior_vec) ? cfg.da_prior_vec(k)
+                                                                                  : sg;
+      }
+      off += b.lsize;
+    }
+  }
+
+  // free-block value snapshot/restore (backtracking on true-cost increase)
+  auto snapshot = [&]() {
+    std::vector<std::vector<double>> s;
+    for (auto &b : layout)
+      s.emplace_back(b.ptr, b.ptr + b.gsize);
+    return s;
+  };
+  auto restore = [&](const std::vector<std::vector<double>> &s) {
+    for (size_t i = 0; i < layout.size(); ++i)
+      std::copy(s[i].begin(), s[i].end(), layout[i].ptr);
+  };
+
+  // local deviation of the CURRENT p from the seed, per block (shared by the
+  // prior fold and the prior-cost term of the merit)
+  auto local_dev = [&](size_t bi) {
+    auto &b = layout[bi];
+    Eigen::VectorXd dloc(b.lsize);
+    if (b.is_quat) {
+      Eigen::Map<const Eigen::Vector4d> qn(b.ptr);
+      Eigen::Map<const Eigen::Vector4d> q0(seed[bi].data());
+      dloc = 2.0 * ov_core::quat_multiply(qn, ov_core::Inv(Eigen::Vector4d(q0))).head<3>();
+    } else {
+      for (int k = 0; k < b.lsize; ++k)
+        dloc(k) = b.ptr[k] - seed[bi][k];
+    }
+    return dloc;
+  };
+
+  // Prior cost at the current p. The damped step is computed from the
+  // prior-AUGMENTED system, so acceptance must judge the same objective --
+  // comparing data cost alone accepts points that are not minima of the
+  // objective whose curvature ships in rep.sigma.
+  auto prior_cost_now = [&]() {
+    double c = 0.0;
+    int off = 0;
+    for (size_t bi = 0; bi < layout.size(); ++bi) {
+      const Eigen::VectorXd dloc = local_dev(bi);
+      for (int k = 0; k < layout[bi].lsize; ++k) {
+        const double z = dloc(k) / rep.prior_sigma_vec(off + k);
+        c += 0.5 * z * z;
+      }
+      off += layout[bi].lsize;
+    }
+    return c;
+  };
+
+  // manifold retraction of a local step onto the free blocks
+  auto apply_dp = [&](const Eigen::VectorXd &dp) {
+    int off = 0;
+    for (auto &b : layout) {
+      if (b.is_quat) {
+        Eigen::Vector4d dq;
+        dq.head<3>() = 0.5 * dp.segment<3>(off);
+        dq(3) = 1.0;
+        dq /= dq.norm();
+        Eigen::Map<Eigen::Vector4d> qcur(b.ptr);
+        qcur = ov_core::quat_multiply(dq, Eigen::Vector4d(qcur));
+      } else {
+        for (int k = 0; k < b.lsize; ++k)
+          b.ptr[k] += dp(off + k);
+      }
+      off += b.lsize;
+    }
+  };
+
+  // Outer-level Levenberg step from the fused reduced system. The exported
+  // Lambda is GAUSS-NEWTON information: in the tightly-coupled dw/da/td/grav
+  // valley the true curvature carries second-order residual terms GN cannot
+  // see (measured ~10-30x stiffer at linear-seed residual levels), so a raw
+  // Newton step overshoots the valley wall. Damping bends the step toward
+  // gradient descent using the SAME (Lambda, g) -- a rejected candidate costs
+  // one evaluation pass, never a new linearization.
+  Eigen::MatrixXd Lsum(np, np);
+  Eigen::MatrixXd accepted_L = Eigen::MatrixXd::Zero(np, np);
+  Eigen::VectorXd gsum(np);
+  Eigen::VectorXd accepted_g = Eigen::VectorXd::Zero(np);
+  double prev_merit = std::numeric_limits<double>::infinity();
+  std::vector<std::vector<double>> accepted_p = snapshot();
+  // No additional allocation in the legacy/unlimited path: alignment-sensitive
+  // builds must not have their window storage perturbed by an unused backup.
+  const auto entry_p = cfg.fused_schur ? accepted_p : std::vector<std::vector<double>>{};
+  int accepted_windows = 0;
+
+  // Working copies + GUARDED two-path warm starts (strand/duel vocabulary:
+  // see JointConfig). Warm-only carrying can strand -- LM from the previous
+  // optimum may sit above the shifted valley floor at the new p and the
+  // outer loop stalls; cold re-seeding every pass avoids that but leaves
+  // %-level inner hysteresis in the merit (re-seeds at nearby p take
+  // different inner paths), which on real data exceeds the acceptance band
+  // and stalls the outer loop in reject loops. The guard takes both: solve
+  // from the ACCEPTED point's nuisance optimum (path A, the warm strand:
+  // continuous, few inner iterations); if that fails or lands suspiciously
+  // above the window's accepted cost, ALSO solve from a fresh seed at the
+  // current p (path B) and keep the cheaper result. Bias/gauge priors are
+  // anchored at the p-independent window seed, so both paths minimize the
+  // same objective.
+  std::vector<WindowData> work(windows.begin(), windows.end());
+  std::vector<char> dead(work.size(), 0); // failed at an accepted point: never fusable
+  // Preint-cache slots, resolved by uid on the MAIN thread (ensure() may
+  // resize the store; pointers are taken only after every ensure() ran).
+  // Workers touch only their own window's entry (window i writes slot i).
+  std::vector<WindowPreint *> pslot(work.size(), nullptr);
+  if (store) {
+    for (const WindowData &w : work)
+      store->ensure(w.uid);
+    for (size_t wi = 0; wi < work.size(); ++wi)
+      if (work[wi].uid)
+        pslot[wi] = &store->by_uid[work[wi].uid];
+  }
+  std::vector<WindowWarmState> warm_acc(work.size());  // nuisance optima at the accepted point
+  std::vector<WindowWarmState> warm_cand(work.size()); // chosen result of the current evaluation
+  std::vector<WindowWarmState> warm_dual(work.size()); // duel_on_accept: deferred path-B optima
+  std::vector<double> cost_acc(work.size(), std::numeric_limits<double>::infinity());
+  const double strand_guard = 0.05; // warm result above accepted cost by more than this -> try a fresh seed too
+  // Certificate state: accepted q_n references (+inf = no reference yet ->
+  // only the cost-relative ceiling applies) and the accepted q_n per window.
+  std::vector<double> qn_ref(work.size(), std::numeric_limits<double>::infinity());
+  std::vector<double> qn_acc(work.size(), 0.0);
+  std::vector<char> jump(work.size(), 0); // carry stamp mismatch: force one duel at entry
+  // Export-on-accept veto arm: a window whose DEFERRED export failed at an
+  // accepted candidate switches to inline eval exports (the legacy path) for
+  // the rest of this solve, so further failures surface at eval time -- where
+  // the path-B rescue and the candidate veto live. Never set on a healthy
+  // record (the deferred export then fails nowhere), so the eoa byte-parity
+  // contract is untouched.
+  std::vector<char> export_suspect(work.size(), 0);
+  // Seed anchors of record (promoted at ACCEPTANCE only, per kept path -- a
+  // rejected candidate's path-B re-seed must never leak into the carry).
+  std::vector<SeedSnap> seeds_acc(work.size());
+  auto snap_seeds = [](const WindowData &w, SeedSnap &out) {
+    out.has = w.has_seeds;
+    out.q = w.seed_q;
+    out.v = w.seed_v;
+    out.p = w.seed_p;
+    out.feats = w.seed_feats;
+    out.grav = w.seed_grav;
+    out.bg = w.seed_bg;
+    out.ba = w.seed_ba;
+  };
+  auto apply_seeds = [](const SeedSnap &in, WindowData &w) {
+    if (!in.has)
+      return;
+    w.has_seeds = true;
+    w.seed_q = in.q;
+    w.seed_v = in.v;
+    w.seed_p = in.p;
+    w.seed_feats = in.feats;
+    w.seed_grav = in.grav;
+    w.seed_bg = in.bg;
+    w.seed_ba = in.ba;
+  };
+  // EXACT seed restore (export-on-accept): unlike apply_seeds -- which is a
+  // carry consumer and correctly no-ops on an empty snapshot -- this puts the
+  // window's seed fields back bit-for-bit INCLUDING has_seeds=false, so a
+  // kept-A export re-entry sees precisely the anchors its evaluation solved
+  // under, and the post-export state is precisely what legacy leaves behind.
+  auto force_seeds = [](const SeedSnap &in, WindowData &w) {
+    w.has_seeds = in.has;
+    w.seed_q = in.q;
+    w.seed_v = in.v;
+    w.seed_p = in.p;
+    w.seed_feats = in.feats;
+    w.seed_grav = in.grav;
+    w.seed_bg = in.bg;
+    w.seed_ba = in.ba;
+  };
+  // ---- carry consume (stage-entry warm start across staged calls) ----
+  const bool carry_on = (carry != nullptr) && cfg.use_carry;
+  if (carry_on && carry->valid && carry->warm.size() == work.size()) {
+    const std::vector<double> now = full_stamp();
+    bool stamp_match = (now.size() == carry->p_stamp.size());
+    if (stamp_match)
+      for (size_t i = 0; i < now.size(); ++i)
+        if (carry->p_stamp[i] != now[i]) { // bitwise
+          stamp_match = false;
+          break;
+        }
+    bool noise_match = true;
+    for (int k = 0; k < entry_noise.size(); ++k)
+      if (carry->noise_stamp(k) != entry_noise(k)) { // bitwise: whitener identity
+        noise_match = false;
+        break;
+      }
+    const bool sig_match = (carry->layout_sig == layout_sig);
+    const bool full = stamp_match && noise_match && sig_match;
+    for (size_t wi = 0; wi < work.size(); ++wi) {
+      warm_acc[wi] = carry->warm[wi];
+      if (full) { // kept-path seeds only persist within the shape that arbitrated them
+        apply_seeds(carry->seeds[wi], work[wi]);
+        seeds_acc[wi] = carry->seeds[wi];
+      }
+      cost_acc[wi] = full ? carry->cost[wi] : std::numeric_limits<double>::infinity();
+      qn_ref[wi] = full ? carry->qn_ref[wi] : std::numeric_limits<double>::infinity();
+      jump[wi] = full ? 0 : 1; // demoted carry: one arbitration duel at entry (warm vs stage-fresh cold)
+    }
+    if (cfg.verbose)
+      std::printf("[joint] carry consumed: %s (stamp %s, whitener %s, shape %s)\n",
+                  full ? "FULL (costs comparable)" : "warm-only (jump duels)", stamp_match ? "match" : "moved",
+                  noise_match ? "match" : "moved", sig_match ? "match" : "moved");
+  }
+
+  // Per-window evaluation slots, reduced IN WINDOW ORDER after the parallel
+  // sweep -- the fixed-order reduction contract: serial == parallel
+  // bit-identical (window i writes only slot i; the fold below is serial).
+  struct EvalSlot {
+    bool attempted = false, ok = false;
+    Eigen::MatrixXd L;
+    Eigen::VectorXd g;
+    double cost = 0.0;
+    double t_seed = 0.0, t_preint = 0.0, t_inner = 0.0, t_export = 0.0;
+    int iters = 0;
+    // two-path evidence (per pass): which paths ran, why cold fired, whether it won
+    char ran_warm = 0, cold_cause = 0, cold_win = 0;
+    double cold_gain = 0.0;
+    // kept-result q_n, kept path ('A'/'B'/0), dual agreement, and the
+    // pre-path-B seed stash (path A's anchors of record when A is kept on a
+    // pass where B re-seeded: the promoted snapshot must match the KEPT
+    // path's objective, not the post-re-seed state)
+    double qn = 0.0;
+    char kept_path = 0, dual_agree = 0;
+    SeedSnap seeds_pre;
+    // preint cache hits/misses this pass + factor-construction thread-CPU
+    int phit = 0, pmiss = 0;
+    double t_factor = 0.0;
+    // wall-clock hang-guard firings (must stay 0; nonzero = load-tainted run)
+    int tstop = 0;
+    // duel_on_accept: deferred-duel bookkeeping (phase-B runs post-accept)
+    char deferred_cause = 0;
+    bool d_ran = false, d_ok = false, d_win = false;
+    double d_cost = 0.0, d_qn = 0.0, d_seed = 0.0, d_preint = 0.0, d_inner = 0.0, d_export = 0.0, d_factor = 0.0;
+    long d_iters = 0;
+    int d_phit = 0, d_pmiss = 0, d_tstop = 0;
+    Eigen::MatrixXd d_L;
+    Eigen::VectorXd d_g;
+  };
+  std::vector<EvalSlot> slots(work.size());
+  const int nthreads = std::max(1, std::min(cfg.num_threads, (int)work.size()));
+  ov_init::zbft_sfm::ParallelExecutor pool(nthreads);
+
+  // LPT (longest-processing-time-first) order for the DYNAMIC window schedule.
+  // Window solves cost wildly different amounts -- the nuisance state is
+  // 15*clones + 3*landmarks and the dense factorization is CUBIC in it, so a
+  // 32-clone/300-obs window can cost several times a 12-clone/80-obs one. A
+  // static contiguous partition gates every pass on whichever range drew the
+  // heavy ones (measured: 63% parallel efficiency, ~22 s/solve spent waiting).
+  // Handing the EXPENSIVE windows out first leaves only cheap ones to fill the
+  // tail, which is the classic 4/3-optimal makespan greedy.
+  //
+  // The cost proxy is static and deterministic (no timing feedback), so the
+  // dispatch order is identical on every run and every machine. Results are
+  // bit-identical to the static schedule regardless -- window i writes only slot
+  // i, and the fold below is serial in index order (see Parallel.h).
+  std::vector<int> order(work.size());
+  for (size_t i = 0; i < work.size(); ++i)
+    order[i] = (int)i;
+  {
+    std::vector<double> cost(work.size(), 0.0);
+    for (size_t i = 0; i < work.size(); ++i) {
+      const double nc = (double)work[i].clone_times.size(); // dense nav block is cubic in clones
+      double nobs = 0.0;
+      for (const auto &co : work[i].obs)
+        nobs += (double)co.size();
+      cost[i] = nc * nc * nc + 30.0 * nobs; // factorization + assembly/Schur
+    }
+    std::stable_sort(order.begin(), order.end(), [&](int a, int b) { return cost[a] > cost[b]; });
+  }
+
+  double lm_lambda = 1e-2;
+  int rejects_in_a_row = 0;
+  bool have_lin = false; // (accepted_L, accepted_g) valid at accepted_p
+  const int max_evals = cfg.outer_iterations * (1 + cfg.max_backtracks);
+  int accepted_steps = 0;
+  // Early-stop state: last applied step's post-cap whitened norm, predicted
+  // reduction (undamped model), lambda, cap flag; consecutive-stable counter
+  // and the deterministic cold stop-confirmation pass.
+  // Keep cold-start arbitration for open accel-chain and small-window solves
+  // unless explicitly enabled. A small nuisance decrement is a local
+  // stationarity check; it cannot rule out a different calibration basin.
+  const bool cert_on = cfg.use_cert && (cfg.cert_open_imu || (!calib.imu.calib_da && !calib.imu.calib_RAtoI)) &&
+                       (int)windows.size() >= cfg.cert_min_windows;
+  // Fused evaluations cap inner work. Deferring cold-start arbitration would
+  // compare a partially optimized candidate against a fully optimized
+  // baseline, so duel_on_accept is unsupported with fused_schur.
+  JointConfig cfg_eff = cfg;
+  if (cfg_eff.duel_on_accept && cfg_eff.fused_schur) {
+    if (cfg.verbose)
+      std::printf("[joint] duel_on_accept disarmed: incompatible with fused evals (incomparable merits)\n");
+    cfg_eff.duel_on_accept = false;
+  }
+  const bool duel_defer = cfg_eff.duel_on_accept;
+  // Export-on-accept (see JointConfig::export_on_accept): evaluations run
+  // cost-only -- except cert-stage path A, which exports inline because the
+  // certificate consumes its q_n pre-accept and q_n must be the export's
+  // exact bits -- and the accepted candidate's (Lambda, g, qn) are produced
+  // by ONE deferred pass inside the accept branch (stored where inline,
+  // entry-faithful re-entry elsewhere). eoa=false is the legacy inline-
+  // export path, byte-identical to the reference binary.
+  //
+  // duel_on_accept DISARMS eoa: the deferred-duel fold is INCREMENTAL
+  // (Lsum += d_L - s.L on a winner), so legacy's accepted linearization
+  // carries the loser's export in its rounding -- sum_orig + (win - orig)
+  // and a rebuilt direct sum differ in the last ulp. Reproducing those bits
+  // would require exporting the duel LOSER too, which is the very work eoa
+  // exists to elide; this experimental mode keeps legacy exports instead
+  // (same one-flag-one-behavior doctrine as the fused disarm above).
+  const bool eoa = cfg.export_on_accept && !duel_defer;
+  if (cfg.export_on_accept && duel_defer && cfg.verbose)
+    std::printf("[joint] export_on_accept disarmed under duel_on_accept: the deferred-duel fold is incremental "
+                "(exact-bits parity needs the loser's export)\n");
+  const bool estop_on = cfg.early_stop && cert_on;
+  int stable_run = 0;
+  int conv_run = 0; // conv-stop consecutive below-tolerance accepted steps
+  bool confirm_pending = false, confirm_active = false;
+  double pend_winf = 0.0, pend_pred = 0.0, pend_lambda = 0.0;
+  bool pend_capped = false, have_pending = false;
+  for (int pass = 0; pass < max_evals && accepted_steps < cfg.outer_iterations; ++pass) {
+    // A completed pass is the unit of information: starting one with only
+    // milliseconds left used to overrun by its entire warm/cold solve sweep.
+    // The first pass of a new stage uses the preceding stages' measured hint.
+    // Fused evals also reserve one full pass for their mandatory tight export.
+    const double pass_cost = std::max(cfg.budget_pass_hint_s, rep.max_pass_s);
+    const double reserve = (cfg.fused_schur ? 2.0 : 1.0) * 1.25 * pass_cost + 0.01;
+    if (cfg.max_wall_s > 0.0 && (budget_expired() || cfg.max_wall_s - budget_elapsed_s() <= reserve)) {
+      rep.hit_wall_budget = true;
+      if (cfg.verbose)
+        std::printf("[joint] wall budget %.1fs: no room for a complete pass after %d passes -> keep complete accepted point\n",
+                    cfg.max_wall_s, pass);
+      break;
+    }
+    struct PassTimer {
+      std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+      double &maximum;
+      explicit PassTimer(double &m) : maximum(m) {}
+      ~PassTimer() {
+        maximum = std::max(maximum, std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count());
+      }
+    } pass_timer(rep.max_pass_s);
+    // stop-confirmation pass: force one duel on every window whose accepted
+    // q_n is material -- the fixed-order, deterministic cross-check that a
+    // stable-looking outer point is not resting on under-converged nuisances
+    // (temporal stability alone cannot distinguish the two)
+    confirm_active = confirm_pending;
+    confirm_pending = false;
+    if (confirm_active)
+      for (size_t wi = 0; wi < work.size(); ++wi)
+        if (qn_acc[wi] > cfg.cert_qn_rel * std::max(cost_acc[wi], 1e-300))
+          jump[wi] = 1;
+    // ---- evaluate at the current p: (seed-if-cold + solve nuisances + export) per window ----
+    rep.evaluation_passes++;
+    pool.parallel_dynamic((int)work.size(), [&](int /*worker*/, int k) {
+      {
+        const int wi = order[k]; // LPT: expensive windows are handed out first
+        EvalSlot &s = slots[wi];
+        s.attempted = false;
+        s.ok = false;
+        s.t_seed = s.t_preint = s.t_inner = s.t_export = 0.0;
+        s.iters = 0;
+        s.ran_warm = s.cold_cause = s.cold_win = 0;
+        s.cold_gain = 0.0;
+        s.qn = 0.0;
+        s.kept_path = s.dual_agree = 0;
+        s.seeds_pre.has = false;
+        s.phit = s.pmiss = 0;
+        s.t_factor = 0.0;
+        s.tstop = 0;
+        s.deferred_cause = 0;
+        s.d_ran = s.d_ok = s.d_win = false;
+        if (dead[wi] || budget_expired())
+          return;
+        s.attempted = true;
+        // ---- path A (warm strand): solve from the accepted point's optimum ----
+        WindowSolveReport wrA;
+        WindowWarmState wA = warm_acc[wi]; // copy: the solve mutates its warm state
+        bool okA = false;
+        const bool had_warm = wA.valid;
+        if (wA.valid) {
+          const bool cap_now = cfg.fused_schur && pass >= cfg.fused_warmup_passes &&
+                               accepted_steps < cfg.outer_iterations - cfg.fused_polish_accepts;
+          const int itA = cap_now ? cfg.fused_iters : cfg.window_max_iters;
+          // eoa: cost-only eval -- EXCEPT on cert-on stages, where the
+          // certificate consumes wrA.qn BEFORE the accept decision. q_n must
+          // be the full export's bits: a calib-column-free "qn-only" stats
+          // path was measured 1 ulp off (the smaller H's leading dimension
+          // changes SIMD peeling under -ffast-math; see the note at
+          // Problem::ExportReducedInformation), and q_n feeds thresholded
+          // duel arbitration. So cert stages keep path A's inline export
+          // (its Lambda is then REUSED at accept -- not re-computed), and the
+          // eoa savings there are the path-B/duel-loser exports. Dimension
+          // consistency reads the layout dim, not the (absent) Lambda --
+          // equal to Lambda.rows() whenever an export ran.
+          okA = WindowBA::solve_and_export(work[wi], calib, !eoa || cert_on || export_suspect[wi], wrA, itA, false, &wA,
+                                           pslot[wi], nullptr, nullptr, &bias_priors[wi]) &&
+                wrA.free_dim == np;
+          s.t_preint += wrA.t_preint;
+          s.t_inner += wrA.t_inner;
+          s.t_export += wrA.t_export;
+          s.t_factor += wrA.t_factor;
+          s.iters += wrA.iterations;
+          (wrA.preint_hit ? s.phit : s.pmiss)++;
+          s.tstop += wrA.time_stopped ? 1 : 0;
+          s.ran_warm = 1;
+        }
+        // ---- path B (fresh seed). Under the CERTIFICATE (use_cert): the
+        // duplicate solve runs only on genuine suspicion -- warm failure,
+        // non-stationary inner exit, cost stranding, material nuisance Newton
+        // decrement (q_n polices exactly the stale-shallow-gradient case the
+        // legacy plateau trigger over-approximated: the exported gred is the
+        // first-order-corrected VarPro gradient, so the unpoliced residual is
+        // the second-order term q_n/2), or a carry jump duel. Legacy triggers
+        // (plateau <=2 iters, every-3rd-pass anchor) remain reachable under
+        // use_cert=false for bit-identical A/B. ----
+        const bool anchor_pass = !cert_on && !cfg.fused_schur && (pass % 3 == 0);
+        const bool plateau = !cert_on && !cfg.fused_schur && okA && wrA.iterations <= 2;
+        const bool strand = okA && !(wrA.cost_final <= cost_acc[wi] * (1.0 + strand_guard));
+        bool cert_fail = false;
+        if (cert_on && okA && !strand) {
+          const double qn_band =
+              std::max(cfg.cert_qn_rel * wrA.cost_final, finite_scalar(qn_ref[wi]) ? cfg.cert_ref_growth * qn_ref[wi] : 0.0);
+          // Capped-regime certificate: a capped eval is structurally
+          // !inner_converged, but qn -- the nuisance Newton decrement the
+          // export computes AT the current point -- measures stationarity
+          // regardless of how many iterations produced the point. Under
+          // fused_schur the cert polices on qn alone; in the legacy regime a
+          // non-stationary exit stays suspect as before.
+          cert_fail = (!cfg.fused_schur && !wrA.inner_converged) || wrA.qn > qn_band;
+        }
+        const bool suspect = !okA || anchor_pass || plateau || cert_fail || jump[wi] || strand;
+        // duel_on_accept: quality duels on HEALTHY warm evals defer until the
+        // candidate is accepted (rescue duels stay inline -- only path there)
+        const bool defer = duel_defer && suspect && okA && had_warm;
+        if (defer)
+          s.deferred_cause = jump[wi] ? 'j' : strand ? 's' : cert_fail ? 'c' : plateau ? 'p' : 'a';
+        WindowSolveReport wrB;
+        WindowWarmState wB; // invalid: forces the seed init inside the solve
+        bool okB = false;
+        if (budget_expired())
+          return; // discard this entire candidate; never turn a skipped window into a dead one
+        if (suspect && !defer) {
+          snap_seeds(work[wi], s.seeds_pre); // path A's anchors of record (pre-re-seed)
+          const auto t_s0 = std::chrono::steady_clock::now();
+          LinearSeedReport sr;
+          // Re-seed at the current p; on a GATE failure fall back to the
+          // window's existing seeds (harvest/bootstrap/sim provenance) -- the
+          // fallback is load-bearing: stage entries arrive at a moved p where
+          // marginal windows gate-fail, and killing them starves the very
+          // stages (the A1a/A1b IMU intrinsics) the windows were collected for.
+          const bool seeded = LinearSeed::seed_window(work[wi], calib, work[wi].seed_bg, sr, cfg.seed);
+          s.t_seed += std::chrono::duration<double>(std::chrono::steady_clock::now() - t_s0).count();
+          if (budget_expired())
+            return;
+          if (seeded || work[wi].has_seeds) {
+            // eoa: cost-only duel -- the loser's export was ALWAYS dead state,
+            // and the winner's is deferred to the accept pass. q_n is not
+            // consumed from path B pre-accept (the cert reads wrA.qn only;
+            // the accepted point's q_n comes from the export pass).
+            okB = WindowBA::solve_and_export(work[wi], calib, !eoa || export_suspect[wi], wrB, cfg.window_max_iters, false, &wB,
+                                             pslot[wi], nullptr, nullptr, &bias_priors[wi]) &&
+                  wrB.free_dim == np;
+            s.t_preint += wrB.t_preint;
+            s.t_inner += wrB.t_inner;
+            s.t_export += wrB.t_export;
+            s.t_factor += wrB.t_factor;
+            s.iters += wrB.iterations;
+            (wrB.preint_hit ? s.phit : s.pmiss)++;
+            s.tstop += wrB.time_stopped ? 1 : 0;
+            // cold-cause attribution, priority first > warmfail > jump > strand > cert > plateau > anchor
+            s.cold_cause = !had_warm ? 'f'
+                           : !okA    ? 'x'
+                           : jump[wi] ? 'j'
+                           : strand   ? 's'
+                           : cert_fail ? 'c'
+                           : plateau ? 'p'
+                                     : 'a';
+          }
+        }
+        // ---- keep the cheaper valid result ----
+        const bool useA = okA && (!okB || wrA.cost_final <= wrB.cost_final);
+        if (okA && okB && !useA) {
+          s.cold_win = 1;
+          s.cold_gain = (wrA.cost_final - wrB.cost_final) / std::max(wrA.cost_final, 1e-300);
+        }
+        if (okA && okB && std::abs(wrA.cost_final - wrB.cost_final) <= cfg.cert_agree_rel * std::max(wrA.cost_final, 1e-300))
+          s.dual_agree = 1; // confirming duel: refresh the q_n reference at acceptance
+        s.kept_path = useA ? 'A' : (okB ? 'B' : 0);
+        s.qn = useA ? wrA.qn : wrB.qn;
+        WindowSolveReport &wr = useA ? wrA : wrB;
+        if (okA || okB) {
+          s.L = std::move(wr.Lambda);
+          s.g = std::move(wr.gred);
+          s.cost = wr.cost_final;
+          warm_cand[wi] = useA ? std::move(wA) : std::move(wB);
+          s.ok = true;
+        }
+      }
+    });
+    if (budget_expired()) {
+      rep.hit_wall_budget = true;
+      break; // no reduction, no survivor-set edits, no accepted-state promotion
+    }
+    std::fill(jump.begin(), jump.end(), 0); // entry/confirmation duels fire exactly once
+    // ---- fixed-order reduction + failure semantics ----
+    // A window that fails at an ACCEPTED point (incl. the entry point) is dead:
+    // it can never join the fused sum, and excluding it keeps the merit
+    // comparable across passes. A window that solved at the accepted point but
+    // fails at a CANDIDATE p VETOES the candidate (cost = +inf): the merit
+    // stays a function of p over a FIXED window set, never a silent subset.
+    Lsum.setZero();
+    gsum.setZero();
+    rep.windows_used = 0;
+    double cost_total = 0.0;
+    bool veto = false;
+    for (size_t wi = 0; wi < work.size(); ++wi) {
+      const EvalSlot &s = slots[wi];
+      if (!s.attempted)
+        continue;
+      rep.t_seed_sum += s.t_seed;
+      rep.t_preint_sum += s.t_preint;
+      rep.t_inner_sum += s.t_inner;
+      rep.t_export_sum += s.t_export;
+      rep.t_factor_sum += s.t_factor;
+      rep.preint_hits += s.phit;
+      rep.preint_misses += s.pmiss;
+      rep.time_stops += s.tstop;
+      rep.inner_iters_sum += s.iters;
+      rep.warm_evals += s.ran_warm ? 1 : 0;
+      rep.cert_dual_confirms += s.dual_agree ? 1 : 0;
+      if (s.cold_cause) {
+        rep.cold_evals++;
+        switch (s.cold_cause) {
+        case 'f': rep.cold_first++; break;
+        case 'x': rep.cold_warmfail++; break;
+        case 'j': rep.cold_jump++; break;
+        case 's': rep.cold_strand++; break;
+        case 'c': rep.cold_cert++; break;
+        case 'p': rep.cold_plateau++; break;
+        default:  rep.cold_anchor++; break;
+        }
+        if (s.cold_win) {
+          rep.cold_won++;
+          rep.cold_gain_relsum += s.cold_gain;
+          if (s.cold_cause == 'p' || s.cold_cause == 'a' || s.cold_cause == 'c')
+            rep.cold_won_guard++;
+        }
+      }
+      if (!s.ok) {
+        if (!have_lin) {
+          dead[wi] = 1; // entry-point failure: drop for the whole solve
+          continue;
+        }
+        veto = true; // candidate failure: reject this candidate (re-seeded again next pass)
+        continue;
+      }
+      if (!eoa) { // eoa: evals carry no (L, g); the accept branch's export pass fills Lsum/gsum
+        Lsum += s.L;
+        gsum += s.g;
+      }
+      cost_total += s.cost;
+      rep.windows_used++;
+    }
+    if (rep.windows_used == 0) {
+      restore(accepted_p); // best-effort staged callers must never inherit an unaccepted candidate
+      return false;
+    }
+    double merit = cost_total + prior_cost_now();
+    if (!finite_scalar(merit))
+      veto = true; // a NaN/inf evaluation must never be accepted (NaN defeats comparisons)
+
+    // ---- duel_on_accept: the deferred quality duels run ONLY for a candidate
+    // that already wins on warm-only merit; their improvements can only lower
+    // window costs, so acceptance is monotone (never revoked). Counters land
+    // here (the main reduction ran without them). ----
+    if (duel_defer && !veto && merit <= prev_merit * (1.0 + 1e-4)) {
+      bool any_deferred = false;
+      for (size_t wi = 0; wi < work.size(); ++wi)
+        if (slots[wi].attempted && slots[wi].ok && slots[wi].deferred_cause)
+          any_deferred = true;
+      if (any_deferred) {
+        pool.parallel_dynamic((int)work.size(), [&](int /*worker*/, int k) {
+          {
+            const int wi = order[k];
+            EvalSlot &s = slots[wi];
+            if (!s.attempted || !s.ok || !s.deferred_cause || dead[wi] || budget_expired())
+              return;
+            s.d_ran = true;
+            snap_seeds(work[wi], s.seeds_pre); // path A's anchors of record (pre-re-seed)
+            const auto t_s0 = std::chrono::steady_clock::now();
+            LinearSeedReport sr;
+            const bool seeded = LinearSeed::seed_window(work[wi], calib, work[wi].seed_bg, sr, cfg.seed);
+            s.d_seed = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_s0).count();
+            if (!(seeded || work[wi].has_seeds) || budget_expired())
+              return;
+            WindowSolveReport wrB;
+            WindowWarmState wB;
+            s.d_ok = WindowBA::solve_and_export(work[wi], calib, !eoa, wrB, cfg.window_max_iters, false, &wB, pslot[wi],
+                                                nullptr, nullptr, &bias_priors[wi]) &&
+                     wrB.free_dim == np;
+            s.d_preint = wrB.t_preint;
+            s.d_inner = wrB.t_inner;
+            s.d_export = wrB.t_export;
+            s.d_factor = wrB.t_factor;
+            s.d_iters = wrB.iterations;
+            (wrB.preint_hit ? s.d_phit : s.d_pmiss)++;
+            s.d_tstop = wrB.time_stopped ? 1 : 0;
+            if (s.d_ok) {
+              s.d_cost = wrB.cost_final;
+              s.d_qn = wrB.qn;
+              s.d_L = std::move(wrB.Lambda);
+              s.d_g = std::move(wrB.gred);
+              warm_dual[wi] = std::move(wB);
+            }
+          }
+        });
+        if (budget_expired()) {
+          rep.hit_wall_budget = true;
+          break;
+        }
+        // serial fold: counters + incremental (Lsum, gsum, cost) updates
+        for (size_t wi = 0; wi < work.size(); ++wi) {
+          EvalSlot &s = slots[wi];
+          if (!s.d_ran)
+            continue;
+          rep.t_seed_sum += s.d_seed;
+          rep.t_preint_sum += s.d_preint;
+          rep.t_inner_sum += s.d_inner;
+          rep.t_export_sum += s.d_export;
+          rep.t_factor_sum += s.d_factor;
+          rep.preint_hits += s.d_phit;
+          rep.preint_misses += s.d_pmiss;
+          rep.time_stops += s.d_tstop;
+          rep.inner_iters_sum += s.d_iters;
+          rep.cold_evals++;
+          switch (s.deferred_cause) {
+          case 'j': rep.cold_jump++; break;
+          case 's': rep.cold_strand++; break;
+          case 'c': rep.cold_cert++; break;
+          case 'p': rep.cold_plateau++; break;
+          default:  rep.cold_anchor++; break;
+          }
+          // the duel RAN: mark the cause regardless of winner so the accept
+          // block promotes the PRE-re-seed anchors for kept-A windows --
+          // omitting this drifts the bias/gauge priors onto post-re-seed
+          // anchors and collapses the session
+          s.cold_cause = s.deferred_cause;
+          if (s.d_ok && std::abs(s.cost - s.d_cost) <= cfg.cert_agree_rel * std::max(s.cost, 1e-300)) {
+            s.dual_agree = 1;
+            rep.cert_dual_confirms++;
+          }
+          if (s.d_ok && s.d_cost < s.cost) {
+            s.d_win = 1;
+            rep.cold_won++;
+            rep.cold_gain_relsum += (s.cost - s.d_cost) / std::max(s.cost, 1e-300);
+            if (s.deferred_cause == 'p' || s.deferred_cause == 'a' || s.deferred_cause == 'c')
+              rep.cold_won_guard++;
+            if (!eoa) { // eoa: no (L, g) anywhere pre-accept; the export pass re-enters the FINAL kept state
+              Lsum += s.d_L - s.L;
+              gsum += s.d_g - s.g;
+              s.L = std::move(s.d_L);
+              s.g = std::move(s.d_g);
+            }
+            cost_total += s.d_cost - s.cost;
+            s.cost = s.d_cost;
+            s.qn = s.d_qn;
+            s.cold_cause = s.deferred_cause;
+            s.cold_win = 1;
+            s.kept_path = 'B';
+            warm_cand[wi] = std::move(warm_dual[wi]);
+          }
+        }
+        merit = cost_total + prior_cost_now(); // monotone <= warm-only merit
+      }
+    }
+
+    // small tolerance absorbs residual inner-solver hysteresis
+    const bool cand_wins = !veto && !(merit > prev_merit * (1.0 + 1e-4));
+    // ---- export-on-accept: the evaluations above ran cost-only (except
+    // cert-stage path A and export_suspect windows, whose inline exports are
+    // REUSED here, never re-derived); produce the WINNING candidate's
+    // (Lambda_w, g_w, qn_w) NOW, once, at the UNCHANGED kept optima -- before
+    // the accept/reject decision commits, because an export failure at a
+    // candidate point must still be able to VETO it (the doctrine at the
+    // entry reduction: the fused set never silently shrinks at a candidate).
+    // A re-entry is entry-faithful so its bytes equal the export legacy
+    // computed inline during the evaluation:
+    //   * kept-A: enter from the PRE-promotion warm baseline (the state A's
+    //     eval entered from) -- a LOCAL copy, so the warm write-back inside
+    //     the call never touches warm_acc (promotion below owns that);
+    //     if a duel re-seeded this window this pass, A's anchors of record
+    //     are the PRE-re-seed seeds (seeds_pre) -- swap them in, restore
+    //     after (work[wi] must keep the post-re-seed seeds, as legacy does).
+    //   * kept-B: enter cold from the window's current (post-re-seed) seeds
+    //     -- exactly B's evaluation entry.
+    // Then state_at overrides to the kept optimum (warm_cand, still un-
+    // moved) and max_iters=0 exports there. Calib holds the accepted p
+    // (apply_dp runs only at the bottom of the loop).
+    if (eoa && cand_wins) {
+      struct ExpSlot {
+        bool ran = false, ok = false, stored = false;
+        Eigen::MatrixXd L;
+        Eigen::VectorXd g;
+        double qn = 0.0;
+        double t_pre = 0.0, t_fac = 0.0, t_exp = 0.0;
+        int phit = 0, pmiss = 0;
+        double min_pivot = 0.0; // veto diagnostics: failing export's Hnn min pivot
+        int nn = 0;
+        int clamped = 0; // spectral elimination: rank-clamped landmark dirs
+      };
+      std::vector<ExpSlot> ex(work.size());
+      pool.parallel_dynamic((int)work.size(), [&](int /*worker*/, int k) {
+        {
+          const int wi = order[k];
+          EvalSlot &s = slots[wi];
+          if (dead[wi] || !s.attempted || !s.ok || budget_expired())
+            return;
+          ExpSlot &e = ex[wi];
+          e.ran = true;
+          // inline-exported eval (cert-stage kept-A, or an export_suspect
+          // window on either kept path): s.L/s.g/s.qn are the exact legacy
+          // bytes; reuse, never re-derive (the -ffast-math emitted-loop rule)
+          if ((int)s.L.rows() == np) {
+            e.ok = e.stored = true;
+            return;
+          }
+          WindowWarmState entry; // kept-A entry context (local copy -- see block comment)
+          WindowWarmState *w0 = nullptr;
+          if (s.kept_path == 'A') {
+            entry = warm_acc[wi];
+            w0 = &entry;
+          }
+          SeedSnap live;
+          const bool swap_seeds = (s.kept_path == 'A' && s.cold_cause != 0);
+          if (swap_seeds) {
+            snap_seeds(work[wi], live);
+            force_seeds(s.seeds_pre, work[wi]);
+          }
+          WindowSolveReport wre;
+          e.ok = WindowBA::solve_and_export(work[wi], calib, true, wre, /*max_iters=*/0, false, w0, pslot[wi],
+                                            /*state_at=*/&warm_cand[wi], nullptr, &bias_priors[wi]) &&
+                 (int)wre.Lambda.rows() == np;
+          e.min_pivot = wre.export_min_pivot;
+          e.nn = wre.export_nuis_dim;
+          e.clamped = wre.export_clamped;
+          if (swap_seeds)
+            force_seeds(live, work[wi]);
+          e.t_pre = wre.t_preint;
+          e.t_fac = wre.t_factor;
+          e.t_exp = wre.t_export;
+          (wre.preint_hit ? e.phit : e.pmiss)++;
+          if (e.ok) {
+            e.L = std::move(wre.Lambda);
+            e.g = std::move(wre.gred);
+            e.qn = wre.qn;
+          }
+        }
+      });
+      if (budget_expired()) {
+        rep.hit_wall_budget = true;
+        break; // partial exports never replace the complete accepted information
+      }
+      // OV_ZCALIB_EOA_FAIL_UID ("U" or "U:P"): forensic fault injection for
+      // parity/veto-path tests -- fail window uid U's deferred export,
+      // optionally only at pass P. Keyed on the uid so it stays deterministic
+      // when concurrent solves (the A1b split halves) share a pass counter.
+      static const char *eoa_inj = std::getenv("OV_ZCALIB_EOA_FAIL_UID");
+      static const long inj_uid = eoa_inj ? std::atol(eoa_inj) : -1;
+      static const long inj_pass = (eoa_inj && std::strchr(eoa_inj, ':')) ? std::atol(std::strchr(eoa_inj, ':') + 1) : -1;
+      // fixed-order fold (Lsum/gsum are untouched by the cost-only reduction)
+      bool any_export_fail = false;
+      for (size_t wi = 0; wi < work.size(); ++wi) {
+        ExpSlot &e = ex[wi];
+        if (!e.ran)
+          continue;
+        rep.t_preint_sum += e.t_pre;
+        rep.t_factor_sum += e.t_fac;
+        rep.t_export_sum += e.t_exp;
+        rep.preint_hits += e.phit;
+        rep.preint_misses += e.pmiss;
+        if (inj_uid >= 0 && (long)work[wi].uid == inj_uid && (inj_pass < 0 || (long)pass == inj_pass))
+          e.ok = false;
+        if (!e.ok) {
+          // The eval's damped cost was fine but the UNDAMPED export system is
+          // singular at the kept optimum. Where the failure sits decides the
+          // semantics (the doctrine at the entry reduction):
+          //   * candidate point (have_lin): legacy's inline export failed the
+          //     window AT EVAL, and a window failure at a candidate VETOES the
+          //     candidate -- the fused set never silently shrinks. Reproduce
+          //     that: veto, keep the window, and arm inline exports for it so
+          //     later failures surface at eval, where the path-B rescue lives.
+          //   * entry point: legacy never admitted the window -- dead, and the
+          //     survivor-order merit re-derive below reproduces the accounting
+          //     byte-exactly.
+          if (have_lin) {
+            export_suspect[wi] = 1;
+            veto = true;
+            std::printf("[joint] WARNING pass %d: window %zu (uid %u) export FAILED at the accepted candidate -> "
+                        "candidate VETOED, window kept (inline evals armed for it) [Hnn min pivot %.3e, dim %d, clamped %d]\n",
+                        pass, wi, work[wi].uid, e.min_pivot, e.nn, e.clamped);
+            continue;
+          }
+          dead[wi] = 1;
+          any_export_fail = true;
+          std::printf("[joint] WARNING pass %d: window %zu (uid %u) export FAILED at the entry point -> dead "
+                      "(the window never joins this solve's fused set) [Hnn min pivot %.3e, dim %d, clamped %d]\n",
+                      pass, wi, work[wi].uid, e.min_pivot, e.nn, e.clamped);
+          continue;
+        }
+        if (e.stored) {
+          Lsum += slots[wi].L;
+          gsum += slots[wi].g;
+          // slots[wi].qn already carries the inline export's q_n (legacy bits)
+        } else {
+          Lsum += e.L;
+          gsum += e.g;
+          // the accepted point's q_n -- the value the eval's inline export
+          // would have carried; promoted to qn_acc/qn_ref below
+          slots[wi].qn = e.qn;
+        }
+      }
+      if (any_export_fail) {
+        // Re-derive the accepted merit over the SURVIVING window set in the
+        // legacy accumulation order (window-ordered sum, then the prior): a
+        // subtraction of the dead windows' costs would differ in the last
+        // ulp from never having added them, and prev_merit feeds accept
+        // thresholds and ships as final_merit.
+        cost_total = 0.0;
+        rep.windows_used = 0;
+        for (size_t wi = 0; wi < work.size(); ++wi)
+          if (slots[wi].attempted && slots[wi].ok && !dead[wi]) {
+            cost_total += slots[wi].cost;
+            rep.windows_used++;
+          }
+        if (rep.windows_used == 0) {
+          // every window died at the accepted point (legacy: dead at the
+          // entry reduction). Leave calib at the last ACCEPTED point, not
+          // the un-vetted candidate the failed exports just disowned.
+          restore(accepted_p);
+          return false;
+        }
+        merit = cost_total + prior_cost_now();
+      }
+    }
+    // Deferred duels/exports may have rebuilt the merit and reduced system.
+    // Validate the final candidate before promotion, including overflow in the
+    // ordered reduction. Bit checks survive the production fast-math flags.
+    veto = veto || !finite_scalar(merit) || !finite_matrix(Lsum) || !finite_matrix(gsum);
+    if (veto || merit > prev_merit * (1.0 + 1e-4)) {
+      restore(accepted_p);
+      lm_lambda = std::min(lm_lambda * 8.0, 1e5);
+      ++rejects_in_a_row;
+      if (cfg.verbose)
+        std::printf("[joint] pass %d: %s (%.4e > %.4e) -> damp lambda=%.1e\n", pass, veto ? "candidate VETOED (window failure)" : "merit rose",
+                    merit, prev_merit, lm_lambda);
+      if (estop_on && confirm_active) {
+        // the forced-duel confirmation pass could not even produce an
+        // acceptable candidate: the accepted point stands as stationary
+        rep.stopped_early = true;
+        rep.stop_pass = pass;
+        if (cfg.verbose)
+          std::printf("[joint] early-stop CONFIRMED at pass %d (confirmation pass rejected)\n", pass);
+        restore(accepted_p);
+        break;
+      }
+      if (rejects_in_a_row > cfg.max_backtracks)
+        break; // fully damped and still rising: stop at best
+      // recompute the candidate from the ACCEPTED linearization with more damping
+      if (!have_lin)
+        break;
+    } else {
+      // ---- accept the current point; fold the seed priors; store linearization ----
+      const double merit_before = prev_merit; // for the early-stop stability test
+      rejects_in_a_row = 0;
+      prev_merit = merit;
+      accepted_p = snapshot();
+      accepted_windows = rep.windows_used;
+      // promote the accepted evaluation's nuisance optima to the warm baseline
+      for (size_t wi = 0; wi < work.size(); ++wi)
+        if (slots[wi].attempted && slots[wi].ok && !dead[wi]) {
+          warm_acc[wi] = std::move(warm_cand[wi]);
+          cost_acc[wi] = slots[wi].cost;
+          qn_acc[wi] = slots[wi].qn;
+          // q_n reference: first acceptance arms the growth clause; confirming
+          // duels (paths agreed within cert_agree_rel) refresh it. Without the
+          // init the growth clause never fires and the certificate degrades to
+          // the absolute band alone.
+          if (!finite_scalar(qn_ref[wi]) || slots[wi].dual_agree)
+            qn_ref[wi] = slots[wi].qn;
+          // seed anchors of record, per KEPT path: a pass where B re-seeded
+          // but A was kept must promote A's PRE-re-seed anchors -- the
+          // objective A minimized -- not the post-B state
+          if (slots[wi].kept_path == 'A' && slots[wi].cold_cause != 0)
+            seeds_acc[wi] = slots[wi].seeds_pre;
+          else
+            snap_seeds(work[wi], seeds_acc[wi]);
+        }
+      lm_lambda = std::max(lm_lambda * 0.25, 1e-4);
+      bool stop_after_accept = false;
+      // ---- early-stop: consecutive stable accepted steps + confirmation ----
+      if (estop_on && have_pending) {
+        const double actual = finite_scalar(merit_before) ? merit_before - merit : 0.0;
+        const double rel = std::abs(actual) / std::max(merit, 1.0);
+        const bool stable = !pend_capped && pend_winf <= cfg.stop_step_winf && rel <= cfg.stop_merit_rel &&
+                            pend_lambda <= cfg.stop_lambda_max;
+        if (confirm_active) {
+          if (rel <= cfg.stop_merit_rel) {
+            // the forced duels bought nothing: genuinely stationary
+            rep.stopped_early = true;
+            rep.stop_pass = pass;
+            if (cfg.verbose)
+              std::printf("[joint] early-stop CONFIRMED at pass %d (confirmation duels moved merit %.2e rel)\n", pass, rel);
+            stop_after_accept = true;
+          }
+          stable_run = 0; // confirmation found real progress: keep iterating
+        } else if (stable) {
+          if (++stable_run >= cfg.stop_k)
+            confirm_pending = true;
+        } else {
+          stable_run = 0;
+        }
+      }
+      {
+        int off = 0;
+        for (size_t bi = 0; bi < layout.size(); ++bi) {
+          const Eigen::VectorXd dloc = local_dev(bi);
+          for (int k = 0; k < layout[bi].lsize; ++k) {
+            const double info = 1.0 / (rep.prior_sigma_vec(off + k) * rep.prior_sigma_vec(off + k));
+            Lsum(off + k, off + k) += info;
+            gsum(off + k) += info * dloc(k);
+          }
+          off += layout[bi].lsize;
+        }
+      }
+      accepted_L = Lsum;
+      accepted_g = gsum;
+      have_lin = true;
+      ++accepted_steps;
+      if (cfg.verbose)
+        std::printf("[joint] pass %d: ACCEPT windows=%d merit=%.4e (data %.4e) lambda=%.1e\n", pass, rep.windows_used, merit, cost_total,
+                    lm_lambda);
+      // The confirmation point's parameters/warm states were promoted above;
+      // its information must be promoted too before an early-stop may return.
+      if (stop_after_accept)
+        break;
+      // ---- conv-stop: outer Newton decrement at the accepted point ----
+      if (cfg.conv_stop && accepted_steps >= cfg.conv_min_accepts) {
+        Eigen::LDLT<Eigen::MatrixXd> ldn(accepted_L);
+        if (ldn.info() == Eigen::Success) {
+          const double lam2 = accepted_g.dot(ldn.solve(accepted_g)); // = predicted 2x attainable reduction
+          const bool below = 0.5 * lam2 < cfg.conv_tol_rel * std::max(merit, 1.0);
+          conv_run = below ? conv_run + 1 : 0;
+          if (conv_run >= cfg.conv_k) {
+            rep.stopped_early = true;
+            rep.stop_pass = pass;
+            if (cfg.verbose)
+              std::printf("[joint] conv-stop at pass %d: decrement/2 %.3e < %.1e x merit for %d accepted steps\n", pass, 0.5 * lam2,
+                          cfg.conv_tol_rel, cfg.conv_k);
+            break;
+          }
+        }
+      }
+    }
+
+    // ---- damped step from the accepted linearization ----
+    Eigen::MatrixXd Ld = accepted_L;
+    Ld.diagonal() += lm_lambda * accepted_L.diagonal().cwiseMax(1e-12);
+    Eigen::LDLT<Eigen::MatrixXd> ldlt(Ld);
+    if (ldlt.info() != Eigen::Success || !finite_matrix(ldlt.vectorD()) || !(ldlt.vectorD().array() > 0.0).all()) {
+      restore(accepted_p);
+      return false;
+    }
+    Eigen::VectorXd dp = ldlt.solve(-accepted_g);
+    if (ldlt.info() != Eigen::Success || !finite_matrix(dp)) {
+      restore(accepted_p);
+      return false;
+    }
+    const double wnorm = (dp.cwiseQuotient(rep.prior_sigma_vec)).lpNorm<Eigen::Infinity>();
+    const double trust = 3.0; // max step = 3 prior-sigmas per dof
+    if (wnorm > trust)
+      dp *= trust / wnorm;
+    {
+      // per-block absolute caps (single global scale so the step DIRECTION holds)
+      double scale = 1.0;
+      int off = 0;
+      for (auto &b : layout) {
+        const auto it = cfg.step_cap.find(b.name);
+        if (it != cfg.step_cap.end()) {
+          const double m = dp.segment(off, b.lsize).cwiseAbs().maxCoeff();
+          if (m > it->second)
+            scale = std::min(scale, it->second / m);
+        }
+        off += b.lsize;
+      }
+      dp *= scale;
+      pend_capped = (wnorm > trust) || (scale < 1.0);
+    }
+    // early-stop pending stats for the NEXT pass's stability test: post-cap
+    // whitened step, predicted reduction on the UNDAMPED accepted model
+    pend_winf = (dp.cwiseQuotient(rep.prior_sigma_vec)).lpNorm<Eigen::Infinity>();
+    pend_pred = -(accepted_g.dot(dp) + 0.5 * dp.dot(accepted_L * dp));
+    pend_lambda = lm_lambda;
+    have_pending = true;
+    rep.last_step_norm = dp.norm();
+    if (rep.last_step_norm < 1e-10)
+      break;
+    apply_dp(dp);
+  }
+  // report the last ACCEPTED point: its Lambda/sigma were evaluated exactly
+  // there, and a trailing un-evaluated (or rejected) step must not ship
+  restore(accepted_p);
+  rep.windows_used = accepted_windows;
+  // ---- fused-eval finalize: capped evals carried the outer loop; the SHIPPED
+  // linearization (commit gates read rep sigmas) must be commit-grade. One
+  // tight pass at the accepted point from the accepted warm states, fixed-
+  // order reduction, replacing accepted_L/accepted_g and the warm states.
+  if (cfg.fused_schur && have_lin) {
+    std::vector<Eigen::MatrixXd> Lf(work.size());
+    std::vector<Eigen::VectorXd> gf(work.size());
+    std::vector<WindowSolveReport> final_reports(work.size());
+    std::vector<WindowWarmState> final_warm(work.size());
+    std::vector<char> okf(work.size(), 0);
+    pool.parallel_dynamic((int)work.size(), [&](int, int k) {
+      {
+        const int wi = order[k];
+        if (dead[wi] || !warm_acc[wi].valid || budget_expired())
+          return;
+        // Rejected candidates and losing cold duels may have changed work's
+        // initialization/pose anchors. Tighten the ACCEPTED objective with
+        // those anchors and the solve's immutable physical bias prior.
+        force_seeds(seeds_acc[wi], work[wi]);
+        auto &wrf = final_reports[wi];
+        WindowWarmState wf = warm_acc[wi];
+        if (WindowBA::solve_and_export(work[wi], calib, true, wrf, cfg.window_max_iters, false, &wf, pslot[wi],
+                                        nullptr, nullptr, &bias_priors[wi]) &&
+            (int)wrf.Lambda.rows() == np) {
+          Lf[wi] = std::move(wrf.Lambda);
+          gf[wi] = std::move(wrf.gred);
+          final_warm[wi] = std::move(wf);
+          okf[wi] = 1;
+        }
+      }
+    });
+    Eigen::MatrixXd Lfin = Eigen::MatrixXd::Zero(np, np);
+    Eigen::VectorXd gfin = Eigen::VectorXd::Zero(np);
+    int nfin = 0;
+    for (size_t wi = 0; wi < work.size(); ++wi)
+      if (okf[wi]) {
+        // Workers own one slot each; fold diagnostics in the same fixed order
+        // as the information. Updating rep inside the pool was a data race.
+        const auto &wrf = final_reports[wi];
+        rep.inner_iters_sum += wrf.iterations;
+        rep.t_preint_sum += wrf.t_preint;
+        rep.t_inner_sum += wrf.t_inner;
+        rep.t_export_sum += wrf.t_export;
+        rep.t_factor_sum += wrf.t_factor;
+        rep.time_stops += wrf.time_stopped ? 1 : 0;
+        Lfin += Lf[wi];
+        gfin += gf[wi];
+        nfin++;
+      }
+    if (nfin == accepted_windows && nfin > 0 && !budget_expired()) {
+      double finalized_cost = 0.0;
+      for (size_t wi = 0; wi < work.size(); ++wi)
+        if (okf[wi]) {
+          warm_acc[wi] = std::move(final_warm[wi]);
+          // Cost, convergence diagnostics and optional carry must describe
+          // the SAME tightened states as the information exported below.
+          // Leaving these at the last capped step reports stale convergence
+          // and pairs a carried final state with a different objective value.
+          cost_acc[wi] = final_reports[wi].cost_final;
+          qn_acc[wi] = final_reports[wi].qn;
+          // qn_ref is a historical certificate reference. A warm-only
+          // finalization does not establish the dual agreement to refresh it.
+          finalized_cost += cost_acc[wi];
+        }
+      prev_merit = finalized_cost + prior_cost_now();
+      // fold the seed priors exactly as the accepted-pass reduction does
+      int off = 0;
+      for (size_t bi = 0; bi < layout.size(); ++bi) {
+        const Eigen::VectorXd dloc = local_dev(bi);
+        for (int k = 0; k < layout[bi].lsize; ++k) {
+          const double info = 1.0 / (rep.prior_sigma_vec(off + k) * rep.prior_sigma_vec(off + k));
+          Lfin(off + k, off + k) += info;
+          gfin(off + k) += info * dloc(k);
+        }
+        off += layout[bi].lsize;
+      }
+      accepted_L = Lfin;
+      accepted_g = gfin;
+      if (cfg.verbose)
+        std::printf("[joint] P4 finalize: %d windows tight at the accepted point\n", nfin);
+    } else {
+      // A capped posterior is not commit-grade, and dropping unfinished
+      // windows changes its objective. Let the session restore its previous
+      // stage instead of shipping either kind of incomplete information.
+      rep.hit_wall_budget = rep.hit_wall_budget || budget_expired();
+      have_lin = false;
+      restore(entry_p);
+      if (cfg.verbose)
+        std::printf("[joint] P4 finalize incomplete (%d/%d windows): stage discarded\n", nfin, accepted_windows);
+    }
+  }
+  // Validate before publishing warm states or a carry stamped as accepted.
+  if (have_lin && (!finite_scalar(prev_merit) || !finite_matrix(accepted_g) ||
+                   !posterior_sigmas(accepted_L, rep.sigma)))
+    have_lin = false;
+  if (warm_out && have_lin)
+    *warm_out = warm_acc; // == nuisance optima at accepted_p (promotion contract above)
+  rep.windows_dead = (int)std::count(dead.begin(), dead.end(), (char)1);
+  rep.wall_s = elapsed_s();
+  rep.accepted_passes = accepted_steps;
+  rep.dim_p = np;
+  if (finite_scalar(prev_merit))
+    rep.final_merit = prev_merit;
+  for (size_t wi = 0; wi < work.size(); ++wi)
+    if (!dead[wi])
+      rep.qn_max_final = std::max(rep.qn_max_final, qn_acc[wi]);
+  // ---- carry write-back (accepted point only; pre-linearization failures
+  // leave the container untouched -- the stale stamp self-arbitrates at the
+  // next consume, e.g. the A1b-failure restore re-matching the A1a stamp) ----
+  if (carry_on && have_lin) {
+    carry->p_stamp = full_stamp(); // calib holds accepted_p (restored above); frozen blocks never moved
+    carry->noise_stamp = entry_noise;
+    carry->layout_sig = layout_sig;
+    carry->warm = warm_acc;
+    carry->seeds = seeds_acc;
+    carry->cost = cost_acc;
+    carry->qn_ref = qn_ref;
+    carry->valid = true;
+  }
+  if (cfg.verbose) {
+    std::printf("[joint] done: %d accepted / %d passes, wall %.2fs | summed worker elapsed: seed %.2f preint %.2f inner %.2f (%ld iters) export %.2f\n",
+                accepted_steps, rep.evaluation_passes, rep.wall_s, rep.t_seed_sum, rep.t_preint_sum, rep.t_inner_sum, rep.inner_iters_sum,
+                rep.t_export_sum);
+    std::printf("[joint] paths: warm %ld cold %ld (first %ld fail %ld jump %ld strand %ld cert %ld plateau %ld anchor %ld) cold-won %ld "
+                "(guard %ld, mean gain %.3f%%) dual-agree %ld%s qn_max %.2e\n",
+                rep.warm_evals, rep.cold_evals, rep.cold_first, rep.cold_warmfail, rep.cold_jump, rep.cold_strand, rep.cold_cert,
+                rep.cold_plateau, rep.cold_anchor, rep.cold_won, rep.cold_won_guard,
+                rep.cold_won ? 100.0 * rep.cold_gain_relsum / (double)rep.cold_won : 0.0, rep.cert_dual_confirms,
+                rep.stopped_early ? " EARLY-STOP" : "", rep.qn_max_final);
+  }
+  if (!have_lin)
+    return false; // nothing was ever accepted: no linearization, no posterior to ship
+
+  rep.Lambda = accepted_L;
+  rep.ok = true;
+  return true;
+}

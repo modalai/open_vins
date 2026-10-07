@@ -128,3 +128,23 @@ void ParallelExecutor::parallel_ranges(int n, const std::function<void(int, int,
   }
   job_ = nullptr;
 }
+
+void ParallelExecutor::parallel_dynamic(int n, const std::function<void(int, int)> &body) {
+  if (n <= 0)
+    return;
+  // One atomic cursor handed to every worker: each claims the next index until
+  // the range is exhausted, so a worker that draws a cheap task immediately comes
+  // back for another instead of idling at a range boundary. See the header for
+  // why this cannot perturb the result (task i -> slot i, index-ordered fold).
+  std::atomic<int> cursor{0};
+  const std::function<void(int, int, int)> drain = [&](int worker, int, int) {
+    for (;;) {
+      const int i = cursor.fetch_add(1, std::memory_order_relaxed);
+      if (i >= n)
+        return;
+      body(worker, i);
+    }
+  };
+  // Dispatch one nominal slice per worker; each then drains the shared cursor.
+  parallel_ranges(num_workers_, drain);
+}

@@ -1,0 +1,83 @@
+/*
+ * OpenVINS: An Open Platform for Visual-Inertial Research
+ * Copyright (C) 2025-2026 Joao Leonardo Silva Cotta
+ *
+ * ov_zcalib: live-session state machine + guided-excitation progress.
+ * The streaming one-pass Lambda-sum drives the DISPLAY ONLY; the committed answer
+ * always comes from the end-of-session VarPro refinement (JointCalib) over the
+ * retained windows -- committing the one-pass estimate is a correctness bug by
+ * contract. Prompts are driven by the weakest eigenpairs of the prior-whitened
+ * information sum (marginal sigmas lie under correlation).
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ */
+
+#ifndef OV_ZCALIB_CALIB_SESSION_H
+#define OV_ZCALIB_CALIB_SESSION_H
+
+#include <Eigen/Dense>
+#include <string>
+#include <vector>
+
+namespace ov_zcalib {
+
+enum class SessionState { SETTLE, COLLECT, SOLVE_REFINE, VERIFY, COMMIT, THERMAL_HOLD, ABORT };
+
+/**
+ * @brief Streaming display-side fusion: accumulates whitened window information and
+ *        maps the weakest mode to an operator prompt (variation, not constancy:
+ *        Dw wants per-axis oscillation, Da wants gravity re-orientation sweeps,
+ *        td wants angular rate, tr wants row coverage).
+ */
+class CalibSession {
+public:
+  CalibSession(int np, const Eigen::VectorXd &prior_sigma, const std::vector<std::string> &labels)
+      : L_(Eigen::MatrixXd::Zero(np, np)), prior_(prior_sigma), labels_(labels) {}
+
+  void add_window_information(const Eigen::MatrixXd &Lambda_w) { L_ += Lambda_w; }
+  /// Replace the display's evidence after retention/thermal eligibility changes. A stream's
+  /// all-time sum contains discarded windows and must not guide the current retained solve.
+  void set_window_information(const Eigen::MatrixXd &Lambda) { L_ = Lambda; }
+
+  /// Posterior/prior improvement per dof and the weakest whitened mode
+  void progress(Eigen::VectorXd &improve, std::string &prompt) const {
+    const int np = (int)L_.rows();
+    Eigen::MatrixXd Lw = prior_.asDiagonal() * L_ * prior_.asDiagonal();
+    Lw.diagonal().array() += 1.0; // + whitened prior
+    Eigen::LDLT<Eigen::MatrixXd> ldlt(Lw);
+    const Eigen::MatrixXd Sw = ldlt.solve(Eigen::MatrixXd::Identity(np, np));
+    improve = Sw.diagonal().cwiseMax(1e-300).cwiseSqrt().cwiseInverse(); // >1 means beating prior
+    Eigen::SelfAdjointEigenSolver<Eigen::MatrixXd> eig(Lw);
+    int imax;
+    eig.eigenvectors().col(0).cwiseAbs().maxCoeff(&imax);
+    const std::string &weak = labels_[imax];
+    if (weak.rfind("dw", 0) == 0)
+      prompt = "oscillate rotation about the weak gyro axis (" + weak + ")";
+    else if (weak.rfind("da", 0) == 0)
+      prompt = "slow tilt sweeps re-orienting gravity (" + weak + ")";
+    else if (weak.rfind("tg[", 0) == 0) {
+      // Tg is column-major: one column couples a force axis into all gyros.
+      const int k = std::stoi(weak.substr(3));
+      const char axis = "XYZ"[std::min(2, std::max(0, k / 3))];
+      prompt = std::string("vary acceleration along IMU ") + axis +
+               " while changing tilt; mix translation and rotation at different rates, keep nearby features visible (Tg weak)";
+    } else if (weak.rfind("td", 0) == 0)
+      prompt = "vary angular speed and rotation axis while keeping features tracked (time offset weak)";
+    else if (weak.rfind("p_IinC", 0) == 0)
+      prompt = "controlled rotation sweeps about multiple axes with varied speed; slow down if tracks fall (lever arm weak)";
+    else
+      prompt = "keep varied 6-axis motion (" + weak + " weak)";
+  }
+
+private:
+  Eigen::MatrixXd L_;
+  Eigen::VectorXd prior_;
+  std::vector<std::string> labels_;
+};
+
+} // namespace ov_zcalib
+
+#endif // OV_ZCALIB_CALIB_SESSION_H

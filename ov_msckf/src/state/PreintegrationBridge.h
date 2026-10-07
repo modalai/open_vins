@@ -42,6 +42,11 @@ namespace ov_msckf {
  * Convention for the bias correction (validated by the finite-difference oracle test):
  *   DR(b0+db) = exp_so3(J_th * db) * DR(b0),  alpha += J_alpha*db,  beta += J_beta*db.
  *
+ * This payload represents deterministic transport and bias sensitivity only.
+ * It does not carry the shared transport-noise covariance or its cross-covariance
+ * with the navigation state. A stochastic transport implementation must retain
+ * that joint ownership; independently inflating pixel noise is not equivalent.
+ *
  */
 struct PreintBridgeData {
   /// Integrated interval length (s)

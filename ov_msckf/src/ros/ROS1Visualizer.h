@@ -45,7 +45,9 @@
 #include <atomic>
 #include <fstream>
 #include <memory>
+#include <condition_variable>
 #include <mutex>
+#include <thread>
 
 #include <Eigen/Eigen>
 #include <boost/date_time/posix_time/posix_time.hpp>
@@ -82,6 +84,9 @@ public:
    * @param sim Simulator if we are simulating
    */
   ROS1Visualizer(std::shared_ptr<ros::NodeHandle> nh, std::shared_ptr<VioManager> app, std::shared_ptr<Simulator> sim = nullptr);
+
+  /// Call after sensor callbacks have been quiesced; joins the image publisher.
+  ~ROS1Visualizer();
 
   /**
    * @brief Will setup ROS subscribers and callbacks
@@ -170,15 +175,14 @@ protected:
   bool start_time_set = false;
   boost::posix_time::ptime rT1, rT2;
 
-  // Thread atomics
-  std::atomic<bool> thread_update_running;
-
-  /// Queue up camera measurements sorted by time and trigger once we have
-  /// exactly one IMU measurement with timestamp newer than the camera measurement
-  /// This also handles out-of-order camera measurements, which is rare, but
-  /// a nice feature to have for general robustness to bad camera drivers.
-  std::deque<ov_core::CameraData> camera_queue;
-  std::mutex camera_queue_mtx;
+  // The manager owns the bounded camera queue and the IMU callback owns its
+  // consumer. Serialize ROS producers; never create a worker on every IMU tick.
+  std::mutex camera_ingress_mtx;
+  std::recursive_mutex state_mtx;
+  std::atomic<bool> stop_image_publisher{false};
+  std::thread image_publisher;
+  std::mutex image_wait_mtx;
+  std::condition_variable image_wait_cv;
 
   // Last camera message timestamps we have received (mapped by cam id)
   std::map<int, double> camera_last_timestamp;

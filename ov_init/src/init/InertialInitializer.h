@@ -24,10 +24,12 @@
 #define OV_INIT_INERTIALINITIALIZER_H
 
 #include <map>
+#include <mutex>
 #include <unordered_map>
 
 #include "init/InertialInitializerOptions.h"
 #include "init/ResetPrior.h"
+#include "utils/InitializerPhysicalWarmResult.h"
 
 namespace ov_core {
 class FeatureDatabase;
@@ -89,6 +91,21 @@ public:
   void feed_imu_batch(const std::vector<ov_core::ImuData>& messages, double oldest_time = -1);
 
   /**
+   * Capture a private attempt on the caller/consumer thread. Only bounded
+   * history copying/pruning holds the input locks; policy and solving use the
+   * returned object's independent tracks, IMU, calibration and reset prior.
+   * An attempt must have a single owner calling initialize and no feed calls.
+   */
+  std::shared_ptr<InertialInitializer> make_attempt();
+
+  /// Opt in on a detached attempt only. Unsupported fresh/fixed scope declines
+  /// before solving. An armed joint reset must retain its prior and retry;
+  /// it cannot substitute a cold marginal after selecting that contract.
+  bool request_physical_warmstart(const ov_core::InitPhysicalWarmRequest &request);
+  const ov_core::InitPhysicalWarmResult *physical_warm_result() const { return physical_result.get(); }
+
+
+  /**
    * @brief Try to get the initialized system
    *
    *
@@ -123,6 +140,13 @@ public:
    * tightened first-pose bias prior (see init_dyn_reset_prior_* options). Thread-safe.
    */
   void set_reset_prior(const ResetBiasPrior &prior);
+  ResetBiasPrior reset_prior() const { return reset_ctx->prior(); }
+
+  /// Select the future-only joint reset contract before publishing a replacement State.
+  /// Unsupported or malformed snapshots leave the current reset context unchanged.
+  bool set_physical_reset_prior(std::shared_ptr<const ov_core::InitPhysicalResetPrior> prior);
+  std::shared_ptr<const ov_core::InitPhysicalResetPrior> physical_reset_prior() const { return reset_ctx->prior().joint; }
+
 
   /// Disarm the reset context (successful init or explicit teardown). Thread-safe.
   void clear_reset_prior();
@@ -140,11 +164,14 @@ protected:
   /// Our history of IMU messages (time, angular, linear)
   std::shared_ptr<std::vector<ov_core::ImuData>> imu_data;
 
-  /// Static initialization helper class
-  std::shared_ptr<StaticInitializer> init_static;
+  /// Protect append/prune/snapshot, never a policy decision or nonlinear solve.
+  std::mutex imu_data_mtx;
 
-  /// Dynamic initialization helper class
-  std::shared_ptr<DynamicInitializer> init_dynamic;
+  /// Private attempt objects do not snapshot themselves again.
+  bool is_attempt = false;
+  std::unique_ptr<ov_core::InitPhysicalWarmRequest> physical_request;
+  std::unique_ptr<ov_core::InitPhysicalWarmResult> physical_result;
+
 };
 
 } // namespace ov_init

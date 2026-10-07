@@ -11,6 +11,7 @@ if (catkin_FOUND AND ENABLE_ROS)
             CATKIN_DEPENDS roscpp rosbag sensor_msgs cv_bridge
             INCLUDE_DIRS src/
             LIBRARIES ov_core_lib
+            CFG_EXTRAS ov_core_abi.cmake
     )
 else ()
     add_definitions(-DROS_AVAILABLE=0)
@@ -64,19 +65,8 @@ list(APPEND LIBRARY_SOURCES
         src/utils/print.cpp
 )
 # Only include TrackOCL if OpenCL is available
-if (OpenCL_FOUND)
+if (OV_USE_MODAL_FLOW)
     list(APPEND LIBRARY_SOURCES src/track/TrackOCL/TrackOCL.cpp)
-    # TrackOCL.cpp DIRECTLY uses the modal_flow OCL manager, so link modal_flow into ov_core_lib: that
-    # gives the proper DT_NEEDED so the runtime loader auto-pulls the rest of the chain
-    # (modal_flow -> modal_pipe -> modal_json -> ...). We deliberately do NOT enumerate those INDIRECT
-    # deps -- they're already linked explicitly by the top-level binary, and the executable link
-    # tolerates the indirect undefined symbols via -Wl,--allow-shlib-undefined (set at the top level).
-    find_library(MODAL_FLOW_LIBRARY NAMES modal_flow)
-    if (NOT MODAL_FLOW_LIBRARY)
-        set(MODAL_FLOW_LIBRARY modal_flow) # fall back to -lmodal_flow
-    endif()
-    list(APPEND thirdparty_libraries ${MODAL_FLOW_LIBRARY})
-    message(STATUS "ov_core: linking modal_flow for TrackOCL: ${MODAL_FLOW_LIBRARY}")
 endif()
 # Only include TrackKLT if not disabled
 if (NOT DISABLE_TRACK_KLT)
@@ -84,6 +74,11 @@ if (NOT DISABLE_TRACK_KLT)
 endif()
 file(GLOB_RECURSE LIBRARY_HEADERS "src/*.h")
 add_library(ov_core_lib SHARED ${LIBRARY_SOURCES} ${LIBRARY_HEADERS})
+target_compile_definitions(ov_core_lib PUBLIC ${OV_EIGEN_ABI_DEFINITIONS}
+    HAVE_OPENCL=${OV_USE_MODAL_FLOW} OV_HAVE_MODAL_FLOW=${OV_USE_MODAL_FLOW})
+if (OV_USE_MODAL_FLOW)
+    target_include_directories(ov_core_lib PUBLIC ${OpenCL_INCLUDE_DIRS} ${MODAL_FLOW_INCLUDE_DIR})
+endif()
 target_link_libraries(ov_core_lib ${thirdparty_libraries})
 target_include_directories(ov_core_lib PUBLIC src/)
 install(TARGETS ov_core_lib

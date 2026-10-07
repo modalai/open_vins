@@ -25,11 +25,14 @@
 
 #include <atomic>
 #include <iostream>
+#include <map>
+#include <memory>
 #include <mutex>
 #include <thread>
 #include <unordered_map>
+#include <vector>
 
-#include <boost/date_time/posix_time/posix_time.hpp>
+#include <Eigen/Eigen>
 #include <opencv2/core/core.hpp>
 #include <opencv2/highgui/highgui.hpp>
 #include <opencv2/opencv.hpp>
@@ -38,6 +41,7 @@
 #include <CL/cl.h>
 #endif
 
+#include "utils/ChronoProf.h"
 #include "utils/colors.h"
 #include "utils/print.h"
 #include "utils/sensor_data.h"
@@ -160,7 +164,85 @@ public:
   virtual cl_context get_ocl_context() const { return nullptr; }
 #endif
 
+  // --- optional capabilities implemented by GPU-backed trackers (default no-ops), analogous to
+  //     get_ocl_context() above. They let VioManager / the server use these features through the
+  //     TrackBase interface WITHOUT depending on the concrete tracker type (e.g. TrackOCL). ---
+
+  /// IMU-aided KLT seeding: forward gyro samples / bias / per-camera IMU->camera rotation so the
+  /// tracker can seed nextPts with the IMU-predicted inter-frame rotation. No-op unless supported.
+  virtual void feed_imu(double t, double gx, double gy, double gz) { (void)t; (void)gx; (void)gy; (void)gz; }
+  virtual void set_gyro_bias(double bx, double by, double bz) { (void)bx; (void)by; (void)bz; }
+  virtual void set_cam_imu_rotation(size_t cam_id, const Eigen::Matrix3d &R_ItoC) { (void)cam_id; (void)R_ItoC; }
+
+  /// Per-feature stereo-match confidence (for reinit diagnostics). Empty on trackers that don't
+  /// produce stereo matches; a matching tracker overrides stereo_confidence_map().
+  struct StereoConfidence {
+    float peak_zncc;  // forward peak ZNCC, in [-1, 1]
+    float margin;     // peak - runner_up; uniqueness signal
+    float lr_err;     // px residual of right->left round-trip
+  };
+  virtual const std::unordered_map<size_t, StereoConfidence> &stereo_confidence_map() const {
+    static const std::unordered_map<size_t, StereoConfidence> empty;
+    return empty;
+  }
+
+  // --- Frontend state snapshot/restore (replay harness rewind/branch) --------------------------
+  // Captures the CPU-side last-frame tracking state so a restored State can continue tracking.
+  // Polymorphic: a GPU tracker (TrackOCL) extends FrontendState with its extra CPU state and
+  // overrides capture/restore. The GPU-resident previous-frame pyramid is NOT captured here (it
+  // is not host-visible); the harness rebuilds it by re-feeding the snapshot frame's image
+  // through feed_new_camera() before restoring this CPU state on top.
+
+  /// Base CPU frontend state common to all trackers. Derive to add tracker-specific fields.
+  struct FrontendState {
+    virtual ~FrontendState() = default;
+    std::map<size_t, cv::Mat> img_last;
+    std::map<size_t, cv::Mat> img_mask_last;
+    std::unordered_map<size_t, std::vector<cv::KeyPoint>> pts_last;
+    std::unordered_map<size_t, std::vector<size_t>> ids_last;
+    size_t currid = 0;
+  };
+
+  /// Capture the CPU frontend state (deep copy; cv::Mats cloned so the snapshot is independent)
+  virtual std::shared_ptr<FrontendState> capture_frontend() {
+    auto s = std::make_shared<FrontendState>();
+    capture_frontend_base(*s);
+    return s;
+  }
+
+  /// Restore CPU frontend state in place (tracker object identity preserved)
+  virtual void restore_frontend(const std::shared_ptr<FrontendState> &s) {
+    if (s)
+      restore_frontend_base(*s);
+  }
+
 protected:
+  void capture_frontend_base(FrontendState &s) {
+    std::lock_guard<std::mutex> lck(mtx_last_vars);
+    s.img_last.clear();
+    for (const auto &kv : img_last)
+      s.img_last[kv.first] = kv.second.clone();
+    s.img_mask_last.clear();
+    for (const auto &kv : img_mask_last)
+      s.img_mask_last[kv.first] = kv.second.clone();
+    s.pts_last = pts_last;
+    s.ids_last = ids_last;
+    s.currid = currid.load();
+  }
+
+  void restore_frontend_base(const FrontendState &s) {
+    std::lock_guard<std::mutex> lck(mtx_last_vars);
+    img_last.clear();
+    for (const auto &kv : s.img_last)
+      img_last[kv.first] = kv.second.clone();
+    img_mask_last.clear();
+    for (const auto &kv : s.img_mask_last)
+      img_mask_last[kv.first] = kv.second.clone();
+    pts_last = s.pts_last;
+    ids_last = s.ids_last;
+    currid.store(s.currid);
+  }
+
   /// Camera object which has all calibration in it
   std::unordered_map<size_t, std::shared_ptr<CamBase>> camera_calib;
 
@@ -201,7 +283,7 @@ protected:
   std::atomic<size_t> currid;
 
   // Timing variables (most children use these...)
-  boost::posix_time::ptime rT1, rT2, rT3, rT4, rT5, rT6, rT7;
+  ProfTime rT1, rT2, rT3, rT4, rT5, rT6, rT7;
 };
 
 } // namespace ov_core

@@ -21,6 +21,7 @@
  */
 
 #include "State_JPLQuatLocal.h"
+#include "QuaternionTangent.h"
 
 #include "utils/quat_ops.h"
 
@@ -29,7 +30,7 @@ using namespace ov_init;
 bool State_JPLQuatLocal::Plus(const double *x, const double *delta, double *x_plus_delta) const {
 
   // Apply the standard JPL update: q <-- [d_th/2; 1] (x) q
-  Eigen::Map<const Eigen::Vector4d> q(x);
+  const Eigen::Vector4d q = Eigen::Map<const Eigen::Vector4d>(x);
 
   // Get delta into eigen
   Eigen::Map<const Eigen::Vector3d> d_th(delta);
@@ -41,20 +42,24 @@ bool State_JPLQuatLocal::Plus(const double *x, const double *delta, double *x_pl
     d_q.block(0, 0, 3, 1) = (d_th / theta) * std::sin(theta / 2);
     d_q(3, 0) = std::cos(theta / 2);
   }
-  d_q = ov_core::quatnorm(d_q);
+  d_q.normalize();
 
   // Do the update
   Eigen::Map<Eigen::Vector4d> q_plus(x_plus_delta);
-  q_plus = ov_core::quat_multiply(d_q, q);
+  // Keep the input representative continuous. The generic VINS multiply
+  // canonicalizes the scalar sign; that would violate Plus(q,0)=q for q_w<0
+  // and introduce a discontinuity at a pi rotation in Ceres' ambient state.
+  q_plus.head<3>() = d_q(3) * q.head<3>() + q(3) * d_q.head<3>() - d_q.head<3>().cross(q.head<3>());
+  q_plus(3) = d_q(3) * q(3) - d_q.head<3>().dot(q.head<3>());
+  q_plus.normalize();
   return true;
 }
 
-#if CERES_VERSION_MAJOR >= 2 && CERES_VERSION_MINOR >= 1
+#if CERES_VERSION_MAJOR > 2 || (CERES_VERSION_MAJOR == 2 && CERES_VERSION_MINOR >= 1)
 
 bool State_JPLQuatLocal::PlusJacobian(const double *x, double *jacobian) const {
   Eigen::Map<Eigen::Matrix<double, 4, 3, Eigen::RowMajor>> j(jacobian);
-  j.topRows<3>().setIdentity();
-  j.bottomRows<1>().setZero();
+  j = jpl_plus_jacobian(Eigen::Map<const Eigen::Vector4d>(x));
   return true;
 }
 
@@ -71,16 +76,17 @@ bool State_JPLQuatLocal::Minus(const double *y, const double *x, double *y_minus
   // d_q = y * x^{-1}
   Eigen::Vector4d d_q = ov_core::quat_multiply(q_y, q_x_inv);
 
-  // Extract axis-angle
-  d_th = 2.0 * ov_core::log_so3(ov_core::quat_2_Rot(d_q));
+  // JPL Rot(Exp_q(delta)) = Exp_so3(-delta). Recover the principal
+  // rotation vector once; multiplying the SO(3) logarithm by two is incorrect.
+  const double sine_half = d_q.head<3>().norm();
+  d_th = sine_half > 1e-12 ? (2. * std::atan2(sine_half, d_q(3)) / sine_half) * d_q.head<3>()
+                            : 2. * d_q.head<3>();
   return true;
 }
 
 bool State_JPLQuatLocal::MinusJacobian(const double *x, double *jacobian) const {
-  // At x=y, the Jacobian of Minus w.r.t. y is identity (for small perturbations)
   Eigen::Map<Eigen::Matrix<double, 3, 4, Eigen::RowMajor>> j(jacobian);
-  j.leftCols<3>().setIdentity();
-  j.rightCols<1>().setZero();
+  j = jpl_tangent_lift(Eigen::Map<const Eigen::Vector4d>(x));
   return true;
 }
 
@@ -88,8 +94,7 @@ bool State_JPLQuatLocal::MinusJacobian(const double *x, double *jacobian) const 
 
 bool State_JPLQuatLocal::ComputeJacobian(const double *x, double *jacobian) const {
   Eigen::Map<Eigen::Matrix<double, 4, 3, Eigen::RowMajor>> j(jacobian);
-  j.topRows<3>().setIdentity();
-  j.bottomRows<1>().setZero();
+  j = jpl_plus_jacobian(Eigen::Map<const Eigen::Vector4d>(x));
   return true;
 }
 

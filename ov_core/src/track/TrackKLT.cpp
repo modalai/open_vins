@@ -46,7 +46,7 @@ void TrackKLT::feed_new_camera(const CameraData &message) {
   // Preprocessing steps that we do not parallelize
   // NOTE: DO NOT PARALLELIZE THESE!
   // NOTE: These seem to be much slower if you parallelize them...
-  rT1 = boost::posix_time::microsec_clock::local_time();
+  rT1 = prof_now();
   size_t num_images = message.images.size();
   for (size_t msg_id = 0; msg_id < num_images; msg_id++) {
 
@@ -104,7 +104,7 @@ void TrackKLT::feed_monocular(const CameraData &message, size_t msg_id) {
   cv::Mat img = img_curr.at(cam_id);
   std::vector<cv::Mat> imgpyr = img_pyramid_curr.at(cam_id);
   cv::Mat mask = message.masks.at(msg_id);
-  rT2 = boost::posix_time::microsec_clock::local_time();
+  rT2 = prof_now();
 
   // If we didn't have any successful tracks last time, just extract this time
   // This also handles, the tracking initalization on the first call to this extractor
@@ -129,7 +129,7 @@ void TrackKLT::feed_monocular(const CameraData &message, size_t msg_id) {
   auto pts_left_old = pts_last[cam_id];
   auto ids_left_old = ids_last[cam_id];
   perform_detection_monocular(img_pyramid_last[cam_id], img_mask_last[cam_id], pts_left_old, ids_left_old);
-  rT3 = boost::posix_time::microsec_clock::local_time();
+  rT3 = prof_now();
 
   // Our return success masks, and predicted new features
   std::vector<uchar> mask_ll;
@@ -138,7 +138,7 @@ void TrackKLT::feed_monocular(const CameraData &message, size_t msg_id) {
   // Lets track temporally
   perform_matching(img_pyramid_last[cam_id], imgpyr, pts_left_old, pts_left_new, cam_id, cam_id, mask_ll);
   assert(pts_left_new.size() == ids_left_old.size());
-  rT4 = boost::posix_time::microsec_clock::local_time();
+  rT4 = prof_now();
 
   // If any of our mask is empty, that means we didn't have enough to do ransac, so just return
   if (mask_ll.empty()) {
@@ -188,16 +188,16 @@ void TrackKLT::feed_monocular(const CameraData &message, size_t msg_id) {
     pts_last[cam_id] = good_left;
     ids_last[cam_id] = good_ids_left;
   }
-  rT5 = boost::posix_time::microsec_clock::local_time();
+  rT5 = prof_now();
 
   // Timing information
-  PRINT_ALL("[TIME-KLT]: %.4f seconds for pyramid\n", (rT2 - rT1).total_microseconds() * 1e-6);
-  PRINT_ALL("[TIME-KLT]: %.4f seconds for detection (%zu detected)\n", (rT3 - rT2).total_microseconds() * 1e-6,
+  PRINT_ALL("[TIME-KLT]: %.4f seconds for pyramid\n", prof_s(rT1, rT2));
+  PRINT_ALL("[TIME-KLT]: %.4f seconds for detection (%zu detected)\n", prof_s(rT2, rT3),
             (int)pts_last[cam_id].size());
-  PRINT_ALL("[TIME-KLT]: %.4f seconds for temporal klt\n", (rT4 - rT3).total_microseconds() * 1e-6);
-  PRINT_ALL("[TIME-KLT]: %.4f seconds for feature DB update (%d features)\n", (rT5 - rT4).total_microseconds() * 1e-6,
+  PRINT_ALL("[TIME-KLT]: %.4f seconds for temporal klt\n", prof_s(rT3, rT4));
+  PRINT_ALL("[TIME-KLT]: %.4f seconds for feature DB update (%d features)\n", prof_s(rT4, rT5),
             (int)good_left.size());
-  PRINT_ALL("[TIME-KLT]: %.4f seconds for total\n", (rT5 - rT1).total_microseconds() * 1e-6);
+  PRINT_ALL("[TIME-KLT]: %.4f seconds for total\n", prof_s(rT1, rT5));
 }
 
 void TrackKLT::feed_stereo(const CameraData &message, size_t msg_id_left, size_t msg_id_right) {
@@ -215,7 +215,7 @@ void TrackKLT::feed_stereo(const CameraData &message, size_t msg_id_left, size_t
   std::vector<cv::Mat> imgpyr_right = img_pyramid_curr.at(cam_id_right);
   cv::Mat mask_left = message.masks.at(msg_id_left);
   cv::Mat mask_right = message.masks.at(msg_id_right);
-  rT2 = boost::posix_time::microsec_clock::local_time();
+  rT2 = prof_now();
 
   // If we didn't have any successful tracks last time, just extract this time
   // This also handles, the tracking initalization on the first call to this extractor
@@ -250,7 +250,7 @@ void TrackKLT::feed_stereo(const CameraData &message, size_t msg_id_left, size_t
   perform_detection_stereo(img_pyramid_last[cam_id_left], img_pyramid_last[cam_id_right], img_mask_last[cam_id_left],
                            img_mask_last[cam_id_right], cam_id_left, cam_id_right, pts_left_old, pts_right_old, ids_left_old,
                            ids_right_old);
-  rT3 = boost::posix_time::microsec_clock::local_time();
+  rT3 = prof_now();
 
   // Our return success masks, and predicted new features
   std::vector<uchar> mask_ll, mask_rr;
@@ -267,7 +267,7 @@ void TrackKLT::feed_stereo(const CameraData &message, size_t msg_id_left, size_t
                                      is_left ? mask_ll : mask_rr);
                   }
                 }));
-  rT4 = boost::posix_time::microsec_clock::local_time();
+  rT4 = prof_now();
 
   //===================================================================================
   //===================================================================================
@@ -277,7 +277,7 @@ void TrackKLT::feed_stereo(const CameraData &message, size_t msg_id_left, size_t
   // TODO: maybe we should collect all tracks that are in both frames and make they pass this?
   // std::vector<uchar> mask_lr;
   // perform_matching(imgpyr_left, imgpyr_right, pts_left_new, pts_right_new, cam_id_left, cam_id_right, mask_lr);
-  rT5 = boost::posix_time::microsec_clock::local_time();
+  rT5 = prof_now();
 
   //===================================================================================
   //===================================================================================
@@ -380,17 +380,17 @@ void TrackKLT::feed_stereo(const CameraData &message, size_t msg_id_left, size_t
     ids_last[cam_id_left] = good_ids_left;
     ids_last[cam_id_right] = good_ids_right;
   }
-  rT6 = boost::posix_time::microsec_clock::local_time();
+  rT6 = prof_now();
 
   //  // Timing information
-  PRINT_ALL("[TIME-KLT]: %.4f seconds for pyramid\n", (rT2 - rT1).total_microseconds() * 1e-6);
-  PRINT_ALL("[TIME-KLT]: %.4f seconds for detection (%d detected)\n", (rT3 - rT2).total_microseconds() * 1e-6,
+  PRINT_ALL("[TIME-KLT]: %.4f seconds for pyramid\n", prof_s(rT1, rT2));
+  PRINT_ALL("[TIME-KLT]: %.4f seconds for detection (%d detected)\n", prof_s(rT2, rT3),
             (int)pts_last[cam_id_left].size() - pts_before_detect);
-  PRINT_ALL("[TIME-KLT]: %.4f seconds for temporal klt\n", (rT4 - rT3).total_microseconds() * 1e-6);
-  PRINT_ALL("[TIME-KLT]: %.4f seconds for stereo klt\n", (rT5 - rT4).total_microseconds() * 1e-6);
-  PRINT_ALL("[TIME-KLT]: %.4f seconds for feature DB update (%d features)\n", (rT6 - rT5).total_microseconds() * 1e-6,
+  PRINT_ALL("[TIME-KLT]: %.4f seconds for temporal klt\n", prof_s(rT3, rT4));
+  PRINT_ALL("[TIME-KLT]: %.4f seconds for stereo klt\n", prof_s(rT4, rT5));
+  PRINT_ALL("[TIME-KLT]: %.4f seconds for feature DB update (%d features)\n", prof_s(rT5, rT6),
             (int)good_left.size());
-  PRINT_ALL("[TIME-KLT]: %.4f seconds for total\n", (rT6 - rT1).total_microseconds() * 1e-6);
+  PRINT_ALL("[TIME-KLT]: %.4f seconds for total\n", prof_s(rT1, rT6));
 }
 
 void TrackKLT::perform_detection_monocular(const std::vector<cv::Mat> &img0pyr, const cv::Mat &mask0, std::vector<cv::KeyPoint> &pts0,

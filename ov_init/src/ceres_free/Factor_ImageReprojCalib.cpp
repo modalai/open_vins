@@ -5,7 +5,7 @@
  * Copyright (C) 2018-2023 Guoquan Huang
  * Copyright (C) 2018-2023 OpenVINS Contributors
  *
- * Lifted from ov_init/src/ceres/Factor_ImageReprojCalib.cpp (residual + Jacobians verbatim).
+ * Reprojection factor with shared double-precision distortion and derivatives.
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -15,6 +15,7 @@
 
 #include "Factor_ImageReprojCalib.h"
 
+#include "DistortDouble.h"
 #include "utils/quat_ops.h"
 
 using namespace ov_init::zbft_sfm;
@@ -62,23 +63,22 @@ bool Factor_ImageReprojCalib::Evaluate(double const *const *parameters, double *
   // Square-root information and gate
   Eigen::Matrix<double, 2, 2> sqrtQ_gate = gate * sqrtQ;
 
-  // Get the distorted raw image coordinate using the camera model.
-  // The camera objects are THREAD-LOCAL and reused across evaluations: constructing a
-  // CamRadtan/CamEqui per call heap-allocates its internal VectorXd and rebuilds the OpenCV
-  // matrices -- measurable at ~1e4-1e5 evaluations per initialization. set_value() still runs
-  // every call (the intrinsics are a parameter block and may be optimized), but into reused
-  // storage; the Jacobian buffers are likewise per-thread resize-once. Math is unchanged.
-  Eigen::Vector2d uv_dist;
-  static thread_local Eigen::MatrixXd H_dz_dzn, H_dz_dzeta;
-  static thread_local ov_core::CamEqui cam_eq(0, 0);
-  static thread_local ov_core::CamRadtan cam_rt(0, 0);
-  ov_core::CamBase &cam = is_fisheye ? static_cast<ov_core::CamBase &>(cam_eq) : static_cast<ov_core::CamBase &>(cam_rt);
-  cam.set_value(camera_vals);
-  uv_dist = cam.distort_d(uv_norm);
+  // Forward distortion in DOUBLE (see DistortDouble.h: CamBase::distort_d is
+  // float32-quantized; both reprojection backends share this helper).
+  Eigen::Vector2d uv_dist = distort_double(camera_vals, uv_norm, is_fisheye);
+  // Fixed-size model derivatives avoid camera-object / dynamic-matrix work at
+  // every observation. Intrinsics are usually fixed during VINS initialization,
+  // so compute their Jacobian only when requested.
+  Eigen::Matrix2d H_dz_dzn;
+  Eigen::Matrix<double, 2, 8> H_dz_dzeta;
   if (jacobians) {
-    cam.compute_distort_jacobian(uv_norm, H_dz_dzn, H_dz_dzeta);
+    if (is_fisheye) {
+      equidistant_jacobian_double(camera_vals, uv_norm, H_dz_dzn, jacobians[5] ? &H_dz_dzeta : nullptr);
+    } else {
+      radtan_jacobian_double(camera_vals, uv_norm, H_dz_dzn, jacobians[5] ? &H_dz_dzeta : nullptr);
+    }
     H_dz_dzn = sqrtQ_gate * H_dz_dzn;
-    H_dz_dzeta = sqrtQ_gate * H_dz_dzeta;
+    if (jacobians[5]) H_dz_dzeta = sqrtQ_gate * H_dz_dzeta;
   }
 
   // Compute residual (see upstream notes on sign convention)

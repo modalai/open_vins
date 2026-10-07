@@ -13,12 +13,17 @@
 
 #include "Problem.h"
 
+#include "LandmarkQr.h"
 #include "Parallel.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
+#include <limits>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <set>
 
 using namespace ov_init::zbft_sfm;
@@ -43,6 +48,51 @@ namespace {
 inline double seconds_since(const std::chrono::steady_clock::time_point &t0) {
   return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
 }
+
+// ---- Ordering-cost probe (env OV_ZCALIB_ORDER_PROBE=1) ----------------------------------
+// t_order = accumulated wall of assign_ordering()+analyze_band(), reported against the wall
+// of the entry points that recompute it (Solve / ComputeCovariance / ExportReducedInformation;
+// 2 recomputes per warm eval, 4 per duel). The symbolic/ordering pass is a pure function of
+// (graph structure, constancy signature) and so is a CACHE candidate -- but caching is
+// justified by measurement, never by suspicion; this probe is that measurement. One stderr
+// line at process exit; atomic counters because window solves run concurrently under the
+// session scheduler; two clock reads per call when armed, zero work when the env is unset.
+struct OrderProbe {
+  std::atomic<long long> order_ns{0}, entry_ns{0}, calls{0};
+  const bool on;
+  OrderProbe() : on(std::getenv("OV_ZCALIB_ORDER_PROBE") != nullptr) {}
+  ~OrderProbe() {
+    if (!on)
+      return;
+    const double to = 1e-9 * (double)order_ns.load(), te = 1e-9 * (double)entry_ns.load();
+    std::fprintf(stderr, "[zbft/order-probe] assign_ordering+analyze_band: calls=%lld t_order=%.6f s solver-entry wall=%.3f s share=%.4f%%\n",
+                 calls.load(), to, te, (te > 0.0) ? 100.0 * to / te : 0.0);
+  }
+};
+OrderProbe g_order_probe;
+struct OrderEntryScope { // RAII denominator: covers every return path of the enclosing entry point
+  std::chrono::steady_clock::time_point t0;
+  OrderEntryScope() {
+    if (g_order_probe.on)
+      t0 = std::chrono::steady_clock::now();
+  }
+  ~OrderEntryScope() {
+    if (g_order_probe.on)
+      g_order_probe.entry_ns.fetch_add((long long)std::llround(1e9 * seconds_since(t0)), std::memory_order_relaxed);
+  }
+};
+
+// Staged release switch: the square-root export is exercised independently of
+// the nonlinear step solver. The existing legacy/audit switches still select
+// their original normal-equation paths for matched comparisons.
+bool use_landmark_qr_export() {
+  static const char *mode = std::getenv("OV_ZCALIB_EXPORT_QR");
+  static const bool enabled = mode != nullptr && std::strcmp(mode, "1") == 0 &&
+                              std::getenv("OV_ZCALIB_EXPORT_LEGACY") == nullptr &&
+                              std::getenv("OV_ZCALIB_EXPORT_AUDIT") == nullptr;
+  return enabled;
+}
+
 } // namespace
 
 int Problem::block_index(double *values) const {
@@ -106,6 +156,7 @@ void Problem::AddResidualBlock(const CostFunction *cost, const LossFunction *los
 }
 
 void Problem::assign_ordering() {
+  const auto t_order0 = g_order_probe.on ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
   n_nav_ = 0;
   n_land_ = 0;
   land_diag_.clear();
@@ -168,7 +219,148 @@ void Problem::assign_ordering() {
       }
     }
   }
+
+  // Fixed-size Schur eligibility (see Problem.h): a landmark whose every adjacency is a
+  // 3-dof block takes the unrolled Matrix3d path. Structure-only, so it is decided once
+  // per ordering rather than per trial.
+  land_all3_.assign(land_diag_.size(), 0);
+  for (size_t li = 0; li < land_adj_.size(); ++li) {
+    bool all3 = !land_adj_[li].empty();
+    for (int nb : land_adj_[li])
+      all3 = all3 && (blocks_[nb].lsize == 3);
+    land_all3_[li] = all3 ? 1 : 0;
+  }
+
+  analyze_band();
+  if (g_order_probe.on) {
+    g_order_probe.order_ns.fetch_add((long long)std::llround(1e9 * seconds_since(t_order0)), std::memory_order_relaxed);
+    g_order_probe.calls.fetch_add(1, std::memory_order_relaxed);
+  }
 }
+
+void Problem::analyze_band() {
+  use_banded_ = false;
+  band_half_ = band_nb_ = band_border_ = 0;
+  if (n_nav_ <= 0)
+    return;
+
+  // Column reach of the reduced nav system's LOWER triangle. Every nonzero in it comes from
+  // exactly two places, and BOTH make a CLIQUE of the blocks involved:
+  //   (a) a residual couples all of its variable non-landmark blocks;
+  //   (b) a landmark's Schur fill-in couples all of its adjacent (observing) blocks.
+  // So reach[j] = the largest row that column j can occupy is an EXACT upper bound, which is
+  // what a band extraction needs -- underestimating it would silently drop entries.
+  // Half-bandwidth of the leading nb dofs when the TRAILING (n_nav_ - nb) dofs are pulled out
+  // as a dense border. The border dofs must be EXCLUDED from the cliques, not merely clamped:
+  // every IMU factor ties its two clones to the gravity block, so if gravity stays in the band
+  // then every column "reaches" the end of the window and the band is the whole matrix. Pulling
+  // it into the border is exactly what makes the rest banded.
+  const auto half_band = [&](int nb) {
+    std::vector<int> reach(nb);
+    for (int j = 0; j < nb; ++j)
+      reach[j] = j;
+    const auto clique = [&](const std::vector<int> &blks) {
+      int lo = nb, hi = -1;
+      for (int bidx : blks) {
+        const Block &b = blocks_[bidx];
+        if (b.constant || b.landmark || b.offset >= nb)
+          continue; // constants/landmarks are not in the nav band; offset >= nb IS the border
+        lo = std::min(lo, b.offset);
+        hi = std::max(hi, b.offset + b.lsize - 1);
+      }
+      if (hi >= lo)
+        for (int j = lo; j <= hi; ++j)
+          reach[j] = std::max(reach[j], hi);
+    };
+    for (const Residual &res : residuals_)
+      clique(res.blocks);
+    for (const auto &adj : land_adj_)
+      clique(adj);
+    int b = 0;
+    for (int j = 0; j < nb; ++j)
+      b = std::max(b, reach[j] - j);
+    return b;
+  };
+
+  // Border candidates: nothing, or the LAST nav block (the S2 gravity, which is registered
+  // after every clone -- see WindowBA -- and couples to all of them).
+  int last_off = -1, last_lsize = 0;
+  for (const Block &b : blocks_) {
+    if (b.constant || b.landmark)
+      continue;
+    if (b.offset > last_off) {
+      last_off = b.offset;
+      last_lsize = b.lsize;
+    }
+  }
+  const double dense_cost = (double)n_nav_ * n_nav_ * n_nav_ / 3.0;
+  double best_cost = dense_cost;
+  for (int nbord : {0, last_lsize}) {
+    const int nb = n_nav_ - nbord;
+    if (nb <= 1)
+      continue;
+    const int b = half_band(nb);
+    // banded Cholesky ~ nb*b^2 ; plus (1 + nbord) band solves ~ 2*nb*b each ; plus the
+    // nbord x nbord Schur complement.
+    const double cost = (double)nb * b * b + 2.0 * nb * b * (nbord + 1) + (double)nbord * nbord * nb;
+    if (cost < best_cost * 0.5) { // demand a real win, not a wash: the dense LLT is blocked+fast
+      best_cost = cost;
+      band_half_ = b;
+      band_nb_ = nb;
+      band_border_ = nbord;
+      use_banded_ = true;
+    }
+  }
+  if (use_banded_) {
+    band_AB_.resize(band_half_ + 1, band_nb_);
+    band_C_.resize(band_nb_, std::max(1, band_border_));
+    band_Y_.resize(band_nb_, std::max(1, band_border_));
+    band_S_.resize(std::max(1, band_border_), std::max(1, band_border_));
+    band_z_.resize(band_nb_);
+  }
+}
+
+namespace {
+// Right-looking banded Cholesky, lower band storage AB(k,j) = B(j+k, j), k = 0..b.
+// O(n*b^2) instead of O(n^3/3), and the whole factor lives in (b+1)*n doubles.
+inline bool band_chol(Eigen::MatrixXd &AB, int n, int b) {
+  for (int j = 0; j < n; ++j) {
+    double d = AB(0, j);
+    if (!(d > 0.0))
+      return false; // not positive definite (caller falls back / rejects the step)
+    d = std::sqrt(d);
+    AB(0, j) = d;
+    const int m = std::min(b, n - 1 - j);
+    for (int i = 1; i <= m; ++i)
+      AB(i, j) /= d;
+    for (int k = 1; k <= m; ++k) {
+      const double ajk = AB(k, j);
+      if (ajk == 0.0)
+        continue;
+      for (int i = k; i <= m; ++i)
+        AB(i - k, j + k) -= AB(i, j) * ajk;
+    }
+  }
+  return true;
+}
+// Solve B x = rhs in place, given the band factor from band_chol.
+inline void band_solve(const Eigen::MatrixXd &AB, int n, int b, Eigen::Ref<Eigen::VectorXd> x) {
+  for (int j = 0; j < n; ++j) { // forward: L y = x
+    x(j) /= AB(0, j);
+    const int m = std::min(b, n - 1 - j);
+    const double xj = x(j);
+    for (int i = 1; i <= m; ++i)
+      x(j + i) -= AB(i, j) * xj;
+  }
+  for (int j = n - 1; j >= 0; --j) { // backward: L^T x = y
+    const int m = std::min(b, n - 1 - j);
+    double s = x(j);
+    for (int i = 1; i <= m; ++i)
+      s -= AB(i, j) * x(j + i);
+    x(j) = s / AB(0, j);
+  }
+}
+} // namespace
 
 double Problem::evaluate_cost(ParallelExecutor &exec) const {
   // Residual-only trial scoring. This runs once per LM/dogleg TRIAL (accepted or rejected),
@@ -192,11 +384,22 @@ double Problem::evaluate_cost(ParallelExecutor &exec) const {
         params.push_back(blocks_[bidx].data);
       if (rbuf.size() < nres)
         rbuf.resize(nres);
-      res.cost->Evaluate(params.data(), rbuf.data(), nullptr);
+      if (!res.cost->Evaluate(params.data(), rbuf.data(), nullptr)) {
+        cl = std::numeric_limits<double>::infinity();
+        break;
+      }
       const double s = rbuf.head(nres).squaredNorm();
+      if (!landmark_qr::finite_scalar(s)) {
+        cl = std::numeric_limits<double>::infinity();
+        break;
+      }
       if (res.loss) {
         double rho[2];
         res.loss->Evaluate(s, rho);
+        if (!landmark_qr::finite_scalar(rho[0]) || !landmark_qr::finite_scalar(rho[1])) {
+          cl = std::numeric_limits<double>::infinity();
+          break;
+        }
         cl += 0.5 * rho[0];
       } else {
         cl += 0.5 * s;
@@ -208,13 +411,15 @@ double Problem::evaluate_cost(ParallelExecutor &exec) const {
   double cost = cw_[0];
   for (int w = 1; w < W; ++w)
     cost += cw_[w];
-  return cost;
+  return landmark_qr::finite_scalar(cost) ? cost : std::numeric_limits<double>::infinity();
 }
 
-void Problem::linearize(Eigen::MatrixXd &H, Eigen::VectorXd &grad, double &cost, ParallelExecutor &exec) const {
+bool Problem::linearize(Eigen::MatrixXd &H, Eigen::VectorXd &grad, double &cost, ParallelExecutor &exec) const {
   ++n_jac_evals_;
   const int W = exec.num_workers();
   const int N = n_total_;
+  // Only failed factors write this flag; valid evaluations add no atomic traffic.
+  std::atomic<bool> valid{true};
 
   // Direct manifold Jacobians: for the parameterizations used here (Euclidean V=I and
   // the JPL quaternion V=[I3;0], OVINS convention), the local (error-state) Jacobian is
@@ -275,7 +480,7 @@ void Problem::linearize(Eigen::MatrixXd &H, Eigen::VectorXd &grad, double &cost,
     // For false blocks (gravity), Jeff[k] = Jstore[k] * V where V is the tangent basis.
     // Sized per-block per-residual, heap-backed but resize-and-reuse (steady-state no alloc).
     std::vector<Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>> Jeff;
-    Eigen::Matrix<double, 3, 2> Vbuf; // tangent basis scratch for S² (stack, 3×2)
+    Eigen::Matrix<double, 3, 2, Eigen::RowMajor> Vbuf; // ComputeJacobian writes row-major (S²: stack, 3×2)
 
     for (int ri = begin; ri < end; ++ri) {
       const Residual &res = residuals_[ri];
@@ -298,14 +503,29 @@ void Problem::linearize(Eigen::MatrixXd &H, Eigen::VectorXd &grad, double &cost,
       if (rbuf.size() < nres)
         rbuf.resize(nres);
       auto r = rbuf.head(nres);
-      res.cost->Evaluate(params.data(), rbuf.data(), jacptrs.data());
+      if (!res.cost->Evaluate(params.data(), rbuf.data(), jacptrs.data())) {
+        valid.store(false, std::memory_order_relaxed);
+        break;
+      }
 
       // Robustified cost (0.5*rho(s)) and IRLS weight w = rho'(s), s = ||r||^2.
       const double s = r.squaredNorm();
+      bool finite = landmark_qr::finite_scalar(s);
+      for (int k = 0; k < nb && finite; ++k)
+        if (jacptrs[k])
+          finite = landmark_qr::all_finite(Jstore[k]);
+      if (!finite) {
+        valid.store(false, std::memory_order_relaxed);
+        break;
+      }
       double w = 1.0;
       if (res.loss) {
         double rho[2];
         res.loss->Evaluate(s, rho);
+        if (!landmark_qr::finite_scalar(rho[0]) || !landmark_qr::finite_scalar(rho[1])) {
+          valid.store(false, std::memory_order_relaxed);
+          break;
+        }
         cl += 0.5 * rho[0];
         w = (rho[1] > 0.0) ? rho[1] : 0.0;
       } else {
@@ -330,7 +550,11 @@ void Problem::linearize(Eigen::MatrixXd &H, Eigen::VectorXd &grad, double &cost,
         if (!bi.tangent_leading_identity && bi.param != nullptr) {
           // Compute V (gsize × lsize) and J_local = J_ambient * V
           Jeff[vk[i]].resize(nres, bi.lsize);
-          bi.param->ComputeJacobian(bi.data, Vbuf.data()); // 3×2 row-major for S²
+          if (!bi.param->ComputeJacobian(bi.data, Vbuf.data()) || !landmark_qr::all_finite(Vbuf)) {
+            valid.store(false, std::memory_order_relaxed);
+            cw_[worker] = cl;
+            return;
+          }
           Jeff[vk[i]].noalias() = Jstore[vk[i]] * Vbuf.topLeftCorner(bi.gsize, bi.lsize);
         }
       }
@@ -371,6 +595,8 @@ void Problem::linearize(Eigen::MatrixXd &H, Eigen::VectorXd &grad, double &cost,
   };
 
   exec.parallel_ranges((int)residuals_.size(), body);
+  if (!valid.load(std::memory_order_relaxed))
+    return false;
 
   // Deterministic reduction in fixed worker order (bit-identical regardless of W;
   // worker 0 already lives in H/grad). Adds ONLY the used lower-triangle column tails.
@@ -381,6 +607,13 @@ void Problem::linearize(Eigen::MatrixXd &H, Eigen::VectorXd &grad, double &cost,
     grad += gw_[w];
     cost += cw_[w];
   }
+  if (!landmark_qr::finite_scalar(cost) || !landmark_qr::all_finite(grad))
+    return false;
+  // Scan only entries owned by this assembly, never unwritten triangle storage.
+  for (int j = 0; j < N; ++j)
+    if (!landmark_qr::all_finite(H.col(j).segment(j, col_tail_end_[j] - j)))
+      return false;
+  return true;
 }
 
 bool Problem::solve_step(const Eigen::MatrixXd &H, const Eigen::VectorXd &grad, double lambda, Eigen::VectorXd &delta) const {
@@ -406,7 +639,7 @@ bool Problem::solve_step(const Eigen::MatrixXd &H, const Eigen::VectorXd &grad, 
     delta = -grad;
     llt.matrixL().solveInPlace(delta);
     llt.matrixU().solveInPlace(delta);
-    return delta.allFinite();
+    return landmark_qr::all_finite(delta);
   }
 
   // VISIBILITY-AWARE arrowhead Schur. Each landmark Hessian block is 3x3 and each landmark
@@ -425,12 +658,15 @@ bool Problem::solve_step(const Eigen::MatrixXd &H, const Eigen::VectorXd &grad, 
     Hred_(i, i) += lambda * std::min(std::max(H(i, i), 1e-6), 1e32);
   rhs_.noalias() = -grad.head(n_nav_);
 
+  if (schur_Vinv_.size() < land_diag_.size())
+    schur_Vinv_.resize(land_diag_.size());
   for (size_t li = 0; li < land_diag_.size(); ++li) {
     const int g0 = n_nav_ + land_diag_[li].first;
     Eigen::Matrix3d V = Eigen::Matrix3d(H.block(g0, g0, 3, 3).selfadjointView<Eigen::Lower>());
     for (int d = 0; d < 3; ++d)
       V(d, d) += lambda * std::min(std::max(H(g0 + d, g0 + d), 1e-6), 1e32);
     const Eigen::Matrix3d Vinv = V.inverse();
+    schur_Vinv_[li] = Vinv; // reused by the back-substitution below (same damped V)
     const Eigen::Vector3d gl = grad.segment(g0, 3);
     const std::vector<int> &adj = land_adj_[li];
     const int P = (int)adj.size();
@@ -439,57 +675,141 @@ bool Problem::solve_step(const Eigen::MatrixXd &H, const Eigen::VectorXd &grad, 
       schur_W_.resize(P);
       schur_Ma_.resize(P);
     }
-    // Precompute, per observing pose block: its nav offset, W_a = H[off_a, landmark] (stored
-    // transposed in the landmark row-strip of the lower triangle), and M_a = W_a * V^-1.
+    // FAST PATH: every adjacency is a 3-dof clone pose (the inner solve's only case), so the
+    // whole reduction is 3x3 and can be compiled as such -- no Dynamic dispatch. See Problem.h.
+    if (land_all3_[li]) {
+      if ((int)schur_W3_.size() < P) {
+        schur_W3_.resize(P);
+        schur_Ma3_.resize(P);
+      }
+      for (int ia = 0; ia < P; ++ia) {
+        const int off = blocks_[adj[ia]].offset;
+        schur_off_[ia] = off;
+        schur_W3_[ia] = H.block<3, 3>(g0, off);
+        schur_Ma3_[ia].noalias() = schur_W3_[ia].transpose() * Vinv;
+        rhs_.segment<3>(off).noalias() += schur_Ma3_[ia] * gl;
+      }
+      for (int ia = 0; ia < P; ++ia) {
+        const int offa = schur_off_[ia];
+        const Eigen::Matrix3d &Ma = schur_Ma3_[ia];
+        for (int ib = 0; ib < P; ++ib) {
+          const int offb = schur_off_[ib];
+          if (offa < offb)
+            continue; // lower triangle (incl. diagonal blocks) only
+          Hred_.block<3, 3>(offa, offb).noalias() -= Ma * schur_W3_[ib];
+        }
+      }
+      continue;
+    }
+
+    // GENERAL PATH (the export: calibration blocks are variable, so an adjacency may be
+    // 1-dof td, 3-dof quat/pos or 8-dof camera wide).
+    // Precompute, per adjacent nav block: its nav offset, W_a = H[landmark, off_a] read
+    // directly from the landmark row-strip (3 x lsize_a), and M_a = W_a^T * V^-1.
     // Also fold the rhs update -ga += M_a * g_l here (one pass over P).
     for (int ia = 0; ia < P; ++ia) {
-      const int off = blocks_[adj[ia]].offset;
+      const Block &ba = blocks_[adj[ia]];
+      const int off = ba.offset;
       schur_off_[ia] = off;
-      schur_W_[ia] = H.block(g0, off, 3, 3).transpose();
-      schur_Ma_[ia].noalias() = schur_W_[ia] * Vinv;
-      rhs_.segment(off, 3).noalias() += schur_Ma_[ia] * gl;
+      schur_W_[ia] = H.block(g0, off, 3, ba.lsize);
+      schur_Ma_[ia].noalias() = schur_W_[ia].transpose() * Vinv;
+      rhs_.segment(off, ba.lsize).noalias() += schur_Ma_[ia] * gl;
     }
-    // Symmetric rank-3 fill-in Hred -= W V^-1 W^T. Only the LOWER triangle is written
-    // (Eigen's LLT reads a single triangle) -- halves the O(P^2) 3x3 block updates -- and
-    // W_b is reused from the precompute instead of re-fetched/transposed in the inner loop.
+    // Symmetric fill-in Hred -= W^T V^-1 W. Only the LOWER triangle is written
+    // (Eigen's LLT reads a single triangle) -- halves the O(P^2) block updates -- and
+    // W_b is reused from the precompute instead of re-fetched in the inner loop.
     for (int ia = 0; ia < P; ++ia) {
       const int offa = schur_off_[ia];
-      const Eigen::Matrix3d &Ma = schur_Ma_[ia];
+      const int lsa = (int)schur_Ma_[ia].rows();
+      const Eigen::Matrix<double, Eigen::Dynamic, 3> &Ma = schur_Ma_[ia];
       for (int ib = 0; ib < P; ++ib) {
         const int offb = schur_off_[ib];
         if (offa < offb)
           continue; // lower triangle (incl. diagonal blocks) only
-        Hred_.block(offa, offb, 3, 3).noalias() -= Ma * schur_W_[ib].transpose();
+        Hred_.block(offa, offb, lsa, (int)schur_W_[ib].cols()).noalias() -= Ma * schur_W_[ib];
       }
     }
   }
 
-  // In-place Cholesky on Hred_ (rebuilt every call) -- no factor-storage copy per trial.
-  Eigen::LLT<Eigen::Ref<Eigen::MatrixXd>> llt(Hred_);
-  if (llt.info() != Eigen::Success)
-    return false;
-  da_ = rhs_;
-  llt.matrixL().solveInPlace(da_);
-  llt.matrixU().solveInPlace(da_);
-  if (!da_.allFinite())
+  bool banded_ok = false;
+  if (use_banded_) {
+    // BORDERED-BANDED SOLVE (see Problem.h / analyze_band).  [ B  C ] [x1]   [r1]
+    // B is banded (half-bandwidth b), C/D are the low-rank      [ C' D ] [x2] = [r2]
+    // gravity border. Same solution as the dense Cholesky, at n*b^2 instead of n^3/3 flops
+    // and with the factor resident in L2. Hred_ holds only the LOWER triangle.
+    const int nb = band_nb_, b = band_half_, nc = band_border_;
+    band_AB_.setZero();
+    for (int j = 0; j < nb; ++j) {
+      const int m = std::min(b, nb - 1 - j);
+      for (int i = 0; i <= m; ++i)
+        band_AB_(i, j) = Hred_(j + i, j);
+    }
+    banded_ok = band_chol(band_AB_, nb, b);
+    if (banded_ok) {
+      da_.resize(n_nav_);
+      band_z_ = rhs_.head(nb);
+      band_solve(band_AB_, nb, b, band_z_); // z = B^-1 r1
+      if (nc > 0) {
+        for (int k = 0; k < nc; ++k) // C(:,k) = Hred_(nb+k, 0:nb) (it lives in the lower triangle)
+          for (int i = 0; i < nb; ++i)
+            band_C_(i, k) = Hred_(nb + k, i);
+        band_Y_ = band_C_;
+        for (int k = 0; k < nc; ++k) {
+          Eigen::VectorXd col = band_Y_.col(k);
+          band_solve(band_AB_, nb, b, col); // Y = B^-1 C
+          band_Y_.col(k) = col;
+        }
+        for (int k = 0; k < nc; ++k) // S = D - C' Y   (D from the lower triangle, symmetrized)
+          for (int l = 0; l < nc; ++l)
+            band_S_(k, l) = (k >= l) ? Hred_(nb + k, nb + l) : Hred_(nb + l, nb + k);
+        band_S_.noalias() -= band_C_.transpose() * band_Y_;
+        const Eigen::VectorXd rhs2 = rhs_.segment(nb, nc) - band_C_.transpose() * band_z_;
+        const Eigen::LDLT<Eigen::MatrixXd> ldlt_s(band_S_);
+        if (ldlt_s.info() != Eigen::Success) {
+          banded_ok = false;
+        } else {
+          const Eigen::VectorXd x2 = ldlt_s.solve(rhs2);
+          da_.head(nb) = band_z_ - band_Y_ * x2; // x1 = z - Y x2
+          da_.segment(nb, nc) = x2;
+        }
+      } else {
+        da_.head(nb) = band_z_;
+      }
+    }
+  }
+  if (!banded_ok) {
+    // Dense fallback: a non-PD band (or a shape the gate refused) lands here unchanged.
+    Eigen::LLT<Eigen::Ref<Eigen::MatrixXd>> llt(Hred_);
+    if (llt.info() != Eigen::Success)
+      return false;
+    da_ = rhs_;
+    llt.matrixL().solveInPlace(da_);
+    llt.matrixU().solveInPlace(da_);
+  }
+  if (!landmark_qr::all_finite(da_))
     return false;
   delta.head(n_nav_) = da_;
 
   // Back-substitute landmarks: d_l = -V^-1 (g_l + sum_a W_a^T d_a), with W_a^T read directly
-  // from the landmark row-strip of the lower triangle.
+  // from the landmark row-strip of the lower triangle and the damped V^-1 reused from the
+  // Schur pass above (identical damping; rebuilding + re-inverting it was pure waste).
   for (size_t li = 0; li < land_diag_.size(); ++li) {
     const int g0 = n_nav_ + land_diag_[li].first;
-    Eigen::Matrix3d V = Eigen::Matrix3d(H.block(g0, g0, 3, 3).selfadjointView<Eigen::Lower>());
-    for (int d = 0; d < 3; ++d)
-      V(d, d) += lambda * std::min(std::max(H(g0 + d, g0 + d), 1e-6), 1e32);
     Eigen::Vector3d acc = grad.segment(g0, 3);
-    for (int nb : land_adj_[li]) {
-      const Block &b = blocks_[nb];
-      acc.noalias() += H.block(g0, b.offset, 3, 3) * delta.segment(b.offset, 3);
+    if (land_all3_[li]) { // fixed-size: same arithmetic, unrolled (see Problem.h)
+      for (int nb : land_adj_[li]) {
+        const int off = blocks_[nb].offset;
+        acc.noalias() += H.block<3, 3>(g0, off) * delta.segment<3>(off);
+      }
+    } else {
+      for (int nb : land_adj_[li]) {
+        const Block &b = blocks_[nb];
+        acc.noalias() += H.block(g0, b.offset, 3, b.lsize) * delta.segment(b.offset, b.lsize);
+      }
     }
-    delta.segment(g0, 3).noalias() = V.inverse() * (-acc);
+    delta.segment(g0, 3).noalias() = schur_Vinv_[li] * (-acc);
   }
-  return delta.allFinite();
+  return landmark_qr::all_finite(delta);
 }
 
 double Problem::snapshot(std::vector<double> &backup) const {
@@ -536,8 +856,22 @@ void Problem::apply_delta(const Eigen::VectorXd &delta) {
 }
 
 SolverSummary Problem::Solve(const SolverOptions &options) {
+  OrderEntryScope order_probe_scope; // ordering-probe denominator (no-op unless armed)
   SolverSummary summary;
   const auto t0 = std::chrono::steady_clock::now();
+
+  // [BIT-EXACT dead-state elision]: an accepted step's re-linearization is consumed only by
+  // the NEXT iteration (its gradient check, damping diagonal and step solve). When the
+  // accepted step is the LAST permitted iteration (iter + 1 == max_num_iterations) there is
+  // no next iteration: H/grad are function-locals, the re-linearization's cost lands in a
+  // discarded dummy, and ExportReducedInformation/ComputeCovariance re-linearize
+  // independently. Under fused_iters=1 warm evals this fires on EVERY capped eval -- one of
+  // the eval's two inner linearizations is pure dead state. Skipping it changes ONLY
+  // SolverSummary::jacobian_evals and the time_* splits (consumed by bench tools alone,
+  // grep-verified); every parameter byte, cost, iterate and message is untouched by
+  // construction. OV_ZCALIB_TERMLIN_LEGACY=1 restores the unconditional re-linearize
+  // (replay byte-parity kill-switch: same binary, on vs off, YAML must be byte-identical).
+  static const bool termlin_legacy = (std::getenv("OV_ZCALIB_TERMLIN_LEGACY") != nullptr);
 
   if (options.pin_eigen_single_thread)
     Eigen::setNbThreads(1); // our ParallelExecutor owns the parallelism; keep Eigen serial
@@ -561,8 +895,17 @@ SolverSummary Problem::Solve(const SolverOptions &options) {
   double cost = 0.0;
   {
     const auto tt = std::chrono::steady_clock::now();
-    linearize(H, grad, cost, exec); // residual + Jacobian + cost in one pass
+    const bool valid = linearize(H, grad, cost, exec); // residual + Jacobian + cost in one pass
     t_linearize += seconds_since(tt);
+    if (!valid) {
+      summary.message = "invalid initial factor evaluation";
+      summary.initial_cost = summary.final_cost = std::numeric_limits<double>::infinity();
+      summary.solve_time_seconds = seconds_since(t0);
+      summary.time_linearize_seconds = t_linearize;
+      summary.jacobian_evals = n_jac_evals_;
+      summary.residual_evals = n_res_evals_;
+      return summary;
+    }
   }
   summary.initial_cost = cost;
 
@@ -582,6 +925,7 @@ SolverSummary Problem::Solve(const SolverOptions &options) {
     for (int iter = 0; iter < options.max_num_iterations; ++iter) {
       if (seconds_since(t0) > options.max_solver_time_seconds) {
         summary.message = "time budget reached";
+        summary.time_stopped = true;
         break;
       }
       if (grad.lpNorm<Eigen::Infinity>() < options.gradient_tolerance) {
@@ -609,7 +953,10 @@ SolverSummary Problem::Solve(const SolverOptions &options) {
           summary.message = "GN solve failed";
           break;
         }
-        mu = std::max(kMinMu, 2.0 * mu / kMuFactor); // relax on success
+        // relax from the mu that actually FACTORIZED (m), not the entry value:
+        // relaxing from the entry value re-runs the same failed factorizations
+        // every iteration once the problem needs m > kMinMu
+        mu = std::max(kMinMu, m / kMuFactor);
       }
 
       // Cauchy point: alpha = ||g||^2 / (g^T H g). (H holds the used lower triangle only.)
@@ -624,6 +971,7 @@ SolverSummary Problem::Solve(const SolverOptions &options) {
       while (true) {
         if (seconds_since(t0) > options.max_solver_time_seconds) {
           summary.message = "time budget reached";
+          summary.time_stopped = true;
           break;
         }
 
@@ -663,6 +1011,7 @@ SolverSummary Problem::Solve(const SolverOptions &options) {
         const double actual = cost - cost_new;
         const double rho = (pred > 0.0) ? (actual / pred) : (actual > 0.0 ? 1.0 : -1.0);
         const double step_norm = Hdl_.norm();
+        const bool trial_valid = landmark_qr::finite_scalar(cost_new);
 
         // CERES-ORDER TERMINATION (TrustRegionMinimizer::Minimize, verified against tag 2.2.0):
         // parameter- and function-tolerance are checked on the CANDIDATE step BEFORE the
@@ -673,9 +1022,9 @@ SolverSummary Problem::Solve(const SolverOptions &options) {
         // deviation from Ceres (which always discards the terminal candidate): we KEEP it iff
         // it decreased the cost -- never worse than Ceres' iterate, identical trial counts,
         // and identical to the pre-candidate-check terminal behavior.
-        if ((summary.successful_steps > 0 &&
+        if (trial_valid && ((summary.successful_steps > 0 &&
              step_norm <= options.parameter_tolerance * (x_norm + options.parameter_tolerance)) ||
-            std::abs(actual) <= options.function_tolerance * std::abs(cost)) {
+            std::abs(actual) <= options.function_tolerance * std::abs(cost))) {
           if (actual > 0.0) {
             cost = cost_new;
             summary.successful_steps++;
@@ -689,8 +1038,9 @@ SolverSummary Problem::Solve(const SolverOptions &options) {
           break;
         }
 
-        if (rho > options.min_relative_decrease) {
+        if (trial_valid && rho > options.min_relative_decrease) {
           const double rel = actual / std::max(1e-12, cost);
+          const double previous_cost = cost;
           cost = cost_new;
           if (rho < 0.25)
             radius *= 0.5; // Ceres dogleg radius update
@@ -702,22 +1052,31 @@ SolverSummary Problem::Solve(const SolverOptions &options) {
             std::fprintf(stderr, "[zbft/dl] it=%2d cost=%.8e rel=%.3e gnorm=%.3e radius=%.2e rho=%.3f\n", iter, cost, rel,
                          grad.lpNorm<Eigen::Infinity>(), radius, rho);
           // Re-linearize at the accepted iterate (the candidate checks above already handled
-          // the terminal case, so an accepted step here always continues).
-          {
+          // the terminal case, so an accepted step here always continues). Skipped when this
+          // was the last permitted iteration -- nothing consumes it (see Solve() head).
+          if (termlin_legacy || iter + 1 < options.max_num_iterations) {
             const auto tt = std::chrono::steady_clock::now();
             double cc = 0.0;
-            linearize(H, grad, cc, exec);
+            const bool valid = linearize(H, grad, cc, exec);
             t_linearize += seconds_since(tt);
+            if (!valid) {
+              restore(backup);
+              cost = previous_cost;
+              --summary.successful_steps;
+              step_taken = false;
+              summary.message = "invalid accepted-step linearization; restored previous iterate";
+            }
           }
           break;
         } else {
           restore(backup); // cheap reject: shrink radius and re-blend (NO factorization)
+          ++summary.rejected_steps;
           radius *= 0.5;
           if (radius < 1e-12) {
             // Trust region collapsed with no further decrease => a stationary point (same rationale
             // as the LM max-damping case): CONVERGENCE, not failure. Gates vet the result downstream.
-            converged = true;
-            summary.message = "trust region collapsed (stationary)";
+            converged = trial_valid;
+            summary.message = trial_valid ? "trust region collapsed (stationary)" : "invalid trial factor evaluation";
             break;
           }
         }
@@ -734,6 +1093,7 @@ SolverSummary Problem::Solve(const SolverOptions &options) {
   for (int iter = 0; iter < options.max_num_iterations; ++iter) {
     if (seconds_since(t0) > options.max_solver_time_seconds) {
       summary.message = "time budget reached";
+      summary.time_stopped = true;
       break;
     }
     if (grad.lpNorm<Eigen::Infinity>() < options.gradient_tolerance) {
@@ -749,6 +1109,7 @@ SolverSummary Problem::Solve(const SolverOptions &options) {
     while (true) {
       if (seconds_since(t0) > options.max_solver_time_seconds) {
         summary.message = "time budget reached";
+        summary.time_stopped = true;
         break;
       }
       bool solved;
@@ -784,6 +1145,7 @@ SolverSummary Problem::Solve(const SolverOptions &options) {
       const double actual = cost - cost_new;
       const double rho = (pred > 0.0) ? (actual / pred) : (actual > 0.0 ? 1.0 : -1.0);
       const double step_norm = lm_delta_.norm();
+      const bool trial_valid = landmark_qr::finite_scalar(cost_new);
 
       // CERES-ORDER TERMINATION (TrustRegionMinimizer::Minimize, verified against tag 2.2.0):
       // parameter- and function-tolerance are checked on the CANDIDATE step BEFORE the
@@ -795,9 +1157,9 @@ SolverSummary Problem::Solve(const SolverOptions &options) {
       // from Ceres (which always discards the terminal candidate): we KEEP it iff it decreased
       // the cost -- never worse than Ceres' iterate, identical trial counts, and identical to
       // the pre-candidate-check terminal behavior on accepted steps.
-      if ((summary.successful_steps > 0 &&
+      if (trial_valid && ((summary.successful_steps > 0 &&
            step_norm <= options.parameter_tolerance * (x_norm + options.parameter_tolerance)) ||
-          std::abs(actual) <= options.function_tolerance * std::abs(cost)) {
+          std::abs(actual) <= options.function_tolerance * std::abs(cost))) {
         if (actual > 0.0) {
           cost = cost_new;
           summary.successful_steps++;
@@ -811,8 +1173,9 @@ SolverSummary Problem::Solve(const SolverOptions &options) {
         break;
       }
 
-      if (rho > options.min_relative_decrease) {
+      if (trial_valid && rho > options.min_relative_decrease) {
         const double rel = actual / std::max(1e-12, cost);
+        const double previous_cost = cost;
         cost = cost_new;
         const double f = 2.0 * rho - 1.0;
         lambda *= std::max(1.0 / 3.0, 1.0 - f * f * f);
@@ -825,11 +1188,19 @@ SolverSummary Problem::Solve(const SolverOptions &options) {
                        grad.lpNorm<Eigen::Infinity>(), lambda, rho);
         // Re-linearize at the accepted iterate (the candidate checks above already handled the
         // terminal case, so an accepted step here always continues to the next iteration).
-        {
+        // Skipped when this was the last permitted iteration -- nothing consumes it (Solve() head).
+        if (termlin_legacy || iter + 1 < options.max_num_iterations) {
           const auto tt = std::chrono::steady_clock::now();
           double relin_cost = 0.0;
-          linearize(H, grad, relin_cost, exec);
+          const bool valid = linearize(H, grad, relin_cost, exec);
           t_linearize += seconds_since(tt);
+          if (!valid) {
+            restore(backup);
+            cost = previous_cost;
+            --summary.successful_steps;
+            step_taken = false;
+            summary.message = "invalid accepted-step linearization; restored previous iterate";
+          }
         }
         break;
       } else {
@@ -843,8 +1214,8 @@ SolverSummary Problem::Solve(const SolverOptions &options) {
           // reduced Hessian near-singular along the ambiguous direction, so LM legitimately stalls AT
           // the minimum (the iterate is good -- verified consistent by the NEES gold standard). The
           // downstream gravity-direction gate + covariance-PD check still vet the result.
-          converged = true;
-          summary.message = "no further decrease at max damping (stationary)";
+          converged = trial_valid;
+          summary.message = trial_valid ? "no further decrease at max damping (stationary)" : "invalid trial factor evaluation";
           break;
         }
       }
@@ -867,7 +1238,107 @@ SolverSummary Problem::Solve(const SolverOptions &options) {
   return summary;
 }
 
+// Spectral landmark elimination: eliminate each landmark's 3x3 information block by
+// EIGENDECOMPOSITION with a relative rank cutoff -- THE method, not a fallback. A landmark
+// direction carrying (near-)zero information (the shallow-depth / short-track degeneracy
+// class) contributes ZERO fill-in to the reduced system: that is the flat-prior marginal
+// limit, the statistically honest reduction. An absolute +1e-10 floor + inverse instead
+// injects 1/(0+1e-10) = 1e10-scale rank-deficient fill-in whose cancellation drives the
+// reduced nuisance Hessian indefinite at converged points (measured on-device on a
+// close-depth class: Hnn min pivots -5.5e9 / -1.7e8 / -8.8e2 at dim 467 -- the export-veto
+// class). The cutoff is RELATIVE (tol = 1e-8 * lambda_max): it caps the elimination's
+// condition number at 1e8 -- Schur complement PSD to fp64 roundoff -- while a direction 8
+// orders below the landmark's strongest carries >= 1e4 x the whitened sigma, i.e. no
+// usable signal. The 1e-12 absolute floor retires all-dust landmarks (no real landmark
+// information sits below it) whole. computeDirect() is the closed-form 3x3 path:
+// allocation-free, iteration-free, deterministic -- real-time-safe inside the worker pool.
+static Eigen::Matrix3d eliminate_landmark_pinv(const Eigen::Matrix3d &V, Problem::ExportStats *st) {
+  Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> es;
+  es.computeDirect(V);
+  const Eigen::Vector3d lam = es.eigenvalues(); // ascending
+  const double lmax = lam(2);
+  if (!(lmax > 1e-12)) { // all-dust (or non-finite) landmark: contributes nothing
+    if (st)
+      st->clamped_dirs += 3;
+    return Eigen::Matrix3d::Zero();
+  }
+  const double tol = 1e-8 * lmax;
+  Eigen::Matrix3d Vinv = Eigen::Matrix3d::Zero();
+  for (int k = 0; k < 3; ++k) {
+    if (lam(k) > tol)
+      Vinv.noalias() += (es.eigenvectors().col(k) / lam(k)) * es.eigenvectors().col(k).transpose();
+    else if (st)
+      ++st->clamped_dirs;
+  }
+  return Vinv;
+}
+
+bool Problem::covariance_information(Eigen::MatrixXd &Hred, const SolverOptions &options) {
+  ParallelExecutor exec(options.num_threads, options.worker_init_fn);
+  Eigen::MatrixXd H;
+  Eigen::VectorXd grad;
+  double cov_cost = 0.0;
+  const bool qr_export = n_land_ > 0 && use_landmark_qr_export();
+  if (qr_export) {
+    landmark_qr::Evidence evidence;
+    if (!landmark_qr::assemble(blocks_, residuals_, land_block_idx_, land_adj_, n_nav_, exec, H, grad, evidence))
+      return false;
+    cov_cost = evidence.cost;
+  } else {
+    if (!linearize(H, grad, cov_cost, exec)) // at the current (solved) iterate, undamped
+      return false;
+  }
+
+  // Reduced navigation information with landmarks marginalized (lambda = 0).
+  // H holds only the used lower triangle: B^T = H(land-rows, nav-cols) is stored directly,
+  // the nav-nav block is materialized from its lower half.
+  if (qr_export) {
+    Hred = std::move(H); // already assembled from projected rows; no subtractive Schur fold
+  } else if (n_land_ == 0) {
+    Hred = H.topLeftCorner(n_nav_, n_nav_).selfadjointView<Eigen::Lower>();
+  } else {
+    // Hred = Hnn - (B * D^-1) * B^T with D BLOCK-diagonal: scale B's landmark column-blocks by
+    // the small (lsize x lsize) inverses directly -- never materialize the dense
+    // n_land x n_land D^-1 (that costs an O(n_land^2) zero-fill plus an O(n_nav*n_land^2)
+    // gemm for what is O(n_nav*n_land*lsize) work).
+    // Landmark blocks eliminate via the spectral pinv (rank-clamped): a degenerate
+    // landmark contributes zero along its unobserved directions instead of absolute-floor
+    // poison -- this covariance feeds the COMMIT certification sigmas, where 1e10-scale
+    // fill-in error is a silent cert corruption. Blocks here are 3-dof landmarks (the
+    // only landmark class in this problem); the generic-lsize fallback keeps a
+    // shape-agnostic contract for any future non-3 block.
+    const auto Bt = H.block(n_nav_, 0, n_land_, n_nav_); // = B^T (landmark row-strip, always written)
+    Eigen::MatrixXd BD(n_nav_, n_land_);
+    for (const auto &od : land_diag_) {
+      const int off = od.first;
+      const int ls = od.second;
+      Eigen::MatrixXd Dinv;
+      if (ls == 3) {
+        Dinv = eliminate_landmark_pinv(
+            Eigen::Matrix3d(H.block(n_nav_ + off, n_nav_ + off, 3, 3).selfadjointView<Eigen::Lower>()), nullptr);
+      } else {
+        const Eigen::MatrixXd Dblk =
+            Eigen::MatrixXd(H.block(n_nav_ + off, n_nav_ + off, ls, ls).selfadjointView<Eigen::Lower>());
+        Eigen::SelfAdjointEigenSolver<Eigen::MatrixXd> es(Dblk);
+        const double lmax = (ls > 0) ? es.eigenvalues()(ls - 1) : 0.0;
+        Dinv = Eigen::MatrixXd::Zero(ls, ls);
+        if (lmax > 1e-12) {
+          const double tol = 1e-8 * lmax;
+          for (int k = 0; k < ls; ++k)
+            if (es.eigenvalues()(k) > tol)
+              Dinv.noalias() += (es.eigenvectors().col(k) / es.eigenvalues()(k)) * es.eigenvectors().col(k).transpose();
+        }
+      }
+      BD.middleCols(off, ls).noalias() = Bt.middleRows(off, ls).transpose() * Dinv;
+    }
+    Hred = Eigen::MatrixXd(H.topLeftCorner(n_nav_, n_nav_).selfadjointView<Eigen::Lower>()) - BD * Bt;
+  }
+
+  return landmark_qr::all_finite(Hred);
+}
+
 bool Problem::ComputeCovariance(const std::vector<double *> &blocks, Eigen::MatrixXd &covariance, const SolverOptions &options) {
+  OrderEntryScope order_probe_scope; // ordering-probe denominator (no-op unless armed)
   assign_ordering();
   if (n_total_ == 0)
     return false;
@@ -884,44 +1355,16 @@ bool Problem::ComputeCovariance(const std::vector<double *> &blocks, Eigen::Matr
     out_dim += blocks_[i].lsize;
   }
 
-  ParallelExecutor exec(options.num_threads, options.worker_init_fn);
-  Eigen::MatrixXd H;
-  Eigen::VectorXd grad;
-  double cov_cost = 0.0;
-  linearize(H, grad, cov_cost, exec); // at the current (solved) iterate, undamped
-
-  // Reduced navigation information with landmarks marginalized (lambda = 0).
-  // H holds only the used lower triangle: B^T = H(land-rows, nav-cols) is stored directly,
-  // the nav-nav block is materialized from its lower half.
   Eigen::MatrixXd Hred;
-  if (n_land_ == 0) {
-    Hred = H.topLeftCorner(n_nav_, n_nav_).selfadjointView<Eigen::Lower>();
-  } else {
-    // Hred = Hnn - (B * D^-1) * B^T with D BLOCK-diagonal: scale B's landmark column-blocks by
-    // the small (lsize x lsize) inverses directly -- never materialize the dense
-    // n_land x n_land D^-1 (that costs an O(n_land^2) zero-fill plus an O(n_nav*n_land^2)
-    // gemm for what is O(n_nav*n_land*lsize) work).
-    // Small ridge keeps weakly-observed (near-singular) landmark blocks invertible;
-    // it perturbs the marginal only at the ~1e-8 level for well-observed landmarks.
-    const auto Bt = H.block(n_nav_, 0, n_land_, n_nav_); // = B^T (landmark row-strip, always written)
-    Eigen::MatrixXd BD(n_nav_, n_land_);
-    for (const auto &od : land_diag_) {
-      const int off = od.first;
-      const int ls = od.second;
-      Eigen::MatrixXd Dblk =
-          Eigen::MatrixXd(H.block(n_nav_ + off, n_nav_ + off, ls, ls).selfadjointView<Eigen::Lower>());
-      Dblk.diagonal().array() += 1e-10;
-      BD.middleCols(off, ls).noalias() = Bt.middleRows(off, ls).transpose() * Dblk.inverse();
-    }
-    Hred = Eigen::MatrixXd(H.topLeftCorner(n_nav_, n_nav_).selfadjointView<Eigen::Lower>()) - BD * Bt;
-  }
+  if (!covariance_information(Hred, options))
+    return false;
 
   // Invert (requires the gauge to be anchored -> PD). Marginal covariance = Hred^{-1}.
   Eigen::LDLT<Eigen::MatrixXd> ldlt(Hred);
-  if (ldlt.info() != Eigen::Success)
+  if (ldlt.info() != Eigen::Success || !landmark_qr::all_finite(ldlt.vectorD()))
     return false;
   Eigen::MatrixXd Sigma = ldlt.solve(Eigen::MatrixXd::Identity(n_nav_, n_nav_));
-  if (!Sigma.allFinite() || (ldlt.vectorD().array() <= 0.0).any())
+  if (!landmark_qr::all_finite(Sigma) || (ldlt.vectorD().array() <= 0.0).any())
     return false;
 
   // Extract requested sub-blocks in the requested order.
@@ -938,4 +1381,436 @@ bool Problem::ComputeCovariance(const std::vector<double *> &blocks, Eigen::Matr
   }
   covariance = 0.5 * (covariance + covariance.transpose()).eval(); // symmetrize
   return true;
+}
+
+bool Problem::ComputeConditionalCovariance(const std::vector<double *> &blocks, const std::vector<double *> &consider,
+                                           Eigen::MatrixXd &conditional_covariance, Eigen::MatrixXd &sensitivity,
+                                           const SolverOptions &options) {
+  OrderEntryScope order_probe_scope;
+  if (blocks.empty() || &conditional_covariance == &sensitivity)
+    return false;
+
+  // Validate before changing the export ordering. In particular, the consider
+  // set cannot overlap an optimized block or contain repeated parameter keys.
+  std::vector<int> requested_ids, consider_ids;
+  std::set<int> seen;
+  for (double *ptr : blocks) {
+    const int id = block_index(ptr);
+    if (id < 0 || blocks_[id].constant || blocks_[id].landmark || blocks_[id].lsize <= 0 || !seen.insert(id).second)
+      return false;
+    requested_ids.push_back(id);
+  }
+  for (double *ptr : consider) {
+    const int id = block_index(ptr);
+    if (id < 0 || !blocks_[id].constant || blocks_[id].landmark || blocks_[id].lsize <= 0 || !seen.insert(id).second)
+      return false;
+    consider_ids.push_back(id);
+  }
+
+  // Public solver/export entry points rebuild ordering. Restore constancy on
+  // every exit (including an allocation exception); never call Solve here.
+  struct RestoreConstants {
+    std::vector<Block> &parameters;
+    const std::vector<int> &ids;
+    ~RestoreConstants() {
+      for (int id : ids)
+        parameters[id].constant = true;
+    }
+  } restore{blocks_, consider_ids};
+  for (int id : consider_ids)
+    blocks_[id].constant = false;
+  assign_ordering();
+
+  std::vector<int> consider_rows;
+  std::vector<bool> is_consider(n_nav_, false);
+  for (int id : consider_ids) {
+    const Block &b = blocks_[id];
+    for (int j = 0; j < b.lsize; ++j) {
+      consider_rows.push_back(b.offset + j);
+      is_consider[b.offset + j] = true;
+    }
+  }
+  std::vector<int> active_rows, active_index(n_nav_, -1), requested_rows;
+  for (int j = 0; j < n_nav_; ++j) {
+    if (!is_consider[j]) {
+      active_index[j] = static_cast<int>(active_rows.size());
+      active_rows.push_back(j);
+    }
+  }
+  for (int id : requested_ids) {
+    const Block &b = blocks_[id];
+    for (int j = 0; j < b.lsize; ++j)
+      requested_rows.push_back(active_index[b.offset + j]);
+  }
+
+  // Both Hxx and Hxc come from the landmark-projected information. Selecting
+  // the unprojected Hxc would omit the landmark/calibration cross contribution.
+  Eigen::MatrixXd information;
+  if (!covariance_information(information, options))
+    return false;
+  const int n = static_cast<int>(active_rows.size());
+  const int k = static_cast<int>(consider_rows.size());
+  const int m = static_cast<int>(requested_rows.size());
+  Eigen::MatrixXd Hxx(n, n), rhs = Eigen::MatrixXd::Zero(n, m + k);
+  for (int i = 0; i < n; ++i) {
+    for (int j = 0; j < n; ++j)
+      Hxx(i, j) = information(active_rows[i], active_rows[j]);
+    for (int j = 0; j < k; ++j)
+      rhs(i, m + j) = -information(active_rows[i], consider_rows[j]);
+  }
+  for (int j = 0; j < m; ++j)
+    rhs(requested_rows[j], j) = 1.0;
+  Eigen::LDLT<Eigen::MatrixXd> ldlt(Hxx);
+  if (ldlt.info() != Eigen::Success || !landmark_qr::all_finite(ldlt.vectorD()) || (ldlt.vectorD().array() <= 0.0).any())
+    return false;
+  const Eigen::MatrixXd solved = ldlt.solve(rhs);
+  if (!landmark_qr::all_finite(solved))
+    return false;
+  Eigen::MatrixXd Q(m, m), S(m, k);
+  for (int i = 0; i < m; ++i) {
+    Q.row(i) = solved.row(requested_rows[i]).head(m);
+    S.row(i) = solved.row(requested_rows[i]).tail(k);
+  }
+  Q = 0.5 * (Q + Q.transpose()).eval();
+  conditional_covariance = std::move(Q);
+  sensitivity = std::move(S);
+  return true;
+}
+
+bool Problem::ExportReducedInformation(const std::vector<double *> &blocks, Eigen::MatrixXd &Lambda, Eigen::VectorXd &gred,
+                                       const SolverOptions &options, ExportStats *stats) {
+  OrderEntryScope order_probe_scope; // ordering-probe denominator (no-op unless armed)
+  assign_ordering();
+  if (n_total_ == 0)
+    return false;
+
+  // Requested (kept) blocks must be variable & non-landmark; everything else is marginalized.
+  std::vector<std::pair<int, int>> req; // (nav-offset, lsize)
+  int out_dim = 0;
+  for (double *ptr : blocks) {
+    int i = block_index(ptr);
+    if (i < 0 || blocks_[i].constant || blocks_[i].landmark || blocks_[i].offset < 0 || blocks_[i].offset >= n_nav_)
+      return false;
+    req.emplace_back(blocks_[i].offset, blocks_[i].lsize);
+    out_dim += blocks_[i].lsize;
+  }
+
+  // Partition nav into kept vs nuisance indices (kept in requested order). Hoisted above the
+  // linearization (pure integer bookkeeping, identical values) so the marginalization below
+  // can pick its path from the layout.
+  std::vector<int> kidx, nidx;
+  kidx.reserve(out_dim);
+  std::vector<char> is_kept(n_nav_, 0);
+  for (const auto &of : req)
+    for (int k = 0; k < of.second; ++k) {
+      kidx.push_back(of.first + k);
+      is_kept[of.first + k] = 1;
+    }
+  for (int i = 0; i < n_nav_; ++i)
+    if (!is_kept[i])
+      nidx.push_back(i);
+  const int nk = (int)kidx.size(), nn = (int)nidx.size();
+
+  // Layout probe: the calibrator's export keeps a CONTIGUOUS TRAILING offset range --
+  // WindowBA registers clones + gravity before the calib blocks and assign_ordering assigns
+  // nav offsets in registration order, so nuisance = [0, nn) and kept = [nn, n_nav) always
+  // (the kept range may be internally permuted vs the request order, e.g. cam vs td). kidx
+  // holds nk distinct in-range offsets, so min(kidx) >= nn is equivalent to set equality
+  // with the trailing range. A caller that violates it (none in-tree) stays on the legacy
+  // path unchanged.
+  bool tail_contig = true;
+  for (int i : kidx)
+    if (i < nn) {
+      tail_contig = false;
+      break;
+    }
+
+  // [BIT-EXACT] switches: OV_ZCALIB_EXPORT_LEGACY forces the legacy full-fill path (replay
+  // byte-parity kill-switch); OV_ZCALIB_EXPORT_AUDIT computes BOTH paths per export and
+  // memcmps every consumed output byte (Lambda, gred, stats, ok) -- dual-path in-binary proof.
+  static const bool export_legacy = (std::getenv("OV_ZCALIB_EXPORT_LEGACY") != nullptr);
+  static const bool export_audit = (std::getenv("OV_ZCALIB_EXPORT_AUDIT") != nullptr);
+
+  ParallelExecutor exec(options.num_threads, options.worker_init_fn);
+  if (n_land_ > 0 && use_landmark_qr_export()) {
+    Eigen::MatrixXd Hnav;
+    Eigen::VectorXd gnav;
+    landmark_qr::Evidence evidence;
+    if (!landmark_qr::assemble(blocks_, residuals_, land_block_idx_, land_adj_, n_nav_, exec, Hnav, gnav, evidence))
+      return false;
+    if (stats) {
+      stats->land_decrement += evidence.land_decrement;
+      stats->clamped_dirs += evidence.clamped_dirs;
+    }
+
+    // Keep the full nuisance/calibration cross information and the existing
+    // nuisance LDLT/marginalization semantics. QR changes feature elimination
+    // only; it does not whiten or damp the nuisance solve a second time.
+    Eigen::MatrixXd Hkk(nk, nk), Hkn(nk, nn), Hnn(nn, nn);
+    Eigen::VectorXd gk(nk), gn(nn);
+    for (int a = 0; a < nk; ++a) {
+      gk(a) = gnav(kidx[a]);
+      for (int b = 0; b < nk; ++b)
+        Hkk(a, b) = Hnav(kidx[a], kidx[b]);
+      for (int b = 0; b < nn; ++b)
+        Hkn(a, b) = Hnav(kidx[a], nidx[b]);
+    }
+    for (int a = 0; a < nn; ++a) {
+      gn(a) = gnav(nidx[a]);
+      for (int b = 0; b < nn; ++b)
+        Hnn(a, b) = Hnav(nidx[a], nidx[b]);
+    }
+    if (nn == 0) {
+      Lambda = Hkk;
+      gred = gk;
+      if (stats)
+        stats->nuis_decrement = stats->land_decrement;
+      return landmark_qr::all_finite(Lambda) && landmark_qr::all_finite(gred) &&
+             (!stats || landmark_qr::finite_scalar(stats->nuis_decrement));
+    }
+    Eigen::LDLT<Eigen::MatrixXd> ldlt(Hnn);
+    if (stats) {
+      stats->nuis_dim = nn;
+      stats->nuis_min_pivot =
+          ldlt.info() == Eigen::Success ? ldlt.vectorD().minCoeff() : std::numeric_limits<double>::quiet_NaN();
+    }
+    if (ldlt.info() != Eigen::Success || !landmark_qr::all_finite(ldlt.vectorD()) || (ldlt.vectorD().array() <= 0.0).any())
+      return false;
+    const Eigen::MatrixXd HnnInvHnk = ldlt.solve(Hkn.transpose());
+    Lambda = Hkk - Hkn * HnnInvHnk;
+    gred = gk - HnnInvHnk.transpose() * gn;
+    if (stats) {
+      stats->nuis_decrement = stats->land_decrement + gn.dot(ldlt.solve(gn));
+      stats->nuis_grad_inf = gn.lpNorm<Eigen::Infinity>();
+    }
+    Lambda = 0.5 * (Lambda + Lambda.transpose()).eval();
+    return landmark_qr::all_finite(Lambda) && landmark_qr::all_finite(gred) &&
+           (!stats || (landmark_qr::finite_scalar(stats->nuis_decrement) && landmark_qr::finite_scalar(stats->nuis_grad_inf)));
+  }
+  Eigen::MatrixXd H;
+  Eigen::VectorXd grad;
+  double cost = 0.0;
+  if (!linearize(H, grad, cost, exec)) // at the current iterate, undamped
+    return false;
+
+  // ---- LEGACY marginalization (kept verbatim): the kill-switch path, the audit
+  // reference, and the general path for non-trailing kept layouts. ----
+  const auto run_legacy = [&](Eigen::MatrixXd &L_out, Eigen::VectorXd &g_out, ExportStats *st) -> bool {
+    // Landmark-marginalized nav system, VISIBILITY-AWARE like solve_step: the
+    // dense (n_nav x n_land) x (n_land x n_nav) product multiplied through the
+    // structural zeros of every landmark's non-observing poses (measured ~9% of
+    // window-solve thread-CPU). Per landmark, only its adjacent nav blocks are
+    // touched; the landmark block eliminates via the spectral pinv (rank-
+    // clamped) and the gradient fold g_nav' = g_nav - (B V^+) g_l.
+    Eigen::MatrixXd Hnav = H.topLeftCorner(n_nav_, n_nav_).selfadjointView<Eigen::Lower>();
+    Eigen::VectorXd gnav = grad.head(n_nav_);
+    for (size_t li = 0; li < land_diag_.size(); ++li) {
+      const int g0 = n_nav_ + land_diag_[li].first;
+      const Eigen::Matrix3d V = Eigen::Matrix3d(H.block(g0, g0, 3, 3).selfadjointView<Eigen::Lower>());
+      const Eigen::Matrix3d Vinv = eliminate_landmark_pinv(V, st);
+      const Eigen::Vector3d gl = grad.segment(g0, 3);
+      if (st)
+        st->land_decrement += gl.dot(Vinv * gl);
+      const std::vector<int> &adj = land_adj_[li];
+      const int P = (int)adj.size();
+      if ((int)schur_off_.size() < P) {
+        schur_off_.resize(P);
+        schur_W_.resize(P);
+        schur_Ma_.resize(P);
+      }
+      for (int ia = 0; ia < P; ++ia) {
+        const Block &ba = blocks_[adj[ia]];
+        schur_off_[ia] = ba.offset;
+        schur_W_[ia] = H.block(g0, ba.offset, 3, ba.lsize);
+        schur_Ma_[ia].noalias() = schur_W_[ia].transpose() * Vinv;
+        gnav.segment(ba.offset, ba.lsize).noalias() -= schur_Ma_[ia] * gl;
+      }
+      // FULL (both-triangle) fill-in: the kept/nuisance partition below indexes
+      // Hnav at arbitrary (row, col), unlike solve_step's lower-only Hred.
+      for (int ia = 0; ia < P; ++ia)
+        for (int ib = 0; ib < P; ++ib)
+          Hnav.block(schur_off_[ia], schur_off_[ib], schur_Ma_[ia].rows(), schur_W_[ib].cols()).noalias() -=
+              schur_Ma_[ia] * schur_W_[ib];
+    }
+
+    Eigen::MatrixXd Hkk(nk, nk), Hkn(nk, nn), Hnn(nn, nn);
+    Eigen::VectorXd gk(nk), gn(nn);
+    for (int a = 0; a < nk; ++a) {
+      gk(a) = gnav(kidx[a]);
+      for (int b = 0; b < nk; ++b)
+        Hkk(a, b) = Hnav(kidx[a], kidx[b]);
+      for (int b = 0; b < nn; ++b)
+        Hkn(a, b) = Hnav(kidx[a], nidx[b]);
+    }
+    for (int a = 0; a < nn; ++a) {
+      gn(a) = gnav(nidx[a]);
+      for (int b = 0; b < nn; ++b)
+        Hnn(a, b) = Hnav(nidx[a], nidx[b]);
+    }
+
+    if (nn == 0) {
+      L_out = Hkk;
+      g_out = gk;
+      if (st)
+        st->nuis_decrement = st->land_decrement;
+      return true;
+    }
+    Eigen::LDLT<Eigen::MatrixXd> ldlt(Hnn);
+    if (st) {
+      st->nuis_dim = nn;
+      st->nuis_min_pivot =
+          (ldlt.info() == Eigen::Success) ? ldlt.vectorD().minCoeff() : std::numeric_limits<double>::quiet_NaN();
+    }
+    if (ldlt.info() != Eigen::Success || (ldlt.vectorD().array() <= 0.0).any())
+      return false;
+    const Eigen::MatrixXd HnnInvHnk = ldlt.solve(Hkn.transpose());
+    L_out = Hkk - Hkn * HnnInvHnk;
+    g_out = gk - HnnInvHnk.transpose() * gn;
+    if (st) {
+      // nuisance Newton decrement q_n = g_z' H_zz^{-1} g_z = sum_l gl'V^{-1}gl
+      // + gn'Hnn^{-1}gn (exact block-elimination identity; one extra O(nn^2)
+      // solve on the factorization formed above). q_n/2 = the cost decrease a
+      // further inner solve could still achieve at this linearization -- the
+      // stationarity certificate's statistic.
+      st->nuis_decrement = st->land_decrement + gn.dot(ldlt.solve(gn));
+      st->nuis_grad_inf = gn.lpNorm<Eigen::Infinity>();
+    }
+    L_out = 0.5 * (L_out + L_out.transpose()).eval(); // symmetrize
+    return landmark_qr::all_finite(L_out) && landmark_qr::all_finite(g_out);
+  };
+
+  // ---- Fast marginalization [BIT-EXACT]: dead-write elimination + contiguous
+  // gathers, valid only under the trailing-kept layout probed above.
+  //
+  // Consumed-region catalogue of the legacy Hnav (every read between the fold and the LDLT):
+  //   (1) Hnn gather -> nuisance x nuisance; only the LOWER triangle ever reaches arithmetic
+  //       (Eigen's LDLT<Lower> factors from the lower triangle -- the upper copy was dead the
+  //       moment it was made);
+  //   (2) Hkn gather -> kept rows x nuisance cols; kept offsets >= nn > nuisance offsets,
+  //       i.e. STRICTLY BELOW the diagonal -- lower triangle again;
+  //   (3) Hkk gather -> kept x kept, BOTH triangles (the request order permutes inside the
+  //       trailing range).
+  // Therefore the nuisance-ROW upper strip (rows < nn, cols > row) is dead state: its
+  // selfadjointView materialization and its landmark fill-in writes are skipped. Every
+  // surviving write keeps the legacy expression, operand layout and accumulation order, so
+  // every consumed byte is byte-identical (proved in-binary by OV_ZCALIB_EXPORT_AUDIT and
+  // end-to-end by the OV_ZCALIB_EXPORT_LEGACY replay harness).
+  const auto run_fast = [&](Eigen::MatrixXd &L_out, Eigen::VectorXd &g_out, ExportStats *st) -> bool {
+    Eigen::MatrixXd Hnav(n_nav_, n_nav_); // deliberately uninitialized: the dead strip is never read
+    for (int j = 0; j < n_nav_; ++j)      // lower triangle incl. diagonal: the bytes selfadjointView copied
+      Hnav.col(j).segment(j, n_nav_ - j) = H.col(j).segment(j, n_nav_ - j);
+    for (int j = nn + 1; j < n_nav_; ++j) // kept x kept upper mirror: bytes = H's lower mirrored, as before
+      for (int i = nn; i < j; ++i)
+        Hnav(i, j) = H(j, i);
+    Eigen::VectorXd gnav = grad.head(n_nav_);
+    for (size_t li = 0; li < land_diag_.size(); ++li) {
+      const int g0 = n_nav_ + land_diag_[li].first;
+      const Eigen::Matrix3d V = Eigen::Matrix3d(H.block(g0, g0, 3, 3).selfadjointView<Eigen::Lower>());
+      const Eigen::Matrix3d Vinv = eliminate_landmark_pinv(V, st);
+      const Eigen::Vector3d gl = grad.segment(g0, 3);
+      if (st)
+        st->land_decrement += gl.dot(Vinv * gl);
+      const std::vector<int> &adj = land_adj_[li];
+      const int P = (int)adj.size();
+      if ((int)schur_off_.size() < P) {
+        schur_off_.resize(P);
+        schur_W_.resize(P);
+        schur_Ma_.resize(P);
+      }
+      for (int ia = 0; ia < P; ++ia) {
+        const Block &ba = blocks_[adj[ia]];
+        schur_off_[ia] = ba.offset;
+        schur_W_[ia] = H.block(g0, ba.offset, 3, ba.lsize);
+        schur_Ma_[ia].noalias() = schur_W_[ia].transpose() * Vinv;
+        gnav.segment(ba.offset, ba.lsize).noalias() -= schur_Ma_[ia] * gl;
+      }
+      // Fill-in with the dead nuisance-row upper-strip writes SKIPPED: a block lands there
+      // iff its row block starts above the diagonal (ra < cb; distinct blocks never straddle
+      // it) AND its row block is nuisance (ra < nn). Kept-row upper blocks (ra >= nn -- the
+      // Hkk gather consumes them) keep their OWN gemm, not a transpose-mirror of the lower
+      // slot: Vinv = V.inverse() is not bitwise-symmetric and byte identity is the contract.
+      for (int ia = 0; ia < P; ++ia) {
+        const int ra = schur_off_[ia];
+        for (int ib = 0; ib < P; ++ib) {
+          const int cb = schur_off_[ib];
+          if (ra < cb && ra < nn)
+            continue; // dead write: nuisance-row upper strip
+          Hnav.block(ra, cb, schur_Ma_[ia].rows(), schur_W_[ib].cols()).noalias() -= schur_Ma_[ia] * schur_W_[ib];
+        }
+      }
+    }
+
+    // Contiguous partition gathers (nidx == [0, nn) here, so nidx[b] == b):
+    Eigen::MatrixXd Hkk(nk, nk), Hkn(nk, nn), Hnn(nn, nn);
+    Eigen::VectorXd gk(nk), gn(nn);
+    for (int a = 0; a < nk; ++a) {
+      gk(a) = gnav(kidx[a]);
+      for (int b = 0; b < nk; ++b)
+        Hkk(a, b) = Hnav(kidx[a], kidx[b]);
+      Hkn.row(a) = Hnav.row(kidx[a]).head(nn); // kept row >= nn: lower-triangle reads only
+    }
+    gn = gnav.head(nn);
+    for (int j = 0; j < nn; ++j) // lower-only column tails: exactly the triangle LDLT consumes
+      Hnn.col(j).tail(nn - j) = Hnav.col(j).segment(j, nn - j);
+
+    if (nn == 0) {
+      L_out = Hkk;
+      g_out = gk;
+      if (st)
+        st->nuis_decrement = st->land_decrement;
+      return true;
+    }
+    Eigen::LDLT<Eigen::MatrixXd> ldlt(Hnn); // consumes the lower triangle; Hnn's upper is never read into arithmetic
+    if (st) {
+      st->nuis_dim = nn;
+      st->nuis_min_pivot =
+          (ldlt.info() == Eigen::Success) ? ldlt.vectorD().minCoeff() : std::numeric_limits<double>::quiet_NaN();
+    }
+    if (ldlt.info() != Eigen::Success || (ldlt.vectorD().array() <= 0.0).any())
+      return false;
+    const Eigen::MatrixXd HnnInvHnk = ldlt.solve(Hkn.transpose());
+    L_out = Hkk - Hkn * HnnInvHnk;
+    g_out = gk - HnnInvHnk.transpose() * gn;
+    if (st) {
+      st->nuis_decrement = st->land_decrement + gn.dot(ldlt.solve(gn));
+      st->nuis_grad_inf = gn.lpNorm<Eigen::Infinity>();
+    }
+    L_out = 0.5 * (L_out + L_out.transpose()).eval(); // symmetrize
+    return landmark_qr::all_finite(L_out) && landmark_qr::all_finite(g_out);
+  };
+
+  if (export_audit && tail_contig && !export_legacy) {
+    // Dual-path audit: run BOTH marginalizations from the same (H, grad) and memcmp every
+    // consumed output byte. Aborts loudly on the first divergence (the PREINT_AUDIT pattern).
+    ExportStats s_ref, s_new;
+    if (stats) {
+      s_ref = *stats; // legacy += semantics accumulate from the caller's entry values
+      s_new = *stats;
+    }
+    Eigen::MatrixXd L_ref;
+    Eigen::VectorXd g_ref;
+    const bool ok_ref = run_legacy(L_ref, g_ref, stats ? &s_ref : nullptr);
+    const bool ok_new = run_fast(Lambda, gred, stats ? &s_new : nullptr);
+    bool same = (ok_ref == ok_new);
+    if (same && ok_new) {
+      same = L_ref.rows() == Lambda.rows() && L_ref.cols() == Lambda.cols() && g_ref.size() == gred.size() &&
+             (L_ref.size() == 0 || std::memcmp(L_ref.data(), Lambda.data(), sizeof(double) * (size_t)L_ref.size()) == 0) &&
+             (g_ref.size() == 0 || std::memcmp(g_ref.data(), gred.data(), sizeof(double) * (size_t)g_ref.size()) == 0);
+      if (stats)
+        same = same && std::memcmp(&s_ref.nuis_decrement, &s_new.nuis_decrement, sizeof(double)) == 0 &&
+               std::memcmp(&s_ref.land_decrement, &s_new.land_decrement, sizeof(double)) == 0 &&
+               std::memcmp(&s_ref.nuis_grad_inf, &s_new.nuis_grad_inf, sizeof(double)) == 0;
+    }
+    if (!same) {
+      std::fprintf(stderr, "EXPORT AUDIT FAILURE: fast-path bytes != legacy path (n_nav %d nk %d nn %d ok %d/%d)\n", n_nav_, nk, nn,
+                   (int)ok_ref, (int)ok_new);
+      std::abort();
+    }
+    if (stats)
+      *stats = s_new;
+    return ok_new;
+  }
+  if (tail_contig && !export_legacy)
+    return run_fast(Lambda, gred, stats);
+  return run_legacy(Lambda, gred, stats);
 }

@@ -77,6 +77,28 @@ public:
    */
   void parallel_ranges(int n, const std::function<void(int worker, int begin, int end)> &body);
 
+  /**
+   * @brief Dynamically scheduled loop: workers atomically claim the next index
+   *        until [0,n) is exhausted. body(worker_index, i) runs exactly once per i.
+   *
+   * WHY, over parallel_ranges: a fixed contiguous partition balances only equal-cost
+   * tasks. Window solves are not -- clone count, observation count and LM iteration
+   * count all vary (a warm-vs-cold duel alone can double one), so a static split
+   * gates every outer pass on the slowest range (measured: 149 s of thread-CPU
+   * completing in 59 s wall on 4 workers = 63% efficiency).
+   *
+   * DETERMINISM IS UNAFFECTED -- structurally, not aspirationally. Task i writes
+   * only slot i and is a pure function of (task data, p), so WHICH worker runs it
+   * cannot change WHAT it computes; callers reduce the partials in a SERIAL,
+   * INDEX-ORDERED fold after the region (see JointCalib's "serial fold").
+   * serial == parallel == any schedule, bit for bit. (Strictly WEAKER than
+   * parallel_ranges' contract, which pins ranges to worker indices -- needed only
+   * when a worker accumulates its own partial, which these call sites do not.)
+   *
+   * Feed indices LONGEST-FIRST (LPT) for a near-optimal makespan on unequal tasks.
+   */
+  void parallel_dynamic(int n, const std::function<void(int worker, int i)> &body);
+
 private:
   void worker_loop(int worker_index);
 

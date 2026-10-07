@@ -23,6 +23,8 @@
 #include "UpdaterMSCKF.h"
 
 #include "UpdaterHelper.h"
+#include "LegacyExposure.h"
+#include "RejectStats.h"
 
 #include "feat/Feature.h"
 #include "feat/FeatureInitializer.h"
@@ -30,12 +32,14 @@
 #include "state/StateHelper.h"
 #include "types/LandmarkRepresentation.h"
 #include "utils/colors.h"
+#include "utils/innovation.h"
 #include "utils/print.h"
 #include "utils/quat_ops.h"
 
-#include <boost/date_time/posix_time/posix_time.hpp>
-#include <boost/math/distributions/chi_squared.hpp>
 #include <cmath>
+
+#include "utils/ChronoProf.h"
+#include "utils/chi_square/chi_squared_quantile_table_0_95.h"
 
 using namespace ov_core;
 using namespace ov_type;
@@ -49,12 +53,8 @@ UpdaterMSCKF::UpdaterMSCKF(UpdaterOptions &options, ov_core::FeatureInitializerO
   // Save our feature initializer
   initializer_feat = std::shared_ptr<ov_core::FeatureInitializer>(new ov_core::FeatureInitializer(feat_init_options));
 
-  // Initialize the chi squared test table with confidence level 0.95
-  // https://github.com/KumarRobotics/msckf_vio/blob/050c50defa5a7fd9a04c1eed5687b405f02919b5/src/msckf_vio.cpp#L215-L221
-  for (int i = 1; i < 500; i++) {
-    boost::math::chi_squared chi_squared_dist(i);
-    chi_squared_table[i] = boost::math::quantile(chi_squared_dist, 0.95);
-  }
+  // Chi-squared 0.95 gating thresholds come from the baked table
+  // (utils/chi_square/, bit-identical to the boost::math values this used to compute here)
 }
 
 void UpdaterMSCKF::update(std::shared_ptr<State> state, std::vector<std::shared_ptr<Feature>> &feature_vec) {
@@ -64,8 +64,8 @@ void UpdaterMSCKF::update(std::shared_ptr<State> state, std::vector<std::shared_
     return;
 
   // Start timing
-  boost::posix_time::ptime rT0, rT1, rT2, rT3, rT4, rT5;
-  rT0 = boost::posix_time::microsec_clock::local_time();
+  ov_core::ProfTime rT0, rT1, rT2, rT3, rT4, rT5;
+  rT0 = ov_core::prof_now();
 
   // 0. Get all timestamps our clones are at (and thus valid measurement times)
   std::vector<double> clonetimes;
@@ -78,7 +78,7 @@ void UpdaterMSCKF::update(std::shared_ptr<State> state, std::vector<std::shared_
   while (it0 != feature_vec.end()) {
 
     // Clean the feature
-    (*it0)->clean_old_measurements(clonetimes);
+    UpdaterHelper::clean_feature_measurements(state, **it0, clonetimes);
 
     // Count how many measurements
     int ct_meas = 0;
@@ -94,39 +94,35 @@ void UpdaterMSCKF::update(std::shared_ptr<State> state, std::vector<std::shared_
       it0++;
     }
   }
-  rT1 = boost::posix_time::microsec_clock::local_time();
+  rT1 = ov_core::prof_now();
 
   // 2. Create vector of cloned *CAMERA* poses at each of our clone timesteps
+  // RS row-anchor convention (rs_convention: top 0.0 / center 0.5 / bottom 1.0)
+  const double rs_row_anchor = state->_options.rs_row_anchor;
   std::unordered_map<size_t, std::unordered_map<double, FeatureInitializer::ClonePose>> clones_cam;
   for (const auto &clone_calib : state->_calib_IMUtoCAM) {
 
     // For this camera, create the vector of camera poses
     std::unordered_map<double, FeatureInitializer::ClonePose> clones_cami;
-    const double dt_cam_delta = state->cam_imu_dt_delta(clone_calib.first);
-    for (const auto &clone_imu : state->_clones_IMU) {
+    const double dt_cam_delta = state->uses_physical_clones() ? 0.0 : state->cam_imu_dt_delta(clone_calib.first);
+    state->for_each_clone(clone_calib.first, [&](double clone_time, const std::shared_ptr<PoseJPL> &clone_pose) {
 
-      // Get current IMU pose corrected to this camera's sampling instant: EXACT bridge
-      // composition when the frame was epoch-snapped (bias correction unnecessary at
-      // triangulation accuracy), else the first-order model over the full correction
-      Eigen::Matrix<double, 3, 3> R_GtoIi = clone_imu.second->Rot();
-      Eigen::Matrix<double, 3, 1> p_IiinG = clone_imu.second->pos();
-      const PreintBridgeData *br = state->epoch_bridge(clone_calib.first, clone_imu.first);
-      const double dt_extra = dt_cam_delta + ((br == nullptr) ? state->epoch_residual(clone_calib.first, clone_imu.first) : 0.0);
-      auto kin_it = state->_clones_kinematics.find(clone_imu.first);
-      const bool have_kin = (kin_it != state->_clones_kinematics.end());
-      if (br != nullptr && have_kin) {
-        const Eigen::Matrix3d R_clone = R_GtoIi;
-        R_GtoIi = br->DR * R_clone;
-        p_IiinG = p_IiinG + kin_it->second.vel * br->dt + br->p_grav + R_clone.transpose() * br->alpha;
-        if (std::abs(dt_extra) > 1e-10) {
-          const Eigen::Vector3d v_end = kin_it->second.vel + br->v_grav + R_clone.transpose() * br->beta;
-          R_GtoIi = (Eigen::Matrix3d::Identity() - skew_x(br->w_end) * dt_extra) * R_GtoIi;
-          p_IiinG = p_IiinG + v_end * dt_extra;
-        }
-      } else if (std::abs(dt_extra) > 1e-10) {
+      // Exposure views already own the camera endpoint; independent frame
+      // modes apply their relative-clock constant-kinematics correction here.
+      Eigen::Matrix<double, 3, 3> R_GtoIi = clone_pose->Rot();
+      Eigen::Matrix<double, 3, 1> p_IiinG = clone_pose->pos();
+      const double dt_extra = dt_cam_delta;
+      const auto *kin = state->clone_kinematics(clone_calib.first, clone_time);
+      const bool have_kin = kin != nullptr;
+      const Eigen::Vector3d velocity = state->velocity_for_camera(clone_calib.first, clone_time);
+      if (std::abs(dt_extra) > 1e-10) {
         if (have_kin) {
-          R_GtoIi = (Eigen::Matrix3d::Identity() - skew_x(kin_it->second.omega) * dt_extra) * R_GtoIi;
-          p_IiinG = p_IiinG + kin_it->second.vel * dt_extra;
+          if (legacy_exposure::uses_body_velocity(*state, clone_calib.first, false)) {
+            legacy_exposure::warp_pose(R_GtoIi, p_IiinG, clone_pose->Rot_fej(), kin->vel, kin->omega, dt_extra);
+          } else {
+            R_GtoIi = exp_so3(-kin->omega * dt_extra) * R_GtoIi;
+            p_IiinG = p_IiinG + velocity * dt_extra;
+          }
         } else {
           state->_kin_miss_count++;
         }
@@ -137,8 +133,8 @@ void UpdaterMSCKF::update(std::shared_ptr<State> state, std::vector<std::shared_
       Eigen::Matrix<double, 3, 1> p_CioinG = p_IiinG - R_GtoCi.transpose() * clone_calib.second->pos();
 
       // Append to our map
-      clones_cami.insert({clone_imu.first, FeatureInitializer::ClonePose(R_GtoCi, p_CioinG)});
-    }
+      clones_cami.insert({clone_time, FeatureInitializer::ClonePose(R_GtoCi, p_CioinG)});
+    });
 
     // Append to our map
     clones_cam.insert({clone_calib.first, clones_cami});
@@ -154,14 +150,18 @@ void UpdaterMSCKF::update(std::shared_ptr<State> state, std::vector<std::shared_
   }
 
   // 3. Try to triangulate all MSCKF or new SLAM features that have measurements
+  RejectCounters rc; // DIAGNOSTIC: stereo-vs-mono gate-level reject accounting
+  // FeatureInitializer reads only the track's observed keys. Allocate the row
+  // map once per batch, then reset/warp only those keys from the immutable base.
+  // This avoids O(features * cameras * window) copies and per-track map nodes.
+  std::unordered_map<size_t, std::unordered_map<double, FeatureInitializer::ClonePose>> clones_cam_rs;
+  if (has_rolling_shutter) clones_cam_rs = clones_cam;
   auto it1 = feature_vec.begin();
   while (it1 != feature_vec.end()) {
 
     // Apply per-observation rolling shutter correction to clone poses for this feature
-    std::unordered_map<size_t, std::unordered_map<double, FeatureInitializer::ClonePose>> clones_cam_rs;
     auto *clones_for_tri = &clones_cam;
     if (has_rolling_shutter) {
-      clones_cam_rs = clones_cam;
       for (const auto &obs_pair : (*it1)->timestamps) {
         size_t cam_id = obs_pair.first;
         if (state->_calib_camera_readout.find(cam_id) == state->_calib_camera_readout.end()) continue;
@@ -175,51 +175,75 @@ void UpdaterMSCKF::update(std::shared_ptr<State> state, std::vector<std::shared_
           double clone_time = obs_pair.second.at(m);
           if (clones_cam_rs.find(cam_id) == clones_cam_rs.end()) continue;
           if (clones_cam_rs.at(cam_id).find(clone_time) == clones_cam_rs.at(cam_id).end()) continue;
-          if (state->_clones_kinematics.find(clone_time) == state->_clones_kinematics.end()) continue;
+          auto &row_pose = clones_cam_rs.at(cam_id).at(clone_time);
+          row_pose = clones_cam.at(cam_id).at(clone_time);
+          if (state->clone_kinematics(cam_id, clone_time) == nullptr) continue;
           double v_pixel = (double)(*it1)->uvs.at(cam_id).at(m)(1);
-          double dt_rs = (v_pixel * inv_img_h) * t_readout;
+          double dt_rs = (v_pixel * inv_img_h - rs_row_anchor) * t_readout;
           if (std::abs(dt_rs) < 1e-10) continue;
           // Recover IMU pose from camera pose (undo camera transform)
-          Eigen::Matrix3d R_GtoCi = clones_cam_rs.at(cam_id).at(clone_time).Rot();
-          Eigen::Vector3d p_CiinG = clones_cam_rs.at(cam_id).at(clone_time).pos();
+          Eigen::Matrix3d R_GtoCi = row_pose.Rot();
+          Eigen::Vector3d p_CiinG = row_pose.pos();
           Eigen::Matrix3d R_GtoIi = R_ItoC.transpose() * R_GtoCi;
           Eigen::Vector3d p_IiinG = p_CiinG + R_GtoCi.transpose() * p_IinC;
-          // Apply RS correction in IMU frame
-          const State::CloneKinematics &kin = state->_clones_kinematics.at(clone_time);
-          R_GtoIi = (Eigen::Matrix3d::Identity() - skew_x(kin.omega) * dt_rs) * R_GtoIi;
-          p_IiinG = p_IiinG + kin.vel * dt_rs;
+          // Use the same exposure angular rate and owned velocity as the
+          // residual model when transporting to this observed row.
+          const State::CloneKinematics &kin = *state->clone_kinematics(cam_id, clone_time);
+          Eigen::Vector3d w_rs = kin.omega;
+          Eigen::Vector3d v_rs = state->velocity_for_camera(cam_id, clone_time);
+          R_GtoIi = exp_so3(-w_rs * dt_rs) * R_GtoIi;
+          p_IiinG = p_IiinG + v_rs * dt_rs;
           // Recompute camera pose
           R_GtoCi = R_ItoC * R_GtoIi;
           p_CiinG = p_IiinG - R_GtoCi.transpose() * p_IinC;
-          clones_cam_rs[cam_id][clone_time] = FeatureInitializer::ClonePose(R_GtoCi, p_CiinG);
+          row_pose = FeatureInitializer::ClonePose(R_GtoCi, p_CiinG);
         }
       }
       clones_for_tri = &clones_cam_rs;
     }
 
+    // DIAGNOSTIC: feature is "stereo" this update if observed in >1 camera.
+    bool is_stereo = (*it1)->timestamps.size() > 1;
+    if (is_stereo) rc.s_n++; else rc.m_n++;
+
     // Triangulate the feature and remove if it fails
+    FeatureInitializer::FailReason tri_reason = FeatureInitializer::FailReason::NONE;
     bool success_tri = true;
     if (initializer_feat->config().triangulate_1d) {
       success_tri = initializer_feat->single_triangulation_1d(*it1, *clones_for_tri);
     } else {
-      success_tri = initializer_feat->single_triangulation(*it1, *clones_for_tri);
+      success_tri = initializer_feat->single_triangulation(*it1, *clones_for_tri, &tri_reason);
     }
 
     // Gauss-newton refine the feature
+    FeatureInitializer::FailReason gn_reason = FeatureInitializer::FailReason::NONE;
     bool success_refine = true;
     if (initializer_feat->config().refine_features) {
-      success_refine = initializer_feat->single_gaussnewton(*it1, *clones_for_tri);
+      success_refine = initializer_feat->single_gaussnewton(*it1, *clones_for_tri, &gn_reason);
     }
 
     // Remove the feature if not a success
     if (!success_tri || !success_refine) {
+      if (kEnableRejectDiag) {
+        using FR = FeatureInitializer::FailReason;
+        FR r = (!success_tri) ? tri_reason : gn_reason;
+        switch (r) {
+          case FR::TRI_COND:    is_stereo ? rc.s_tri_cond++  : rc.m_tri_cond++;  break;
+          case FR::TRI_DEPTH:   is_stereo ? rc.s_tri_depth++ : rc.m_tri_depth++; break;
+          case FR::TRI_NAN:     is_stereo ? rc.s_tri_nan++   : rc.m_tri_nan++;   break;
+          case FR::GN_BASELINE: is_stereo ? rc.s_gn_base++   : rc.m_gn_base++;   break;
+          case FR::GN_DEPTH:    is_stereo ? rc.s_gn_depth++  : rc.m_gn_depth++;  break;
+          case FR::GN_NAN:      is_stereo ? rc.s_gn_nan++    : rc.m_gn_nan++;     break;
+          default: break; // 1d path or unclassified
+        }
+      }
       (*it1)->to_delete = true;
       it1 = feature_vec.erase(it1);
       continue;
     }
     it1++;
   }
-  rT2 = boost::posix_time::microsec_clock::local_time();
+  rT2 = ov_core::prof_now();
 
   // Calculate the max possible measurement size
   size_t max_meas_size = 0;
@@ -265,8 +289,11 @@ void UpdaterMSCKF::update(std::shared_ptr<State> state, std::vector<std::shared_
     if (LandmarkRepresentation::is_relative_representation(feat.feat_representation)) {
       feat.anchor_cam_id = (*it2)->anchor_cam_id;
       feat.anchor_clone_timestamp = (*it2)->anchor_clone_timestamp;
-      feat.p_FinA = (*it2)->p_FinA;
-      feat.p_FinA_fej = (*it2)->p_FinA;
+      // Triangulation uses actual exposure poses; estimator landmarks use the
+      // virtual camera at the retained clone epoch. Keep the frontend feature's
+      // exposure coordinates untouched for any later triangulation/refinement.
+      feat.p_FinA = UpdaterHelper::world_to_anchor(state, feat.anchor_cam_id, feat.anchor_clone_timestamp, (*it2)->p_FinG);
+      feat.p_FinA_fej = feat.p_FinA;
     } else {
       feat.p_FinG = (*it2)->p_FinG;
       feat.p_FinG_fej = (*it2)->p_FinG;
@@ -285,23 +312,22 @@ void UpdaterMSCKF::update(std::shared_ptr<State> state, std::vector<std::shared_
     UpdaterHelper::nullspace_project_inplace(H_f, H_x, res);
 
     /// Chi2 distance check
+    bool is_stereo = feat.timestamps.size() > 1; // for the reject-diag accounting below
+    double sigma2_f = _options.sigma_pix_sq;
     Eigen::MatrixXd P_marg = StateHelper::get_marginal_covariance(state, Hx_order);
     Eigen::MatrixXd S = H_x * P_marg * H_x.transpose();
-    S.diagonal() += _options.sigma_pix_sq * Eigen::VectorXd::Ones(S.rows());
-    double chi2 = res.dot(S.llt().solve(res));
+    S.diagonal() += sigma2_f * Eigen::VectorXd::Ones(S.rows());
+    double chi2;
+    const bool valid_innovation = innovation_chi2(S, res, chi2) &&
+                                  ov_core::numeric::finite(sigma2_f) && sigma2_f > 0.0;
 
-    // Get our threshold (we precompute up to 500 but handle the case that it is more)
-    double chi2_check;
-    if (res.rows() < 500) {
-      chi2_check = chi_squared_table[res.rows()];
-    } else {
-      boost::math::chi_squared chi_squared_dist(res.rows());
-      chi2_check = boost::math::quantile(chi_squared_dist, 0.95);
-      PRINT_WARNING(YELLOW "chi2_check over the residual limit - %d\n" RESET, (int)res.rows());
-    }
+    // Threshold from the baked quantile table (full reachable dof range; no runtime solve)
+    double chi2_check = ov_core::chi_squared_quantile_0_95((int)res.rows());
 
     // Check if we should delete or not
-    if (chi2 > _options.chi2_multipler * chi2_check) {
+    const double chi2_limit = _options.chi2_multipler * chi2_check;
+    if (!valid_innovation || !valid_innovation_limit(chi2_limit) || chi2 > chi2_limit) {
+      if (kEnableRejectDiag) { if (is_stereo) rc.s_chi2++; else rc.m_chi2++; }
       (*it2)->to_delete = true;
       it2 = feature_vec.erase(it2);
       // PRINT_DEBUG("featid = %d\n", feat.featid);
@@ -311,6 +337,15 @@ void UpdaterMSCKF::update(std::shared_ptr<State> state, std::vector<std::shared_
       // PRINT_DEBUG(ss.str().c_str());
       continue;
     }
+    if (kEnableRejectDiag) { if (is_stereo) rc.s_accept++; else rc.m_accept++; }
+
+    // Whiten this feature's rows by 1/sigma_f so the stacked system has isotropic
+    // unit noise. Required because the global measurement compression and the EKF
+    // update below assume R = I. For a mono feature (sigma2_f == sigma_pix_sq) this
+    // is identical to the previous R = sigma_pix_sq * I formulation.
+    double inv_sigma_f = 1.0 / std::sqrt(sigma2_f);
+    H_x *= inv_sigma_f;
+    res *= inv_sigma_f;
 
     // We are good!!! Append to our large H vector
     size_t ct_hx = 0;
@@ -333,7 +368,12 @@ void UpdaterMSCKF::update(std::shared_ptr<State> state, std::vector<std::shared_
     ct_meas += res.rows();
     it2++;
   }
-  rT3 = boost::posix_time::microsec_clock::local_time();
+  rT3 = ov_core::prof_now();
+
+  // DIAGNOSTIC: emit per-update gate-reject accounting (state ts for yaw align).
+  if (kEnableRejectDiag) {
+    log_reject_stats(state->_timestamp, "MSCKF", rc);
+  }
 
   // We have appended all features to our Hx_big, res_big
   // Delete it so we do not reuse information
@@ -355,20 +395,25 @@ void UpdaterMSCKF::update(std::shared_ptr<State> state, std::vector<std::shared_
   if (Hx_big.rows() < 1) {
     return;
   }
-  rT4 = boost::posix_time::microsec_clock::local_time();
+  rT4 = ov_core::prof_now();
 
-  // Our noise is isotropic, so make it here after our compression
-  Eigen::MatrixXd R_big = _options.sigma_pix_sq * Eigen::MatrixXd::Identity(res_big.rows(), res_big.rows());
+  // Each feature's rows were whitened by 1/sigma_f above (per-feature stereo/mono
+  // noise), so the stacked & compressed system already has unit isotropic noise.
+  Eigen::MatrixXd R_big = Eigen::MatrixXd::Identity(res_big.rows(), res_big.rows());
 
   // 6. With all good features update the state
-  StateHelper::EKFUpdate(state, Hx_order_big, Hx_big, res_big, R_big);
-  rT5 = boost::posix_time::microsec_clock::local_time();
+  if (!StateHelper::EKFUpdate(state, Hx_order_big, Hx_big, res_big, R_big)) {
+    PRINT_WARNING(YELLOW "[UPDATE]: rejected invalid combined measurement update\n" RESET);
+    feature_vec.clear(); // rejected batch is discarded, not reported as applied
+    return;
+  }
+  rT5 = ov_core::prof_now();
 
   // Debug print timing information
-  PRINT_ALL("[MSCKF-UP]: %.4f seconds to clean\n", (rT1 - rT0).total_microseconds() * 1e-6);
-  PRINT_ALL("[MSCKF-UP]: %.4f seconds to triangulate\n", (rT2 - rT1).total_microseconds() * 1e-6);
-  PRINT_ALL("[MSCKF-UP]: %.4f seconds create system (%d features)\n", (rT3 - rT2).total_microseconds() * 1e-6, (int)feature_vec.size());
-  PRINT_ALL("[MSCKF-UP]: %.4f seconds compress system\n", (rT4 - rT3).total_microseconds() * 1e-6);
-  PRINT_ALL("[MSCKF-UP]: %.4f seconds update state (%d size)\n", (rT5 - rT4).total_microseconds() * 1e-6, (int)res_big.rows());
-  PRINT_ALL("[MSCKF-UP]: %.4f seconds total\n", (rT5 - rT1).total_microseconds() * 1e-6);
+  PRINT_ALL("[MSCKF-UP]: %.4f seconds to clean\n", ov_core::prof_s(rT0, rT1));
+  PRINT_ALL("[MSCKF-UP]: %.4f seconds to triangulate\n", ov_core::prof_s(rT1, rT2));
+  PRINT_ALL("[MSCKF-UP]: %.4f seconds create system (%d features)\n", ov_core::prof_s(rT2, rT3), (int)feature_vec.size());
+  PRINT_ALL("[MSCKF-UP]: %.4f seconds compress system\n", ov_core::prof_s(rT3, rT4));
+  PRINT_ALL("[MSCKF-UP]: %.4f seconds update state (%d size)\n", ov_core::prof_s(rT4, rT5), (int)res_big.rows());
+  PRINT_ALL("[MSCKF-UP]: %.4f seconds total\n", ov_core::prof_s(rT1, rT5));
 }

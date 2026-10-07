@@ -23,6 +23,8 @@
 #ifndef OV_MSCKF_UPDATER_OPTIONS_H
 #define OV_MSCKF_UPDATER_OPTIONS_H
 
+#include <cmath>
+
 #include "utils/print.h"
 
 namespace ov_msckf {

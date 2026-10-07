@@ -21,7 +21,9 @@
  */
 
 #include "Factor_ImageReprojCalib.h"
+#include "QuaternionTangent.h"
 
+#include "ceres_free/DistortDouble.h"
 #include "utils/quat_ops.h"
 
 using namespace ov_init;
@@ -70,27 +72,19 @@ bool Factor_ImageReprojCalib::Evaluate(double const *const *parameters, double *
   Eigen::Matrix<double, 2, 2> sqrtQ_gate = gate * sqrtQ;
 
   // Get the distorted raw image coordinate using the camera model
+  // (forward projection in DOUBLE via the shared helper: CamBase::distort_d is
+  // float32-quantized, and the two reprojection backends must agree bit-level)
   // Also if jacobians are requested, then compute derivatives
-  Eigen::Vector2d uv_dist;
-  Eigen::MatrixXd H_dz_dzn, H_dz_dzeta;
-  if (is_fisheye) {
-    ov_core::CamEqui cam(0, 0);
-    cam.set_value(camera_vals);
-    uv_dist = cam.distort_d(uv_norm);
-    if (jacobians) {
-      cam.compute_distort_jacobian(uv_norm, H_dz_dzn, H_dz_dzeta);
-      H_dz_dzn = sqrtQ_gate * H_dz_dzn;
-      H_dz_dzeta = sqrtQ_gate * H_dz_dzeta;
-    }
-  } else {
-    ov_core::CamRadtan cam(0, 0);
-    cam.set_value(camera_vals);
-    uv_dist = cam.distort_d(uv_norm);
-    if (jacobians) {
-      cam.compute_distort_jacobian(uv_norm, H_dz_dzn, H_dz_dzeta);
-      H_dz_dzn = sqrtQ_gate * H_dz_dzn;
-      H_dz_dzeta = sqrtQ_gate * H_dz_dzeta;
-    }
+  Eigen::Vector2d uv_dist = ov_init::distort_double(camera_vals, uv_norm, is_fisheye);
+  Eigen::Matrix2d H_dz_dzn;
+  Eigen::Matrix<double, 2, 8> H_dz_dzeta;
+  if (jacobians) {
+    if (is_fisheye)
+      equidistant_jacobian_double(camera_vals, uv_norm, H_dz_dzn, jacobians[5] ? &H_dz_dzeta : nullptr);
+    else
+      radtan_jacobian_double(camera_vals, uv_norm, H_dz_dzn, jacobians[5] ? &H_dz_dzeta : nullptr);
+    H_dz_dzn = sqrtQ_gate * H_dz_dzn;
+    if (jacobians[5]) H_dz_dzeta = sqrtQ_gate * H_dz_dzeta;
   }
 
   // Compute residual
@@ -107,15 +101,14 @@ bool Factor_ImageReprojCalib::Evaluate(double const *const *parameters, double *
   if (jacobians) {
 
     // Normalized coordinates in respect to projection function
-    Eigen::MatrixXd H_dzn_dpfc = Eigen::MatrixXd::Zero(2, 3);
+    Eigen::Matrix<double, 2, 3> H_dzn_dpfc;
     H_dzn_dpfc << 1.0 / p_FinCi(2), 0, -p_FinCi(0) / std::pow(p_FinCi(2), 2), 0, 1.0 / p_FinCi(2), -p_FinCi(1) / std::pow(p_FinCi(2), 2);
-    Eigen::MatrixXd H_dz_dpfc = H_dz_dzn * H_dzn_dpfc;
+    Eigen::Matrix<double, 2, 3> H_dz_dpfc = H_dz_dzn * H_dzn_dpfc;
 
     // Jacobian wrt q_GtoIi
     if (jacobians[0]) {
       Eigen::Map<Eigen::Matrix<double, 2, 4, Eigen::RowMajor>> jacobian(jacobians[0]);
-      jacobian.block(0, 0, 2, 3) = H_dz_dpfc * R_ItoC * ov_core::skew_x(p_FinIi);
-      jacobian.block(0, 3, 2, 1).setZero();
+      jacobian = H_dz_dpfc * R_ItoC * ov_core::skew_x(p_FinIi) * jpl_tangent_lift(q_GtoIi);
     }
 
     // Jacobian wrt p_IiinG
@@ -133,8 +126,7 @@ bool Factor_ImageReprojCalib::Evaluate(double const *const *parameters, double *
     // Jacbian wrt IMU-camera transform q_ItoC
     if (jacobians[3]) {
       Eigen::Map<Eigen::Matrix<double, 2, 4, Eigen::RowMajor>> jacobian(jacobians[3]);
-      jacobian.block(0, 0, 2, 3) = H_dz_dpfc * ov_core::skew_x(R_ItoC * p_FinIi);
-      jacobian.block(0, 3, 2, 1).setZero();
+      jacobian = H_dz_dpfc * ov_core::skew_x(R_ItoC * p_FinIi) * jpl_tangent_lift(q_ItoC);
     }
 
     // Jacbian wrt IMU-camera transform p_IinC

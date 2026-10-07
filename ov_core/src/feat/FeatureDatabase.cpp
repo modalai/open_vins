@@ -21,11 +21,25 @@
  */
 
 #include "FeatureDatabase.h"
+#include "utils/InitializerPhysicalWarmResult.h"
+
+#include <algorithm>
 
 #include "Feature.h"
 #include "utils/print.h"
 
 using namespace ov_core;
+
+std::shared_ptr<FeatureDatabase> FeatureDatabase::clone() {
+  auto snapshot = std::make_shared<FeatureDatabase>();
+  std::lock_guard<std::mutex> lock(mtx);
+  snapshot->features_idlookup.reserve(features_idlookup.size());
+  for (const auto &feature : features_idlookup) {
+    if (feature.second)
+      snapshot->features_idlookup.emplace(feature.first, std::make_shared<Feature>(*feature.second));
+  }
+  return snapshot;
+}
 
 std::shared_ptr<Feature> FeatureDatabase::get_feature(size_t id, bool remove) {
   std::lock_guard<std::mutex> lck(mtx);
@@ -126,6 +140,36 @@ std::vector<std::shared_ptr<Feature>> FeatureDatabase::features_not_containing_n
   return feats_old;
 }
 
+std::vector<std::shared_ptr<Feature>> FeatureDatabase::features_lost_after_camera_updates(
+    const std::vector<double> &latest_camera_times, const std::vector<int> &updated_cameras,
+    bool remove, bool skip_deleted) {
+  std::vector<std::shared_ptr<Feature>> lost;
+  std::lock_guard<std::mutex> lck(mtx);
+  for (auto it = features_idlookup.begin(); it != features_idlookup.end();) {
+    const auto &feature = it->second;
+    bool belongs_to_update = false, actively_tracked = false;
+    if (!(skip_deleted && feature->to_delete)) {
+      for (const auto &camera : feature->timestamps) {
+        if (camera.second.empty())
+          continue;
+        belongs_to_update |= std::find(updated_cameras.begin(), updated_cameras.end(), static_cast<int>(camera.first)) != updated_cameras.end();
+        // An unknown/unadvanced stream cannot prove that its track is lost.
+        actively_tracked |= camera.first >= latest_camera_times.size() ||
+                            camera.second.back() >= latest_camera_times[camera.first];
+      }
+    }
+    if (belongs_to_update && !actively_tracked) {
+      lost.push_back(feature);
+      if (remove) {
+        it = features_idlookup.erase(it);
+        continue;
+      }
+    }
+    ++it;
+  }
+  return lost;
+}
+
 std::vector<std::shared_ptr<Feature>> FeatureDatabase::features_containing_older(double timestamp, bool remove, bool skip_deleted) {
 
   // Our vector of old features
@@ -207,6 +251,130 @@ std::vector<std::shared_ptr<Feature>> FeatureDatabase::features_containing(doubl
 
   // Return the features
   return feats_has_timestamp;
+}
+
+std::vector<std::shared_ptr<Feature>> FeatureDatabase::features_containing_camera(size_t camera_id, double timestamp, bool remove,
+                                                                                bool skip_deleted) {
+  std::vector<std::shared_ptr<Feature>> found;
+  std::lock_guard<std::mutex> lck(mtx);
+  for (auto it = features_idlookup.begin(); it != features_idlookup.end();) {
+    const auto &feature = it->second;
+    const auto times = feature->timestamps.find(camera_id);
+    const bool matches = !(skip_deleted && feature->to_delete) && times != feature->timestamps.end() &&
+                         std::find(times->second.begin(), times->second.end(), timestamp) != times->second.end();
+    if (matches) {
+      found.push_back(feature);
+      if (remove) {
+        it = features_idlookup.erase(it);
+        continue;
+      }
+    }
+    ++it;
+  }
+  return found;
+}
+
+namespace {
+template <typename Remove> void compact_camera_observations(Feature &feature, size_t camera_id, Remove remove) {
+  const auto it = feature.timestamps.find(camera_id);
+  if (it == feature.timestamps.end())
+    return;
+  auto &times = it->second;
+  auto &pixels = feature.uvs.at(camera_id);
+  auto &normalized = feature.uvs_norm.at(camera_id);
+  size_t write = 0;
+  for (size_t read = 0; read < times.size(); ++read) {
+    if (remove(times[read]))
+      continue;
+    if (write != read) {
+      times[write] = times[read];
+      pixels[write] = std::move(pixels[read]);
+      normalized[write] = std::move(normalized[read]);
+    }
+    ++write;
+  }
+  times.resize(write);
+  pixels.resize(write);
+  normalized.resize(write);
+}
+
+bool has_observations(const Feature &feature) {
+  for (const auto &camera : feature.timestamps)
+    if (!camera.second.empty())
+      return true;
+  return false;
+}
+} // namespace
+
+void FeatureDatabase::cleanup_measurements_camera(size_t camera_id, double timestamp) {
+  std::lock_guard<std::mutex> lck(mtx);
+  for (auto it = features_idlookup.begin(); it != features_idlookup.end();) {
+    compact_camera_observations(*it->second, camera_id, [timestamp](double t) { return t < timestamp; });
+    if (!has_observations(*it->second))
+      it = features_idlookup.erase(it);
+    else
+      ++it;
+  }
+}
+
+void FeatureDatabase::cleanup_measurements_exact_camera(size_t camera_id, double timestamp) {
+  std::lock_guard<std::mutex> lck(mtx);
+  for (auto it = features_idlookup.begin(); it != features_idlookup.end();) {
+    compact_camera_observations(*it->second, camera_id, [timestamp](double t) { return t == timestamp; });
+    if (!has_observations(*it->second))
+      it = features_idlookup.erase(it);
+    else
+      ++it;
+  }
+}
+
+size_t FeatureDatabase::cleanup_measurements_exact_for_features(const std::vector<size_t> &feature_ids,
+                                                              const std::vector<double> &sorted_timestamps) {
+  assert(std::is_sorted(sorted_timestamps.begin(), sorted_timestamps.end()));
+  std::lock_guard<std::mutex> lck(mtx);
+  size_t removed = 0;
+  for (size_t id : feature_ids) {
+    const auto it = features_idlookup.find(id);
+    if (it == features_idlookup.end())
+      continue;
+    auto &feature = *it->second;
+    for (const auto &camera : feature.timestamps) {
+      const size_t before = camera.second.size();
+      compact_camera_observations(feature, camera.first, [&](double t) {
+        return std::binary_search(sorted_timestamps.begin(), sorted_timestamps.end(), t);
+      });
+      removed += before - camera.second.size();
+    }
+    if (!has_observations(feature))
+      features_idlookup.erase(it);
+  }
+  return removed;
+}
+
+size_t FeatureDatabase::cleanup_measurements_exact_observations(const std::vector<InitObservationKey> &observations) {
+  auto keys = observations;
+  std::sort(keys.begin(), keys.end());
+  std::lock_guard<std::mutex> lck(mtx);
+  size_t removed = 0;
+  for (size_t begin = 0; begin < keys.size();) {
+    size_t end = begin + 1;
+    while (end < keys.size() && keys[end].feature_id == keys[begin].feature_id) ++end;
+    const auto it = features_idlookup.find(keys[begin].feature_id);
+    if (it != features_idlookup.end()) {
+      auto &feature = *it->second;
+      for (const auto &camera : feature.timestamps) {
+        const size_t before = camera.second.size();
+        compact_camera_observations(feature, camera.first, [&](double t) {
+          return std::binary_search(keys.begin() + begin, keys.begin() + end,
+                                    InitObservationKey{keys[begin].feature_id, camera.first, t});
+        });
+        removed += before - camera.second.size();
+      }
+      if (!has_observations(feature)) features_idlookup.erase(it);
+    }
+    begin = end;
+  }
+  return removed;
 }
 
 void FeatureDatabase::cleanup() {

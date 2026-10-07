@@ -24,6 +24,7 @@
 
 #include "core/VioManager.h"
 #include "sim/Simulator.h"
+#include "sim/SimulationTruthTime.h"
 #include "state/State.h"
 #include "state/StateHelper.h"
 
@@ -156,10 +157,8 @@ void ROSVisualizerHelper::sim_save_total_state_to_file(std::shared_ptr<State> st
                                                        std::ofstream &of_state_est, std::ofstream &of_state_std,
                                                        std::ofstream &of_state_gt) {
 
-  // We want to publish in the IMU clock frame
-  // The timestamp in the state will be the last camera time
-  double t_ItoC = state->_calib_dt_CAMtoIMU->value()(0);
-  double timestamp_inI = state->_timestamp + t_ItoC;
+  // Navigation time is the accepted IMU endpoint, unaffected by later clock updates.
+  double timestamp_inI = state->imu_endpoint();
 
   // If we have our simulator, then save it to our groundtruth file
   if (sim != nullptr) {
@@ -167,7 +166,7 @@ void ROSVisualizerHelper::sim_save_total_state_to_file(std::shared_ptr<State> st
     // Note that we get the true time in the IMU clock frame
     // NOTE: we record both the estimate and groundtruth with the same "true" timestamp if we are doing simulation
     Eigen::Matrix<double, 17, 1> state_gt;
-    timestamp_inI = state->_timestamp + sim->get_true_parameters().calib_camimu_dt;
+    timestamp_inI = simulation_truth_time(*state, sim->get_true_parameters().sim_camimu_dts);
     if (sim->get_state(timestamp_inI, state_gt)) {
       // STATE: write current true state
       of_state_gt.precision(5);

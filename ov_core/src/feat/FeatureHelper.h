@@ -49,7 +49,7 @@ public:
    * Then we loop through each and find the uv of it in the next requested frame.
    * Features are skipped if no tracked feature is found (it was lost).
    * NOTE: this is on the RAW coordinates of the feature not the normalized ones.
-   * NOTE: This computes the disparity over all cameras!
+   * NOTE: This computes disparity over all cameras unless camera_id is specified.
    *
    * @param db Feature database pointer
    * @param time0 First camera frame timestamp
@@ -59,10 +59,11 @@ public:
    * @param total_feats Total number of common features
    */
   static void compute_disparity(std::shared_ptr<ov_core::FeatureDatabase> db, double time0, double time1, double &disp_mean,
-                                double &disp_var, int &total_feats) {
+                                double &disp_var, int &total_feats, int camera_id = -1) {
 
     // Get features seen from the first image
-    std::vector<std::shared_ptr<Feature>> feats0 = db->features_containing(time0, false, true);
+    std::vector<std::shared_ptr<Feature>> feats0 = camera_id < 0 ? db->features_containing(time0, false, true)
+        : db->features_containing_camera(static_cast<size_t>(camera_id), time0, false, true);
 
     // Compute the disparity
     std::vector<double> disparities;
@@ -73,6 +74,8 @@ public:
 
         // First find the two timestamps
         size_t camid = campairs.first;
+        if (camera_id >= 0 && camid != static_cast<size_t>(camera_id))
+          continue;
         auto it0 = std::find(feat->timestamps.at(camid).begin(), feat->timestamps.at(camid).end(), time0);
         auto it1 = std::find(feat->timestamps.at(camid).begin(), feat->timestamps.at(camid).end(), time1);
         if (it0 == feat->timestamps.at(camid).end() || it1 == feat->timestamps.at(camid).end())
@@ -87,11 +90,22 @@ public:
       }
     }
 
+    // The filtered form is also used to pool camera statistics by sample count.
+    // It reports a singleton with zero within-camera spread. Unfiltered callers
+    // require two samples for their sample standard deviation.
+    if (camera_id >= 0 && disparities.size() < 2) {
+      total_feats = static_cast<int>(disparities.size());
+      disp_mean = disparities.empty() ? -1.0 : disparities.front();
+      disp_var = disparities.empty() ? -1.0 : 0.0;
+      return;
+    }
+
     // If no disparities, just return
     if (disparities.size() < 2) {
       disp_mean = -1;
       disp_var = -1;
       total_feats = 0;
+      return;
     }
 
     // Compute mean and standard deviation in respect to it
@@ -165,6 +179,7 @@ public:
       disp_mean = -1;
       disp_var = -1;
       total_feats = 0;
+      return;
     }
 
     // Compute mean and standard deviation in respect to it

@@ -67,6 +67,13 @@ public:
   /// Number of times the update has failed for this feature (we should remove if it fails a couple times!)
   int update_fail_count = 0;
 
+  /// (stereo->mono graceful degrade): if true, this landmark was admitted
+  /// as MONO after its stereo (two-view) form failed the chi2 gate. The SLAM update
+  /// must then keep using ONLY its anchor camera's observations -- otherwise the
+  /// update path would re-fetch both cameras, re-impose the failing stereo
+  /// constraint, and evict it. Stays mono for the landmark's life.
+  bool demoted_to_mono = false;
+
   /// First normalized uv coordinate bearing of this measurement (used for single depth representation)
   Eigen::Vector3d uv_norm_zero;
 
@@ -90,6 +97,33 @@ public:
     //  PRINT_DEBUG(YELLOW "WARNING DEPTH %.8f BECAME CLOSE TO ZERO IN UPDATE!!!\n" RESET, _value(_value.rows() - 1));
     //  should_marg = true;
     // }
+  }
+
+  /**
+   * @brief Deep-copy this landmark.
+   *
+   * Vec::clone() constructs a plain Vec and would SLICE away every Landmark field
+   * (_featid, anchor, representation, ...). This override preserves the full landmark so state
+   * snapshots and any other clone() caller get a faithful copy. Local id is not copied (clone()
+   * contract: the caller assigns covariance placement via set_local_id()).
+   */
+  std::shared_ptr<Type> clone() override {
+    auto Clone = std::shared_ptr<Landmark>(new Landmark((int)_size));
+    Clone->set_value(value());
+    Clone->set_fej(fej());
+    Clone->_featid = _featid;
+    Clone->_unique_camera_id = _unique_camera_id;
+    Clone->_anchor_cam_id = _anchor_cam_id;
+    Clone->_anchor_clone_timestamp = _anchor_clone_timestamp;
+    Clone->_quality = _quality;
+    Clone->has_had_anchor_change = has_had_anchor_change;
+    Clone->should_marg = should_marg;
+    Clone->update_fail_count = update_fail_count;
+    Clone->demoted_to_mono = demoted_to_mono;
+    Clone->uv_norm_zero = uv_norm_zero;
+    Clone->uv_norm_zero_fej = uv_norm_zero_fej;
+    Clone->_feat_representation = _feat_representation;
+    return Clone;
   }
 
   /**

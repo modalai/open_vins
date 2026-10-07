@@ -23,11 +23,16 @@
 #ifndef OV_MSCKF_STATE_OPTIONS_H
 #define OV_MSCKF_STATE_OPTIONS_H
 
+#include <algorithm>
+#include <cmath>
 #include <map>
+
+#include <limits>
 
 #include "types/LandmarkRepresentation.h"
 #include "utils/opencv_yaml_parse.h"
 #include "utils/print.h"
+#include "utils/finite.h"
 #include "utils/sensor_data.h"
 
 namespace ov_msckf {
@@ -73,10 +78,28 @@ struct StateOptions {
   /// (a 12ms-error seed under a 1ms prior is a 12-sigma fight the filter effectively never wins).
   double calib_cam_readout_init_sigma = 0.001;
 
-  /// Analytic IMU-bias columns from the preintegration bridge (see VioManagerOptions)
-  bool epoch_bridge_bias_cols = true;
+  /// Retain a stochastic pose at each camera's physical exposure time. Raw
+  /// observation keys stay camera-owned. Currently global-shutter only.
+  bool physical_camera_clones = false;
 
-  /// Freeze dt/readout Jacobian columns while the window motion is degenerate for temporal
+  /// Epoch scheduling with camera-owned stochastic exposure poses. Selected
+  /// by VioManager; observations keep their raw camera timestamps.
+  bool stochastic_epoch_transport = false;
+
+  /// Rolling-shutter row-anchor convention: which image row the frame stamp refers to. Row v
+  /// samples at stamp + (v/h - rs_row_anchor) * readout. Parsed from "rs_convention":
+  ///   top    (anchor 0.0) -- stamp is the raw HAL3 SOF (top row, start of readout). The
+  ///                          pre-flip system convention; replays of that era's recordings
+  ///                          use it to reproduce their trajectories.
+  ///   center (anchor 0.5) -- stamp is the center-row mid-exposure instant (the default;
+  ///                          the producer anchors stamps to match, see frame_timestamp_s)
+  ///   bottom (anchor 1.0) -- stamp refers to the last row (producers that stamp end-of-frame)
+  /// The stamp producer derives its anchoring from this SAME key, so stamps and filter model
+  /// cannot disagree.
+  double rs_row_anchor = 0.5;
+
+  /// Freeze dt/readout mean-gain rows while retaining their uncertainty and full measurement
+  /// Jacobians (Schmidt update) when the window motion is degenerate for temporal
   /// calibration (MVIS degenerate motions: static / constant velocity / slow pure rotation).
   /// Opt-in (default off): rigs enable it explicitly in their estimator config.
   bool dt_calib_gate = false;
@@ -99,8 +122,52 @@ struct StateOptions {
   /// What model our IMU intrinsics are
   ImuModel imu_model = ImuModel::KALIBR;
 
-  /// Max clone size of sliding window
+  /// Configured per-view track graduation length and legacy clone-window size.
   int max_clone_size = 11;
+
+  /// Bound the exposure window needed for the slowest camera's track baseline.
+  int max_epoch_clones = 64;
+
+  bool configure_epoch_window(const std::map<size_t, double> &rates) {
+    if (max_epoch_clones < max_clone_size)
+      return false;
+    size_t declared = 0;
+    double slowest = std::numeric_limits<double>::infinity(), total_rate = 0.;
+    for (const auto &rate : rates) {
+      if (rate.first >= static_cast<size_t>(num_cameras) || !ov_core::numeric::finite(rate.second) || rate.second < 0.)
+        return false;
+      if (rate.second > 0.) {
+        ++declared;
+        slowest = std::min(slowest, rate.second);
+        total_rate += rate.second;
+      }
+    }
+    // The option parser records zero for an undeclared nominal rate.
+    if (declared != static_cast<size_t>(num_cameras))
+      return max_pose_clones() <= max_epoch_clones;
+    const double capacity = std::ceil(max_clone_size * (total_rate / slowest));
+    if (!ov_core::numeric::finite(capacity) || capacity > max_epoch_clones)
+      return false;
+    pose_clone_capacity = static_cast<int>(capacity);
+    return true;
+  }
+
+  /// Resolve the total pose capacity once, without changing max_clone_size.
+  /// Independent frame cloning needs one window per camera. Synchronized and
+  /// single-camera configurations retain the configured capacity.
+  bool configure_clone_policy(bool async_frame_clones, bool synchronized_cameras) {
+    if (max_clone_size < 1 || num_cameras < 1)
+      return false;
+    const int multiplier = physical_camera_clones || stochastic_epoch_transport ||
+        (async_frame_clones && !synchronized_cameras) ? num_cameras : 1;
+    if (max_clone_size > std::numeric_limits<int>::max() / multiplier)
+      return false;
+    pose_clone_capacity = max_clone_size * multiplier;
+    return true;
+  }
+
+  /// Direct State users retain legacy behavior until a manager resolves policy.
+  int max_pose_clones() const { return pose_clone_capacity > 0 ? pose_clone_capacity : max_clone_size; }
 
   /// Max number of estimated SLAM features
   int max_slam_features = 25;
@@ -157,6 +224,25 @@ struct StateOptions {
         PRINT_ERROR(RED "calib_cam_readout_init_sigma must be positive (got %.6f)\n" RESET, calib_cam_readout_init_sigma);
         std::exit(EXIT_FAILURE);
       }
+      std::string rs_convention_str = "center";
+      parser->parse_config("rs_convention", rs_convention_str, false);
+      if (rs_convention_str == "top") {
+        rs_row_anchor = 0.0;
+      } else if (rs_convention_str == "center") {
+        rs_row_anchor = 0.5;
+      } else if (rs_convention_str == "bottom") {
+        rs_row_anchor = 1.0;
+      } else {
+        PRINT_ERROR(RED "invalid rs_convention: '%s'\n" RESET, rs_convention_str.c_str());
+        PRINT_ERROR(RED "please select a valid convention: top, center, bottom\n" RESET);
+        if (rs_convention_str.empty()) {
+          // The classic cause of an EMPTY read: a ':' inside the key's TRAILING comment --
+          // cv::FileStorage splits there and the node parses as a map. Own-line comments are safe.
+          PRINT_ERROR(RED "an empty value usually means a ':' in the key's trailing comment "
+                          "(cv::FileStorage splits on it); move the comment to its own line\n" RESET);
+        }
+        std::exit(EXIT_FAILURE);
+      }
       parser->parse_config("dt_calib_gate", dt_calib_gate, false);
       parser->parse_config("dt_calib_gate_min_omega", dt_calib_gate_min_omega, false);
       parser->parse_config("dt_calib_gate_min_vel_spread", dt_calib_gate_min_vel_spread, false);
@@ -165,6 +251,7 @@ struct StateOptions {
 
       // State parameters
       parser->parse_config("max_clones", max_clone_size);
+      parser->parse_config("max_epoch_clones", max_epoch_clones, false);
       parser->parse_config("max_slam", max_slam_features);
       parser->parse_config("max_slam_in_update", max_slam_in_update);
       parser->parse_config("max_msckf_in_update", max_msckf_in_update);
@@ -208,6 +295,8 @@ struct StateOptions {
     PRINT_DEBUG("  - cam_imu_dt_ref_camid: %d\n", cam_imu_dt_ref_camid);
     PRINT_DEBUG("  - calib_cam_readout: %d\n", do_calib_camera_readout);
     PRINT_DEBUG("  - calib_cam_readout_init_sigma: %.4f\n", calib_cam_readout_init_sigma);
+    PRINT_DEBUG("  - rs_convention: %s (row anchor %.1f)\n",
+                rs_row_anchor == 0.0 ? "top" : (rs_row_anchor == 1.0 ? "bottom" : "center"), rs_row_anchor);
     PRINT_DEBUG("  - calib_imu_intrinsics: %d\n", do_calib_imu_intrinsics);
     PRINT_DEBUG("  - calib_imu_g_sensitivity: %d\n", do_calib_imu_g_sensitivity);
     PRINT_DEBUG("  - imu_model: %d\n", imu_model);
@@ -221,6 +310,9 @@ struct StateOptions {
     PRINT_DEBUG("  - feat_rep_slam: %s\n", ov_type::LandmarkRepresentation::as_string(feat_rep_slam).c_str());
     PRINT_DEBUG("  - feat_rep_aruco: %s\n", ov_type::LandmarkRepresentation::as_string(feat_rep_aruco).c_str());
   }
+
+private:
+  int pose_clone_capacity = 0;
 };
 
 } // namespace ov_msckf
