@@ -170,6 +170,7 @@ public:
   struct EndpointKinematics {
     Eigen::Vector3d omega = Eigen::Vector3d::Zero();
     Eigen::Vector3d omega_fej = Eigen::Vector3d::Zero();
+    Eigen::Vector3d acceleration = Eigen::Vector3d::Zero();
   };
 
   /**

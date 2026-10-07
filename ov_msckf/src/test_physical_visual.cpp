@@ -169,12 +169,11 @@ void projection_and_fd() {
     const auto P=StateHelper::get_full_covariance(a.s);
     check((P.row(a.s->cam_imu_dt_var(0)->id())*H.transpose()).norm()>1e-8,
           "independent active camera clock still couples to visual innovation through pose covariance");
-    // Current clock estimates and stale legacy caches may not warp owned poses a second time.
-    for(int c=0;c<2;++c){Eigen::VectorXd td(1);td<<.04-.08*c;a.s->cam_imu_dt_var(c)->set_value(td);
-      for(double t:a.raw){a.s->_epoch_residuals[t][c]=.1;PreintBridgeData b;b.valid=true;b.dt=.1;b.DR=exp_so3(V3(.1,.2,-.1));a.s->_epoch_bridges[t][c]=b;}}
+    // A later clock correction must not warp an already-owned exposure again.
+    for(int c=0;c<2;++c){Eigen::VectorXd td(1);td<<.04-.08*c;a.s->cam_imu_dt_var(c)->set_value(td);}
     auto unchanged=linear(a.s,f);
     check((L.r-unchanged.r).norm()==0.&&(L.Hx-unchanged.Hx).norm()==0.&&(L.Hf-unchanged.Hf).norm()==0.,
-          "owned exposure mean and Jacobian ignore later td estimates and legacy bridge payloads");
+          "owned exposure mean and Jacobian ignore later td estimates");
   }
 }
 void nullspaces_and_owners() {

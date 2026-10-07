@@ -221,12 +221,9 @@ public:
     double startup_imu_time = -1;
     double distance = 0;
     double newest_imu_time = -std::numeric_limits<double>::infinity();
-    double last_ref_frame_time = -1;
-    double ref_period_ema = -1;
-    bool epoch_marg_pending = false;
     // ZUPT gating flags travel with the state: has_moved_since_zupt permanently disables ZUPT
     // under zupt_only_at_beginning (restoring a pre-motion snapshot must re-arm it), and
-    // did_zupt_update is the carried same-timestamp decision an epoch-snapped companion frame
+    // did_zupt_update is the carried same-timestamp decision a companion frame
     // re-reads right after a restore.
     bool did_zupt_update = false;
     bool has_moved_since_zupt = false;
@@ -235,8 +232,7 @@ public:
     // (thread flags + queued init timestamps), the initializer's private IMU buffer
     // (joint pre-init restores seed it from the captured propagator history), the
     // active-track retriangulation accumulators and viz outputs
-    // (self-heal on the next base-cam frame), and telemetry counters (epoch_snapped etc. keep
-    // counting across the rewind). trackARUCO state is neither captured nor reset -- snapshot()
+    // (self-heal on the next base-cam frame), and ingest telemetry counters. trackARUCO state is neither captured nor reset -- snapshot()
     // warns when an aruco tracker is active, since its database would replay duplicated
     // observations on a branch.
   };
@@ -410,16 +406,6 @@ protected:
   bool physical_group_zupt = false;
 
 
-  /**
-   * @brief Epoch-anchored cloning decision for one incoming frame (VIO thread).
-   *
-   * Reference-camera frames define epochs; a non-reference frame within the binding horizon of
-   * the newest epoch CLONE is snapped onto it: `timestamp` is rewritten to the epoch time
-   * (bit-exact) and the known residual t_raw - t_epoch is recorded per camera for the
-   * measurement models. Returns true if the frame was snapped.
-   */
-  bool apply_epoch_snap(double &timestamp, const std::vector<int> &sensor_ids);
-
   /// Lock-free async multi-camera ingest (per-stream rings + ordered release)
   std::shared_ptr<AsyncCameraBuffer> camera_buffer;
 
@@ -428,25 +414,6 @@ protected:
 
   /// Newest IMU timestamp fed to the estimator (VIO thread only; gates frame release)
   double newest_imu_time = -std::numeric_limits<double>::infinity();
-
-  /// @name Epoch-anchored cloning state (VIO thread only)
-  /// @{
-  /// Timestamp of the newest reference-camera frame (the current epoch)
-  double last_ref_frame_time = -1;
-  /// EMA of the reference camera's frame period (binding horizon scale)
-  double ref_period_ema = -1;
-
-public:
-  /// Frames snapped onto an epoch clone instead of spawning their own (telemetry)
-  uint64_t epoch_snapped = 0;
-  /// Non-reference frames that fell back to creating their own clone (telemetry)
-  uint64_t epoch_fallbacks = 0;
-
-protected:
-  /// Epoch mode: the oldest clone is marginalized when the epoch COMPLETES (next new-time message)
-  bool epoch_marg_pending = false;
-
-  /// @}
 
   /**
    * @brief Given a new set of camera images, this will track them.

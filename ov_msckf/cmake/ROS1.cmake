@@ -298,6 +298,13 @@ if (OV_MSCKF_BUILD_TESTS)
     target_link_libraries(test_virtual_anchor ov_msckf_lib ${thirdparty_libraries})
     add_test(NAME test_virtual_anchor COMMAND test_virtual_anchor)
 
+    add_executable(test_epoch_exposure_jacobian src/test_epoch_exposure_jacobian.cpp)
+    target_link_libraries(test_epoch_exposure_jacobian ov_msckf_lib ${thirdparty_libraries})
+    add_test(NAME test_epoch_exposure_jacobian COMMAND test_epoch_exposure_jacobian)
+    add_executable(test_epoch_velocity_owner src/test_epoch_velocity_owner.cpp)
+    target_link_libraries(test_epoch_velocity_owner ov_msckf_lib)
+    add_test(NAME test_epoch_velocity_owner COMMAND test_epoch_velocity_owner)
+
     add_executable(test_imu_endpoint_views src/test_imu_endpoint_views.cpp)
     target_link_libraries(test_imu_endpoint_views ov_msckf_lib ${thirdparty_libraries})
     add_test(NAME test_imu_endpoint_views COMMAND test_imu_endpoint_views)
@@ -348,26 +355,31 @@ if (OV_MSCKF_BUILD_TESTS)
             ${CMAKE_CURRENT_SOURCE_DIR}/../config/voxl_sim/estimator_config.yaml
             --traj ${CMAKE_CURRENT_SOURCE_DIR}/../ov_data/sim/udel_gore.txt
             --name synced --assert-pos-rmse 0.75 --assert-ori-rmse 0.40 --assert-nees-max 40)
-    # Async dual-mono: asserts the TARGET envelope (near-synced) and currently FAILS it by design
-    # (S0 measured: 41.9 m / 25.8 deg / NEES 5041, window halved to 0.167 s = defects B1+B5; with
-    # --jitter additionally 1135/10220 frames dropped = B3). WILL_FAIL inverts the exit code so the
-    # suite stays green while the log documents the real [FAILED]; the S4/S5 stages must REMOVE the
-    # WILL_FAIL property (and keep these asserts) to claim the async fix.
-    add_test(NAME test_async_dual_baseline_KNOWNFAIL COMMAND test_async_dual
+    # Negative control: deliberately omit asynchronous timing handling. The
+    # existing accuracy gates must reject this configuration; WILL_FAIL is
+    # confined to this explicitly named negative control.
+    add_test(NAME test_async_dual_unmodeled_timing_negative_control COMMAND test_async_dual
             ${CMAKE_CURRENT_SOURCE_DIR}/../config/voxl_sim/estimator_config.yaml
             --traj ${CMAKE_CURRENT_SOURCE_DIR}/../ov_data/sim/udel_gore.txt
             --phase1 0.0073 --dt1 0.012 --no-epoch
             --name async_baseline --assert-pos-rmse 1.0 --assert-ori-rmse 0.6 --assert-nees-max 50)
-    set_tests_properties(test_async_dual_baseline_KNOWNFAIL PROPERTIES WILL_FAIL TRUE)
-    # Epoch-anchored cloning + ACI2 bridge + deferred epoch marginalization: the unsynced dual
-    # rig now MEETS/BEATS the synced envelope (measured 0.385 m / 0.60 deg / NEES 11.2 vs synced
-    # 0.436 / 0.40 / 32 -- the staggered second camera adds temporal diversity and the per-cam dt
-    # model is more honest than the single-dt lump). Thresholds carry ~50% headroom.
+    set_tests_properties(test_async_dual_unmodeled_timing_negative_control PROPERTIES WILL_FAIL TRUE)
+    # Camera-owned stochastic transport, with the original frozen acceptance
+    # envelope. Correlated time-average NEES is a diagnostic, not MC coverage.
     add_test(NAME test_async_dual_epoch COMMAND test_async_dual
             ${CMAKE_CURRENT_SOURCE_DIR}/../config/voxl_sim/estimator_config.yaml
             --traj ${CMAKE_CURRENT_SOURCE_DIR}/../ov_data/sim/udel_gore.txt
             --phase1 0.0073 --dt1 0.012 --epoch
             --name async_epoch --assert-pos-rmse 0.60 --assert-ori-rmse 1.0 --assert-nees-max 25)
+
+    foreach(epoch_seed IN ITEMS 6 30 40)
+        add_test(NAME test_async_dual_epoch_mixed_rs_gs_${epoch_seed} COMMAND test_async_dual
+                ${CMAKE_CURRENT_SOURCE_DIR}/../config/voxl_sim/estimator_config.yaml
+                --traj ${CMAKE_CURRENT_SOURCE_DIR}/../ov_data/sim/udel_gore.txt
+                --phase1 0.0073 --dt1 0.012 --epoch --mixed-rs-gs --seed ${epoch_seed}
+                --name epoch_mixed_rs_gs_${epoch_seed}
+                --assert-pos-rmse 0.60 --assert-ori-rmse 1.0 --assert-nees-max 25)
+    endforeach()
 
     # Opt-in stochastic clone at each raw frame time, with the same asynchronous
     # trajectory, timing offsets and acceptance envelope as the epoch control.

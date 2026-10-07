@@ -167,8 +167,8 @@ void same_endpoint_covariance() {
   check(near(StateHelper::get_full_covariance(state), StateHelper::get_full_covariance(expected)) &&
             near(state->_imu->value(), expected->_imu->value()),
         "public caller matches one propagation plus both full owner-clock augmentations");
-  check(state->clone_count() == 2 && state->_clones_IMU.empty() && state->_epoch_bridges.empty() &&
-            state->_epoch_residuals.empty() && manager.get_camera_buffer()->count_released() == 1 &&
+  check(state->clone_count() == 2 && state->_clones_IMU.empty() &&
+            manager.get_camera_buffer()->count_released() == 1 &&
             manager.get_camera_buffer()->count_physical_views() == 2,
         "physical group adds two views and no legacy clone or deterministic bridge");
 }

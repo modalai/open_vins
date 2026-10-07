@@ -211,7 +211,8 @@ bool select_covered_point(const std::vector<ov_core::ImuData> &data, double time
   return true;
 }
 
-Propagator::EndpointKinematics endpoint_kinematics(const std::shared_ptr<State> &state, const ov_core::ImuData &sample) {
+Propagator::EndpointKinematics endpoint_kinematics(const std::shared_ptr<State> &state, const ov_core::ImuData &sample,
+                                                const Eigen::Vector3d &gravity) {
   const Eigen::Matrix3d Dw = State::Dm(state->_options.imu_model, state->_calib_imu_dw->value());
   const Eigen::Matrix3d Da = State::Dm(state->_options.imu_model, state->_calib_imu_da->value());
   const Eigen::Matrix3d Tg = State::Tg(state->_calib_imu_tg->value());
@@ -223,6 +224,7 @@ Propagator::EndpointKinematics endpoint_kinematics(const std::shared_ptr<State> 
   Propagator::EndpointKinematics out;
   out.omega = state->_calib_imu_GYROtoIMU->Rot() * Dw * (sample.wm - state->_imu->bias_g() - Tg * a);
   out.omega_fej = state->_calib_imu_GYROtoIMU->Rot_fej() * Dw_fej * (sample.wm - state->_imu->bias_g_fej() - Tg_fej * a_fej);
+  out.acceleration = state->_imu->Rot().transpose() * a - gravity;
   return out;
 }
 } // namespace
@@ -279,8 +281,9 @@ bool Propagator::propagate_to_imu(std::shared_ptr<State> state, double target_im
   }
 
   if (time1 == time0) {
-    const auto endpoint = endpoint_kinematics(state, endpoint_sample);
-    if (!finite_coefficients(endpoint.omega) || !finite_coefficients(endpoint.omega_fej)) return false;
+    const auto endpoint = endpoint_kinematics(state, endpoint_sample, _gravity);
+    if (!finite_coefficients(endpoint.omega) || !finite_coefficients(endpoint.omega_fej) ||
+        !finite_coefficients(endpoint.acceleration)) return false;
     out = endpoint;
     state->_timestamp = reference_timestamp;
     state->_imu_endpoint = time1;
@@ -334,8 +337,9 @@ bool Propagator::propagate_to_imu(std::shared_ptr<State> state, double target_im
   }
   assert(std::abs((time1 - time0) - dt_summed) < 1e-4);
 
-  const EndpointKinematics endpoint = endpoint_kinematics(state, endpoint_sample);
-  if (!finite_coefficients(endpoint.omega) || !finite_coefficients(endpoint.omega_fej)) return reject_mean();
+  const EndpointKinematics endpoint = endpoint_kinematics(state, endpoint_sample, _gravity);
+  if (!finite_coefficients(endpoint.omega) || !finite_coefficients(endpoint.omega_fej) ||
+      !finite_coefficients(endpoint.acceleration)) return reject_mean();
 
   // Do the update to the covariance with our "summed" state transition and IMU noise addition...
   std::vector<std::shared_ptr<Type>> Phi_order;

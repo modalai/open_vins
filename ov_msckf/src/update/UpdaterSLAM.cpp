@@ -165,9 +165,8 @@ void UpdaterSLAM::delayed_init(std::shared_ptr<State> state, std::vector<std::sh
     const double dt_cam_delta = state->uses_physical_clones() ? 0.0 : state->cam_imu_dt_delta(clone_calib.first);
     state->for_each_clone(clone_calib.first, [&](double clone_time, const std::shared_ptr<PoseJPL> &clone_pose) {
 
-      // Get current IMU pose corrected to this camera's sampling instant: EXACT bridge
-      // composition when the frame was epoch-snapped (bias correction unnecessary at
-      // triangulation accuracy), else the constant-kinematics exact-SO(3) model over the full correction
+      // Exposure views already own the camera endpoint; independent frame
+      // modes apply their relative-clock constant-kinematics correction here.
       Eigen::Matrix<double, 3, 3> R_GtoIi = clone_pose->Rot();
       Eigen::Matrix<double, 3, 1> p_IiinG = clone_pose->pos();
       const size_t clone_index = static_cast<size_t>(std::lower_bound(clonetimes.begin(), clonetimes.end(), clone_time) - clonetimes.begin());
@@ -176,36 +175,25 @@ void UpdaterSLAM::delayed_init(std::shared_ptr<State> state, std::vector<std::sh
         anchor.R_GtoC = clone_calib.second->Rot() * R_GtoIi;
         anchor.p_CinG = p_IiinG - anchor.R_GtoC.transpose() * clone_calib.second->pos();
       }
-      const PreintBridgeData *br = state->epoch_bridge(clone_calib.first, clone_time);
-      const double dt_extra = dt_cam_delta + ((br == nullptr) ? state->epoch_residual(clone_calib.first, clone_time) : 0.0);
+      const double dt_extra = dt_cam_delta;
       const auto *kin = state->clone_kinematics(clone_calib.first, clone_time);
       const bool have_kin = kin != nullptr;
+      const Eigen::Vector3d velocity = state->velocity_for_camera(clone_calib.first, clone_time);
       if (has_rolling_shutter) {
         auto &motion = _row_motion_scratch[clone_calib.first * clone_count + clone_index];
         motion.available = have_kin;
         if (have_kin) {
-          motion.omega = br != nullptr ? br->w_end : kin->omega;
-          motion.velocity = kin->vel;
-          if (br != nullptr)
-            motion.velocity += br->v_grav + R_GtoIi.transpose() * br->beta;
+          motion.omega = kin->omega;
+          motion.velocity = velocity;
         }
       }
-      if (br != nullptr && have_kin) {
-        const Eigen::Matrix3d R_clone = R_GtoIi;
-        R_GtoIi = br->DR * R_clone;
-        p_IiinG = p_IiinG + kin->vel * br->dt + br->p_grav + R_clone.transpose() * br->alpha;
-        if (std::abs(dt_extra) > 1e-10) {
-          const Eigen::Vector3d v_end = kin->vel + br->v_grav + R_clone.transpose() * br->beta;
-          R_GtoIi = exp_so3(-br->w_end * dt_extra) * R_GtoIi;
-          p_IiinG = p_IiinG + v_end * dt_extra;
-        }
-      } else if (std::abs(dt_extra) > 1e-10) {
+      if (std::abs(dt_extra) > 1e-10) {
         if (have_kin) {
-          if (legacy_exposure::uses_body_velocity(*state, clone_calib.first, br != nullptr)) {
+          if (legacy_exposure::uses_body_velocity(*state, clone_calib.first, false)) {
             legacy_exposure::warp_pose(R_GtoIi, p_IiinG, clone_pose->Rot_fej(), kin->vel, kin->omega, dt_extra);
           } else {
             R_GtoIi = exp_so3(-kin->omega * dt_extra) * R_GtoIi;
-            p_IiinG = p_IiinG + kin->vel * dt_extra;
+            p_IiinG = p_IiinG + velocity * dt_extra;
           }
         } else {
           state->_kin_miss_count++;
@@ -226,12 +214,12 @@ void UpdaterSLAM::delayed_init(std::shared_ptr<State> state, std::vector<std::sh
 
   // One temporary row-pose map serves both normal triangulation and mono retry.
   // Everything it reads is from the pre-update batch snapshot: earlier accepted
-  // landmarks can change live clones, extrinsics, readout and bridge end velocity.
+  // landmarks can change live clones, extrinsics, readout and exposure velocity.
   std::unordered_map<size_t, std::unordered_map<double, FeatureInitializer::ClonePose>> clones_cam_rs;
+  if (has_rolling_shutter) clones_cam_rs = clones_cam;
   auto triangulation_poses = [&](const Feature &feature) {
     if (!has_rolling_shutter)
       return &clones_cam;
-    clones_cam_rs = clones_cam;
     for (const auto &obs_pair : feature.timestamps) {
       size_t cam_id = obs_pair.first;
       const auto &camera = _row_camera_scratch.at(cam_id);
@@ -242,6 +230,8 @@ void UpdaterSLAM::delayed_init(std::shared_ptr<State> state, std::vector<std::sh
         double clone_time = obs_pair.second.at(m);
         if (clones_cam_rs.find(cam_id) == clones_cam_rs.end()) continue;
         if (clones_cam_rs.at(cam_id).find(clone_time) == clones_cam_rs.at(cam_id).end()) continue;
+        auto &row_pose = clones_cam_rs.at(cam_id).at(clone_time);
+        row_pose = clones_cam.at(cam_id).at(clone_time);
         const auto time = std::lower_bound(clonetimes.begin(), clonetimes.end(), clone_time);
         if (time == clonetimes.end() || *time != clone_time) continue;
         const size_t clone_index = static_cast<size_t>(time - clonetimes.begin());
@@ -251,18 +241,18 @@ void UpdaterSLAM::delayed_init(std::shared_ptr<State> state, std::vector<std::sh
         double dt_rs = (v_pixel * camera.inverse_height - rs_row_anchor) * camera.readout;
         if (std::abs(dt_rs) < 1e-10) continue;
         // Recover IMU pose from camera pose (undo camera transform)
-        Eigen::Matrix3d R_GtoCi = clones_cam_rs.at(cam_id).at(clone_time).Rot();
-        Eigen::Vector3d p_CiinG = clones_cam_rs.at(cam_id).at(clone_time).pos();
+        Eigen::Matrix3d R_GtoCi = row_pose.Rot();
+        Eigen::Vector3d p_CiinG = row_pose.pos();
         Eigen::Matrix3d R_GtoIi = R_ItoC.transpose() * R_GtoCi;
         Eigen::Vector3d p_IiinG = p_CiinG + R_GtoCi.transpose() * p_IinC;
-        // The bridge endpoint, or clone-time cache without a bridge, is the
-        // same motion model used by this batch's original residual geometry.
+        // This retained exposure motion matches the batch's original residual
+        // geometry, including when an earlier landmark changed the live state.
         R_GtoIi = exp_so3(-motion.omega * dt_rs) * R_GtoIi;
         p_IiinG = p_IiinG + motion.velocity * dt_rs;
         // Recompute camera pose
         R_GtoCi = R_ItoC * R_GtoIi;
         p_CiinG = p_IiinG - R_GtoCi.transpose() * p_IinC;
-        clones_cam_rs[cam_id][clone_time] = FeatureInitializer::ClonePose(R_GtoCi, p_CiinG);
+        row_pose = FeatureInitializer::ClonePose(R_GtoCi, p_CiinG);
       }
     }
     return &clones_cam_rs;

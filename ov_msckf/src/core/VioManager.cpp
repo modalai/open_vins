@@ -95,11 +95,13 @@ VioManager::VioManager(VioManagerOptions &params_) : thread_init_running(false),
   cv::setRNGSeed(0);
 
   // Forward manager-level knobs consumed inside the state/updaters
-  params.state_options.epoch_bridge_bias_cols = params.epoch_bridge_bias_cols;
+  params.state_options.stochastic_epoch_transport = params.use_epoch_clones();
   if (!params.state_options.configure_clone_policy(params.async_frame_clones, params.synchronize_camera_timestamps())) {
     PRINT_ERROR(RED "VioManager(): invalid camera/clone counts or total pose-clone capacity overflow\n" RESET);
     std::exit(EXIT_FAILURE);
   }
+  if (params.use_epoch_clones() && !params.state_options.configure_epoch_window(params.camera_fps))
+    throw std::invalid_argument("epoch camera rates exceed the bounded clone window; check max_epoch_clones and camera FPS");
   PRINT_DEBUG("  - resolved pose clones: %d (per-view max track: %d)\n", params.state_options.max_pose_clones(),
               params.state_options.max_clone_size);
 
@@ -114,7 +116,7 @@ VioManager::VioManager(VioManagerOptions &params_) : thread_init_running(false),
       throw std::invalid_argument("physical_camera_clones currently requires global-shutter cameras");
   }
 
-  // Config-drift guard: an unsynced multi-camera rig running WITHOUT epoch-anchored cloning
+  // Config-drift guard: an unsynced multi-camera rig running WITHOUT stochastic exposure ownership
   // clones at every camera's frame time, so the shared window covers only window/N seconds per
   // camera -- no track can reach max-track length (SLAM starves at zero features forever) and
   // near-hover MSCKF triangulation collapses with the baseline. This is exactly what a STALE
@@ -186,32 +188,6 @@ VioManager::VioManager(VioManagerOptions &params_) : thread_init_running(false),
   params.init_options.camera_imu_dt.clear();
   for (int i = 0; i < state->_options.num_cameras; ++i)
     params.init_options.camera_imu_dt.emplace((size_t)i, state->cam_imu_dt((size_t)i));
-
-  // Declared nominal frame rates seed the rate estimators that otherwise need frames to settle:
-  // the epoch binding horizon runs at design width from the FIRST reference frame (fresh start
-  // and every hard reset), instead of a 50ms bootstrap guess.
-  {
-    const int ref_id = params.state_options.cam_imu_dt_ref_camid;
-    if (params.camera_fps.count((size_t)ref_id) && params.camera_fps.at((size_t)ref_id) > 0.0) {
-      ref_period_ema = 1.0 / params.camera_fps.at((size_t)ref_id);
-    }
-
-    // Epoch-anchoring constraint: the reference must be the FASTEST declared camera. A slower
-    // reference makes a faster camera deliver >1 frame per epoch; the extras hit the
-    // one-frame-per-(camera,epoch) rule and fall back to their own clones, fragmenting the
-    // window into mixed epoch/fallback times -- the fast camera's tracks split across them,
-    // max-track/SLAM graduation starves, and the few surviving MSCKF features drag the
-    // calibration (observed on hardware with ref=30Hz vs 42Hz: calib random-walk, divergence).
-    if (params.use_epoch_clones()) {
-      for (auto const &fps : params.camera_fps) {
-        if (params.camera_fps.count((size_t)ref_id) && fps.second > params.camera_fps.at((size_t)ref_id) + 1e-6) {
-          PRINT_WARNING(RED "VioManager(): epoch reference cam%d (%.1f fps) is SLOWER than cam%zu (%.1f fps)!\n" RESET, ref_id,
-                        params.camera_fps.at((size_t)ref_id), fps.first, fps.second);
-          PRINT_WARNING(RED "\tExpect epoch-fallback churn and starved updates; set cam_imu_dt_ref_camid to the fastest camera.\n" RESET);
-        }
-      }
-    }
-  }
 
   // Lock-free async multi-camera ingest: one SPSC ring per stream, ordered release from the IMU
   // feed. Dropped frames flow through the processed-callback with processed=false so the owner can
@@ -593,9 +569,6 @@ std::shared_ptr<VioManager::Snapshot> VioManager::snapshot() {
   snap->startup_imu_time = startup_imu_time;
   snap->distance = distance;
   snap->newest_imu_time = newest_imu_time;
-  snap->last_ref_frame_time = last_ref_frame_time;
-  snap->ref_period_ema = ref_period_ema;
-  snap->epoch_marg_pending = epoch_marg_pending;
   snap->did_zupt_update = did_zupt_update;
   snap->has_moved_since_zupt = has_moved_since_zupt;
 
@@ -653,9 +626,6 @@ void VioManager::restore(const std::shared_ptr<Snapshot> &snap, const std::vecto
   tracked_camera_times = snap->tracked_camera_times;
   distance = snap->distance;
   newest_imu_time = snap->newest_imu_time;
-  last_ref_frame_time = snap->last_ref_frame_time;
-  ref_period_ema = snap->ref_period_ema;
-  epoch_marg_pending = snap->epoch_marg_pending;
   did_zupt_update = snap->did_zupt_update;
   has_moved_since_zupt = snap->has_moved_since_zupt;
 
@@ -737,60 +707,6 @@ void VioManager::restore(const std::shared_ptr<Snapshot> &snap, const std::vecto
   }
 }
 
-bool VioManager::apply_epoch_snap(double &timestamp, const std::vector<int> &sensor_ids) {
-  if (!params.use_epoch_clones() || !is_initialized_vio) {
-    return false;
-  }
-  const int ref_id = state->cam_imu_dt_ref_camid();
-  const bool has_ref = std::find(sensor_ids.begin(), sensor_ids.end(), ref_id) != sensor_ids.end();
-  if (has_ref) {
-    if (last_ref_frame_time > 0 && timestamp > last_ref_frame_time) {
-      const double period = timestamp - last_ref_frame_time;
-      ref_period_ema = (ref_period_ema > 0) ? (0.9 * ref_period_ema + 0.1 * period) : period;
-    }
-    last_ref_frame_time = timestamp; // this frame IS the new epoch
-    return false;
-  }
-  const double t_raw = timestamp;
-  const double horizon = ((ref_period_ema > 0) ? ref_period_ema : 0.05) * params.epoch_bind_factor;
-  bool can_bind = last_ref_frame_time > 0 && t_raw >= last_ref_frame_time && (t_raw - last_ref_frame_time) <= horizon &&
-                  state->_clones_IMU.find(last_ref_frame_time) != state->_clones_IMU.end();
-  if (can_bind) {
-    // One frame per (camera, epoch): a rate-beat collision falls back to its own clone
-    auto res_it = state->_epoch_residuals.find(last_ref_frame_time);
-    for (int cid : sensor_ids) {
-      if (res_it != state->_epoch_residuals.end() && res_it->second.count((size_t)cid) > 0) {
-        can_bind = false;
-      }
-    }
-  }
-  if (!can_bind) {
-    epoch_fallbacks++;
-    return false;
-  }
-  auto &residuals = state->_epoch_residuals[last_ref_frame_time];
-  for (int cid : sensor_ids) {
-    residuals[(size_t)cid] = t_raw - last_ref_frame_time;
-  }
-
-  // Build the exact ACI2 bridge over the KNOWN residual, at the current bias estimates (IMU
-  // coverage is guaranteed by the ingest release gate). If it cannot be built the updaters
-  // degrade to the first-order deterministic model for this snapped frame.
-  // Neither branch here carries the complete stochastic transport covariance.
-  Propagator::BridgeData bd;
-  const double t0_imu = last_ref_frame_time + state->cam_imu_dt_ref();
-  if (propagator->compute_bridge(state, t0_imu, t0_imu + (t_raw - last_ref_frame_time), bd)) {
-    auto &bmap = state->_epoch_bridges[last_ref_frame_time];
-    for (int cid : sensor_ids) {
-      bmap[(size_t)cid] = bd;
-    }
-  }
-
-  timestamp = last_ref_frame_time;
-  epoch_snapped++;
-  return true;
-}
-
 void VioManager::begin_physical_group(const std::vector<std::pair<size_t, double>> &keys, double imu_time) {
   if (&keys != &physical_group_keys)
     physical_group_keys = keys;
@@ -854,12 +770,17 @@ bool VioManager::prepare_physical_group() {
     view.camera_id = key.first;
     view.raw_time = key.second;
     view.imu_time = physical_group_imu_time;
-    view.pose = StateHelper::augment_pose_view(state, key.first, kinematics.omega);
+    if (state->_options.stochastic_epoch_transport &&
+        (state->_calib_camera_readout.at(key.first)->id() >= 0 ||
+         state->_calib_camera_readout.at(key.first)->value()(0) != 0.)) {
+      const auto motion = StateHelper::augment_motion_view(state, key.first, kinematics.omega, kinematics.acceleration);
+      view.pose = motion.first; view.velocity = motion.second;
+    } else view.pose = StateHelper::augment_pose_view(state, key.first, kinematics.omega);
     view.kinematics.omega = kinematics.omega;
     view.kinematics.omega_fej = kinematics.omega_fej;
     view.kinematics.vel = state->_imu->vel();
     view.kinematics.vel_fej = state->_imu->vel_fej();
-    state->_exposure_poses.push_back(std::move(view));
+    state->append_exposure_pose(std::move(view));
   }
   physical_group_valid = true;
   return true;
@@ -946,7 +867,7 @@ void VioManager::drain_camera_buffer() {
   camera_buffer->drain(
       newest_imu_time,
       [this](const std::vector<int> &sensor_ids) {
-        // Propagation and epoch bridges end in the reference camera clock even
+        // Legacy propagation uses a reference camera label even
         // when this message contains only a camera with a smaller time offset.
         return std::max(state->cam_imu_dt_ref(), state->cam_imu_dt_max_for_ids(sensor_ids));
       },
@@ -1080,7 +1001,6 @@ void VioManager::feed_measurement_simulation(double timestamp, const std::vector
   const auto trackSIM = std::dynamic_pointer_cast<TrackSIM>(trackFEATS);
 
   // Epoch-anchored cloning applies to the simulation path too (obs must land at clone times)
-  apply_epoch_snap(timestamp, camids);
 
   // Feed our simulation tracker
   if (!state->uses_physical_clones()) {
@@ -1168,13 +1088,6 @@ ov_core::CameraData VioManager::track_camera(const ov_core::CameraData &message_
     else ov_core::prepare_camera_for_tracking(message, params.downsample_cameras);
   }
 
-  // Epoch-anchored cloning: only REFERENCE-camera frames define clone times; a non-reference
-  // frame arriving within the binding horizon of the newest epoch is SNAPPED onto it -- its
-  // timestamp becomes the epoch time (bit-exact, so every obs time equals a clone time across
-  // the whole pipeline) and its KNOWN residual t_raw - t_epoch enters the measurement model's
-  // dt_total. This keeps the clone rate at the reference rate and the window baseline intact
-  // for unsynced rigs. Frames with no bindable epoch clone fall back to cloning (counted).
-  apply_epoch_snap(message.timestamp, message.sensor_ids);
 
   // Perform our feature tracking!
   trackFEATS->feed_new_camera(message);
@@ -1242,15 +1155,6 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
     PRINT_WARNING(YELLOW "image received out of order, unable to do anything (prop dt = %3f)\n" RESET,
                   (message.timestamp - state->_timestamp));
     return;
-  }
-
-  // Epoch mode defers the old-clone marginalization until the epoch is COMPLETE (a message with
-  // a NEW time arrives): every camera's own update call must still see the full window, otherwise
-  // non-reference tracks can never reach max-track length and never graduate to SLAM features
-  // (they would be consumed as short MSCKF scraps at the reference camera's call instead).
-  if (epoch_marg_pending && state->_timestamp != message.timestamp) {
-    StateHelper::marginalize_old_clone(state);
-    epoch_marg_pending = false;
   }
 
   // Propagate the state forward to the current update time
@@ -1571,7 +1475,7 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
       oldest_raw = std::min(oldest_raw, owner.raw_time);
     used_features_map.erase(used_features_map.begin(), used_features_map.lower_bound(oldest_raw));
   } else {
-    // Preserve the existing single-clone and deferred epoch lifecycle.
+    // Synchronized and independent-frame modes retain their clone lifecycle.
     updaterSLAM->change_anchors(state);
     if ((int)state->clone_count() > state->_options.max_pose_clones()) {
       trackFEATS->get_feature_database()->cleanup_measurements(state->margtimestep());
@@ -1591,15 +1495,7 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
     }
     }
 
-  // Finally marginalize the oldest clone if needed
-    if (params.use_epoch_clones()) {
-    // Defer: the epoch's remaining (snapped) camera calls must still see the full window so their
-    // tracks can reach max-track length and graduate to SLAM; executed when the next NEW-time
-    // message arrives (see the top of this function)
-    epoch_marg_pending = ((int)state->clone_count() > state->_options.max_pose_clones());
-    } else {
-      StateHelper::marginalize_old_clone(state);
-    }
+    StateHelper::marginalize_old_clone(state);
   }
   rT7 = ov_core::prof_now();
 
@@ -1626,13 +1522,12 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
   }
   PRINT_DEBUG(BLUE "[TIME]: %.4f seconds for re-tri & marg (%d clones in state)\n" RESET, time_marg, (int)state->clone_count());
 
-  // Epoch/ingest health: fallbacks should stay ~0 on a well-configured rig (fastest cam = ref).
-  // A climbing fallback count = fragmented clone window = starved updates (see the ctor guard).
+  // Bounded exposure ownership and ingest health.
   if (params.use_epoch_clones() && camera_buffer != nullptr) {
-    PRINT_DEBUG(BLUE "[EPOCH]: %llu snapped, %llu fallbacks | ingest: %llu late, %llu full, %llu bogus drops\n" RESET,
-                (unsigned long long)epoch_snapped, (unsigned long long)epoch_fallbacks,
-                (unsigned long long)camera_buffer->count_drop_late(), (unsigned long long)camera_buffer->count_drop_full(),
-                (unsigned long long)camera_buffer->count_drop_bogus());
+    PRINT_DEBUG(BLUE "[EPOCH]: %zu stochastic exposures, cap %d | ingest: %llu late, %llu full, %llu bogus drops\n" RESET,
+                  state->clone_count(), state->_options.max_pose_clones(),
+                  (unsigned long long)camera_buffer->count_drop_late(), (unsigned long long)camera_buffer->count_drop_full(),
+                  (unsigned long long)camera_buffer->count_drop_bogus());
   }
 
   std::stringstream ss;

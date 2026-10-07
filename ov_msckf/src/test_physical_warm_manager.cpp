@@ -293,7 +293,7 @@ void fresh_boot() {
   if (!manager.success()) return;
   check(state->_initialization_episode_id != 0 && state->imu_endpoint() == reference.accepted_imu_endpoint &&
         state->_timestamp == reference.reference_clock_label && state->_exposure_poses.size() == reference.owners.size() &&
-        state->_clones_IMU.empty() && state->_epoch_bridges.empty(), "manager installs physical owners and endpoint without legacy clones or bridge state");
+        state->_clones_IMU.empty(), "manager installs physical owners and endpoint without legacy clones or bridge state");
   check(near(StateHelper::get_full_covariance(state),reference.joint_covariance) && near(state->_imu->value(),reference.imu_mean),
         "manager imports complete conditional joint posterior, without another process-noise increment");
   const Eigen::Matrix3d R = state->_imu->Rot();

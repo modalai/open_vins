@@ -104,8 +104,6 @@ std::shared_ptr<State> StateHelper::clone_state(std::shared_ptr<State> state) {
   out->_options = state->_options;
   out->_kin_miss_count = state->_kin_miss_count;
   out->_clones_kinematics = state->_clones_kinematics;
-  out->_epoch_residuals = state->_epoch_residuals;
-  out->_epoch_bridges = state->_epoch_bridges;
 
   // 3) Rewire every Type-holding map/pointer to the clones
   out->_imu = std::dynamic_pointer_cast<IMU>(resolve(state->_imu));
@@ -113,10 +111,12 @@ std::shared_ptr<State> StateHelper::clone_state(std::shared_ptr<State> state) {
   out->_clones_IMU.clear();
   for (const auto &kv : state->_clones_IMU)
     out->_clones_IMU[kv.first] = std::dynamic_pointer_cast<PoseJPL>(resolve(kv.second));
-
   out->_exposure_poses = state->_exposure_poses;
-  for (auto &view : out->_exposure_poses)
+  for (auto &view : out->_exposure_poses) {
     view.pose = std::dynamic_pointer_cast<PoseJPL>(resolve(view.pose));
+    view.velocity = std::dynamic_pointer_cast<Vec>(resolve(view.velocity));
+  }
+  out->_exposure_pose_index = state->_exposure_pose_index;
 
   out->_features_SLAM.clear();
   for (const auto &kv : state->_features_SLAM)
@@ -795,8 +795,7 @@ bool StateHelper::make_initial_physical_warm_request(std::shared_ptr<State> stat
   if (!state || !episode_id || !state->uses_physical_clones() || !state->_imu || state->_imu->id() != 0 ||
       state->_variables.empty() || state->_variables.front() != state->_imu || state->_timestamp != -1. ||
       state->_initialization_episode_id || state->_imu_endpoint_valid || !state->_exposure_poses.empty() ||
-      !state->_clones_IMU.empty() || !state->_features_SLAM.empty() || !state->_clones_kinematics.empty() ||
-      !state->_epoch_residuals.empty() || !state->_epoch_bridges.empty()) return false;
+      !state->_clones_IMU.empty() || !state->_features_SLAM.empty() || !state->_clones_kinematics.empty()) return false;
   const auto &options = state->_options;
   if (options.num_cameras <= 0 || options.max_pose_clones() <= 0 || options.do_calib_camera_readout ||
       options.do_calib_imu_intrinsics || options.do_calib_imu_g_sensitivity) return false;
@@ -901,7 +900,7 @@ bool StateHelper::set_initial_state_physical_warm(std::shared_ptr<State> state, 
       !state->uses_physical_clones() || !state->_imu || state->_imu->id() != 0 ||
       state->_variables.empty() || state->_variables.front() != state->_imu || state->_Cov.rows() < 15 ||
       !state->_exposure_poses.empty() || !state->_clones_IMU.empty() || !state->_features_SLAM.empty() ||
-      !state->_clones_kinematics.empty() || !state->_epoch_residuals.empty() || !state->_epoch_bridges.empty() ||
+      !state->_clones_kinematics.empty() ||
       state->_initialization_episode_id != 0 || state->_imu_endpoint_valid) return false;
   InitPhysicalWarmRequest live;
   if(result.reset_prior!=expected_reset_prior ||
@@ -1070,6 +1069,7 @@ bool StateHelper::set_initial_state_physical_warm(std::shared_ptr<State> state, 
     variables.push_back(view.pose); owners.push_back(std::move(view));
   }
   state->_Cov.swap(covariance); state->_variables.swap(variables); state->_exposure_poses.swap(owners);
+  state->rebuild_exposure_index();
   state->_imu = std::move(imu);
   state->_timestamp = result.reference_clock_label;
   state->_imu_endpoint = result.accepted_imu_endpoint;
@@ -1711,6 +1711,32 @@ std::shared_ptr<PoseJPL> StateHelper::augment_pose_view(std::shared_ptr<State> s
   return pose;
 }
 
+std::pair<std::shared_ptr<PoseJPL>, std::shared_ptr<Vec>>
+StateHelper::augment_motion_view(std::shared_ptr<State> state, size_t clock_cam_id, const Eigen::Vector3d &omega,
+                                 const Eigen::Vector3d &acceleration) {
+  const auto clock = state->_calib_dt_CAMtoIMU_map.at(clock_cam_id);
+  if (!ov_core::numeric::finite_matrix(omega) || !ov_core::numeric::finite_matrix(acceleration))
+    throw std::invalid_argument("nonfinite stochastic exposure kinematics");
+  const auto pose = std::dynamic_pointer_cast<PoseJPL>(state->_imu->pose()->clone());
+  const auto velocity = std::dynamic_pointer_cast<Vec>(state->_imu->v()->clone());
+  const int source = state->_imu->pose()->id();
+  assert(state->_imu->v()->id() == source + 6);
+  const int old = state->_Cov.rows();
+  state->_Cov.conservativeResizeLike(Eigen::MatrixXd::Zero(old + 9, old + 9));
+  state->_Cov.block(0, old, old, 9) = state->_Cov.block(0, source, old, 9);
+  state->_Cov.block(old, 0, 9, old) = state->_Cov.block(0, old, old, 9).transpose();
+  state->_Cov.block<9,9>(old,old) = state->_Cov.block<9,9>(source,source);
+  if (clock && clock->id() >= 0) {
+    Eigen::Matrix<double,9,1> jet;
+    jet << omega, state->_imu->vel(), acceleration;
+    state->_Cov.block(0,old,state->_Cov.rows(),9) += state->_Cov.col(clock->id()) * jet.transpose();
+    state->_Cov.block(old,0,9,state->_Cov.rows()) += jet * state->_Cov.row(clock->id());
+  }
+  pose->set_local_id(old); velocity->set_local_id(old + 6);
+  state->_variables.push_back(pose); state->_variables.push_back(velocity);
+  return {pose,velocity};
+}
+
 void StateHelper::marginalize_old_clone(std::shared_ptr<State> state) {
   if (state->uses_physical_clones()) {
     if (state->_exposure_poses.size() > static_cast<size_t>(state->_options.max_pose_clones())) {
@@ -1718,7 +1744,15 @@ void StateHelper::marginalize_old_clone(std::shared_ptr<State> state) {
       // The visual owner must already have reanchored or removed landmarks
       // using this exposure. Equal-time owners are distinct covariance Types.
       StateHelper::marginalize(state, state->_exposure_poses.front().pose);
+      if (state->_exposure_poses.front().velocity)
+        StateHelper::marginalize(state, state->_exposure_poses.front().velocity);
       state->_exposure_poses.erase(state->_exposure_poses.begin());
+      if (state->_options.stochastic_epoch_transport) {
+        for (auto it = state->_exposure_pose_index.begin(); it != state->_exposure_pose_index.end();) {
+          if (it->second == 0) it = state->_exposure_pose_index.erase(it);
+          else { --it->second; ++it; }
+        }
+      }
     }
     return;
   }
@@ -1732,8 +1766,6 @@ void StateHelper::marginalize_old_clone(std::shared_ptr<State> state) {
     // Thus we just need to remove the pointer to it from our state
     state->_clones_IMU.erase(marginal_time);
     state->_clones_kinematics.erase(marginal_time);
-    state->_epoch_residuals.erase(marginal_time);
-    state->_epoch_bridges.erase(marginal_time);
   }
 }
 

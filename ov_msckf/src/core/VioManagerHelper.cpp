@@ -445,12 +445,16 @@ bool VioManager::finish_initialization(const std::shared_ptr<InitializationAttem
         view.camera_id = owner.first;
         view.raw_time = owner.second;
         view.imu_time = target;
-        view.pose = StateHelper::augment_pose_view(state, owner.first, endpoint.omega);
+        if (state->_options.stochastic_epoch_transport &&
+            (state->_calib_camera_readout.at(owner.first)->id() >= 0 || state->_calib_camera_readout.at(owner.first)->value()(0) != 0.)) {
+          const auto motion = StateHelper::augment_motion_view(state,owner.first,endpoint.omega,endpoint.acceleration);
+          view.pose = motion.first; view.velocity = motion.second;
+        } else view.pose = StateHelper::augment_pose_view(state,owner.first,endpoint.omega);
         view.kinematics.omega = endpoint.omega;
         view.kinematics.omega_fej = endpoint.omega_fej;
         view.kinematics.vel = state->_imu->vel();
         view.kinematics.vel_fej = state->_imu->vel_fej();
-        state->_exposure_poses.push_back(std::move(view));
+        state->append_exposure_pose(std::move(view));
         StateHelper::marginalize_old_clone(state);
       }
     } else {
@@ -513,11 +517,10 @@ void VioManager::retriangulate_active_tracks(const ov_core::CameraData &message)
     // IMU historical clone
     Eigen::Matrix3d R_GtoI = state->pose_for_camera(cam_id, active_tracks_time)->Rot();
     Eigen::Vector3d p_IinG = state->pose_for_camera(cam_id, active_tracks_time)->pos();
-    const double dt_cam_delta = state->uses_physical_clones() ? 0.0 : state->cam_imu_dt_delta(cam_id) + state->epoch_residual(cam_id, active_tracks_time);
+    const double dt_cam_delta = state->uses_physical_clones() ? 0.0 : state->cam_imu_dt_delta(cam_id);
     if (std::abs(dt_cam_delta) > 1e-10 && state->clone_kinematics(cam_id, active_tracks_time) != nullptr) {
       const State::CloneKinematics &kin = *state->clone_kinematics(cam_id, active_tracks_time);
-      const bool has_bridge = state->epoch_bridge(cam_id, active_tracks_time) != nullptr;
-      if (legacy_exposure::uses_body_velocity(*state, cam_id, has_bridge)) {
+      if (legacy_exposure::uses_body_velocity(*state, cam_id, false)) {
         legacy_exposure::warp_pose(R_GtoI, p_IinG, state->pose_for_camera(cam_id, active_tracks_time)->Rot_fej(),
                                     kin.vel, kin.omega, dt_cam_delta);
       } else {

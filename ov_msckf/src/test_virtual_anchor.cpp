@@ -135,21 +135,6 @@ struct Fixture {
         s->_clones_kinematics[t].vel_fej += V3(.03, -.02, .01);
         s->_clones_kinematics[t].omega_fej += V3(.01, .005, -.007);
       }
-      if (timing == 2) {
-        PreintBridgeData b;
-        b.valid = true;
-        b.dt = .018;
-        b.DR = exp_so3(-omega * b.dt);
-        b.w_end = omega;
-        b.alpha = V3(.0006, -.0003, .0012);
-        b.beta = V3(.04, -.015, .08);
-        b.p_grav = V3(0, 0, -.5 * 9.81 * b.dt * b.dt);
-        b.v_grav = V3(0, 0, -9.81 * b.dt);
-        b.J_b.topLeftCorner<3, 3>() = b.dt * M3::Identity();
-        b.J_b.block<3, 3>(3, 3) = -.5 * b.dt * b.dt * M3::Identity();
-        s->_epoch_bridges[t][1] = b;
-        s->_epoch_residuals[t][1] = b.dt;
-      }
     }
     const int n = s->max_covariance_size();
     Mat P = .001 * Mat::Identity(n, n);
@@ -168,17 +153,9 @@ struct Fixture {
     const auto kin = s->_clones_kinematics.at(t);
     M3 R = clone->Rot();
     V3 p = clone->pos(), v = kin.vel, w = kin.omega;
-    const auto b = s->epoch_bridge(camera, t);
     double tau = s->cam_imu_dt_delta(camera) +
                  (row / 480. - s->_options.rs_row_anchor) *
                      s->_calib_camera_readout.at(camera)->value()(0);
-    if (b) {
-      R = b->DR * R;
-      p += kin.vel * b->dt + b->p_grav + clone->Rot().transpose() * b->alpha;
-      v += b->v_grav + clone->Rot().transpose() * b->beta;
-      w = b->w_end;
-    } else
-      tau += s->epoch_residual(camera, t);
     R = exp_so3(-w * tau) * R;
     p += v * tau;
     return cal->Rot() * R * (point - p) + cal->pos();
@@ -323,8 +300,6 @@ void representation_checks() {
         maxfd = std::max(maxfd, (fd - hf.col(c)).cwiseAbs().maxCoeff());
       }
       // Temporal metadata changes must not redefine an already-stored landmark.
-      a.s->_epoch_bridges.clear();
-      a.s->_epoch_residuals.clear();
       a.s->_clones_kinematics.clear();
       for (int cam = 0; cam < 2; ++cam) {
         Eigen::VectorXd value(1);
@@ -338,7 +313,7 @@ void representation_checks() {
       UpdaterHelper::get_feature_jacobian_representation(a.s, f, hf2, hx2, o2);
       check(hf == hf2 && hx.size() == hx2.size() && hx[0] == hx2[0] &&
                 hx[1] == hx2[1],
-            "anchor representation is unchanged by td/RS/bridge/kinematic "
+            "anchor representation is unchanged by td/RS/kinematic "
             "metadata");
       const V3 gravity(0, 0, 1);
       const auto clone = frozen->_clones_IMU.at(f.anchor_clone_timestamp);
@@ -368,7 +343,7 @@ void system_equivalence() {
         auto b = linear(a.s, f);
         check((g.r - b.r).cwiseAbs().maxCoeff() < 1e-9,
               "global and virtual anchored means agree for physical "
-              "td/RS/bridge observations");
+              "td/RS observations");
         Mat bf = b.Hf, bx = align(a.s, b);
         auto br = b.r;
         UpdaterHelper::nullspace_project_inplace(bf, bx, br);
@@ -802,7 +777,7 @@ void rolling_shutter_retry_checks() {
   UpdaterOptions options, aruco;
   FeatureInitializerOptions fi;
   double max_seed_difference = 0.0, max_truth_error = 0.0;
-  double min_live_calibration_change = 1.0, min_live_endpoint_change = 1.0;
+  double min_live_calibration_change = 1.0;
   int retries = 0;
   for (int mode : {1, 2})
     for (bool fej : {false, true})
@@ -814,8 +789,6 @@ void rolling_shutter_retry_checks() {
           Eigen::VectorXd tr(1); tr << .03;
           a.s->_calib_camera_readout.at(1)->set_value(tr);
           a.s->_calib_camera_readout.at(1)->set_fej(tr);
-          for (auto &entry : a.s->_epoch_bridges)
-            entry.second.at(1).w_end += V3(.12, -.07, .1);
           auto first_track = a.track(true, false);
           a.point += V3(.2, .5, .6);
           auto reference = a.track(false, false);
@@ -868,21 +841,10 @@ void rolling_shutter_retry_checks() {
               (first_state->_calib_camera_readout.at(1)->value() - a.s->_calib_camera_readout.at(1)->value()).norm();
           min_live_calibration_change = std::min(min_live_calibration_change, calibration_change);
           check(calibration_change > 1e-9, "earlier insertion moves the live RS/extrinsic calibration in the retry fixture");
-          if (mode == 2) {
-            double endpoint_change = 0.0;
-            for (const auto &entry : a.s->_epoch_bridges) {
-              const auto &beta = entry.second.at(1).beta;
-              endpoint_change = std::max(endpoint_change,
-                  ((first_state->_clones_IMU.at(entry.first)->Rot().transpose() -
-                    a.s->_clones_IMU.at(entry.first)->Rot().transpose()) * beta).norm());
-            }
-            min_live_endpoint_change = std::min(min_live_endpoint_change, endpoint_change);
-            check(endpoint_change > 1e-9, "earlier insertion changes bridge endpoint velocity if recomputed from the live pose");
-          }
         }
-  check(retries == 48, "all endpoint/clone-rate, FEJ, representation and row-convention cases exercised mono retry");
-  std::printf("RS_RETRY cases=%d maxSeedDifference=%.3e maxTruthError=%.3e minLiveCalibrationChange=%.3e minLiveEndpointChange=%.3e\n",
-              retries, max_seed_difference, max_truth_error, min_live_calibration_change, min_live_endpoint_change);
+  check(retries == 48, "all timing, FEJ, representation and row-convention cases exercised mono retry");
+  std::printf("RS_RETRY cases=%d maxSeedDifference=%.3e maxTruthError=%.3e minLiveCalibrationChange=%.3e\n",
+              retries, max_seed_difference, max_truth_error, min_live_calibration_change);
 }
 
 #ifndef OV_TEST_LEGACY_RS_RETRY

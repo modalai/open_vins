@@ -61,7 +61,6 @@ VioManagerOptions options(bool enabled, int cameras = 2, bool stereo = false) {
 
 struct Manager : VioManager {
   using VioManager::VioManager;
-  using VioManager::apply_epoch_snap;
   const VioManagerOptions &resolved() const { return params; }
 };
 
@@ -86,7 +85,8 @@ void option_checks() {
     const bool independent = enabled && cameras > 1 && !stereo;
     const int expected = independent ? 4*cameras : 4;
     check(p.state_options.configure_clone_policy(enabled, stereo) && p.state_options.max_pose_clones() == expected &&
-          p.state_options.max_clone_size == 4 && p.use_async_frame_clones() == independent && p.use_epoch_clones() == !independent,
+          p.state_options.max_clone_size == 4 && p.use_async_frame_clones() == independent &&
+          p.use_epoch_clones() == (!p.synchronize_camera_timestamps() && !independent),
           "default/single/stereo/independent policies derive one finite total capacity");
     for (int reset = 0; reset < 3; ++reset)
       check(p.state_options.configure_clone_policy(enabled, stereo) && p.state_options.max_pose_clones() == expected &&
@@ -119,29 +119,32 @@ void option_checks() {
 }
 
 void manager_checks() {
-  auto raw_options = options(true), legacy_options = options(false);
-  Manager raw(raw_options), legacy(legacy_options);
-  check(raw.get_state()->_options.max_pose_clones() == 8 && legacy.get_state()->_options.max_pose_clones() == 4,
-        "manager resolves capacity before allocating state");
-  seed(raw); seed(legacy);
-  for (Manager *manager : {&raw, &legacy}) {
-    double reference_time = 1.01;
-    check(!manager->apply_epoch_snap(reference_time, {0}), "reference frame remains at its raw timestamp");
-    check(manager->get_propagator()->propagate_and_clone(manager->get_state(), reference_time), "reference clone propagation succeeds");
-  }
-  double raw_frame_time = 1.023, legacy_frame_time = raw_frame_time;
-  check(!raw.apply_epoch_snap(raw_frame_time, {1}) && raw_frame_time == 1.023 &&
-        raw.get_state()->_epoch_residuals.empty() && raw.get_state()->_epoch_bridges.empty(),
-        "opt-in independent frame retains its raw key without bridge/residual payloads");
-  check(raw.get_propagator()->propagate_and_clone(raw.get_state(), raw_frame_time) && raw.get_state()->_clones_IMU.count(1.023),
-        "opt-in frame gets its own normal stochastic clone");
-  const std::vector<double> truth_offsets{.03125, .25};
-  const double reference_truth_time = simulation_truth_time(*legacy.get_state(), truth_offsets);
-  check(legacy.apply_epoch_snap(legacy_frame_time, {1}) && legacy_frame_time == 1.01 &&
-        !legacy.get_state()->_epoch_residuals.empty(), "default policy retains the existing epoch path");
-  check(simulation_truth_time(*legacy.get_state(), truth_offsets) == reference_truth_time &&
-        reference_truth_time == 1.01 + truth_offsets[0] && reference_truth_time != 1.023 + truth_offsets[1],
-        "two camera updates at one epoch use identical returned-state truth time despite different raw stamps/offsets");
+  auto excessive=options(false);
+  excessive.epoch_mode=true;
+  excessive.state_options.max_clone_size=33;
+  bool rejected=false;
+  try { Manager invalid(excessive); }
+  catch(const std::invalid_argument &) { rejected=true; }
+  check(rejected,"undeclared-rate epoch capacity also obeys the resource bound before state allocation");
+  auto raw_options = options(true), epoch_options = options(false);
+  Manager raw(raw_options), epoch(epoch_options);
+  check(raw.get_state()->_options.max_pose_clones() == 8 && epoch.get_state()->_options.max_pose_clones() == 8,
+        "frame and stochastic epoch policies allocate their bounded exposure windows");
+  check(!raw.get_state()->uses_physical_clones() && epoch.get_state()->_options.stochastic_epoch_transport,
+        "epoch resolves to stochastic physical ownership, with no snapping policy");
+  seed(raw); seed(epoch);
+  check(raw.get_propagator()->propagate_and_clone(raw.get_state(),1.01),"raw reference clone propagation succeeds");
+  check(raw.get_propagator()->propagate_and_clone(raw.get_state(),1.023) && raw.get_state()->_clones_IMU.count(1.023),
+        "independent frame keeps its own raw stochastic clone");
+  epoch.feed_measurement_simulation(1.01,{0},{{}});
+  epoch.feed_measurement_simulation(1.023,{1},{{}});
+  check(epoch.get_state()->find_pose(0,1.01) && epoch.get_state()->find_pose(1,1.023) &&
+        !epoch.get_state()->find_pose(1,1.01) && epoch.get_state()->_clones_IMU.empty(),
+        "epoch preserves each camera raw key and covariance-owned exposure");
+  const std::vector<double> truth_offsets{.03125,.25};
+  check(simulation_truth_time(*epoch.get_state(),truth_offsets)==epoch.get_state()->imu_endpoint() &&
+        epoch.get_state()->imu_endpoint()==1.023,
+        "epoch truth scoring uses the accepted endpoint, independently of later clock relabeling");
   StateOptions alternate_clock;
   alternate_clock.num_cameras = 2;
   alternate_clock.cam_imu_dt_ref_camid = 1;
@@ -201,7 +204,7 @@ void covariance_and_capacity_checks() {
           StateHelper::get_full_covariance(a) == StateHelper::get_full_covariance(b),
           "oldest clone marginalizes exactly at the separate total capacity");
   }
-  check(a->cam_imu_dt_delta(1) == -.375 && a->_epoch_bridges.empty() && a->_epoch_residuals.empty(),
+  check(a->cam_imu_dt_delta(1) == -.375,
         "raw-frame policy preserves per-camera relative td and adds no bridge state");
 }
 

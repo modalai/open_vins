@@ -23,6 +23,8 @@
 #ifndef OV_MSCKF_STATE_OPTIONS_H
 #define OV_MSCKF_STATE_OPTIONS_H
 
+#include <algorithm>
+#include <cmath>
 #include <map>
 
 #include <limits>
@@ -30,6 +32,7 @@
 #include "types/LandmarkRepresentation.h"
 #include "utils/opencv_yaml_parse.h"
 #include "utils/print.h"
+#include "utils/finite.h"
 #include "utils/sensor_data.h"
 
 namespace ov_msckf {
@@ -75,12 +78,13 @@ struct StateOptions {
   /// (a 12ms-error seed under a 1ms prior is a 12-sigma fight the filter effectively never wins).
   double calib_cam_readout_init_sigma = 0.001;
 
-  /// Analytic IMU-bias columns from the preintegration bridge (see VioManagerOptions)
-  bool epoch_bridge_bias_cols = true;
-
   /// Retain a stochastic pose at each camera's physical exposure time. Raw
   /// observation keys stay camera-owned. Currently global-shutter only.
   bool physical_camera_clones = false;
+
+  /// Epoch scheduling with camera-owned stochastic exposure poses. Selected
+  /// by VioManager; observations keep their raw camera timestamps.
+  bool stochastic_epoch_transport = false;
 
   /// Rolling-shutter row-anchor convention: which image row the frame stamp refers to. Row v
   /// samples at stamp + (v/h - rs_row_anchor) * readout. Parsed from "rs_convention":
@@ -121,13 +125,41 @@ struct StateOptions {
   /// Configured per-view track graduation length and legacy clone-window size.
   int max_clone_size = 11;
 
+  /// Bound the exposure window needed for the slowest camera's track baseline.
+  int max_epoch_clones = 64;
+
+  bool configure_epoch_window(const std::map<size_t, double> &rates) {
+    if (max_epoch_clones < max_clone_size)
+      return false;
+    size_t declared = 0;
+    double slowest = std::numeric_limits<double>::infinity(), total_rate = 0.;
+    for (const auto &rate : rates) {
+      if (rate.first >= static_cast<size_t>(num_cameras) || !ov_core::numeric::finite(rate.second) || rate.second < 0.)
+        return false;
+      if (rate.second > 0.) {
+        ++declared;
+        slowest = std::min(slowest, rate.second);
+        total_rate += rate.second;
+      }
+    }
+    // The option parser records zero for an undeclared nominal rate.
+    if (declared != static_cast<size_t>(num_cameras))
+      return max_pose_clones() <= max_epoch_clones;
+    const double capacity = std::ceil(max_clone_size * (total_rate / slowest));
+    if (!ov_core::numeric::finite(capacity) || capacity > max_epoch_clones)
+      return false;
+    pose_clone_capacity = static_cast<int>(capacity);
+    return true;
+  }
+
   /// Resolve the total pose capacity once, without changing max_clone_size.
   /// Independent frame cloning needs one window per camera. Synchronized and
   /// single-camera configurations retain the configured capacity.
   bool configure_clone_policy(bool async_frame_clones, bool synchronized_cameras) {
     if (max_clone_size < 1 || num_cameras < 1)
       return false;
-    const int multiplier = physical_camera_clones || (async_frame_clones && !synchronized_cameras) ? num_cameras : 1;
+    const int multiplier = physical_camera_clones || stochastic_epoch_transport ||
+        (async_frame_clones && !synchronized_cameras) ? num_cameras : 1;
     if (max_clone_size > std::numeric_limits<int>::max() / multiplier)
       return false;
     pose_clone_capacity = max_clone_size * multiplier;
@@ -219,6 +251,7 @@ struct StateOptions {
 
       // State parameters
       parser->parse_config("max_clones", max_clone_size);
+      parser->parse_config("max_epoch_clones", max_epoch_clones, false);
       parser->parse_config("max_slam", max_slam_features);
       parser->parse_config("max_slam_in_update", max_slam_in_update);
       parser->parse_config("max_msckf_in_update", max_msckf_in_update);

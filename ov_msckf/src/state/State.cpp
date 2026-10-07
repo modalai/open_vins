@@ -30,7 +30,7 @@ State::State(StateOptions &options) {
 
   // Save our options
   _options = options;
-  if (_options.physical_camera_clones) {
+  if (uses_physical_clones()) {
     _exposure_poses.reserve(static_cast<size_t>(_options.max_pose_clones()) + static_cast<size_t>(_options.num_cameras));
   }
   if (_options.cam_imu_dt_ref_camid < 0 || _options.cam_imu_dt_ref_camid >= _options.num_cameras) {

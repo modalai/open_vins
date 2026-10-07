@@ -59,8 +59,7 @@ public:
    * (each cloned variable keeps its local id), rebuilds every state map (_imu, _clones_IMU,
    * _features_SLAM, calib, intrinsics) to point at the cloned variables, preserves the
    * _calib_dt_CAMtoIMU alias into _calib_dt_CAMtoIMU_map, deep-copies the camera intrinsic
-   * objects, and copies all non-covariance metadata (_clones_kinematics, _epoch_residuals,
-   * _epoch_bridges, _timestamp, _options, _kin_miss_count).
+   * objects, and copies kinematics, exposure ownership, clocks, options and counters.
    *
    * This is the core primitive behind the replay harness's snapshot / rewind / branch. It has
    * private access to _Cov and _variables, which is why it lives on StateHelper.
@@ -344,6 +343,12 @@ public:
    */
   static void augment_clone(std::shared_ptr<State> state, Eigen::Matrix<double, 3, 1> last_w,
                             Eigen::Matrix<double, 3, 1> last_w_fej);
+
+  /// Joint pose/velocity clone and sparse owner-clock congruence. The 9D
+  /// owner grows the dense covariance once, preserving every cross block.
+  static std::pair<std::shared_ptr<ov_type::PoseJPL>, std::shared_ptr<ov_type::Vec>>
+  augment_motion_view(std::shared_ptr<State> state, size_t clock_cam_id, const Eigen::Vector3d &omega,
+                      const Eigen::Vector3d &acceleration);
 
   /**
    * Append an owned pose view with sparse Jacobian E_pose + [omega; v] e_clock^T.

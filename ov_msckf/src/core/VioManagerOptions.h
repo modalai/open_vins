@@ -139,8 +139,6 @@ struct VioManagerOptions {
     if (parser != nullptr) {
       parser->parse_config("dt_slam_delay", dt_slam_delay);
       parser->parse_config("try_zupt", try_zupt);
-      parser->parse_config("epoch_bind_factor", epoch_bind_factor, false);
-      parser->parse_config("epoch_bridge_bias_cols", epoch_bridge_bias_cols, false);
       parser->parse_config("async_ring_size", async_ring_size, false);
       parser->parse_config("async_guard", async_guard, false);
       parser->parse_config("async_stale_factor", async_stale_factor, false);
@@ -154,8 +152,6 @@ struct VioManagerOptions {
       parser->parse_config("record_timing_filepath", record_timing_filepath);
     }
     PRINT_DEBUG("  - dt_slam_delay: %.1f\n", dt_slam_delay);
-    PRINT_DEBUG("  - epoch_bind_factor: %.2f\n", epoch_bind_factor);
-    PRINT_DEBUG("  - epoch_bridge_bias_cols: %d\n", epoch_bridge_bias_cols);
     PRINT_DEBUG("  - async_ring_size: %d\n", async_ring_size);
     PRINT_DEBUG("  - async_guard: %.4f\n", async_guard);
     PRINT_DEBUG("  - async_stale_factor: %.2f\n", async_stale_factor);
@@ -244,15 +240,15 @@ struct VioManagerOptions {
   /// Rotation from accelerometer to the "IMU" gyroscope frame frame
   Eigen::Matrix<double, 4, 1> q_GYROtoIMU;
 
-  /// Epoch-anchored cloning: clones are created only at REFERENCE-camera frame times; other
-  /// cameras' frames snap onto the previous epoch clone (known residual enters the measurement
-  /// model) instead of spawning their own clones. Restores the full clone-window baseline for
-  /// unsynced multi-camera rigs (defect B1). Frames with no bindable epoch fall back to cloning.
+  /// Unsynchronized epoch policy: retain camera-owned stochastic exposure
+  /// views in physical time, with a bounded time window resolved from declared
+  /// rates. This carries the transport process noise and state cross terms
+  /// through delayed visual updates; raw observation timestamps never snap.
   bool epoch_mode = false;
 
   /// Opt-in stochastic clone at every independent camera's raw frame time.
   /// Normal propagation owns the complete clone covariance and cross blocks.
-  /// This bypasses epoch bridges and expands only the total pose capacity;
+  /// This expands only the total pose capacity;
   /// per-camera feature graduation still uses the configured max_clones.
   /// Pose time remains raw frame time + reference td; the existing relative
   /// per-camera td and rolling-shutter transport models remain in use.
@@ -286,13 +282,6 @@ struct VioManagerOptions {
     PRINT_DEBUG("  - physical_camera_clones: %d\n", state_options.physical_camera_clones);
   }
 
-  /// Epoch binding horizon as a multiple of the reference camera's frame period
-  double epoch_bind_factor = 1.2;
-
-  /// Analytic IMU-bias columns from the preintegration bridge (escape hatch: set false if
-  /// vibration/mismodeling lets camera residuals over-drive the biases)
-  bool epoch_bridge_bias_cols = true;
-
   /// Async camera ingest: per-camera ring capacity (frames)
   int async_ring_size = 16;
 
@@ -316,7 +305,7 @@ struct VioManagerOptions {
   std::map<size_t, bool> camera_shutter_rolling;
 
   /// Per-camera NOMINAL frame rate (Hz) from the estimator config (camN_fps). Used to seed the
-  /// epoch-period/staleness EMAs before they converge and to sanity-check the readout time.
+  /// staleness EMAs, size the epoch exposure window, and check the readout time.
   /// 0 = undeclared.
   std::map<size_t, double> camera_fps;
 

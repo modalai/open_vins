@@ -35,7 +35,6 @@
 #include <unordered_map>
 #include <vector>
 
-#include "PreintegrationBridge.h"
 #include "StateOptions.h"
 #include "cam/CamBase.h"
 #include "types/IMU.h"
@@ -83,11 +82,11 @@ public:
   /// FEJ twins). Consumed by the per-camera time-offset / rolling-shutter measurement models as the
   /// CLONE-SIDE Jacobian linearization point. Metadata only -- never in the state vector/covariance.
   ///
-  /// Design rationale: freezing these at augment time is exactly what FEJ prescribes for
-  /// clone-anchored Jacobians (the fej twins), and cheaper by ~2x in clone-block covariance work
-  /// than carrying velocity inside each clone. Value-side pose shifts to measurement time must NOT
-  /// rely on the cached velocity over long gaps -- the preintegration bridge integrates the actual
-  /// IMU samples for that; the cached values remain only linearization points. omega is the
+  /// Legacy modes use the cached world velocity. Stochastic epoch RS views
+  /// instead read their live velocity Type and its immutable FEJ value; this
+  /// metadata does not substitute for that velocity's covariance.
+  /// FEJ metadata stays frozen at augmentation. Long inter-camera intervals
+  /// use actual navigation propagation and stochastic exposure ownership. omega is the
   /// intrinsics/bias-corrected gyro at the clone instant (select_imu_readings boundary-interpolated),
   /// matching the dnc_dt = [w; v] augment Jacobian. Lifecycle: augment_clone stores, marginalize
   /// erases, warmstart restore rebuilds by finite differences; consumers must use tolerant lookups.
@@ -107,11 +106,43 @@ public:
     double raw_time = -1.0;
     double imu_time = -1.0;
     std::shared_ptr<ov_type::PoseJPL> pose;
+    std::shared_ptr<ov_type::Vec> velocity;
     CloneKinematics kinematics;
   };
 
-  bool uses_physical_clones() const { return _options.physical_camera_clones; }
+  bool uses_physical_clones() const { return _options.physical_camera_clones || _options.stochastic_epoch_transport; }
   size_t clone_count() const { return uses_physical_clones() ? _exposure_poses.size() : _clones_IMU.size(); }
+
+  const ExposurePose *exposure_for_camera(size_t camera_id, double raw_time) const {
+    if (_options.stochastic_epoch_transport) {
+      const auto key = std::make_pair(camera_id, ov_core::initializer_time_bits(raw_time));
+      const auto entry = _exposure_pose_index.find(key);
+      return entry == _exposure_pose_index.end() ? nullptr : &_exposure_poses.at(entry->second);
+    }
+    for (const auto &view : _exposure_poses)
+      if (view.camera_id == camera_id && ov_core::initializer_time_bits(view.raw_time) == ov_core::initializer_time_bits(raw_time))
+        return &view;
+    return nullptr;
+  }
+
+  void append_exposure_pose(ExposurePose view) {
+    if (_options.stochastic_epoch_transport) {
+      const auto key = std::make_pair(view.camera_id, ov_core::initializer_time_bits(view.raw_time));
+      if (!_exposure_pose_index.emplace(key, _exposure_poses.size()).second)
+        throw std::logic_error("duplicate stochastic exposure owner");
+    }
+    _exposure_poses.push_back(std::move(view));
+  }
+
+  void rebuild_exposure_index() {
+    _exposure_pose_index.clear();
+    if (!_options.stochastic_epoch_transport) return;
+    for (size_t i = 0; i < _exposure_poses.size(); ++i) {
+      const auto &view = _exposure_poses[i];
+      if (!_exposure_pose_index.emplace(std::make_pair(view.camera_id, ov_core::initializer_time_bits(view.raw_time)),i).second)
+        throw std::logic_error("duplicate stochastic exposure owner");
+    }
+  }
 
   /// A pre-first-propagation state may still carry the initializer's camera
   /// clock label. After any accepted propagation/ZUPT, the stored endpoint is
@@ -125,9 +156,8 @@ public:
       auto it = _clones_IMU.find(raw_time);
       return it == _clones_IMU.end() ? nullptr : it->second;
     }
-    for (const auto &view : _exposure_poses)
-      if (view.camera_id == camera_id && ov_core::initializer_time_bits(view.raw_time) == ov_core::initializer_time_bits(raw_time))
-        return view.pose;
+    if (const auto *view = exposure_for_camera(camera_id, raw_time))
+      return view->pose;
     return nullptr;
   }
 
@@ -143,10 +173,27 @@ public:
       auto it = _clones_kinematics.find(raw_time);
       return it == _clones_kinematics.end() ? nullptr : &it->second;
     }
-    for (const auto &view : _exposure_poses)
-      if (view.camera_id == camera_id && ov_core::initializer_time_bits(view.raw_time) == ov_core::initializer_time_bits(raw_time))
-        return &view.kinematics;
+    if (const auto *view = exposure_for_camera(camera_id, raw_time))
+      return &view->kinematics;
     return nullptr;
+  }
+
+  std::shared_ptr<ov_type::Vec> clone_velocity(size_t camera_id, double raw_time) const {
+    if (uses_physical_clones()) {
+      if (const auto *view = exposure_for_camera(camera_id, raw_time))
+        return view->velocity;
+      return nullptr;
+    }
+    return nullptr;
+  }
+
+  Eigen::Vector3d velocity_for_camera(size_t camera_id, double raw_time, bool fej = false) const {
+    if (const auto velocity = clone_velocity(camera_id, raw_time))
+      return fej ? Eigen::Vector3d(velocity->fej()) : Eigen::Vector3d(velocity->value());
+    const auto *kinematics = clone_kinematics(camera_id, raw_time);
+    if (!kinematics)
+      return Eigen::Vector3d::Zero();
+    return fej ? kinematics->vel_fej : kinematics->vel;
   }
 
   /// Bounded allocation-free traversal. Legacy mode exposes its shared clone
@@ -410,39 +457,9 @@ public:
   /// Kinematic metadata at each clone time (metadata, not in state/covariance)
   std::map<double, CloneKinematics> _clones_kinematics;
 
-  /// Epoch-mode KNOWN time residuals: for a frame of camera c snapped onto the epoch clone at
-  /// time t, _epoch_residuals[t][c] = t_raw - t_epoch (its true sampling instant relative to the
-  /// clone, in the camera clock). Consumed additively in the measurement models' dt_total.
-  /// Metadata only; erased with the clone at marginalization.
-  std::map<double, std::map<size_t, double>> _epoch_residuals;
-
-  /// KNOWN epoch time residual for (camera, clone time); 0 when none was recorded
-  double epoch_residual(size_t cam_id, double clone_time) const {
-    if (uses_physical_clones())
-      return 0.0;
-    auto it = _epoch_residuals.find(clone_time);
-    if (it == _epoch_residuals.end()) {
-      return 0.0;
-    }
-    auto it2 = it->second.find(cam_id);
-    return (it2 == it->second.end()) ? 0.0 : it2->second;
-  }
-
-  /// ACI2 preintegration bridges for epoch-snapped frames, keyed like _epoch_residuals.
-  /// Built once per (camera, epoch) at bind time; erased with the clone.
-  std::map<double, std::map<size_t, PreintBridgeData>> _epoch_bridges;
-
-  /// Bridge lookup for (camera, clone time); nullptr when none exists (first-order fallback)
-  const PreintBridgeData *epoch_bridge(size_t cam_id, double clone_time) const {
-    if (uses_physical_clones())
-      return nullptr;
-    auto it = _epoch_bridges.find(clone_time);
-    if (it == _epoch_bridges.end()) {
-      return nullptr;
-    }
-    auto it2 = it->second.find(cam_id);
-    return (it2 == it->second.end() || !it2->second.valid) ? nullptr : &it2->second;
-  }
+  /// Epoch exposure resolution is O(log K), rather than scanning K owners
+  /// for each of the O(K) observations of every feature track.
+  std::map<std::pair<size_t, uint64_t>, size_t> _exposure_pose_index;
 
   /// Calibration poses for each camera (R_ItoC, p_IinC)
   std::unordered_map<size_t, std::shared_ptr<ov_type::PoseJPL>> _calib_IMUtoCAM;
