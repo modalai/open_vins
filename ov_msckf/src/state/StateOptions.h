@@ -62,8 +62,8 @@ struct StateOptions {
   /// final use_stereo is known); an explicit calib_cam_stereo_lock_soft in the YAML always wins.
   bool calib_cam_stereo_lock_soft = false;
   bool calib_cam_stereo_lock_soft_explicit = false; ///< calib_cam_stereo_lock_soft was set in the YAML
-  double calib_cam_stereo_lock_sigma_rot = 0.0044; // rad (~0.25 deg)
-  double calib_cam_stereo_lock_sigma_pos = 0.002;  // m
+  double calib_cam_stereo_lock_sigma_rot = 0.0088; // rad (~0.5 deg)
+  double calib_cam_stereo_lock_sigma_pos = 0.008;  // m
 
   /// True if camera cam_id's imu-to-camera pose is an estimated state variable
   bool calib_camera_pose_estimated(size_t cam_id) const {
