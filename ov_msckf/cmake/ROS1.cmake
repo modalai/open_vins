@@ -318,6 +318,10 @@ if (OV_MSCKF_BUILD_TESTS)
     target_link_libraries(test_innovation_guards ov_msckf_lib ${thirdparty_libraries})
     add_test(NAME test_innovation_guards COMMAND test_innovation_guards)
 
+    add_executable(test_stereo_lock src/test_stereo_lock.cpp)
+    target_link_libraries(test_stereo_lock ov_msckf_lib ${thirdparty_libraries})
+    add_test(NAME test_stereo_lock COMMAND test_stereo_lock)
+
     add_executable(test_ekf_update_atomic src/test_ekf_update_atomic.cpp)
     target_link_libraries(test_ekf_update_atomic ov_msckf_lib ${thirdparty_libraries})
     add_test(NAME test_ekf_update_atomic COMMAND test_ekf_update_atomic)
