@@ -181,6 +181,22 @@ struct StateOptions {
   /// What representation our features are in (aruco tag features)
   ov_type::LandmarkRepresentation::Representation feat_rep_aruco = ov_type::LandmarkRepresentation::Representation::GLOBAL_3D;
 
+  /// Stereo lock keys (all optional); records whether calib_cam_stereo_lock_soft was set explicitly
+  void parse_stereo_lock(const std::shared_ptr<ov_core::YamlParser> &parser) {
+    parser->parse_config("calib_cam_stereo_locked", calib_cam_stereo_locked, false);
+    {
+      // presence check without a parser API: an absent key leaves both opposite defaults untouched
+      bool lo = false, hi = true;
+      parser->parse_config("calib_cam_stereo_lock_soft", lo, false);
+      parser->parse_config("calib_cam_stereo_lock_soft", hi, false);
+      calib_cam_stereo_lock_soft_explicit = (lo == hi);
+      if (calib_cam_stereo_lock_soft_explicit)
+        calib_cam_stereo_lock_soft = lo;
+    }
+    parser->parse_config("calib_cam_stereo_lock_sigma_rot", calib_cam_stereo_lock_sigma_rot, false);
+    parser->parse_config("calib_cam_stereo_lock_sigma_pos", calib_cam_stereo_lock_sigma_pos, false);
+  }
+
   /// Nice print function of what parameters we have loaded
   void print(const std::shared_ptr<ov_core::YamlParser> &parser = nullptr) {
     if (parser != nullptr) {
@@ -203,18 +219,7 @@ struct StateOptions {
 
       // Calibration booleans
       parser->parse_config("calib_cam_extrinsics", do_calib_camera_pose);
-      parser->parse_config("calib_cam_stereo_locked", calib_cam_stereo_locked, false);
-      {
-        // presence check without a parser API: an absent key leaves both opposite defaults untouched
-        bool lo = false, hi = true;
-        parser->parse_config("calib_cam_stereo_lock_soft", lo, false);
-        parser->parse_config("calib_cam_stereo_lock_soft", hi, false);
-        calib_cam_stereo_lock_soft_explicit = (lo == hi);
-        if (calib_cam_stereo_lock_soft_explicit)
-          calib_cam_stereo_lock_soft = lo;
-      }
-      parser->parse_config("calib_cam_stereo_lock_sigma_rot", calib_cam_stereo_lock_sigma_rot, false);
-      parser->parse_config("calib_cam_stereo_lock_sigma_pos", calib_cam_stereo_lock_sigma_pos, false);
+      parse_stereo_lock(parser);
       parser->parse_config("calib_cam_intrinsics", do_calib_camera_intrinsics);
       parser->parse_config("calib_cam_timeoffset", do_calib_camera_timeoffset);
       parser->parse_config("cam_imu_dt_ref_camid", cam_imu_dt_ref_camid, false);

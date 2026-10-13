@@ -285,6 +285,15 @@ struct VioManagerOptions {
     PRINT_DEBUG("  - physical_camera_clones: %d\n", state_options.physical_camera_clones);
   }
 
+  /// Soft stereo lock is the default for stereo tracking: the stereo measurements are only geometrically consistent if
+  /// cam1's extrinsic stays tied to cam0's through T_01. Resolve once the final use_stereo is known (the owner may
+  /// override it after loading the YAML); an explicit calib_cam_stereo_lock_soft keeps its value.
+  void resolve_stereo_lock() {
+    StateOptions &so = state_options;
+    if (!so.calib_cam_stereo_lock_soft_explicit)
+      so.calib_cam_stereo_lock_soft = use_stereo && so.num_cameras == 2 && so.do_calib_camera_pose && !so.calib_cam_stereo_locked;
+  }
+
   /// Epoch binding horizon as a multiple of the reference camera's frame period
   double epoch_bind_factor = 1.2;
 
