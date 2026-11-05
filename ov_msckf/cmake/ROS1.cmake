@@ -76,6 +76,12 @@ endif ()
 
 target_link_libraries(ov_msckf_lib ${thirdparty_libraries})
 target_include_directories(ov_msckf_lib PUBLIC src/)
+if (NOT catkin_FOUND OR NOT ENABLE_ROS)
+    # Standalone install: the libraries share lib/ and resolve each other (and
+    # ov_core's optional libov_modal_flow_host) without LD_LIBRARY_PATH; RUNPATH
+    # is not transitive, so each library needs its own.
+    set_target_properties(ov_msckf_lib PROPERTIES INSTALL_RPATH "$ORIGIN")
+endif ()
 install(TARGETS ov_msckf_lib
         ARCHIVE DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}
         LIBRARY DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}
@@ -84,6 +90,17 @@ install(TARGETS ov_msckf_lib
 install(DIRECTORY src/
         DESTINATION ${CATKIN_GLOBAL_INCLUDE_DESTINATION}
         FILES_MATCHING PATTERN "*.h" PATTERN "*.hpp"
+)
+
+# ROS-free VIO over the ov_core sensor stream (stdin) with a binary result
+# stream (stdout): voxl-logger logs and ROS 1/2 bags replayed by the studio.
+add_executable(ov_msckf_replay src/run_replay_msckf.cpp)
+target_link_libraries(ov_msckf_replay ov_msckf_lib ${thirdparty_libraries} ${CMAKE_DL_LIBS})
+if (NOT catkin_FOUND OR NOT ENABLE_ROS)
+    set_target_properties(ov_msckf_replay PROPERTIES INSTALL_RPATH "$ORIGIN/../${CMAKE_INSTALL_LIBDIR}")
+endif ()
+install(TARGETS ov_msckf_replay
+        RUNTIME DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
 
 ##################################################

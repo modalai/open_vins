@@ -119,4 +119,11 @@ install(DIRECTORY launch/ DESTINATION share/${PROJECT_NAME}/launch/)
 install(DIRECTORY ../config/ DESTINATION share/${PROJECT_NAME}/config/)
 
 # finally define this as the package
+# ROS-free VIO over the ov_core sensor stream (stdin) with a binary result
+# stream (stdout): voxl-logger logs and ROS 1/2 bags replayed by the studio.
+add_executable(ov_msckf_replay src/run_replay_msckf.cpp)
+ament_target_dependencies(ov_msckf_replay ${ament_libraries})
+target_link_libraries(ov_msckf_replay ov_msckf_lib ${thirdparty_libraries} ${CMAKE_DL_LIBS})
+install(TARGETS ov_msckf_replay DESTINATION lib/${PROJECT_NAME})
+
 ament_package()

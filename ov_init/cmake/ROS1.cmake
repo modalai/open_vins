@@ -98,6 +98,12 @@ endif ()
 
 target_link_libraries(ov_init_lib ${thirdparty_libraries})
 target_include_directories(ov_init_lib PUBLIC src/)
+if (NOT catkin_FOUND OR NOT ENABLE_ROS)
+    # Standalone install: the libraries share lib/ and resolve each other (and
+    # ov_core's optional libov_modal_flow_host) without LD_LIBRARY_PATH; RUNPATH
+    # is not transitive, so each library needs its own.
+    set_target_properties(ov_init_lib PROPERTIES INSTALL_RPATH "$ORIGIN")
+endif ()
 install(TARGETS ov_init_lib
         ARCHIVE DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}
         LIBRARY DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}
