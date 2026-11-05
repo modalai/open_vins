@@ -1,0 +1,10 @@
+# The top-level CMakeLists.txt is the ROS-free superbuild. Discover the ROS
+# packages directly so colcon does not identify that superbuild as one package.
+build:
+  base-paths: [ov_core, ov_init, ov_msckf, ov_eval, ov_zcalib]
+test:
+  base-paths: [ov_core, ov_init, ov_msckf, ov_eval, ov_zcalib]
+list:
+  base-paths: [ov_core, ov_init, ov_msckf, ov_eval, ov_zcalib]
+graph:
+  base-paths: [ov_core, ov_init, ov_msckf, ov_eval, ov_zcalib]

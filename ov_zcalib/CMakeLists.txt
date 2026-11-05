@@ -11,6 +11,27 @@ cmake_minimum_required(VERSION 3.5)
 project(ov_zcalib)
 
 find_package(Eigen3 REQUIRED)
+include(GNUInstallDirs)
+include(${CMAKE_CURRENT_SOURCE_DIR}/../ov_core/cmake/EigenAbi.cmake)
+
+# This module is also a first-class catkin/ament package. The ROS-free
+# superbuild already supplies the two library targets and needs no ROS discovery.
+set(ZCALIB_ROS_VERSION 0)
+if (CATKIN_DEVEL_PREFIX OR "$ENV{ROS_VERSION}" STREQUAL "1")
+    find_package(catkin REQUIRED COMPONENTS roscpp sensor_msgs cv_bridge ov_core ov_init)
+    set(ZCALIB_ROS_VERSION 1)
+    catkin_package(INCLUDE_DIRS src LIBRARIES ov_zcalib_lib
+        CATKIN_DEPENDS roscpp sensor_msgs cv_bridge ov_core ov_init DEPENDS Eigen3)
+    include_directories(${catkin_INCLUDE_DIRS})
+elseif ("$ENV{ROS_VERSION}" STREQUAL "2")
+    find_package(ament_cmake REQUIRED)
+    find_package(rclcpp REQUIRED)
+    find_package(sensor_msgs REQUIRED)
+    find_package(cv_bridge REQUIRED)
+    find_package(ov_core REQUIRED)
+    find_package(ov_init REQUIRED)
+    set(ZCALIB_ROS_VERSION 2)
+endif ()
 
 include_directories(
         src
@@ -57,8 +78,16 @@ if (NOT DISABLE_TRACK_KLT)
 endif ()
 
 add_library(ov_zcalib_lib SHARED ${OV_ZCALIB_LIB_SOURCES})
-target_link_libraries(ov_zcalib_lib ov_core_lib ov_init_lib)
+if (TARGET ov_core_lib AND TARGET ov_init_lib)
+    target_link_libraries(ov_zcalib_lib ov_core_lib ov_init_lib)
+endif ()
 target_include_directories(ov_zcalib_lib PUBLIC src/)
+target_compile_definitions(ov_zcalib_lib PUBLIC ${OV_EIGEN_ABI_DEFINITIONS})
+if (ZCALIB_ROS_VERSION EQUAL 2)
+    ament_target_dependencies(ov_zcalib_lib ov_core ov_init)
+elseif (ZCALIB_ROS_VERSION EQUAL 1)
+    target_link_libraries(ov_zcalib_lib ${catkin_LIBRARIES})
+endif ()
 
 install(TARGETS ov_zcalib_lib
         LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
@@ -148,3 +177,35 @@ endif ()
 # constrain it — on-target replay is how solve-time work gets measured.
 add_executable(ov_zcalibrate src/run_calibrate.cpp)
 target_link_libraries(ov_zcalibrate ov_zcalib_lib)
+if (ZCALIB_ROS_VERSION EQUAL 0)
+    set_target_properties(ov_zcalib_lib PROPERTIES INSTALL_RPATH "$ORIGIN")
+    set_target_properties(ov_zcalibrate PROPERTIES INSTALL_RPATH "$ORIGIN/../${CMAKE_INSTALL_LIBDIR}")
+    install(TARGETS ov_zcalibrate RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+else ()
+    install(TARGETS ov_zcalibrate RUNTIME DESTINATION lib/${PROJECT_NAME})
+    # Capture uses the existing default TrackKLT frontend. Device replay builds
+    # may deliberately strip it; they still build the calibrator and the viewer.
+    if (NOT DISABLE_TRACK_KLT)
+        find_package(OpenCV REQUIRED)
+        if (ZCALIB_ROS_VERSION EQUAL 2)
+            add_executable(ov_zcalib_capture src/ros/Ros2Capture.cpp)
+            ament_target_dependencies(ov_zcalib_capture rclcpp sensor_msgs cv_bridge ov_core ov_init)
+        else ()
+            add_executable(ov_zcalib_capture src/ros/Ros1Capture.cpp)
+            target_include_directories(ov_zcalib_capture PRIVATE ${catkin_INCLUDE_DIRS})
+            target_link_libraries(ov_zcalib_capture ${catkin_LIBRARIES})
+        endif ()
+        target_include_directories(ov_zcalib_capture PRIVATE ${OpenCV_INCLUDE_DIRS})
+        target_link_libraries(ov_zcalib_capture ov_zcalib_lib ${OpenCV_LIBRARIES})
+        install(TARGETS ov_zcalib_capture RUNTIME DESTINATION lib/${PROJECT_NAME})
+    endif ()
+endif ()
+install(DIRECTORY src/ DESTINATION include/${PROJECT_NAME}
+    FILES_MATCHING PATTERN "*.h")
+if (ZCALIB_ROS_VERSION EQUAL 2)
+    ament_export_include_directories(include/${PROJECT_NAME})
+    ament_export_libraries(ov_zcalib_lib)
+    ament_export_dependencies(ov_core ov_init Eigen3)
+    ament_export_definitions(${OV_EIGEN_ABI_DEFINITIONS})
+    ament_package()
+endif ()

@@ -1,0 +1,22 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>ov_zcalib</name>
+  <version>2.7.0</version>
+  <description>Targetless visual-inertial calibration, replay, and default-tracker ROS capture.</description>
+  <maintainer email="pgeneva@udel.edu">OpenVINS maintainers</maintainer>
+  <license>GPL-3.0-or-later</license>
+  <buildtool_depend condition="$ROS_VERSION == 1">catkin</buildtool_depend>
+  <buildtool_depend condition="$ROS_VERSION == 2">ament_cmake</buildtool_depend>
+  <depend condition="$ROS_VERSION == 1">roscpp</depend>
+  <depend condition="$ROS_VERSION == 2">rclcpp</depend>
+  <depend>sensor_msgs</depend>
+  <depend>cv_bridge</depend>
+  <depend>ov_core</depend>
+  <depend>ov_init</depend>
+  <depend>eigen</depend>
+  <depend>libopencv-dev</depend>
+  <export>
+    <build_type condition="$ROS_VERSION == 1">catkin</build_type>
+    <build_type condition="$ROS_VERSION == 2">ament_cmake</build_type>
+  </export>
+</package>
