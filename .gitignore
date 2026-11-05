@@ -11,3 +11,14 @@ doxgen_generated
 *.swo
 doc
 .vscode
+__pycache__/
+*.pyc
+*.egg-info/
+.pytest_cache/
+/build-*/
+/install-*/
+/log-*/
+/install/
+/log/
+/.drivers/
+.python-deps/
