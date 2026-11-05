@@ -29,7 +29,7 @@ Two front doors, one engine:
 | `src/init/` | bootstrap: relative-rotation models, coarse xcorr, hand-eye, geometric rotation/time refinement |
 | `src/solve/` | per-window micro-BA + reduced-information export, cross-window VarPro fusion (JointCalib), factors |
 | `src/types/` | shared calibration state, imu2 intrinsic model, kalibr chain conversion |
-| `src/utils/` | session record (kFormat 5), lock-free SPSC rings, voxl-logger feeder, atomic YAML writeback |
+| `src/utils/` | session record (kFormat 7; reads 5/6/7), lock-free SPSC rings, voxl-logger feeder, atomic YAML writeback |
 | `src/window/` | excitation-gated harvester, diversity reservoir + D-optimal selection, arrowhead linear seeder |
 | `src/sim/` | synthetic targetless world shared by the tests |
 
@@ -54,8 +54,9 @@ IMU-frame vectors into the camera frame, left-quaternion error, gravity
   `--tr <s>` on the CLI *is* that value; 0 means global shutter.
 - `td` is defined against center stamps and consumed verbatim by the chain,
   VIO, and the hot-start path.
-- Session records are **kFormat 5**; older-format records refuse loudly —
-  re-record rather than guess at stamp semantics.
+- New session records are **kFormat 7**, with a checked completion footer.
+  Formats 5/6 remain readable with completeness unknown; formats older than 5
+  are refused rather than guessing at timestamp semantics.
 
 ## Statistical honesty (the gates)
 
@@ -117,7 +118,7 @@ cross-binary byte equality is not attainable under `-ffast-math`.
 
 ```
 ov_zcalibrate --replay session.bin --out cal.yaml \
-              --tr 0.007777778 --solve-budget-s 60      # faithful replay
+              --solve-budget-s 60 --report-json cal.report.json
 ov_zcalibrate --voxl /path/log0001 --flight             # voxl-logger log
 ov_zcalibrate --selftest                                # writeback smoke
 ```
@@ -125,9 +126,14 @@ ov_zcalibrate --selftest                                # writeback smoke
 - A device session's record mirror replays bit-identically on the same
   binary; cross-platform replays gate on value tolerances plus identical
   gate/commit decisions.
-- Records do not carry `--tr` or the solve budget: pass the device values
-  (`--tr <readout>` for rolling cameras, `--solve-budget-s <profile value>`)
-  or the replay truncates where the live session did not.
+- Current records carry per-camera hardware readout. Replay uses those stored
+  values; `--tr <readout>` is used when converting a raw VOXL log. The solve
+  budget is not stored: pass `--solve-budget-s <profile value>` to reproduce a
+  device session's configured limit.
+- `--report-json <path>` writes the engine's structured values, gate evidence,
+  and provenance atomically after replay, including aborted sessions. Report
+  persistence failure is a nonzero exit, independently of the calibration
+  verdict.
 - `--flight` applies the flight profile; `--threads N` changes wall clock
   only (the result YAML is byte-identical); the seeding-study knobs
   (`--imu-seed`, `--seed-rot/-pos/-td`, `--tg`, `--noise`) let one recorded

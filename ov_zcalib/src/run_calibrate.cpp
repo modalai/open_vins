@@ -30,9 +30,11 @@
 #include <cstdio>
 #include <cstring>
 #include <iostream>
+#include <sys/utsname.h>
 
 #include "utils/VoxlLogFeeder.h"
 #include "utils/YamlWriteback.h"
+#include "utils/ReportJson.h"
 #include "core/CalibSessionRunner.h"
 #include "core/SessionProfiles.h"
 #include "utils/quat_ops.h"
@@ -72,6 +74,10 @@ static void print_report(const SessionReport &rep) {
 
 int main(int argc, char **argv) {
   std::string replay_path, voxl_dir, out_yaml = "ov_zcalib_result.yaml";
+  std::string report_json;
+  bool temperature_unavailable = false;
+  // Line buffering lets desktop/ROS process supervisors display progress promptly.
+  std::setvbuf(stdout, nullptr, _IOLBF, 0);
   std::string cam_pipe = "tracking_front";
   std::string profile_ovr; ///< --profile voxl|flight|library (untagged records / deliberate re-scoring)
   bool selftest = false, quiet = false, joint_verbose = false;
@@ -176,6 +182,10 @@ int main(int argc, char **argv) {
       quiet = true;
     else if (arg("--out") && i + 1 < argc)
       out_yaml = argv[++i];
+    else if (arg("--report-json") && i + 1 < argc)
+      report_json = argv[++i];
+    else if (arg("--temperature-unavailable"))
+      temperature_unavailable = true;
     else if (arg("--cam-mode") && i + 1 < argc) {
       cam_mode = std::atoi(argv[++i]);
       have_cam_mode = true;
@@ -249,6 +259,34 @@ int main(int argc, char **argv) {
   cfg.out_yaml = out_yaml;
   cfg.verbose = !quiet;
   cfg.joint.verbose = joint_verbose; // per-pass ACCEPT/damp lines + the per-stage timing split
+  auto save_report = [&](const SessionReport &rep, const std::string &source, const std::string &path,
+                         const std::string &profile, const std::string &record) {
+    if (report_json.empty())
+      return true;
+    ReportMeta meta;
+    meta.source_kind = source;
+    meta.source_path = path;
+    meta.tracker = source == "log" ? "TrackKLT" : "none (record)";
+    meta.binary = argv[0];
+    meta.out_yaml = out_yaml;
+    meta.record_path = record;
+    meta.profile_tag = profile;
+    meta.cam_mode = cfg.cam_mode;
+    meta.threads = cfg.joint.num_threads;
+    meta.solve_budget_s = cfg.solve_budget_s;
+    meta.gravity_source = "session_record";
+    meta.temperature_available = temperature_unavailable ? 0 : -1;
+    struct utsname machine;
+    if (uname(&machine) == 0)
+      meta.machine = machine.machine;
+    std::string error;
+    if (!write_report_json(report_json, rep, meta, &error)) {
+      std::fprintf(stderr, "report write failed: %s\n", error.c_str());
+      return false;
+    }
+    std::printf("[report] %s\n", report_json.c_str());
+    return true;
+  };
   // Experiment overrides apply LAST (after any profile defaults) via this
   // helper called at each run-branch entry -- CLI always wins over profiles.
   auto apply_cli_overrides = [&](SessionConfig &c) {
@@ -462,9 +500,12 @@ int main(int argc, char **argv) {
     SessionReport rep;
     if (!CalibSessionRunner::run_replay(rec, cfg, rep, ovr_p)) {
       std::printf("replay of the converted record failed: %s\n", rep.abort_reason.c_str());
+      save_report(rep, "log", voxl_dir, flight ? "voxl+flight" : "voxl", rec);
       return 1;
     }
     print_report(rep);
+    if (!save_report(rep, "log", voxl_dir, flight ? "voxl+flight" : "voxl", rec))
+      return 3;
     // deltas vs the extrinsics.conf REFERENCE (the evaluation truth; NOT seeded)
     const Eigen::Matrix3d R_est = ov_core::quat_2_Rot(rep.committed.cams[0].q_ItoC);
     const double ang =
@@ -583,13 +624,17 @@ int main(int argc, char **argv) {
     apply_cli_overrides(cfg);
     if (!CalibSessionRunner::run_replay(replay_path, cfg, rep, ovr_p)) {
       std::printf("replay failed for %s: %s\n", replay_path.c_str(), rep.abort_reason.c_str());
+      save_report(rep, "record", replay_path, pname, replay_path);
       return 1;
     }
     print_report(rep);
+    if (!save_report(rep, "record", replay_path, pname, replay_path))
+      return 3;
     return rep.final_state == RunnerState::DONE ? 0 : 2;
   }
 
   std::printf("usage: ov_zcalibrate --replay <session.bin> | --voxl <log_dir> | --selftest [options]\n");
+  std::printf("       --out <yaml> --report-json <json> --cam-mode {0|1|2} --solve-budget-s <s> --threads <n>\n");
   std::printf("(live device sessions run in-process: voxl-open-vins-server --calibrate)\n");
   return 1;
 }

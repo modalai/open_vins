@@ -138,7 +138,7 @@ void CalibSessionRunner::feed_imu(const RawImu &s) {
           bg0_ = still_gyro_sum_ / std::max(still_gyro_n_, 1);
           have_baseline_ = true;
           boot_t0_ = s.timestamp;
-          enter_(RunnerState::BOOTSTRAP, "still baseline captured (bias + thermal)");
+          enter_(RunnerState::BOOTSTRAP, "still baseline captured (bias)");
         }
       } else {
         still_since_ = -1.0;

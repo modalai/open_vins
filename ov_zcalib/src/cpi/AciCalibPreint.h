@@ -48,7 +48,7 @@ struct RawImu {
   double timestamp = 0.0;
   Eigen::Vector3d wm = Eigen::Vector3d::Zero(); ///< raw gyro (sensor frame)
   Eigen::Vector3d am = Eigen::Vector3d::Zero(); ///< raw accel (sensor frame)
-  double temp_c = 0.0; ///< sensor temperature (thermal gates/fingerprints; ignored by the preintegration)
+  double temp_c = 0.0; ///< temperature telemetry; 0 is also the legacy unavailable placeholder (not a physical 0 C claim)
 };
 
 /**

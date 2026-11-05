@@ -25,6 +25,10 @@ int main() {
     std::fprintf(stderr, "FAIL report JSON: unknown solver budget must not be invented\n");
     return 1;
   }
+  if (json.find("\"temperature_available\"") != std::string::npos) {
+    std::fprintf(stderr, "FAIL report JSON: unknown temperature availability must not be invented\n");
+    return 1;
+  }
   for (const char *expected : {"\"t_solve_s\":null", "\"t_verify_s\":null", "\"t_total_s\":null",
                                "\"reprojection_sigma_px\":null", "\"reprojection_sigma_uses_window_default\":true",
                                "camera \\\"left\\\"\\nmissing\\\\stream\\t"}) {
@@ -37,9 +41,11 @@ int main() {
   rep.committed.grav_mag = 9.79321;
   meta.gravity_source = "calibration_profile";
   meta.solve_budget_s = 120.0;
+  meta.temperature_available = 0;
   const std::string finite = ov_zcalib::report_to_json(rep, meta);
   for (const char *expected : {"\"sigma_semantics\":\"local_curvature_precision\"",
                                "\"coverage_calibrated\":false", "\"coverage_kappa\":null", "\"solve_budget_s\":120",
+                               "\"temperature_available\":false", "\"thermal_checks_evaluated\":false",
                                "\"verdict_semantics\":\"configured_policy_certification\"",
                                "\"r_semantics\":\"directions_above_configured_information_floor\""}) {
     if (finite.find(expected) == std::string::npos) {

@@ -461,6 +461,11 @@ void emit_meta(std::string &o, const ReportMeta &m, const SessionReport &rep) {
   s.s_opt("out_yaml", m.out_yaml);
   s.s_opt("record_path", m.record_path);
   s.n("gravity_mag", rep.committed.grav_mag);
+  if (m.temperature_available >= 0) {
+    s.b("temperature_available", m.temperature_available != 0);
+    if (m.temperature_available == 0)
+      s.b("thermal_checks_evaluated", false);
+  }
   s.s_opt("gravity_source", m.gravity_source);
   s.s_opt("started_utc", m.started_utc);
   if (m.cam_mode >= 0)

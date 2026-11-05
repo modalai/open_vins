@@ -68,6 +68,8 @@ struct ReportMeta {
   /// Configured solver wall limit only; 0 unlimited, -1 not supplied by caller.
   /// Collection and held-out verification have separate durations.
   double solve_budget_s = -1.0;
+  /// -1 unknown, 0 unavailable, 1 provided. Standard sensor_msgs/Imu has no temperature.
+  int temperature_available = -1;
 };
 
 /// Serialize a finished session; non-finite doubles become null.
