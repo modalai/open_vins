@@ -804,30 +804,59 @@ class RigView(QWidget):
 
 
 class CoverageView(QWidget):
+    """Occupied 8x6 image cells: one camera, or one titled grid per camera side by side."""
+
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.grid = np.zeros((6, 8), dtype=int)
+        self.grids = [("", np.zeros((6, 8), dtype=int))]
         self.setMinimumHeight(96)
 
+    @property
+    def grid(self):
+        return self.grids[0][1]
+
     def set_grid(self, grid):
-        self.grid = grid
+        self.set_grids([("", grid)])
+
+    def set_grids(self, grids):
+        self.grids = list(grids) or [("", np.zeros((6, 8), dtype=int))]
         self.update()
 
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
-        cell_w, cell_h = self.width() / 8, self.height() / 6
-        for y in range(6):
-            for x in range(8):
-                rect = QRectF(x * cell_w + 2, y * cell_h + 2, cell_w - 4, cell_h - 4)
-                amount = int(self.grid[y, x])
-                painter.setPen(Qt.NoPen)
-                painter.setBrush(
-                    QColor(10, 132, 255, min(200, 45 + amount * 18))
-                    if amount
-                    else QColor("#2f2f31")
+        count = len(self.grids)
+        gap = 10 if count > 1 else 0
+        width = (self.width() - gap * (count - 1)) / count
+        titled = any(name for name, _ in self.grids)
+        top = 14 if titled else 0
+        cell_w, cell_h = width / 8, (self.height() - top) / 6
+        painter.setFont(font(7.5))
+        for index, (name, grid) in enumerate(self.grids):
+            left = index * (width + gap)
+            if name:
+                painter.setPen(QColor(MUTED))
+                painter.drawText(
+                    QRectF(left, 0, width, top - 2),
+                    Qt.AlignLeft | Qt.AlignVCenter,
+                    painter.fontMetrics().elidedText(name, Qt.ElideRight, int(width)),
                 )
-                painter.drawRoundedRect(rect, 2.0, 2.0)
+            painter.setPen(Qt.NoPen)
+            for y in range(6):
+                for x in range(8):
+                    rect = QRectF(
+                        left + x * cell_w + 1.5,
+                        top + y * cell_h + 1.5,
+                        cell_w - 3,
+                        cell_h - 3,
+                    )
+                    amount = int(grid[y, x])
+                    painter.setBrush(
+                        QColor(10, 132, 255, min(200, 45 + amount * 18))
+                        if amount
+                        else QColor("#2f2f31")
+                    )
+                    painter.drawRoundedRect(rect, 2.0, 2.0)
 
 
 class StageView(QWidget):
@@ -1099,7 +1128,6 @@ class CameraGrid(QWidget):
         for index, name in enumerate(self.names):
             view = FeatureView()
             view.setMinimumSize(160, 110)
-            view.show_grid = False
             view.title = name
             view.captions = captions
             self.views.append(view)

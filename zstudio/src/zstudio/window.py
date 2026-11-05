@@ -879,18 +879,28 @@ class StudioWindow(QMainWindow):
             if not log or (overview and tab == 0):
                 frame = self._with_image(frame, cam_index, self.feature_view)
                 self.feature_view.set_frame(frame, cam, self.session.demo)
+            all_points = []
             if overview and (not log or tab == 1):
                 for index, view in enumerate(self.multi_views):
+                    other = self.session.frame_at(self.offset, index)
                     view.set_frame(
-                        self._with_image(
-                            self.session.frame_at(self.offset, index), index, view
-                        ),
+                        self._with_image(other, index, view),
                         self.session.cameras[index],
                         self.session.demo,
                     )
+                    all_points.append(
+                        (
+                            view.title or f"Camera {index:02d}",
+                            other.points if other is not None else points,
+                            self.session.cameras[index],
+                        )
+                    )
             if frame is not None:
                 points = frame.points
-            self._coverage(points, cam)
+            if tab == 1 and len(all_points) > 1:
+                self._coverage_all(all_points)
+            else:
+                self._coverage(points, cam)
             self.metric_values[1].setText(
                 f"{self.session.camera_rates[cam_index]:.1f} Hz"
             )
@@ -1389,9 +1399,23 @@ class StudioWindow(QMainWindow):
     def _coverage(self, points, cam):
         grid = coverage(points, cam.width, cam.height)
         occupied = int(np.count_nonzero(grid))
+        self.coverage_view.setFixedHeight(68)
         self.coverage_view.set_grid(grid)
         self.coverage_text.setText(
             f"{occupied}/48 cells occupied  ·  {occupied / 48:.0%}"
+        )
+
+    def _coverage_all(self, entries):
+        """Coverage of every camera in the All view: (name, points, camera) per camera."""
+        grids = [
+            (name, coverage(points, cam.width, cam.height)) for name, points, cam in entries
+        ]
+        self.coverage_view.setFixedHeight(82)
+        self.coverage_view.set_grids(grids)
+        self.coverage_text.setText(
+            "  ·  ".join(
+                f"{name} {np.count_nonzero(grid) / 48:.0%}" for name, grid in grids
+            )
         )
 
     def _tick(self):
@@ -1662,6 +1686,7 @@ class StudioWindow(QMainWindow):
             [entry["camera"] for entry in snapshot["cameras"]],
             "Live seed · extrinsics unknown",
         )
+        live_points = []
         for index, entry in enumerate(snapshot["cameras"]):
             live_frame = entry["frame"]
             live_stamp = entry["image_stamp"]
@@ -1682,12 +1707,24 @@ class StudioWindow(QMainWindow):
                         width=entry["image"].width(), height=entry["image"].height()
                     )
             self.multi_views[index].set_frame(live_frame, live_cam)
+            live_points.append(
+                (
+                    self.multi_views[index].title or f"Camera {index:02d}",
+                    live_frame.points
+                    if live_frame is not None
+                    else np.zeros(0, dtype=POINT_DTYPE),
+                    live_cam,
+                )
+            )
         data = snapshot["imu"]
         if len(data):
             data = data[data[:, 0] > data[-1, 0] - 8.0][:: max(1, len(data) // 1000)]
         self.gyro_plot.set_data(data)
         self.accel_plot.set_data(data)
-        self._coverage(points, cam)
+        if self.view_tabs.currentIndex() == 1 and len(live_points) > 1:
+            self._coverage_all(live_points)
+        else:
+            self._coverage(points, cam)
         ready_cameras = sum(
             entry["image_age"] < 2.0 and entry["info"] for entry in snapshot["cameras"]
         )
@@ -1731,8 +1768,9 @@ class StudioWindow(QMainWindow):
     def _view_changed(self, index):
         self.view_switch.set_value(index)
         self.camera_box.setVisible(index == 0)
-        self.grid_check.setVisible(index == 0)
-        self.trails_check.setVisible(index == 0)
+        # Coverage and trails apply to every camera view; only the rig has neither.
+        self.grid_check.setVisible(index != 2)
+        self.trails_check.setVisible(index != 2)
         self._refresh_view()
 
     def _setup_multi_views(self, names):
@@ -1747,7 +1785,7 @@ class StudioWindow(QMainWindow):
             view = FeatureView()
             view.setMinimumSize(200, 140)
             view.title = name
-            view.show_grid = False
+            view.show_grid = self.grid_check.isChecked()
             view.show_trails = self.trails_check.isChecked()
             self.multi_views.append(view)
             self.multi_layout.addWidget(view, index // columns, index % columns)

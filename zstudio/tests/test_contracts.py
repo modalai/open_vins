@@ -308,5 +308,52 @@ class DesktopContracts(unittest.TestCase):
         self.app.processEvents()
 
 
+    def test_coverage_shown_for_every_camera(self):
+        """Feature coverage stays visible in the multi-camera view, per camera."""
+        import numpy as np
+        from zstudio.model import POINT_DTYPE, Camera, Frame, Session
+        from zstudio.window import PAGE_OVERVIEW, StudioWindow
+
+        def points(u0, u1):
+            pts = np.zeros(40, dtype=POINT_DTYPE)
+            pts["id"] = np.arange(40)
+            pts["u"] = np.linspace(u0, u1, 40)
+            pts["v"] = np.linspace(20, 460, 40)
+            return pts
+
+        frames = []
+        for seq, stamp in enumerate(np.arange(0.0, 2.0, 0.05)):
+            frames.append(Frame(float(stamp), points(10, 300), cam=0, seq=seq))
+            frames.append(Frame(float(stamp), points(330, 630), cam=1, seq=seq))
+        t = np.arange(0.0, 2.0, 0.005)
+        imu = np.column_stack((t, np.zeros((len(t), 6)), np.full(len(t), 25.0)))
+        session = Session("two cameras", [Camera(), Camera()], imu, frames)
+        window = StudioWindow()
+        try:
+            window.playing = False
+            window._session_loaded(session)
+            window.show()
+            self.app.processEvents()
+            self.assertEqual(window.pages.currentIndex(), PAGE_OVERVIEW)
+            self.assertEqual(window.view_tabs.currentIndex(), 1)  # All cameras
+            self.assertTrue(window.grid_check.isVisibleTo(window))
+            self.assertTrue(window.quality_card.isVisibleTo(window))
+            self.assertTrue(all(view.show_grid for view in window.multi_views))
+            window._refresh_view()
+            grids = window.coverage_view.grids
+            self.assertEqual(len(grids), 2)
+            self.assertGreater(np.count_nonzero(grids[0][1][:, :4]), 0)  # camera 0: left half
+            self.assertEqual(np.count_nonzero(grids[1][1][:, :4]), 0)
+            self.assertGreater(np.count_nonzero(grids[1][1][:, 4:]), 0)
+            window.grid_check.setChecked(False)
+            self.assertFalse(any(view.show_grid for view in window.multi_views))
+            window.view_switch.set_value(0, emit=True)
+            window._refresh_view()
+            self.assertEqual(len(window.coverage_view.grids), 1)
+        finally:
+            window.close()
+            self.app.processEvents()
+
+
 if __name__ == "__main__":
     unittest.main()
