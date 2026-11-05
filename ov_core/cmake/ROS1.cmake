@@ -7,10 +7,22 @@ find_package(catkin QUIET COMPONENTS roscpp rosbag sensor_msgs cv_bridge)
 option(ENABLE_ROS "Enable or disable building with ROS (if it is found)" ON)
 if (catkin_FOUND AND ENABLE_ROS)
     add_definitions(-DROS_AVAILABLE=1)
+    set(OV_CORE_CATKIN_INCLUDE_DIRS src/)
+    set(OV_CORE_CATKIN_LIBRARIES ov_core_lib)
+    if (OV_MODAL_FLOW_HOST)
+        # Devel-space consumers compile modal_flow headers through ov_core's public headers.
+        list(APPEND OV_CORE_CATKIN_INCLUDE_DIRS ${OV_MODAL_FLOW_HOST_INCLUDE_DIRS})
+        foreach (dir ${OpenCL_INCLUDE_DIRS})
+            if (NOT dir IN_LIST CMAKE_CXX_IMPLICIT_INCLUDE_DIRECTORIES)
+                list(APPEND OV_CORE_CATKIN_INCLUDE_DIRS ${dir})
+            endif ()
+        endforeach ()
+        list(APPEND OV_CORE_CATKIN_LIBRARIES ov_modal_flow_host)
+    endif ()
     catkin_package(
             CATKIN_DEPENDS roscpp rosbag sensor_msgs cv_bridge
-            INCLUDE_DIRS src/
-            LIBRARIES ov_core_lib
+            INCLUDE_DIRS ${OV_CORE_CATKIN_INCLUDE_DIRS}
+            LIBRARIES ${OV_CORE_CATKIN_LIBRARIES}
             CFG_EXTRAS ov_core_abi.cmake
     )
 else ()
@@ -86,6 +98,12 @@ install(TARGETS ov_core_lib
         LIBRARY DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}
         RUNTIME DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
+if (OV_MODAL_FLOW_HOST)
+    # The harness library is installed beside ov_core_lib; find it without LD_LIBRARY_PATH.
+    set_property(TARGET ov_core_lib APPEND PROPERTY INSTALL_RPATH "$ORIGIN")
+    ov_modal_flow_host_install(${CATKIN_PACKAGE_LIB_DESTINATION} ${CATKIN_PACKAGE_BIN_DESTINATION}
+            ${CATKIN_GLOBAL_INCLUDE_DESTINATION})
+endif ()
 install(DIRECTORY src/
         DESTINATION ${CATKIN_GLOBAL_INCLUDE_DESTINATION}
         FILES_MATCHING PATTERN "*.h" PATTERN "*.hpp"

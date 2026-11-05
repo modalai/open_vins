@@ -48,6 +48,26 @@
 
 using namespace ov_core;
 
+namespace {
+// Desktop producers (log/bag replay, simulators) deliver CV_8UC1 cv::Mat images
+// without modal_flow upload views. Wrap one in a CPU view whose release hook keeps
+// the pixels alive for as long as the flow manager's pyramid slot references them.
+void release_host_image(void *arg, std::size_t) { delete static_cast<cv::Mat *>(arg); }
+
+modal_flow::Frame host_upload_view(const cv::Mat &image, size_t cam_id, double timestamp)
+{
+    modal_flow::Frame frame{};
+    frame.cam = static_cast<modal_flow::CameraId>(cam_id);
+    frame.t = static_cast<modal_flow::Timestamp>(std::llround(std::max(0.0, timestamp) * 1e9));
+    frame.img.desc = {image.cols, image.rows, modal_flow::PixelFormat::R8, static_cast<int>(image.step)};
+    frame.img.data = image.data;
+    frame.img.data_release = &release_host_image;
+    frame.img.data_release_arg = new cv::Mat(image); // shares the pixel buffer's refcount
+    frame.img.data_release_size = image.total();
+    return frame;
+}
+} // namespace
+
 int test_feed_all = 0;
 
 // ============================================================================
@@ -410,7 +430,10 @@ void TrackOCL::feed_new_camera(const CameraData &message_const)
 {
     CameraData message = message_const;
     prepare_camera_masks(message);
-    if (message.img_frames.size() != message.sensor_ids.size())
+    // VOXL producers attach one upload view per camera; host producers send only
+    // cv::Mat images, which are uploaded from CPU memory below.
+    const bool host_images = message.img_frames.empty() && !message.images.empty();
+    if (!host_images && message.img_frames.size() != message.sensor_ids.size())
         throw std::invalid_argument("TrackOCL requires one image upload view per camera");
 
     // Error check that we have all the data
@@ -468,7 +491,11 @@ void TrackOCL::feed_new_camera(const CameraData &message_const)
     for (size_t i = 0; i < num_images; ++i) {
         const auto dims = mgr_.get_cam_dim(message.sensor_ids[i]);
         flow_mask_view(message.masks[i]).validate(dims.first, dims.second);
-        if (message.img_frames[i].cam != static_cast<modal_flow::CameraId>(message.sensor_ids[i]) ||
+        if (host_images) {
+            const cv::Mat &image = message.images[i];
+            if (image.type() != CV_8UC1 || image.cols != dims.first || image.rows != dims.second)
+                throw std::invalid_argument("TrackOCL host images must be CV_8UC1 at the camera's resolution");
+        } else if (message.img_frames[i].cam != static_cast<modal_flow::CameraId>(message.sensor_ids[i]) ||
             message.img_frames[i].img.desc.width != dims.first || message.img_frames[i].img.desc.height != dims.second)
             throw std::invalid_argument("TrackOCL upload view must match its camera and mask dimensions");
     }
@@ -479,7 +506,8 @@ void TrackOCL::feed_new_camera(const CameraData &message_const)
         size_t cam_id = message.sensor_ids.at(msg_id);
         std::lock_guard<std::mutex> lck(mtx_feeds.at(cam_id));
 
-        modal_flow::Frame frame = message.img_frames[msg_id];
+        modal_flow::Frame frame = host_images ? host_upload_view(message.images[msg_id], cam_id, message.timestamp)
+                                              : message.img_frames[msg_id];
 
         // upload image to flow manager
         if (img_buf_next_[cam_id]) {

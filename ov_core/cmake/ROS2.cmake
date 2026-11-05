@@ -73,16 +73,26 @@ install(TARGETS ov_core_lib
         RUNTIME DESTINATION bin
         PUBLIC_HEADER DESTINATION include
 )
+if (OV_MODAL_FLOW_HOST)
+    set_property(TARGET ov_core_lib APPEND PROPERTY INSTALL_RPATH "$ORIGIN")
+    ov_modal_flow_host_install(lib bin include)
+endif ()
 install(DIRECTORY src/
         DESTINATION include
         FILES_MATCHING PATTERN "*.h" PATTERN "*.hpp"
 )
 ament_export_include_directories(include)
 ament_export_libraries(ov_core_lib)
+if (OV_MODAL_FLOW_HOST)
+    ament_export_libraries(ov_modal_flow_host)
+endif ()
 ament_export_definitions(${OV_EIGEN_ABI_DEFINITIONS}
     HAVE_OPENCL=${OV_USE_MODAL_FLOW} OV_HAVE_MODAL_FLOW=${OV_USE_MODAL_FLOW})
 ament_export_dependencies(rclcpp cv_bridge Eigen3)
-if (OV_USE_MODAL_FLOW)
+if (OV_MODAL_FLOW_HOST)
+    # Harness headers are installed under include/ov_modal_flow_host (see cmake/ModalFlowHost.cmake).
+    ament_export_include_directories(include/ov_modal_flow_host ${OpenCL_INCLUDE_DIRS})
+elseif (OV_USE_MODAL_FLOW)
     ament_export_include_directories(${OpenCL_INCLUDE_DIRS} ${MODAL_FLOW_INCLUDE_DIR})
 endif()
 

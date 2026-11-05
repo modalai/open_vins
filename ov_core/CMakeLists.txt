@@ -30,23 +30,43 @@ endif ()
 
 # GPU camera payloads and TrackOCL require OpenCL AND libmodal-flow. OpenCL
 # alone (common on desktop ROS machines) does not provide the VOXL types/driver.
-find_package(OpenCL QUIET)
-find_path(MODAL_FLOW_INCLUDE_DIR NAMES modal_flow_ocl_manager.h)
-find_library(MODAL_FLOW_LIBRARY NAMES modal_flow)
+# OV_MODAL_FLOW=AUTO (default) builds TrackOCL whenever libmodal-flow is found:
+# an installed library (VOXL), or a source tree (OV_MODAL_FLOW_SOURCE_DIR or a
+# searched location) built for this host by the harness -- any arch, any OpenCL
+# >= 2.0 platform. ON requires it, OFF skips it. See ../cmake/ModalFlowHost.cmake
+# and ../docs/opencl-host-harness.md.
 set(OV_USE_MODAL_FLOW 0)
-if (OpenCL_FOUND AND MODAL_FLOW_INCLUDE_DIR AND MODAL_FLOW_LIBRARY
-    AND EXISTS "${MODAL_FLOW_INCLUDE_DIR}/modal_flow/Types.hpp"
-    AND EXISTS "${MODAL_FLOW_INCLUDE_DIR}/modal_flow/StereoMatcher.hpp")
-    if(NOT EXISTS "${MODAL_FLOW_INCLUDE_DIR}/modal_flow/Mask.hpp")
-        message(FATAL_ERROR "TrackOCL mask inputs require libmodal-flow >= 1.0.10")
+set(OV_MODAL_FLOW_HOST OFF)
+include(${CMAKE_CURRENT_SOURCE_DIR}/../cmake/ModalFlowHost.cmake OPTIONAL RESULT_VARIABLE OV_MODAL_FLOW_HOST_CMAKE)
+if (OV_MODAL_FLOW_HOST_CMAKE)
+    ov_modal_flow_configure()
+else ()
+    # ov_core outside the open_vins checkout: installed libmodal-flow only.
+    if (OV_MODAL_FLOW_SOURCE_DIR OR NOT "$ENV{OV_MODAL_FLOW_SOURCE_DIR}" STREQUAL "")
+        message(FATAL_ERROR "OV_MODAL_FLOW_SOURCE_DIR is set but cmake/ModalFlowHost.cmake is not next to ov_core "
+            "(build ov_core from the open_vins repository checkout).")
+    endif ()
+    find_package(OpenCL QUIET)
+    find_path(MODAL_FLOW_INCLUDE_DIR NAMES modal_flow_ocl_manager.h)
+    find_library(MODAL_FLOW_LIBRARY NAMES modal_flow)
+    if (OpenCL_FOUND AND MODAL_FLOW_INCLUDE_DIR AND MODAL_FLOW_LIBRARY
+        AND EXISTS "${MODAL_FLOW_INCLUDE_DIR}/modal_flow/Types.hpp"
+        AND EXISTS "${MODAL_FLOW_INCLUDE_DIR}/modal_flow/StereoMatcher.hpp")
+        if(NOT EXISTS "${MODAL_FLOW_INCLUDE_DIR}/modal_flow/Mask.hpp")
+            message(FATAL_ERROR "TrackOCL mask inputs require libmodal-flow >= 1.0.10")
+        endif()
+        set(OV_USE_MODAL_FLOW 1)
+        message(STATUS "OpenCL/modal-flow tracker enabled")
+    else()
+        message(STATUS "OpenCL/modal-flow tracker unavailable; building CPU trackers")
     endif()
-    set(OV_USE_MODAL_FLOW 1)
+endif ()
+if (OV_MODAL_FLOW_HOST)
+    list(APPEND thirdparty_libraries ${MODAL_FLOW_LIBRARY})
+elseif (OV_USE_MODAL_FLOW)
     include_directories(${OpenCL_INCLUDE_DIRS} ${MODAL_FLOW_INCLUDE_DIR})
     list(APPEND thirdparty_libraries ${OpenCL_LIBRARIES} ${MODAL_FLOW_LIBRARY})
-    message(STATUS "OpenCL/modal-flow tracker enabled")
-else()
-    message(STATUS "OpenCL/modal-flow tracker unavailable; building CPU trackers")
-endif()
+endif ()
 add_definitions(-DHAVE_OPENCL=${OV_USE_MODAL_FLOW} -DOV_HAVE_MODAL_FLOW=${OV_USE_MODAL_FLOW})
 
 # check if we have our python libs files (will search for python3 then python2 installs)
@@ -109,4 +129,9 @@ if (OV_CORE_BUILD_TESTS)
     target_include_directories(test_camera_projection PRIVATE ${Boost_INCLUDE_DIRS})
     target_link_libraries(test_camera_projection ov_core_lib ${thirdparty_libraries})
     add_test(NAME test_camera_projection COMMAND test_camera_projection)
+endif ()
+
+# TrackOCL on the host OpenCL harness (built when a libmodal-flow source tree is used).
+if (OV_MODAL_FLOW_HOST)
+    ov_modal_flow_host_add_tests("ov_core_lib;${thirdparty_libraries}")
 endif ()
