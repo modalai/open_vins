@@ -620,6 +620,73 @@ class StudioPages(unittest.TestCase):
             self.app.processEvents()
             time.sleep(0.005)
 
+    def test_vio_coverage_grid_follows_estimator_config(self):
+        from zstudio.vio_page import OPENVINS_GRID, VioPage
+
+        page = VioPage(lambda: None)
+        with TemporaryDirectory() as tmp:
+            config = Path(tmp) / "estimator_config.yaml"
+            config.write_text("%YAML:1.0\nuse_klt: true\ngrid_x: 8 # cols\ngrid_y: 4\n")
+            page.config_path = str(config)
+            self.assertEqual(page._config_grid(), (8, 4))
+            config.write_text("%YAML:1.0\nuse_klt: true\n")
+            self.assertEqual(page._config_grid(), OPENVINS_GRID)
+        page.deleteLater()
+
+    def test_overview_shows_vio_feature_coverage(self):
+        """After a VIO run, the Overview shows the tracked features and their coverage."""
+        from types import SimpleNamespace
+
+        from zstudio.window import PAGE_OVERVIEW, StudioWindow
+
+        with TemporaryDirectory() as tmp:
+            root = make_voxl_log(Path(tmp) / "log0007")
+            window = StudioWindow()
+            try:
+                window.playing = False
+                window.open_path(str(root), ask=False)
+                self.pump(30, lambda: window.log_loader is None and window.inspection is not None)
+                window.navigate(PAGE_OVERVIEW)
+                window._refresh_view()
+                self.assertFalse(window.quality_card.isVisibleTo(window))
+                self.assertIn("run VIO", window.metric_notes[0].text())
+
+                # A run that tracked tracking_left only: features on its left half.
+                log = window.session.log
+                left = next(i for i, c in enumerate(log.cameras) if c.name == "tracking_left")
+                cam = log.cameras[left]
+                vio = window.vio_page
+                vio.run_cameras = [cam.name]
+                vio.run_grid = (5, 5)  # grid_x / grid_y of the run's estimator config
+                uv = np.column_stack(
+                    (np.linspace(1, cam.width / 2 - 1, 30), np.linspace(1, cam.height - 1, 30))
+                )
+                for t in cam.times:
+                    vio.results.add_tracks(
+                        SimpleNamespace(cam=0, t=float(t), ids=np.arange(30), uv=uv)
+                    )
+                window.offset = window.session.duration / 2  # cameras start after the IMU
+                window._refresh_view()
+                self.assertTrue(window.quality_card.isVisibleTo(window))
+                self.assertIn("VIO", window.metric_notes[0].text())
+                self.assertEqual(window.view_tabs.currentIndex(), 1)
+                tiles = window.multi_views
+                self.assertEqual(len(tiles[left].frame.points), 30)
+                self.assertTrue(tiles[left].show_grid)
+                other = 1 - left
+                self.assertEqual(len(tiles[other].frame.points), 0)
+                grid = window.coverage_view.grid  # only the tracked camera is summarised
+                self.assertEqual(len(window.coverage_view.grids), 1)
+                self.assertEqual(grid.shape, (5, 5))  # the estimator's extraction grid
+                self.assertEqual(tiles[left].coverage_grid, (5, 5))
+                self.assertGreater(np.count_nonzero(grid[:, :3]), 0)
+                self.assertEqual(np.count_nonzero(grid[:, 3:]), 0)
+                self.assertIn("/25 cells", window.coverage_text.text())
+                self.assertEqual(window.metric_values[0].text(), "30")
+            finally:
+                window.close()
+                self.app.processEvents()
+
     def test_channel_and_convert_dialogs(self):
         from zstudio.logdialogs import ChannelDialog, ConvertDialog
         from zstudio.logs import ChannelInfo

@@ -63,6 +63,7 @@ from .model import (
     Camera,
     Frame,
     POINT_DTYPE,
+    CAPTURE_GRID,
     coverage,
     demo_session,
     rate,
@@ -714,7 +715,11 @@ class StudioWindow(QMainWindow):
         live = self.source is not None
         self.connect_button.setVisible(live)
         self.source_badge.setVisible(live)
-        tracked = live or (not session.demo and log is None)
+        tracked = (
+            live
+            or (not session.demo and log is None)
+            or (log is not None and self.vio_page.has_tracks())
+        )
         self.capture_button.setVisible(live)
         self.quality_card.setVisible(tracked or session.demo)
 
@@ -807,11 +812,7 @@ class StudioWindow(QMainWindow):
             )
         self.session_name.setText(session.name)
         if session.log is not None:
-            log = session.log
-            self.session_meta.setText(
-                f"{len(log.cameras)} camera{'s' if len(log.cameras) != 1 else ''} · {len(log.imus)} IMU · {len(session.frames):,} frames\n"
-                f"{log.format_label} · images from the log · no tracks"
-            )
+            self._log_meta(tracked=False)
         integrity = (
             "Complete recording"
             if session.complete
@@ -844,7 +845,7 @@ class StudioWindow(QMainWindow):
         self.metric_notes[0].setText(
             "Synthetic observations"
             if session.demo
-            else "Images only · no tracks"
+            else "Images only · run VIO for tracks"
             if session.log is not None
             else "Recorded observations"
         )
@@ -876,29 +877,46 @@ class StudioWindow(QMainWindow):
             log = self.session.log is not None
             overview = self.pages.currentIndex() == PAGE_OVERVIEW
             tab = self.view_tabs.currentIndex()
+            # A log has images only; after a VIO run its tracked features show here.
+            tracked = log and self.vio_page.has_tracks()
+            tracked_cams = set(self.vio_page.tracked_cameras()) if tracked else set()
+            for view in (self.feature_view, *self.multi_views):
+                view.coverage_grid = self._coverage_grid()
+            frame = self._with_tracks(frame, cam_index)
             if not log or (overview and tab == 0):
                 frame = self._with_image(frame, cam_index, self.feature_view)
                 self.feature_view.set_frame(frame, cam, self.session.demo)
             all_points = []
             if overview and (not log or tab == 1):
                 for index, view in enumerate(self.multi_views):
-                    other = self.session.frame_at(self.offset, index)
+                    other = self._with_tracks(
+                        self.session.frame_at(self.offset, index), index
+                    )
                     view.set_frame(
                         self._with_image(other, index, view),
                         self.session.cameras[index],
                         self.session.demo,
                     )
-                    all_points.append(
-                        (
-                            view.title or f"Camera {index:02d}",
-                            other.points if other is not None else points,
-                            self.session.cameras[index],
+                    if not log or index in tracked_cams:
+                        all_points.append(
+                            (
+                                view.title or f"Camera {index:02d}",
+                                other.points if other is not None else points,
+                                self.session.cameras[index],
+                            )
                         )
-                    )
             if frame is not None:
                 points = frame.points
-            if tab == 1 and len(all_points) > 1:
+            if log:
+                self.quality_card.setVisible(bool(tracked))
+                self.metric_notes[0].setText(
+                    "Tracked by the last VIO run" if tracked else "Images only · run VIO for tracks"
+                )
+                self._log_meta(bool(tracked))
+            if tab == 1 and all_points and (len(all_points) > 1 or tracked):
                 self._coverage_all(all_points)
+                if tracked:  # every camera the run tracked, not only the selected one
+                    points = np.concatenate([p for _, p, _ in all_points])
             else:
                 self._coverage(points, cam)
             self.metric_values[1].setText(
@@ -924,6 +942,30 @@ class StudioWindow(QMainWindow):
         self.play_button.setIcon(icon("pause" if self.playing else "play"))
 
     # -- logs ---------------------------------------------------------------------
+    def _log_meta(self, tracked):
+        log, session = self.session.log, self.session
+        self.session_meta.setText(
+            f"{len(log.cameras)} camera{'s' if len(log.cameras) != 1 else ''} · {len(log.imus)} IMU · {len(session.frames):,} frames\n"
+            f"{log.format_label} · "
+            + ("features tracked by the last VIO run" if tracked else "images from the log · no tracks")
+        )
+
+    def _with_tracks(self, frame, cam_index):
+        """A log frame carrying the features the latest VIO run tracked at it (if any)."""
+        if frame is None or self.session.log is None:
+            return frame
+        points = self.vio_page.tracked_points(cam_index, frame.seq)
+        if points is None:
+            return frame
+        return Frame(
+            frame.timestamp,
+            points,
+            cam=frame.cam,
+            seq=frame.seq,
+            exposure=frame.exposure,
+            image=frame.image,
+        )
+
     def _with_image(self, frame, cam_index, view=None):
         """Attach the decoded log image to a replay frame (asynchronous, cached)."""
         if frame is None or self.session.log is None or self.provider is None:
@@ -1396,25 +1438,44 @@ class StudioWindow(QMainWindow):
 
         self._run_worker(check, done, "Stereo geometry check")
 
+    def _coverage_grid(self):
+        """(cols, rows) of the extraction grid behind the shown features.
+
+        A log's features come from the last VIO run: its estimator config's
+        grid_x / grid_y. Sessions and live capture use ov_zcalib's capture tracker.
+        """
+        if self.session.log is not None and self.vio_page.has_tracks():
+            return self.vio_page.run_grid
+        return CAPTURE_GRID
+
     def _coverage(self, points, cam):
-        grid = coverage(points, cam.width, cam.height)
-        occupied = int(np.count_nonzero(grid))
+        grid = coverage(points, cam.width, cam.height, self._coverage_grid())
+        occupied, cells = int(np.count_nonzero(grid)), grid.size
         self.coverage_view.setFixedHeight(68)
         self.coverage_view.set_grid(grid)
         self.coverage_text.setText(
-            f"{occupied}/48 cells occupied  ·  {occupied / 48:.0%}"
+            f"{occupied}/{cells} cells occupied  ·  {occupied / cells:.0%}"
         )
 
     def _coverage_all(self, entries):
         """Coverage of every camera in the All view: (name, points, camera) per camera."""
+        size = self._coverage_grid()
         grids = [
-            (name, coverage(points, cam.width, cam.height)) for name, points, cam in entries
+            (name, coverage(points, cam.width, cam.height, size))
+            for name, points, cam in entries
         ]
         self.coverage_view.setFixedHeight(82)
         self.coverage_view.set_grids(grids)
+        if len(grids) == 1:
+            name, grid = grids[0]
+            occupied, cells = int(np.count_nonzero(grid)), grid.size
+            self.coverage_text.setText(
+                f"{name}  ·  {occupied}/{cells} cells  ·  {occupied / cells:.0%}"
+            )
+            return
         self.coverage_text.setText(
             "  ·  ".join(
-                f"{name} {np.count_nonzero(grid) / 48:.0%}" for name, grid in grids
+                f"{name} {np.count_nonzero(grid) / grid.size:.0%}" for name, grid in grids
             )
         )
 

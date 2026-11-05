@@ -8,6 +8,7 @@ can be scrubbed (live runs follow the newest estimate until you seek).
 """
 
 import bisect
+import re
 from datetime import datetime
 from pathlib import Path
 
@@ -72,6 +73,10 @@ def _get(record, *names, default=None):
         if hasattr(record, name):
             return getattr(record, name)
     return default
+
+
+# ov_msckf VioManagerOptions defaults for grid_x / grid_y.
+OPENVINS_GRID = (5, 5)
 
 
 class VioResults:
@@ -173,6 +178,7 @@ class VioPage(QWidget):
         self.log = None
         self.run = None
         self.results = VioResults()
+        self.run_grid = OPENVINS_GRID
         self.config_path = None
         self.run_dir = None
         self.live = True
@@ -449,6 +455,7 @@ class VioPage(QWidget):
             self.stop()
         self.log = log
         self.results = VioResults()
+        self.run_grid = OPENVINS_GRID
         self.config_path = None
         self.run_dir = None
         self.cameras.blockSignals(True)
@@ -756,6 +763,7 @@ class VioPage(QWidget):
             self.notify.emit(f"VIO could not start: {error}", True)
             return
         self.run_cameras = [c.name for c in cameras]
+        self.run_grid = self._config_grid()
         if cameras and self.cam_box.findText(cameras[0].name) >= 0:
             self.cam_box.setCurrentText(cameras[0].name)
         self.diverged = False
@@ -912,6 +920,55 @@ class VioPage(QWidget):
         elif self.cam_box.currentIndex() >= 0:
             self._show_tracks(self.camera_view, self.cam_box.currentIndex(), t)
 
+    def _config_grid(self):
+        """(grid_x, grid_y) of the estimator config this run uses (OpenVINS default 5 x 5)."""
+        values = {}
+        pset = self.editor.param_set if self.editor is not None else None
+        for key in ("grid_x", "grid_y"):
+            value = pset.value(key) if pset is not None else None
+            if value is None and self.config_path:
+                try:
+                    text = Path(self.config_path).read_text(encoding="utf-8")
+                    match = re.search(rf"^\s*{key}\s*:\s*(\d+)", text, re.M)
+                    value = match.group(1) if match else None
+                except OSError:
+                    value = None
+            try:
+                values[key] = max(1, int(value))
+            except (TypeError, ValueError):
+                values[key] = None
+        default_x, default_y = OPENVINS_GRID
+        return (values["grid_x"] or default_x, values["grid_y"] or default_y)
+
+    def has_tracks(self):
+        """True once the latest run has delivered feature tracks for some camera."""
+        return bool(getattr(self, "run_cameras", None)) and bool(self.results.track_times)
+
+    def tracked_points(self, cam_index, row):
+        """Features the latest VIO run tracked in log camera ``cam_index`` at frame ``row``.
+
+        None when that camera was not part of the run or has no tracks at that frame.
+        """
+        if self.log is None or not 0 <= cam_index < len(self.log.cameras):
+            return None
+        cam = self.log.cameras[cam_index]
+        run_cameras = getattr(self, "run_cameras", [])
+        if cam.name not in run_cameras or not 0 <= row < len(cam):
+            return None
+        period = float(np.median(np.diff(cam.times))) if len(cam) > 1 else 0.05
+        return self.results.tracks_at(
+            run_cameras.index(cam.name),
+            float(cam.times[row]),
+            tolerance=max(0.6 * period, 0.012),
+        )
+
+    def tracked_cameras(self):
+        """Indices of log cameras that the latest run tracked."""
+        if self.log is None:
+            return []
+        names = set(getattr(self, "run_cameras", []))
+        return [i for i, cam in enumerate(self.log.cameras) if cam.name in names]
+
     def _show_tracks(self, view, cam_index, t):
         cam = self.log.cameras[cam_index]
         if not len(cam):
@@ -923,17 +980,8 @@ class VioPage(QWidget):
         if provider is not None:
             provider.set_width(cam_index, view.width() * view.devicePixelRatioF())
             image = provider.image(cam_index, row, rate=self.playback_rate * fps)
-        run_index = (
-            self.run_cameras.index(cam.name)
-            if cam.name in getattr(self, "run_cameras", [])
-            else None
-        )
-        points = None
-        if run_index is not None:
-            period = float(np.median(np.diff(cam.times))) if len(cam) > 1 else 0.05
-            points = self.results.tracks_at(
-                run_index, float(cam.times[row]), tolerance=max(0.6 * period, 0.012)
-            )
+        points = self.tracked_points(cam_index, row)
+        view.coverage_grid = self.run_grid
         from .model import Camera
 
         intr = cam.intrinsics or {}

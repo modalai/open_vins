@@ -132,6 +132,10 @@ class FormatContracts(unittest.TestCase):
         session = read_record(self.path)
         points = session.frames[0].points.copy()
         self.assertEqual(coverage(points, 640, 480).sum(), 1)
+        five = coverage(points, 640, 480, (5, 5))
+        self.assertEqual(five.shape, (5, 5))  # (rows, cols) for grid_x = grid_y = 5
+        self.assertEqual(five.sum(), 1)
+        self.assertEqual(coverage(points, 640, 480, (8, 6)).shape, (6, 8))
         points["u"] = -1
         self.assertEqual(coverage(points, 640, 480).sum(), 0)
 

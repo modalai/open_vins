@@ -244,21 +244,30 @@ def read_report(path):
     return report
 
 
-def coverage(points, width, height):
-    """Occupied cells, not a statistical observability or calibration certificate."""
-    grid = np.zeros((6, 8), dtype=int)
+# The ov_zcalib capture front end detects in an 8 x 6 grid (CaptureCore: TrackKLT
+# grid 8, 6). A VIO run uses its estimator config's grid_x / grid_y instead.
+CAPTURE_GRID = (8, 6)
+
+
+def coverage(points, width, height, grid=CAPTURE_GRID):
+    """Features per tracker extraction cell, shape (rows, cols) for grid = (cols, rows).
+
+    Occupied cells, not a statistical observability or calibration certificate.
+    """
+    cols, rows = max(1, int(grid[0])), max(1, int(grid[1]))
+    out = np.zeros((rows, cols), dtype=int)
     if len(points):
         x, y = points["u"], points["v"]
         keep = (x >= 0) & (x < width) & (y >= 0) & (y < height)
         np.add.at(
-            grid,
+            out,
             (
-                np.minimum(5, (y[keep] / height * 6).astype(int)),
-                np.minimum(7, (x[keep] / width * 8).astype(int)),
+                np.minimum(rows - 1, (y[keep] / height * rows).astype(int)),
+                np.minimum(cols - 1, (x[keep] / width * cols).astype(int)),
             ),
             1,
         )
-    return grid
+    return out
 
 
 def rate(times):

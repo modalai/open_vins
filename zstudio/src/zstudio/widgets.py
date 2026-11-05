@@ -27,7 +27,7 @@ from PyQt5.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
-from .model import coverage
+from .model import CAPTURE_GRID, coverage
 
 # Design tokens: Apple-style dark appearance (system grays, one accent, semantic colors).
 BG = "#1c1c1e"  # window
@@ -216,6 +216,7 @@ class FeatureView(QWidget):
         self.camera = None
         self.demo = False
         self.show_grid = True
+        self.coverage_grid = CAPTURE_GRID  # (cols, rows) of the tracker's extraction grid
         self.show_trails = True
         self.history = deque(maxlen=14)
         self.title = ""  # camera name shown in the heading
@@ -292,29 +293,30 @@ class FeatureView(QWidget):
         if image is None and self.demo:
             self._demo_background(painter, cam, frame.timestamp if frame else 0.0)
         if self.show_grid and frame is not None and len(frame.points):
-            grid = coverage(frame.points, cam.width, cam.height)
-            for y in range(6):
-                for x in range(8):
+            grid = coverage(frame.points, cam.width, cam.height, self.coverage_grid)
+            rows, cols = grid.shape
+            for y in range(rows):
+                for x in range(cols):
                     if grid[y, x]:
                         cell = QRectF(
-                            x * cam.width / 8,
-                            y * cam.height / 6,
-                            cam.width / 8,
-                            cam.height / 6,
+                            x * cam.width / cols,
+                            y * cam.height / rows,
+                            cam.width / cols,
+                            cam.height / rows,
                         )
                         painter.fillRect(
-                            cell, QColor(10, 132, 255, min(40, int(grid[y, x]) * 5))
+                            cell, QColor(10, 132, 255, min(90, 30 + 6 * int(grid[y, x])))
                         )
             painter.setPen(QPen(QColor(255, 255, 255, 18), 0.6 / scale))
-            for x in range(9):
+            for x in range(cols + 1):
                 painter.drawLine(
-                    QPointF(x * cam.width / 8, 0),
-                    QPointF(x * cam.width / 8, cam.height),
+                    QPointF(x * cam.width / cols, 0),
+                    QPointF(x * cam.width / cols, cam.height),
                 )
-            for y in range(7):
+            for y in range(rows + 1):
                 painter.drawLine(
-                    QPointF(0, y * cam.height / 6),
-                    QPointF(cam.width, y * cam.height / 6),
+                    QPointF(0, y * cam.height / rows),
+                    QPointF(cam.width, y * cam.height / rows),
                 )
         if frame is not None and len(frame.points):
             painter.setRenderHint(QPainter.Antialiasing, True)
@@ -804,12 +806,12 @@ class RigView(QWidget):
 
 
 class CoverageView(QWidget):
-    """Occupied 8x6 image cells: one camera, or one titled grid per camera side by side."""
+    """Occupied tracker-grid cells: one camera, or one titled grid per camera side by side."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.grids = [("", np.zeros((6, 8), dtype=int))]
-        self.setMinimumHeight(96)
+        self.setMinimumHeight(64)
 
     @property
     def grid(self):
@@ -830,9 +832,10 @@ class CoverageView(QWidget):
         width = (self.width() - gap * (count - 1)) / count
         titled = any(name for name, _ in self.grids)
         top = 14 if titled else 0
-        cell_w, cell_h = width / 8, (self.height() - top) / 6
         painter.setFont(font(7.5))
         for index, (name, grid) in enumerate(self.grids):
+            rows, cols = grid.shape
+            cell_w, cell_h = width / cols, (self.height() - top) / rows
             left = index * (width + gap)
             if name:
                 painter.setPen(QColor(MUTED))
@@ -842,8 +845,8 @@ class CoverageView(QWidget):
                     painter.fontMetrics().elidedText(name, Qt.ElideRight, int(width)),
                 )
             painter.setPen(Qt.NoPen)
-            for y in range(6):
-                for x in range(8):
+            for y in range(rows):
+                for x in range(cols):
                     rect = QRectF(
                         left + x * cell_w + 1.5,
                         top + y * cell_h + 1.5,
