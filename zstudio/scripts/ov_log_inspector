@@ -1,0 +1,23 @@
+#!/usr/bin/env python3
+"""Run from a checkout, catkin/ament install, or standalone CMake install."""
+
+from pathlib import Path
+import sys
+
+here = Path(__file__).resolve()
+for root in (
+    here.parent.parent / "src",
+    here.parent.parent / "lib" / "zstudio",
+    here.parent.parent / "lib64" / "zstudio",
+):
+    if (root / "zstudio").is_dir():
+        sys.path.insert(0, str(root))
+        break
+
+try:
+    from zstudio.logcli import main
+except ImportError as error:
+    raise SystemExit(f"Cannot start ov_log_inspector: {error}. Install the Python requirements: python3 -m pip install -r zstudio/requirements.txt")
+
+if __name__ == "__main__":
+    sys.exit(main())

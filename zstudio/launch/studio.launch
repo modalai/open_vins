@@ -1,0 +1,5 @@
+<launch>
+  <arg name="session" default="" />
+  <node pkg="zstudio" type="zstudio" name="zstudio"
+        args="--open &quot;$(arg session)&quot;" output="screen" />
+</launch>

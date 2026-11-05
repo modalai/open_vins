@@ -20,6 +20,11 @@ if (OV_BUILD_CALIB)
 	add_subdirectory(ov_zcalib)
 endif()
 
+option(OV_BUILD_ZSTUDIO "Install zstudio, the VINS inspection and calibration studio (no ROS required)" OFF)
+if (OV_BUILD_ZSTUDIO)
+    add_subdirectory(zstudio)
+endif()
+
 # Make subdirectory tests discoverable from the build root. Aggregate binaries
 # into one dependency graph so -j can compile independent test TUs concurrently.
 # The host OpenCL harness, when libmodal-flow's source is found, registers

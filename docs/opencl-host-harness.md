@@ -89,7 +89,7 @@ Use any estimator config with `use_klt: true` and `use_gpu: true`. Optional envi
 The first device selection prints one line, e.g.
 `[ov_modal_flow_host] OpenCL device: Intel(R) Arc(TM) Graphics (GPU, Intel(R) OpenCL Graphics (integrated))`.
 `ov_msckf_replay --capabilities` lists `"ocl"` among its trackers when the
-harness is built.
+harness is built; zstudio offers it automatically.
 
 ## Setup on a developer PC
 

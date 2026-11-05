@@ -1,0 +1,35 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>zstudio</name>
+  <version>0.1.0</version>
+  <description>zstudio, a complete inspection tool for VINS: voxl-logger and ROS 1 / ROS 2 bag inspection,
+    ROS-free OpenVINS replay and the native Qt ov_zcalib calibration studio (ROS 2, ROS 1, and standalone).</description>
+  <maintainer email="pgeneva@udel.edu">OpenVINS maintainers</maintainer>
+  <license>GPL-3.0-or-later</license>
+  <author email="joao.cotta@modalai.com">Joao Leonardo Silva Cotta, PhD</author>
+  <buildtool_depend condition="$ROS_VERSION == 1">catkin</buildtool_depend>
+  <buildtool_depend condition="$ROS_VERSION == 2">ament_cmake</buildtool_depend>
+  <buildtool_depend condition="$ROS_VERSION == 2">ament_cmake_python</buildtool_depend>
+  <exec_depend>ov_zcalib</exec_depend>
+  <!-- Python requirements mirror requirements.txt; the install step pip-installs
+       whichever of them the interpreter still lacks into a private directory. -->
+  <buildtool_depend>python3</buildtool_depend>
+  <exec_depend>python3-pip</exec_depend>
+  <exec_depend>python3-pyqt5</exec_depend>
+  <exec_depend>python3-numpy</exec_depend>
+  <!-- Log inspection / VIO extras: bags (pure Python, no sourced ROS), full-resolution
+       demosaic and the stereo check, report plots. The studio degrades gracefully without them. -->
+  <exec_depend>python3-rosbags-pip</exec_depend>
+  <exec_depend>python3-opencv</exec_depend>
+  <exec_depend>python3-matplotlib</exec_depend>
+  <exec_depend condition="$ROS_VERSION == 1">rospy</exec_depend>
+  <exec_depend condition="$ROS_VERSION == 2">rclpy</exec_depend>
+  <exec_depend condition="$ROS_VERSION == 2">launch_ros</exec_depend>
+  <exec_depend condition="$ROS_VERSION == 2">ament_index_python</exec_depend>
+  <exec_depend condition="$ROS_VERSION == 1">roslaunch</exec_depend>
+  <exec_depend>sensor_msgs</exec_depend>
+  <export>
+    <build_type condition="$ROS_VERSION == 1">catkin</build_type>
+    <build_type condition="$ROS_VERSION == 2">ament_cmake</build_type>
+  </export>
+</package>

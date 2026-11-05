@@ -20,6 +20,11 @@ Two front doors, one engine:
   (`--replay`, the CI and forensics path), converts voxl-logger logs
   (`--voxl`), and runs a writeback smoke test (`--selftest`).
 
+[zstudio](../zstudio/README.md), the native studio, adds live ROS 2 / ROS 1
+topic viewing and default-TrackKLT capture, ROS-free session replay, IMU plots,
+sensor-rig inspection, calibration controls, and JSON report inspection. Both
+modules are catkin/ament packages; the studio also runs directly without ROS.
+
 ## Layout
 
 | dir | content |

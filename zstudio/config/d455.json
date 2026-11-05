@@ -1,0 +1,15 @@
+{
+  "transport": "ROS 2",
+  "reliable_images": true,
+  "camera_name": "Left IR · D4 rectified",
+  "image_topic": "/zcalib/d455/infra1/image",
+  "info_topic": "/zcalib/d455/infra1/camera_info",
+  "imu_topic": "/camera/camera/imu",
+  "timestamp_reference": "center",
+  "readout_s": 0.0,
+  "exposure_s": 0.01,
+  "extra_cameras": [
+    {"camera_name": "Right IR · D4 rectified", "image_topic": "/zcalib/d455/infra2/image", "info_topic": "/zcalib/d455/infra2/camera_info"},
+    {"camera_name": "RGB · rectified", "image_topic": "/zcalib/d455/color/image", "info_topic": "/zcalib/d455/color/camera_info"}
+  ]
+}

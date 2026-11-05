@@ -1,0 +1,30 @@
+#!/usr/bin/env python3
+"""zstudio, a complete inspection tool for VINS.
+
+Runs from a checkout, a catkin/ament install, or a standalone CMake install.
+"""
+
+from pathlib import Path
+import sys
+
+here = Path(__file__).resolve()
+for root in (
+    here.parent.parent / "src",
+    here.parent.parent / "lib" / "zstudio",
+    here.parent.parent / "lib64" / "zstudio",
+):
+    if (root / "zstudio").is_dir():
+        sys.path.insert(0, str(root))
+        break
+
+try:
+    from zstudio.app import main
+except ImportError as error:
+    raise SystemExit(
+        f"Cannot start zstudio: {error}.\n"
+        "Install the Python requirements: python3 -m pip install -r zstudio/requirements.txt\n"
+        "(or reinstall the package: the install step resolves requirements.txt)."
+    )
+
+if __name__ == "__main__":
+    main()

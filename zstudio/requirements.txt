@@ -1,0 +1,16 @@
+# Python requirements of the ov_zcalib Calibration Studio and ov_log_inspector.
+#
+# The install step (cmake --install, colcon build, catkin_make install) runs
+# scripts/install_requirements.py on this file: requirements that the Python
+# interpreter can already import are left alone, missing ones are installed with
+# pip into a private directory next to the studio (<prefix>/lib/zstudio/
+# python-deps) — never into the system Python. Disable with
+# -DZSTUDIO_INSTALL_PYTHON_DEPS=OFF (e.g. distribution packaging, where
+# package.xml / rosdep provide the same dependencies).
+#
+# Format: <pip requirement>  # import: <module checked before installing>
+numpy>=1.21                     # import: numpy
+PyQt5>=5.15                     # import: PyQt5
+rosbags>=0.9.20                 # import: rosbags.highlevel  (ROS 1 / ROS 2 bags without a sourced ROS; rosbags is a namespace package)
+matplotlib>=3.5                 # import: matplotlib   (report plots)
+opencv-python-headless>=4.5     # import: cv2          (full-resolution demosaic, stereo check)
