@@ -138,6 +138,13 @@ ov_zcalibrate --selftest                                # writeback smoke
   only (the result YAML is byte-identical); the seeding-study knobs
   (`--imu-seed`, `--seed-rot/-pos/-td`, `--tg`, `--noise`) let one recorded
   session be scored across the whole seeding matrix.
+- `ov_zcalib_track OUT.bin` (ROS-free, built with TrackKLT) turns any log into
+  a session: it reads the sensor stream documented in
+  `ov_core/src/utils/sensor_stream.h` (center-row mid-exposure stamps, per-frame
+  exposure, IMU with temperature) on stdin and tracks 1-16 cameras through the
+  same `CaptureCore` as the ROS capture node. The studio's
+  *Convert to session* feeds it from voxl-logger logs and ROS 1 / ROS 2 bags;
+  for one VOXL camera it matches `--voxl` exactly.
 
 ## Tests (ctest, `OV_ZCALIB_BUILD_TESTS=ON`)
 
